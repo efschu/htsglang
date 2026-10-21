@@ -1292,8 +1292,15 @@ _ADMISSION_WAIT_CAP = 1024
 def _note_admission_wait(rid: str, host_code: str, host_price, host_budget,
                          local: str, price, budget) -> None:
     """How often and how long a request waits on the host's gate (metal
-    question: is a host-backed span starving?). One line per refusal
-    (first 20, then every 64th), one line when the waiting rid is admitted."""
+    question: is a host-backed span starving?). One line when the waiting rid
+    is admitted (AFTER-WAIT).
+
+    D-ADMIT-REFUSED (rc27 D 02:15:44-56, pdflip-2-30, 11 refusals in 12.3 s
+    without a line): the refusal lines are throttled PER RID -- its first 3, a
+    change of the host's code, refusal counts that are a power of two and
+    every 64th -- not on the process-global count, which stood between 65 and
+    127 for that whole window and printed none of them. The global first 20
+    stay as before."""
     import time
 
     if host_code != ADMISSION_ADMIT:
@@ -1301,11 +1308,15 @@ def _note_admission_wait(rid: str, host_code: str, host_price, host_budget,
         if ent is None:
             if len(_ADMISSION_WAIT) >= _ADMISSION_WAIT_CAP:
                 _ADMISSION_WAIT.pop(next(iter(_ADMISSION_WAIT)))
-            ent = _ADMISSION_WAIT[rid] = [time.monotonic(), 0]
+            ent = _ADMISSION_WAIT[rid] = [time.monotonic(), 0, None]
         ent[1] += 1
+        _code_changed = len(ent) > 2 and ent[2] != host_code
+        if len(ent) > 2:
+            ent[2] = host_code
         _STATS["admission_refused"] = _STATS.get("admission_refused", 0) + 1
         n = _STATS["admission_refused"]
-        if n <= 20 or n % 64 == 0:
+        k = ent[1]
+        if n <= 20 or _code_changed or k <= 3 or (k & (k - 1)) == 0 or k % 64 == 0:
             logger.info(
                 "H105 RU FORM-A ADMISSION WAIT rid=%s host=%s host_price=%s "
                 "host_budget=%s local=%s local_price=%s local_budget=%s "

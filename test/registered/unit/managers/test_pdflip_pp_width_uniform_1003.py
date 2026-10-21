@@ -178,7 +178,11 @@ def test_host_kv_without_anchor_at_told_is_short_too():
     tree = _StageTree(dev=HEAD, host=TOLD - HEAD, anchor=HEAD)
     s = _stage(1, tree)
     assert tf.rank_resumable(s, _req(), TOLD) == HEAD
-    assert tf.pp0_admissible(s, _req(), TOLD) == TOLD, "PP0's TF probe is unchanged"
+    # NF-TF-GAP 1021 (a2d47f1a10): PP0's TF probe asks the SAME aligned reach the
+    # followers ack with -- the anchor at 13184 below the host run's end stops
+    # PP0's admission there too, so PP0 no longer claims told (before: 16640, the
+    # bare device + host count; that disagreement is the START-SPLIT direction)
+    assert tf.pp0_admissible(s, _req(), TOLD) == HEAD == tf.rank_resumable(s, _req(), TOLD)
 
 
 def test_a_follower_whose_tree_reaches_told_reads_nothing_more():

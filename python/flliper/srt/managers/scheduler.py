@@ -252,6 +252,7 @@ from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
 from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
+from flliper.srt.pdflip import d_admit_refusal as _d_admit_refusal  # D-ADMIT-REFUSED
 from flliper.srt.pdflip import head_vote_hold as _pdflip_head_vote_hold  # S42
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
@@ -267,6 +268,7 @@ from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D
 from flliper.srt.pdflip import d_seat_rewake as _pdflip_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed wake cohort
 from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
+from flliper.srt.pdflip import d_mem_share as _pdflip_d_mem_share  # D-MEM-SHARE (nf-decode-host-1020)
 from flliper.srt.layers.moe import em_fetch_probe as _em_fetch_probe  # S78 EM-FETCH instrument
 from flliper.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from flliper.srt.pdflip import short_read as _pdflip_short_read  # held short wake reads
@@ -1817,6 +1819,31 @@ def _pdflip_prefetch_span_start(sched, req, matched_len: int) -> int:
             int(getattr(req, "host_hit_length", 0) or 0), int(anchor), k,
         )
     return int(anchor)
+
+
+def _s109r_admission_anchor_read(sched, req) -> bool:
+    """S109R (NF rc29, 21.10.): at the ADMISSION match, an anchor that lives only on L3 -- the S109c aux round released
+    the host copy of a device-KV node after both its KV pages and its anchor had their L3 copy -- is read back (e1 /
+    ``UnifiedRadixCache.pdflip_anchor_only_read``, for that node shape the S109R device read) and the request is matched
+    again. Without it the match fell back to the last state above the node and every token behind it was recomputed
+    whenever the loss stayed under X (above X, S59 re-reads; below, nobody did). e1 asked only at intake and at the
+    deferral retry; a request waiting for D room lost the anchor in between (H105g ``anchor_dropped``) and never asked.
+
+    Group D (no PP) only -- the PP form's floors are PP0's told (S43/S90b read there). Rank-local like e1: only a
+    GDN-holding rank reads, it only raises its own match, the group MIN stays the verdict (SOLL R11). One read per
+    depth per request (e1's own mark). Returns True when the request was matched again."""
+    ps = getattr(sched, "ps", None)
+    if ps is not None and int(getattr(ps, "pp_size", 1) or 1) > 1:
+        return False
+    tc = getattr(sched, "tree_cache", None)
+    fn = getattr(tc, "pdflip_anchor_only_read", None)
+    if not callable(fn):
+        return False
+    got = fn(req)
+    if not isinstance(got, int) or isinstance(got, bool) or got <= 0:
+        return False   # nothing attached (a double that answers every call is no attach either)
+    req.init_next_round_input(tc)
+    return True
 
 
 _PRESENCE_PROBE_N = [0]
@@ -4729,6 +4756,7 @@ class Scheduler(
             _stage_sync(f"result-{tmp_batch.forward_mode.name}")
             _h58_span("result_ms", _h58_t0)
             _slow.span("result_ms", _h58_t0)
+            _pdflip_d_decode_gap.span(self, "result", _h58_t0)  # nf-decode-host-1020: D-DECODE-GAP spans
 
         # nf-pd-post: the last batch's result was processed in the iteration
         # that launched it (pdflip/skip_first.result_now) -- nothing to pop for it.
@@ -4745,6 +4773,7 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             _h58_span("recv_ms", _h58_t0)
             _slow.span("recv_ms", _h58_t0)
+            _pdflip_d_decode_gap.span(self, "recv", _h58_t0)  # nf-decode-host-1020: D-DECODE-GAP spans
             if self._engine_paused:
                 continue
 
@@ -4754,6 +4783,9 @@ class Scheduler(
             _t_slow = time.perf_counter()
             self._dual_group_lane_tick()
             _slow.span("lane_ms", _t_slow)
+
+            # NF-R6-REST-EXAKT (SOLL R6): an extend forward that ended reports its after-rest now, not after the next launch
+            self._pdflip_d_ext_poll()
 
             # #616 instrument: consume/stage the index-race counters. Sync-free
             # (staged D2H + event query), no-op unless the guard is armed.
@@ -4797,6 +4829,8 @@ class Scheduler(
                 # idle poll ladder to its zero-poll rung.
                 if self.idle_sleeper is not None:
                     self.idle_sleeper.reset()
+                # NF-R6-REST-EXAKT: building this batch can take 100 ms (lend return, fences) -- the previous extend's end first
+                self._pdflip_d_ext_poll()
                 _t_slow = time.perf_counter()
                 batch_result = self.run_batch(batch)
                 _slow.span("run_ms", _t_slow)
@@ -13258,13 +13292,17 @@ class Scheduler(
         # D-TRANSIENT-LEND: extend work pending -> the lent rows go back
         # first, before the stage tick and the #794 width vote read the card
         # (UNIFY 1002: round_boundary runs _pdflip_d_seat_vram.runtime_tick itself)
+        _t_gap = time.perf_counter()  # nf-decode-host-1020: D-DECODE-GAP spans (host ms, rank-local)
         _pdflip_d_transient_lend.round_start(self)
+        _pdflip_d_decode_gap.span(self, "lend_start", _t_gap)
+        _t_gap = time.perf_counter()
         _pdflip_d_seat_rewake.round_boundary(self)
         # DUAL-TP3PP3 unified KV (C): D's share of the card pool follows its
         # running demand (rank-symmetric; no-op unless the D actor is attached)
         from flliper.srt.pdflip import dual_d_kv_stage as _ddk
 
         _ddk.tick(self)
+        _pdflip_d_decode_gap.span(self, "seat_stage", _t_gap)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -13958,7 +13996,9 @@ class Scheduler(
                 self._retry_deferred_prefetches()
         else:
             _dqh_verdicts = self.__dict__.get("_pass_prefetch_verdicts")
+            _t_gap = time.perf_counter()
             prefill_plan = self.get_new_batch_prefill(running_batch)
+            _pdflip_d_decode_gap.span(self, "admit", _t_gap)  # nf-decode-host-1020
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
             self.pdflip_d_head_hold.note_pass(
@@ -14120,7 +14160,9 @@ class Scheduler(
         # D-TRANSIENT-LEND: the booked transient is expert rows between two
         # extends -- returned here before an extend runs, lent after SETTLE
         # decode rounds; the verdict is the batch's kind (rank-symmetric)
+        _t_gap = time.perf_counter()
         _pdflip_d_transient_lend.on_batch(self, ret)
+        _pdflip_d_decode_gap.span(self, "lend_end", _t_gap)  # nf-decode-host-1020
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
 
@@ -15554,6 +15596,10 @@ class Scheduler(
                 0 if _pre is None else len(_pre), "-" if _anc is None else int(_anc),
                 uncached, verdict,
             )
+        try:  # D-ADMIT-REFUSED: what the X gate priced, for the not-added line
+            setattr(req, _d_admit_refusal.XGATE_ATTR, (int(uncached), int(limit)))
+        except Exception:  # noqa: BLE001 -- a slotted stand-in
+            pass
         if verdict == "W31":
             # #1471b (z30m 03:19-03:22, pdflip-116-141): three W31s priced the
             # WHOLE prompt right after every rank had read 28096/4352/36800 of
@@ -15836,11 +15882,78 @@ class Scheduler(
         tail_start, tail_wait = (None, False) if covered is None else _ta.peek_target_start(
             req, int(covered), batch_empty=batch_empty
         )
-        return _vdg.bounded(
-            _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait),
-            str(req.rid),
-            defers,
-        )
+        v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
+        if v == _vdg.REFUSE and covered is not None and not getattr(req, "_pdflip_vision_rows_tried", False):
+            # VISION-ROWS (rc30 visiontail, pdflip-10-516): an image P's tower already encoded and that ends in the
+            # partial page past the group's covered prefix is computed HERE from P's published rows -- no tower,
+            # no second flip. Every input of this branch is replicated (the group's covered, the tail peek, the
+            # request's items), so every rank enters it for the same request; rank 0 reads, one broadcast.
+            req._pdflip_vision_rows_tried = True
+            bound = max(int(covered), int(tail_start or 0))
+            if Scheduler._pdflip_vision_d_rows(self, req, bound, int(covered)):
+                req._pdflip_vision_need = _vdg.image_end(req)
+                v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
+        return _vdg.bounded(v, str(req.rid), defers)
+
+    def _pdflip_vision_d_rows(self, req: Req, bound: int, covered: int) -> bool:
+        """VISION-ROWS (D side, ``pdflip/vision_row_store.py``): attach the rows of every image of ``req`` that
+        reaches at or past ``bound`` from the shared store P publishes to -- all or none. TP rank 0 reads the files
+        and ONE broadcast hands the same tensors to every rank (no rank reads the directory itself: an eviction
+        between two ranks' reads can never split the group, R11 / Rang-Einigkeit). True when attached."""
+        from flliper.srt.pdflip import vision_d_guard as _vdg
+        from flliper.srt.pdflip import vision_row_store as _vrs
+
+        items = _vdg.items_past(req, bound)
+        if not items:
+            return False
+        if not all(_vrs.per_image(it) for it in _vdg._items(req)):
+            # one item with several offsets sends the whole request down mm_utils' combined path, which looks up
+            # no per-image rows and would ask the tower (replicated input: the same answer on every rank)
+            logger.info("%s MISS rid=%s why=not per-image items -- P-only (W123 + reroute)", _vrs.TAG, req.rid)
+            return False
+        tp = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
+        src = True
+        if tp > 1:
+            tpg = getattr(self, "tp_group", None)
+            if tpg is None:
+                return False
+            src = tpg.rank == tpg.ranks[0]
+        rows = None
+        why = ""
+        if src:
+            try:
+                d = _vrs.store_dir_for(getattr(self, "server_args", None))
+                if d is None:
+                    why = "store off / no content hash"
+                else:
+                    hf = getattr(getattr(self, "model_config", None), "hf_config", None)
+                    vc = getattr(hf, "vision_config", None)
+                    w = getattr(vc, "out_hidden_size", None)
+                    if w is not None:
+                        w = int(w) * (1 + len(getattr(vc, "deepstack_visual_indexes", None) or ()))
+                    rows = _vrs.load(items, d, w)
+                    if rows is None:
+                        why = "rows not published (or count/width differs)"
+            except Exception as exc:  # noqa: BLE001 -- a failed read is no rows, never a dead rank
+                rows, why = None, f"{type(exc).__name__}: {exc}"
+        if tp > 1:
+            payload = {"rows": rows, "why": why} if src else None
+            got = self._form_a_tp_exchange("pdflip-vision-rows/tp<-rows", payload) or {}
+            rows, why = got.get("rows"), str(got.get("why", "") or "")
+        if rows is None:
+            logger.info("%s MISS rid=%s items=%d covered=%d bound=%d why=%s -- the image stays P-only (W123 + "
+                        "reroute through P, SOLL R9)", _vrs.TAG, req.rid, len(items), covered, bound, why)
+            return False
+        try:
+            n = _vrs.attach(items, rows)
+        except Exception as exc:  # noqa: BLE001 -- replicated input, so the same failure on every rank
+            logger.warning("%s REFUSED rid=%s %s: %s", _vrs.TAG, req.rid, type(exc).__name__, exc)
+            return False
+        logger.info("%s HIT rid=%s items=%d rows=%d covered=%d bound=%d image_end=%d (P's tower rows from the "
+                    "shared store: D computes these image positions itself, no tower, no flip -- SOLL R9 only for "
+                    "an image D cannot compute)", _vrs.TAG, req.rid, len(items), n, covered, bound,
+                    max(int(o[1]) + 1 for it in items for o in it.offsets))
+        return True
 
     def _pdflip_answer_vision_d_refusals(self, refused: List[Req], head_inputs=None) -> None:
         """Remove the W123-refused requests and answer them BY NAME -- the
@@ -17447,7 +17560,9 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
+        _t_gap = time.perf_counter()  # nf-decode-host-1020: D-DECODE-GAP span (nested in admit)
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        _pdflip_d_decode_gap.span(self, "match", _t_gap)
         # #823 W9: and then put its HEAD in the group's order. calc_priority
         # sorts by this rank's own num_matched_prefix_tokens, which is read
         # from the rank-local radix tree and therefore differs between TP
@@ -18599,6 +18714,9 @@ class Scheduler(
 
             _ir_t0 = time.perf_counter()  # xsn326: the match/load_back of a re-admission
             req.init_next_round_input(self.tree_cache)
+            # S109R: the admission match itself reads an anchor only L3 still holds (S109c released its host copy
+            # while the request waited) -- before, only intake and the deferral retry asked (e1)
+            _s109r_admission_anchor_read(self, req)
             if getattr(self, "_pdflip_post_wake_pass_n", None) is not None:
                 _irl = getattr(self, "_pdflip_gnbp_initr", None)
                 if _irl is None:
@@ -19014,6 +19132,7 @@ class Scheduler(
                 if _pdflip_lbv.admit_holds(self, req):
                     _lbv_held = True
                     res = AddReqResult.OTHER
+                    _d_admit_refusal.stamp(adder, req, "lbv_unreleased", res)
                 else:
                     try:
                         with _lanes_p.chunk_scope(adder, req):  # L3: a lower lane's chunk is smaller while a higher lane waits
@@ -19038,6 +19157,7 @@ class Scheduler(
                 if _lb_verdict is None:
                     raise
                 res = AddReqResult.OTHER if _lb_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
+                _d_admit_refusal.stamp(adder, req, "agreed_room_short", res)
             except ArenaChainMismatch as _acm:
                 # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0 ``#1424 CHAIN MISMATCH node=460 page=174``): ``load_back`` refused a chain page
                 # nothing proves ("the LAST latch"; the proof_cut vote that cuts the match before it runs in the TP group D only) --
@@ -19048,6 +19168,7 @@ class Scheduler(
                 if _cm_verdict is None:
                     raise
                 res = AddReqResult.OTHER if _cm_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
+                _d_admit_refusal.stamp(adder, req, "arena_chain_mismatch", res)
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
                 # different root): requests admitted EARLIER in this same loop
@@ -19106,6 +19227,9 @@ class Scheduler(
                         from flliper.srt.pdflip import d_park_runtime as _dpr_q702
 
                         _dpr_q702.note_adder_refusal(self, adder, req, running_batch)
+                    # D-MEM-SHARE guard (nf-decode-host-1020): a request this rank could not fund gets no
+                    # shared-prefix credit from the next tick on (group MIN -> the stage grows for its length)
+                    _pdflip_d_mem_share.note_refused(self, req)
                     _hol_go_on = _hol.may_overtake(req)
                     if _hol_go_on:
                         pass  # D-HOL backfill: later requests that fit the free KV still run
@@ -19169,6 +19293,7 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if added:
                     _p_intake.note_intake_resumed(self, req, adder)  # review A2: names an admission out of a wait
+                    _d_admit_refusal.note_admitted(self, req)  # D-ADMIT-REFUSED: the after-line
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -19176,6 +19301,17 @@ class Scheduler(
                     req.mamba_needs_clear = False
                     acquired_here = getattr(
                         req, "mamba_slot_acquired_this_admission", False
+                    )
+                    # D-ADMIT-REFUSED (pdflip/d_admit_refusal.py, rc27 02:15:44-56
+                    # pdflip-2-30): the refusal behind this give-back is named with
+                    # its gate and numbers (throttled per rid) -- the give-back line
+                    # alone named only the slot.
+                    _d_admit_refusal.note_not_added(
+                        self, adder, req, res, site="admission_revert",
+                        gave_back=(
+                            "-" if req.mamba_pool_idx is None or getattr(req, "session", None)
+                            else ("slot" if acquired_here else "kept_owner")
+                        ),
                     )
                     if req.mamba_pool_idx is not None and not getattr(
                         req, "session", None
@@ -19224,6 +19360,10 @@ class Scheduler(
                 if _hol_go_on:
                     continue
                 break
+            # CONTINUE only (the branch above always leaves the iteration): a
+            # request D's admission refused before is in -- D-ADMIT-REFUSED after-line
+            if adder.can_run_list and req is adder.can_run_list[-1]:
+                _d_admit_refusal.note_admitted(self, req)
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
@@ -19716,8 +19856,10 @@ class Scheduler(
         self._pdflip_ready_ms = (_wk_t3 - _wk_t2b) * 1000.0
         # TWIN ANCHOR (pdflip/twin_anchor.py): the boundaries of twins still
         # queued behind this batch's requests (None when off / none queued)
-        new_batch.pdflip_twin_bounds = _pdflip_twin_anchor.batch_bounds(
-            can_run_list, self.waiting_queue, page=self.page_size
+        # NF-TWIN-ROW 1021: PP0 decides them, a PP follower adopts PP0's row from
+        # this pass's proxy frame -- never from its own waiting queue
+        new_batch.pdflip_twin_bounds = _pdflip_twin_anchor.plan_bounds(
+            self, can_run_list, self.waiting_queue, page=self.page_size
         )
         try:
             new_batch.prepare_for_extend()
@@ -21000,6 +21142,9 @@ class Scheduler(
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
+            if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
+                self._pdflip_d_ext_arm_done(batch)
+
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
@@ -21039,6 +21184,33 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _pdflip_d_ext_arm_done(self, batch: ScheduleBatch) -> None:
+        """NF-R6-REST-EXAKT (SOLL R6 + R11, user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): a device event behind this
+        extend forward; ``_pdflip_d_ext_poll`` writes the batch's after-rest (D-EXTEND-BEACON v3) as soon as it has
+        completed -- not only from ``process_batch_result``, which under overlap runs after the NEXT batch was built and
+        launched (rc28 pdflip-12-275: the front read the chunk-start rest 1394 at 18:36:32.98, 50 ms after chunk 1's
+        forward had ended; D's exact rest was 626). Never a sync: the event is only queried."""
+        try:
+            ev = self.device_module.Event()
+            if self.enable_overlap:
+                ev.record(self.forward_stream)
+            else:
+                ev.record()
+            self.pdflip_d_ext_beacon.arm_done(
+                key=int(batch.forward_iter), rids=[req.rid for req in batch.reqs], ready=ev.query
+            )
+        except Exception:  # noqa: BLE001 -- no event: the result path writes the after-rest as before
+            pass
+
+    def _pdflip_d_ext_poll(self) -> None:
+        """NF-R6-REST-EXAKT: write the after-rest of every extend batch whose forward has ended (non-blocking)."""
+        b = self.pdflip_d_ext_beacon
+        if b is not None:
+            try:
+                b.poll_done()
+            except Exception:  # noqa: BLE001 -- an instrument never stops the scheduler
+                pass
 
     def _draft_kv_producer_wants(self, batch: ScheduleBatch) -> bool:
         """#1233 (C7): the last stage's extend chunk, and nothing else.
@@ -21289,7 +21461,9 @@ class Scheduler(
             # (review A2c: a skip batch reports too -- note_extend queued its after-rest, the FIFO stays aligned)
             # EZ-S2b review A2 (SOLL R6, D-EXTEND-BEACON v3): the extend forward has ended and its result is processed --
             # re-report the REST AFTER it (0 for a finished prefill); R6 counts nothing D has already computed
-            self.pdflip_d_ext_beacon.note_extend_done(rids=[req.rid for req in batch.reqs])
+            # NF-R6-REST-EXAKT: the backstop -- what the poll already wrote at the forward's device end is not written twice
+            self.pdflip_d_ext_beacon.note_extend_done(rids=[req.rid for req in batch.reqs],
+                                                      key=getattr(batch, "forward_iter", None))
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
         # nf-pd-post: a skip batch's #639 ballot is decided after its result
@@ -23739,6 +23913,12 @@ class Scheduler(
             # ranks (one schedule); capped -- D's bs is single digits.
             ret["pdflip_kv"]["running_rids"] = [str(r.rid) for r in list(
                 getattr(getattr(self, "running_batch", None), "reqs", None) or ())[:64]]
+            # NF-C-SITZ 1021: the decodes D's SEAT-AGE CAN park this round (under speculative decoding only the
+            # batch's back) -- the front's AGE PLAN victim comes from this set, D's own victim too (one rule,
+            # d_park_runtime.displaceable).
+            from flliper.srt.pdflip.d_park_runtime import displaceable_rids as _disp_rids
+
+            ret["pdflip_kv"]["displaceable_rids"] = _disp_rids(getattr(self, "running_batch", None))[:64]
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
             pass
         # PDFLIP MODE-PARITY (h16m 1014, N4): this group's priority mode for the

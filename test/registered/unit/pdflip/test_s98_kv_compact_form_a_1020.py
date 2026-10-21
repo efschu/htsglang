@@ -331,7 +331,7 @@ def test_a_tp0_peer_refusal_keeps_the_worker_on_s9(floor_env, monkeypatch, caplo
 # (TP0) vs ``aux_host_only:8`` (TP1/TP2) -- the host and the expert workers do not hold
 # the same host-side state. KV-COMPACT's ``backed`` reads exactly such state.
 
-from test_s77_kv_compact_s9_hold_1019 import MAMBA  # noqa: E402
+from test_s77_kv_compact_s9_hold_1019 import MAMBA, _key  # noqa: E402
 
 
 def _three_ranks(monkeypatch, *, host_backs_x):
@@ -384,10 +384,6 @@ def test_three_ranks_with_unequal_backed_choose_the_same_eviction_and_digest(flo
     local_backed = {n: {k: sv.owner[min(v.component_data[FULL].value.tolist()) // PG].backed
                         for k, v in nodes.items()} for n, _s, sv, nodes in ranks}
     assert local_backed["TP0"]["x"] is False and local_backed["TP1"]["x"] is True   # the premise
-    # the class: planned on each rank's OWN survey (beef9035eb and before), the host keeps X
-    # and evicts Y while the workers evict X -- different digests, the W86-style group death
-    rank_local = [KC.plan_for(sv, S8_PAGE)[0] for _n, _s, sv, _x in ranks]
-    assert len({KC.plan_digest(8, p) for p in rank_local}) > 1
     res = _vote_and_plan(ranks)
     digests = set()
     for name, plan, why, nodes in res:
@@ -406,30 +402,48 @@ def test_three_ranks_backed_everywhere_evict_by_the_replicated_order(floor_env, 
     assert all(p is not None and p.evicts for _n, p, _w, _x in res)
 
 
-def test_a_page_live_on_one_rank_and_free_on_another_refuses_everywhere(floor_env, monkeypatch):
+def test_a_page_live_on_one_rank_and_free_on_another_no_longer_refuses(floor_env, monkeypatch):
+    """S112 (rc27 1020_145331 n=64, 15:16:55: page 3996 free on TP0, node 189 on TP1/TP2
+    -- the allocators of Form A are no replicas): the MOVES are rank-local, each rank
+    moves its own pages onto its own room; the group agrees on the stage and on the
+    evictions. A page whose replicas differ is never part of an eviction."""
     ranks = _three_ranks(monkeypatch, host_backs_x=True)
     name, sched, sv, nodes = ranks[2]
     sv.live_above = [p for p in sv.live_above if p != 6400]                  # TP2: page free
     sv.owner.pop(6400)
     res = _vote_and_plan(ranks)
-    for name, plan, why, _x in res:
-        assert plan is None and "live on some ranks and free on others" in why, (name, why)
+    evicted = []
+    for name, plan, why, nodes in res:
+        assert plan is not None, (name, why)
+        lab = {id(v): k for k, v in nodes.items()}
+        evicted.append([lab[id(m.node)] for m in plan.evicts])               # best fit, by content
+        moved = sorted(p for _m, src, _d in plan.moves for p in src)
+        assert 6400 not in moved if name == "TP2" else 6400 in moved, name
+    assert evicted[0] == evicted[1] == evicted[2] and evicted[0] in (["x"], ["y"]), evicted
+    assert len({KC.plan_digest(8, p) for _n, p, _w, _x in res}) == 1
 
 
 def test_a_page_blocked_on_one_rank_blocks_every_rank(floor_env, monkeypatch):
     ranks = _three_ranks(monkeypatch, host_backs_x=True)
     ranks[1][2].owner[6300].pinned = True                                     # TP1: Y pinned
     res = _vote_and_plan(ranks)
-    assert all(p is None and "blocks on a rank" in w for _n, p, w, _x in res), \
-        [w for _n, _p, w, _x in res]
+    # S112b: page ids name other content on another rank, so a block is TP1's own
+    # verdict; the plan check's MIN over "plan here" refuses the stage on every rank
+    assert res[1][1] is None and "pinned" in res[1][2], res[1][2]
+    assert min(1 if p is not None else 0 for _n, p, _w, _x in res) == 0
 
 
-def test_a_destination_free_on_one_rank_only_is_no_destination(floor_env, monkeypatch):
+def test_a_destination_free_on_one_rank_only_is_no_destination_there(floor_env, monkeypatch):
+    """S112: destinations are each rank's own free pages; the GAP is the group's (MAX of
+    the local gaps), so the agreed evictions give every rank enough room."""
     ranks = _three_ranks(monkeypatch, host_backs_x=True)
     ranks[0][2].free = [p for p in ranks[0][2].free if p != 5000]            # TP0: 5000 taken
     res = _vote_and_plan(ranks)
-    for _n, plan, _w, _x in res:
-        assert plan is not None and 5000 not in [d for _m, _s, ds in plan.moves for d in ds]
+    for name, plan, _w, nodes in res:
+        assert plan is not None
+        if name == "TP0":
+            assert 5000 not in [d for _m, _s, ds in plan.moves for d in ds]
+        assert {id(m.node) for m in plan.evicts} == {id(nodes["x"]), id(nodes["y"])}, name
     assert len({KC.plan_digest(8, p) for _n, p, _w, _x in res}) == 1
 
 
@@ -486,14 +500,18 @@ def test_a_rank_without_a_plan_still_enters_the_digest_collective(floor_env, mon
     calls = []
 
     def same(sched_, value):
-        calls.append(int(value))
-        return int(value), 12345                                       # a peer has its plan
+        calls.append(list(value))
+        k = len(value) // 3
+        return list(value), [1] * k + list(value[k:2 * k]) + [12345] * k   # a peer has its plan
     monkeypatch.setattr(dsv_, "_group_same", same)
     ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
-    assert calls == [-1]
+    k = len(calls[0]) // 3
+    assert len(calls) == 1 and calls[0][:k] == [0] * k and calls[0][2 * k:] == [-1] * k
     assert not st.changed and ms.stage == 9
     assert torch.equal(turn.component_data[FULL].value, v_old)
-    assert any("verdict=refused-plan-diff" in m for m in caplog.messages)
+    # S112: the plan check's MIN carries this rank's "no plan": no candidate every rank
+    # clears -- a uniform, named refusal (nothing moved), never a crash
+    assert any("verdict=refused " in m and "no plan here" in m for m in caplog.messages)
 
 
 def test_no_plan_on_every_rank_after_a_yes_vote_is_a_refusal(floor_env, monkeypatch, caplog):
@@ -560,23 +578,18 @@ def test_three_ranks_with_other_node_cuts_make_the_same_page_plan_and_move_alike
     assert vals[0] == vals[1] == vals[2] == list(range(5000, 5010))
 
 
-def test_the_rc24_split_with_a_needed_eviction_is_agreed_or_refused_uniformly(
-        floor_env, monkeypatch):
-    """Short of room the fallback evicts NODES (cut-dependent): the digest compares the
-    pages they free. TP0 frees 6200..6207 with its one node; TP1/TP2 evict the leaf
-    6204..6207 only -- the page sets differ, so the digests differ: the group refuses
-    (uniform, nothing moved) instead of a crash-stop."""
+def test_the_rc24_split_with_a_needed_eviction_is_agreed(floor_env, monkeypatch):
+    """S112: short of room the evictions are UNITS -- a chain of single-device-child
+    links is one unit, so TP0's one node 6200..6207 and TP1/TP2's split 6200..6203 ->
+    6204..6207 free the same pages: the same digest, agreed (S98c refused it)."""
     ranks = _split_ranks(monkeypatch, free_below=range(5000, 5006))      # 6 of 10 pages
     res = _vote_and_plan(ranks)
     plans = [p for _n, p, _w, _x in res]
-    # TP0 evicts its one node (all 8 pages); TP1/TP2 move the leaf and cannot evict the
-    # parent (a device child that stays) -- no plan there
-    assert plans[0] is not None and plans[0].evict_pages == list(range(6200, 6208))
-    assert plans[1] is None and plans[2] is None
-    digests = [KC.plan_digest(8, p) if p is not None else -1 for p in plans]
-    lo, hi = min(digests), max(digests)
-    assert lo != hi        # -> _kv_compact_for_shrink: uniform refusal, nothing moved
-                           #    (test_a_rank_without_a_plan_still_enters_the_digest_collective)
+    assert all(p is not None for p in plans), [w for _n, _p, w, _x in res]
+    assert all(p.evict_pages == list(range(6200, 6208)) for p in plans)
+    assert [len(p.evicts) for p in plans] == [1, 2, 2]                    # the local cuts
+    assert len({KC.plan_digest(8, p) for p in plans}) == 1
+    assert all(p.pairs == [(6300, 5000), (6301, 5001)] for p in plans)
 
 
 class _NullCopier:
@@ -586,10 +599,10 @@ class _NullCopier:
         return 0
 
 
-def test_an_eviction_that_frees_pages_below_the_floor_differs_by_those_pages(floor_env, monkeypatch):
-    """The digest counts EVERY page an eviction frees, not only the ones above the floor:
-    TP0's one node 6140..6143 + 6200..6207 frees 6140..6143 with it, TP1's split leaf
-    6200..6207 does not -- the allocators would part, so the digests must differ."""
+def test_an_eviction_frees_pages_below_the_floor_alike_on_both_cuts(floor_env, monkeypatch):
+    """The digest counts EVERY page an eviction frees, not only the ones above the floor
+    (TP0's one node 6140..6143 + 6200..6207). S112: TP1's split chain 6140..6143 ->
+    6200..6207 is one unit, so it frees the very same pages -- the digests agree."""
     plans = []
     for name, form in (("TP0", _tp0), ("TP1", _tp1)):
         target, dw = form(monkeypatch)
@@ -599,11 +612,13 @@ def test_an_eviction_that_frees_pages_below_the_floor_differs_by_those_pages(flo
         _take(alloc, list(range(1, S8_PAGE + 1)))                     # no room below S8
         low, high = list(range(6140, 6144)), list(range(6200, 6208))
         if name == "TP0":                                             # low: taken above
-            _node(tree, alloc, high, PG, backed=True).component_data[FULL].value = \
-                torch.cat([_tokens_of(low), _tokens_of(high)])
+            one = _node(tree, alloc, high, PG, backed=True)
+            one.component_data[FULL].value = torch.cat([_tokens_of(low), _tokens_of(high)])
+            one.key = _key(torch.cat([_tokens_of(low), _tokens_of(high)]).tolist())
         else:
             a = _node(tree, alloc, [], PG, backed=True)
             a.component_data[FULL].value = _tokens_of(low)
+            a.key = _key(_tokens_of(low).tolist())
             _node(tree, alloc, high, PG, backed=True, parent=a)
         sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
                                       draft_worker=dw, tree_cache=tree)
@@ -615,8 +630,8 @@ def test_an_eviction_that_frees_pages_below_the_floor_differs_by_those_pages(flo
     got = [dsv._kv_compact_plans_from_vote(sv, group, S8_PAGE, TOP // PG, [S8_PAGE])[0][0]
            for sv, _s in plans]
     assert got[0] is not None and got[1] is not None
-    assert got[0].evict_pages == low + high and got[1].evict_pages == high
-    assert KC.plan_digest(8, got[0]) != KC.plan_digest(8, got[1])
+    assert got[0].evict_pages == low + high and got[1].evict_pages == low + high
+    assert KC.plan_digest(8, got[0]) == KC.plan_digest(8, got[1])
 
 
 def _tokens_of(pages):
@@ -674,14 +689,14 @@ def test_a_rank_whose_source_free_throws_still_enters_the_outcome_collective(
         sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
                                       draft_worker=dw, tree_cache=tree,
                                       _pdflip_group_min_ints=group.min_ints(name))
-        if name == "TP1":
-            real_free = alloc.free
-
-            def free(idx, _real=real_free, _n=[0]):
-                _n[0] += 1
-                raise RuntimeError("cudaErrorIllegalAddress (desk: TP1's source free)")
-            alloc.free = free
         ranks.append((name, sched))
+    real_give_back = KC._give_back
+
+    def give_back(allocator, pages):               # S112b: the sources go back host-informed
+        if threading.current_thread().name == "TP1":
+            raise RuntimeError("cudaErrorIllegalAddress (desk: TP1's source free)")
+        return real_give_back(allocator, pages)
+    monkeypatch.setattr(KC, "_give_back", give_back)
     # the form helpers above patch kv_owner_block with their own rank's block; the
     # threads need each rank's own one at the same time
     monkeypatch.setattr(dsv, "kv_owner_block", lambda: owners[threading.current_thread().name])
@@ -708,7 +723,7 @@ def test_a_rank_whose_source_free_throws_still_enters_the_outcome_collective(
             "%s waited for a peer that skipped the collective (the gloo-timeout hang)" % name
         assert isinstance(exc, dsv.PdFlipKvCompactDivergence) and "FAILED on a rank" in str(exc), \
             (name, exc)
-    assert group.calls["TP0"] == group.calls["TP1"] == group.calls["TP2"] == 3   # vote, digest, outcome
+    assert group.calls["TP0"] == group.calls["TP1"] == group.calls["TP2"] == 3   # vote, plan check, outcome
     assert any("moves FAILED here" in m and "RuntimeError" in m for m in caplog.messages)
 
 
@@ -820,7 +835,7 @@ def test_the_witness_names_a_running_requests_page(floor_env, monkeypatch):
     sched.req_to_token_pool = types.SimpleNamespace(req_to_token=rtt)
     sched.running_batch.reqs = [types.SimpleNamespace(rid="pdflip-4-16", req_pool_idx=2,
                                                       origin_input_ids=[0] * 100, output_ids=[0] * 28)]
-    sv = KC.survey(tree, alloc, PG, S8_PAGE)
+    sv = KC.survey(tree, alloc, PG, S8_PAGE, running=sched.running_batch.reqs, req_to_token=rtt)
     w = dsv._kv_compact_page_witness(sched, sv, 6146)
     assert "request(rid=pdflip-4-16 running)" in w, w
 

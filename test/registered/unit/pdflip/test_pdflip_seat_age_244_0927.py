@@ -148,9 +148,11 @@ class DSide(unittest.TestCase):
         self.assertIsNone(self._run(lambda: DPR.displace_for_age(sched, batch)))
 
     def test_spec_only_the_back_may_leave(self):
+        # NF-C-SITZ 1021: under spec decoding the victim is the batch's back (6 -- younger than the waiter 2), not a
+        # youngest D cannot park (7 in the middle: was DISPLACE-WAIT, the head stuck on D on credit)
         sched, batch = self._sched([self._req(R(7)), self._req(R(5)), self._req(R(6))], [self._req(R(2))],
                                    spec=True)
-        self.assertIsNone(self._run(lambda: DPR.displace_for_age(sched, batch)))
+        self.assertEqual(self._run(lambda: DPR.displace_for_age(sched, batch)), R(6))
         sched, batch = self._sched([self._req(R(5)), self._req(R(6)), self._req(R(7))], [self._req(R(2))],
                                    spec=True)
         self.assertEqual(self._run(lambda: DPR.displace_for_age(sched, batch)), R(7))

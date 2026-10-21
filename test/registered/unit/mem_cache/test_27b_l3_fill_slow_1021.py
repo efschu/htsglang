@@ -85,7 +85,7 @@ def test_o_direct_only_for_big_pages():
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB", None)
         lim = HiCacheFile._l3wb_direct_min_bytes()
-    assert lim == 1 << 20
+    assert lim == 256 << 10                          # NF rc29 L3TOUCH-1021 (merged rc31): one threshold, 256 KiB
     assert 32768 < lim                               # 27B KV page (one token): buffered, stays in the page cache
     assert 78446592 >= lim                           # 27B mamba anchor: O_DIRECT as NF
     src = open(hs.__file__, encoding="utf-8").read()

@@ -207,16 +207,56 @@ class FullComponent(TreeComponent):
                     _ef.note_peel_short(self.cache, ct)
 
     def _peel(self, request: int, tracker: dict[ComponentType, int]) -> None:
-        heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
-            for n in self.cache.evictable_device_leaves
-        ]
+        # UD-LAST (NF rc27 1021_023225 P PP0 02:37:15, pdflip/ud_last.py): pass 1 holds every un-backed write_back
+        # leaf whose backup the full arena refused (it stays on the device with its fresh KV/anchor) and pays the
+        # request from the backed leaves; pass 2 -- only when pass 1 ended short -- peels the held leaves in the old
+        # order (UD / UD-H drop, parents next). The one-pass peel dropped 14272 fresh tokens of pdflip-0-22 while
+        # 78016 evictable tokens stayed behind.
+        from flliper.srt.pdflip import ud_last as _udl
+
+        # (unbound calls: hermetic tests borrow _peel onto bare namespaces)
+        ct = self.component_type
+        prev = _udl.begin(self.cache)
+        if prev is False:   # switch off: the one-pass peel, byte for byte
+            FullComponent._peel_heap(
+                self, [n for n in self.cache.evictable_device_leaves], request, tracker
+            )
+            return
+        try:
+            FullComponent._peel_heap(
+                self, [n for n in self.cache.evictable_device_leaves], request, tracker
+            )
+            held = _udl.take(self.cache)   # pass 2 runs with no hold list: it drops as before
+            if not held:
+                return
+            got1 = tracker[ct]
+            dropped_before = int(getattr(self.cache, "_pdflip_sf_unbacked_drop", 0) or 0)
+            if got1 < request:
+                FullComponent._peel_heap(
+                    self,
+                    [n for n in held if n in self.cache.evictable_device_leaves],
+                    request,
+                    tracker,
+                )
+            dropped = int(getattr(self.cache, "_pdflip_sf_unbacked_drop", 0) or 0) - dropped_before
+            _udl.note(self.cache, held, got1, request, tracker[ct], max(0, dropped))
+        finally:
+            _udl.end(self.cache, prev)
+
+    def _peel_heap(self, leaves, request: int, tracker: dict[ComponentType, int]) -> None:
+        from flliper.srt.pdflip import evict_fit as _fit
+
+        heap = [(self.cache.eviction_strategy.get_priority(n), n) for n in leaves]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < request and heap:
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_device_leaves:
                 continue
+            # EVICT-FIT (NF rc27 1021_023225 P PP0 18252 / PP1 18598: node 9/18, 151360 backed tokens demoted whole
+            # for a remaining need of 13376): a backed leaf longer than the remaining need is split, only the tail
+            # leaves the device (pdflip/evict_fit.py; local-PP floor only)
+            _fit.fit(self.cache, x, request - tracker[ct])
             self.cache._evict_device_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
                 heapq.heappush(

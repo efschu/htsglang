@@ -243,6 +243,7 @@ from flliper.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from flliper.srt.runtime_context import get_server_args
 from flliper.srt.server_args import ServerArgs
 from flliper.srt.pdflip import tail_adopt
+from flliper.srt.pdflip import d_admit_refusal as _d_admit_refusal
 from flliper.srt.pdflip import tail_handoff
 from flliper.srt.managers import anchor_tails as _anchor_tails
 
@@ -1021,6 +1022,112 @@ def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
 
 #: H105d: how often a token-cut rank voted NO_TOKEN for want of load-back room.
 _H105D_REFUSED = {"n": 0}
+_H105G_DROPPED = {"n": 0}
+#: NF-RC31 D: ``(rid, why)`` of the last H105g refusal on this adder -- the gate name ``h105g_target_dropped``
+H105G_REFUSED_ATTR = "_h105g_refused"
+
+
+def _h105g_load_back_target_lost(tree_cache, best_match_node, req=None) -> str | None:
+    """H105g: why ``best_match_node`` is no load-back source any more, or None while it still is.
+
+    THE METAL (NF rc29 a773b4ebc4, D log boot_..._a773b4ebc4_1021_022209.D.log 45873-45937, TP0 02:31:11-13Z,
+    pdflip-2-44): the request matched a 150336-token HOST-ONLY leaf (the L3 prefetch of 02:30:48, 2349 pages,
+    its mamba END anchor host-only, ``MAMBA-HOST-RESUME ... depth=169216``) below an 18880-token device prefix.
+    Its own H105d room (``tc.evict``) evicted D nodes 170/167/169; backing 169 up claimed 1987 arena pages, the
+    W3 device round paid short and the host-only round (``W3-HOST-LEAF SPILL ... released_pages=2349 leaves=1
+    aux_leaves=1``) dropped exactly that leaf -- every page on L3 (``l3=on_disk:2349``), ``_evict_host_leaf``:
+    host value None, node out of the tree. The request still held the handle; ``init_load_back`` ->
+    ``LEAF-SET DETACHED node=166 evicted=True`` -> ``build_hicache_transfers``: ``assert cd.host_value is not
+    None`` -> RANK_EXCEPTION, D group gone. S109 (fa527fb6ea) let a leaf whose only host-only aux state is its
+    mamba anchor spill -- the load-back target of a hybrid match is exactly such a leaf (before, ``aux_host_only``
+    kept it as a side effect).
+
+    The same walk ``FullComponent.build_hicache_transfers(LOAD_BACK)`` asserts on: every evicted node from
+    ``best_match_node`` up to the first device node must still be in the tree and carry its Full host rows.
+
+    S109R (``req`` given): the match accepted ``best_match_node``'s mamba state on the HOST
+    (``mamba_host_hit_length > 0``, set by ``MambaComponent`` exactly when that node's state is host-only); the S109c
+    aux round of the same room step can release it from a DEVICE-KV node (``anchor_dropped``). The load-back would
+    then restore no anchor and the prefix would be clamped and recomputed; the next pass's match reads it from L3
+    instead (``S109R ANCHOR-DEVICE-READ``)."""
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import (
+        BASE_COMPONENT_TYPE,
+    )
+
+    root = getattr(tree_cache, "root_node", None)
+    page = getattr(tree_cache, "page_size", None)
+    cur = best_match_node
+    while cur is not None and cur is not root and getattr(cur, "evicted", False):
+        parent = getattr(cur, "parent", None)
+        if parent is None:
+            return "detached"
+        key = getattr(cur, "key", None)
+        children = getattr(parent, "children", None)
+        if (
+            key is not None
+            and isinstance(page, int)
+            and isinstance(children, dict)
+            and children.get(key.child_key(page)) is not cur
+        ):
+            return "detached"
+        if cur.component_data[BASE_COMPONENT_TYPE].host_value is None:
+            return "no_host_value"
+        cur = parent
+    mhit = getattr(req, "mamba_host_hit_length", 0) if req is not None else 0
+    if isinstance(mhit, int) and not isinstance(mhit, bool) and mhit > 0 and best_match_node is not None:
+        from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+        try:
+            mcd = best_match_node.component_data[ComponentType.MAMBA]
+        except (KeyError, IndexError, TypeError, AttributeError):
+            mcd = None   # no mamba component on this tree: no anchor to lose
+        if mcd is not None and getattr(mcd, "value", None) is None and getattr(mcd, "host_value", None) is None:
+            return "anchor_dropped"
+    return None
+
+
+def _h105g_target_kept(adder, req, has_extent, site: str) -> bool:
+    """H105g: the room verdict True holds only while the load-back source this pass will read is still there.
+
+    A room step that dropped it (see ``_h105g_load_back_target_lost``) answers NO_TOKEN instead -- on the token
+    cut that is THIS rank's gate in the gathered MIN (H105d/H105f), so every rank keeps the rid queued and nobody
+    loads back. The next pass matches the live tree: the dropped run is on L3 (the spill writes or finds the L3
+    copy of every page first, #257), the X gate's store arm prices it and S59 re-reads the store -- no recompute.
+    Never a rank-local exit: the answer rides the vote the caller gathers."""
+    if not has_extent:
+        return True
+    why = _h105g_load_back_target_lost(adder.tree_cache, req.best_match_node, req)
+    if why is None:
+        return True
+    # NF-RC31 D: the refusal's own name for the D-ADMIT-REFUSED instrument (``h105g_target_dropped``), read at the
+    # call sites in ``add_one_req`` -- an instrument only, the verdict is the bool below
+    try:
+        setattr(adder, H105G_REFUSED_ATTR, (getattr(req, "rid", None), why))
+    except Exception:  # noqa: BLE001 - a name never fails the vote
+        pass
+    _H105G_DROPPED["n"] += 1
+    n = _H105G_DROPPED["n"]
+    if n <= 8 or (n & (n - 1)) == 0:
+        logger.warning(
+            "H105g LOAD-BACK TARGET DROPPED rid=%s node=%s why=%s site=%s (n=%d): the load-back source this "
+            "request matched left L2 between its match and its load-back (the W3 spill of its own room step: the "
+            "pages are on L3) -- this rank votes NO_TOKEN in the gathered verdict, the group keeps the rid queued "
+            "and the next pass re-matches and reads the store; no stale handle reaches init_load_back",
+            getattr(req, "rid", "?"), getattr(req.best_match_node, "id", "?"), why, site, n,
+        )
+    return False
+
+
+def _h105_room_gate_name(adder, req, room_name: str) -> str:
+    """NF-RC31 D (rc30 review Folgefix D): the D-ADMIT-REFUSED gate name of a False from
+    :func:`_h105d_cut_load_back_room` -- ``h105g_target_dropped`` when that call refused because the load-back
+    source left L2 (H105g / S109R, :func:`_h105g_target_kept`), else ``room_name`` (``h105d_cut_room`` /
+    ``h105f_confirm_room``: no room). Monitor class 2 then counts the H105g refusals without pairing lines.
+    Instrument only: the verdict is the bool the gather already took."""
+    st = getattr(adder, H105G_REFUSED_ATTR, None)
+    if isinstance(st, tuple) and len(st) == 2 and st[0] == getattr(req, "rid", None):
+        return "h105g_target_dropped"
+    return room_name
 
 
 def _h105d_load_back_kv_rows(best_match_node) -> int:
@@ -1102,9 +1209,14 @@ def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
 
     if not form_a_token_cut_active():
         return True
+    try:
+        setattr(adder, H105G_REFUSED_ATTR, None)   # NF-RC31 D: this call's own answer names the gate
+    except Exception:  # noqa: BLE001
+        pass
+    _lb_extent = _pp_load_back_extent(req)
     kv_rows = (
         _h105d_load_back_kv_rows(req.best_match_node)
-        if _pp_load_back_extent(req)
+        if _lb_extent
         else 0
     )
     chunk_rows = _h110_chunk_rows(adder, req, kv_rows)
@@ -1113,7 +1225,8 @@ def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
     alloc = adder.token_to_kv_pool_allocator
     available = int(alloc.available_size())
     if need <= available:
-        return True
+        # H105g: a True verdict only while the load-back source is still in the tree with its host rows
+        return _h105g_target_kept(adder, req, _lb_extent, "no_room_needed")
     from flliper.srt.mem_cache.base_prefix_cache import EvictParams
 
     tc = adder.tree_cache
@@ -1126,14 +1239,17 @@ def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
         # H105f (NF h14 14:50:53, pdflip-0-3): the DRY vote -- may this rank make
         # the room? Nothing is evicted before the group has said ADMIT.
         if need <= available + payable:
-            return True
+            return _h105g_target_kept(adder, req, _lb_extent, "dry_vote")
     elif payable > 0 and need <= available + payable:
         res = tc.evict(EvictParams(num_tokens=min(payable, need - available)))
         # evict() returns None on some caches (as read by H105c/H106 too)
         evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
         available = int(alloc.available_size())
     if need <= available:
-        return True
+        # H105g (NF rc29 02:31:13Z): the eviction above can drop this request's OWN load-back source -- backing
+        # an evicted D node up claims arena pages, the W3 spill pays them with host-only leaves (S109: the
+        # mamba-anchor leaf a hybrid match loads back is one). Room made is no ADMIT if the source is gone.
+        return _h105g_target_kept(adder, req, _lb_extent, "after_room")
     _H105D_REFUSED["n"] += 1
     n = _H105D_REFUSED["n"]
     if n <= 3 or (n & (n - 1)) == 0:
@@ -1803,6 +1919,14 @@ class PrefillAdder:
         if computed is None:
             return input_tokens
         return min(input_tokens, self.ceil_paged_tokens(computed))
+
+    def _refuse(self, req, res, gate: str, **nums):
+        """D-ADMIT-REFUSED (pdflip/d_admit_refusal.py): ``add_one_req`` returns
+        ``res`` for ``req`` at the gate ``gate`` -- stamped with that gate's own
+        numbers for the admission loop's not-added line. Observation only: the
+        returned value is ``res``, unchanged."""
+        _d_admit_refusal.stamp(self, req, gate, res, nums)
+        return res
 
     def budget_state(self):
         # PS2 batch separation: once a born-spilled-deep prompt is in the list
@@ -2929,10 +3053,14 @@ class PrefillAdder:
         # only further skips (H24c, rank-uniform: the group's agreed vote and
         # the request's own parameters), refused here before any match or
         # load-back side effect -- the exact prefix check follows at the commit.
+        # D-ADMIT-REFUSED (pdflip/d_admit_refusal.py): every refusing return of
+        # this call names its gate (and its numbers) for the admission loop's
+        # not-added line; a stamp of an earlier call never names this one.
+        _d_admit_refusal.clear(self)
         if self.prefill_spill_deep_taken:
-            return AddReqResult.OTHER
+            return self._refuse(req, AddReqResult.OTHER, "spill_deep_taken")
         if self.pdflip_skip_extend_taken and not tail_adopt.skip_joinable(req):
-            return AddReqResult.OTHER
+            return self._refuse(req, AddReqResult.OTHER, "skip_extend_not_joinable")
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -2942,19 +3070,21 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
         ):
-            return AddReqResult.OTHER
+            return self._refuse(req, AddReqResult.OTHER, "prefill_delayer")
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
-            return AddReqResult.OTHER
+            return self._refuse(req, AddReqResult.OTHER, "dsa_cp_single")
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return AddReqResult.OTHER
+            return self._refuse(req, AddReqResult.OTHER, "prefill_max_requests",
+                                max=x, admitted=len(self.can_run_list))
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             if self.pdflip_skip_extend_taken:
-                return AddReqResult.OTHER  # H24c: that path never takes the END state
+                # H24c: that path never takes the END state
+                return self._refuse(req, AddReqResult.OTHER, "skip_extend_ignore_eos")
             return self.add_one_req_ignore_eos(req)
 
         # #791 CORE: EXECUTE, DO NOT DERIVE.
@@ -3047,6 +3177,9 @@ class PrefillAdder:
         # depth planted at the top of the pass -- refused through the H105
         # verdict on every rank (OTHER), or the H98 stop without a verdict.
         _gate = _form_a_stale_vote_gate(self, req, _fa_follow)
+        # D-ADMIT-REFUSED: the name and numbers of the first failing local gate
+        _gate_why = None if _gate is None else "h98d_stale_vote"
+        _gate_nums: dict = {}
         _rem_total = self.rem_total_tokens
         if (
             _gate is None
@@ -3064,6 +3197,13 @@ class PrefillAdder:
             ) and not self._admit_born_spilled_deep(req, born_input_tokens):
                 _gate = AddReqResult.NO_TOKEN
                 self._note_lifetime_refusal(req, total_tokens, _rem_total)
+                _gate_why = "lifetime"
+                _gate_nums = dict(
+                    price=int(total_tokens), budget=_rem_total,
+                    born=int(born_input_tokens), extend=int(cand_extend_input_len),
+                    max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
+                    prefix=prefix_len,
+                )
 
         if _gate is None and self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
@@ -3071,6 +3211,8 @@ class PrefillAdder:
             )
             if swa_needed >= self.rem_swa_tokens:
                 _gate = AddReqResult.NO_TOKEN
+                _gate_why = "swa"
+                _gate_nums = dict(swa_needed=swa_needed, rem_swa=self.rem_swa_tokens)
 
         if (
             _gate is None
@@ -3082,9 +3224,11 @@ class PrefillAdder:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
             _gate = AddReqResult.OTHER
+            _gate_why = "rem_input_no_chunk"
+            _gate_nums = dict(input=int(real_input_tokens), rem_input=self.rem_input_tokens)
 
         if _gate is not None and _fa_follow is None:
-            return _gate
+            return self._refuse(req, _gate, _gate_why or "unlabeled", **_gate_nums)
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
@@ -3109,6 +3253,13 @@ class PrefillAdder:
                     _gate = AddReqResult.NO_TOKEN
                     self._note_lifetime_refusal(req, total_tokens, _rem_total)
                     self._pdflip_note_budget_parts(req, total_tokens, _rem_total)
+                    _gate_why = "lifetime_locked"
+                    _gate_nums = dict(
+                        price=int(total_tokens), budget=_rem_total,
+                        born=int(born_input_tokens), extend=int(cand_extend_input_len),
+                        max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
+                        prefix=prefix_len,
+                    )
 
             if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
@@ -3116,6 +3267,8 @@ class PrefillAdder:
                 )
                 if swa_needed >= self.rem_swa_tokens:
                     _gate = AddReqResult.NO_TOKEN
+                    _gate_why = "swa_locked"
+                    _gate_nums = dict(swa_needed=swa_needed, rem_swa=self.rem_swa_tokens)
 
             # H105b (rc12z20 D 12:55:34, pdflip-36-145, FormAAdmissionSplit): the
             # H105 verdict below was sent BEFORE the load-back, and the load-back
@@ -3151,6 +3304,7 @@ class PrefillAdder:
                     self, req, evict=not _h105f
                 ):
                     _gate = AddReqResult.NO_TOKEN
+                    _gate_why = _h105_room_gate_name(self, req, "h105d_cut_room")
                 # H105: after every rank-local gate and BEFORE the load-back
                 # (and the tail-adopt vote behind it) -- the one point every
                 # rank of the group reaches for this rid. The host's verdict
@@ -3161,6 +3315,8 @@ class PrefillAdder:
                 )
                 if _h105f_confirm_due(_gate, _h105f):
                     _room = _h105d_cut_load_back_room(self, req, evict=True)
+                    if not _room:
+                        _gate_why = _h105_room_gate_name(self, req, "h105f_confirm_room")
                     _gate = _fa_follow(
                         req,
                         None if _room else AddReqResult.NO_TOKEN,
@@ -3169,7 +3325,8 @@ class PrefillAdder:
                     )
                 _fa_host_first = False
             if _gate is not None:
-                return _gate
+                # a None local name with a refusal = the group's decider refused
+                return self._refuse(req, _gate, _gate_why or "h105_group_verdict", **_gate_nums)
 
             # #968/#1035: the load-back runs only where its result can be
             # rank-uniform -- and since this slice, uniformity is CONSTRUCTED
@@ -3319,6 +3476,7 @@ class PrefillAdder:
                                 getattr(req, "rid", "?"), int(_lb_extent),
                                 getattr(self, "rem_total_tokens", "?"), _n,
                             )
+                        _d_admit_refusal.stamp(self, req, "loadback_no_room")
                         if _fa_host_first:  # H105b: the group's verdict
                             return _fa_follow(req, AddReqResult.NO_TOKEN,
                                               int(total_tokens), int(self.rem_total_tokens))
@@ -3511,7 +3669,7 @@ class PrefillAdder:
                     req, None, int(total_tokens), int(self.rem_total_tokens)
                 )
                 if _gate is not None:
-                    return _gate
+                    return self._refuse(req, _gate, "h105_group_verdict")
 
             if (
                 self.rem_chunk_tokens is None
@@ -3521,7 +3679,8 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
+                return self._refuse(req, AddReqResult.OTHER, "rem_input_no_chunk",
+                                    input=int(input_tokens), rem_input=self.rem_input_tokens)
 
             if self.pdflip_skip_extend_taken and (
                 self.dllm_config is not None
@@ -3531,7 +3690,7 @@ class PrefillAdder:
                 # H24c: behind a skip only a request that takes the END state
                 # at THIS prefix (the matched page anchor) -- anything else
                 # would run its extend in a batch whose forward is skipped
-                return AddReqResult.OTHER
+                return self._refuse(req, AddReqResult.OTHER, "skip_extend_taken")
             if tail_adopt.skip_waits(
                 req, len(req.prefix_indices),
                 skip_taken=self.pdflip_skip_extend_taken,
@@ -3541,7 +3700,7 @@ class PrefillAdder:
                 # batch that already runs a forward waits one pass instead of
                 # dropping its END state; the next pass leads with it
                 # (pdflip/skip_first.py). Rank-uniform inputs.
-                return AddReqResult.OTHER
+                return self._refuse(req, AddReqResult.OTHER, "skip_waits")
             from flliper.srt.pdflip import d_twin_pass
 
             if not tail_adopt.skip_joinable(
@@ -3550,11 +3709,12 @@ class PrefillAdder:
                 # ZR-4: a twin in this pass computes these tokens already; this
                 # one waits a pass and matches them from the tree (D only; an
                 # END-state adoption computes nothing and never waits here)
-                return AddReqResult.OTHER
+                return self._refuse(req, AddReqResult.OTHER, "twin_pass",
+                                    prefix=len(req.prefix_indices))
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
+                    return self._refuse(req, AddReqResult.OTHER, "dllm_budget")
 
                 assert (
                     truncation_align_size is None
@@ -3590,7 +3750,8 @@ class PrefillAdder:
                     # cold-round1 belt: the whole fit was granted on the tail
                     # (peek) and the plan refused it -- the full extend does
                     # not fit this chunk; the chunked path takes it next pass
-                    return AddReqResult.OTHER
+                    return self._refuse(req, AddReqResult.OTHER, "tail_plan_chunk_belt",
+                                        input=int(input_tokens), rem_chunk=self.rem_chunk_tokens)
                 # W123 belt (D vision guard): the guard admitted an image on
                 # the tail it READ; the target's first computed position is
                 # fixed here. An image reaching it would be prefilled by a
@@ -3609,7 +3770,7 @@ class PrefillAdder:
                             req.rid, _vneed, _tstart,
                             "none" if _tail is None else ("skip" if _tail.skip else "e1"),
                         )
-                        return AddReqResult.OTHER
+                        return self._refuse(req, AddReqResult.OTHER, "vision_tail_lost")
                 _ea_fill = len(req.full_untruncated_fill_ids)
                 if _tail is not None:
                     _ea_start = _tail.resume_at
@@ -3632,7 +3793,7 @@ class PrefillAdder:
                     and (self.chunked_req_outstanding or self.new_chunked_req is not None)
                 ):
                     note_second_continuation_refused(req, "add_one_req/end-anchor")
-                    return AddReqResult.OTHER
+                    return self._refuse(req, AddReqResult.OTHER, "second_continuation_end_anchor")
                 if _tail is not None:
                     # the commit: nothing below leaves this branch without the
                     # request in can_run_list, so the page cannot leak
@@ -3674,19 +3835,20 @@ class PrefillAdder:
                         "W123 VISION TAIL-LOST rid=%s image_end=%d target_start=%d tail=chunked "
                         "(refused by name next pass)", req.rid, _vneed, len(req.prefix_indices),
                     )
-                    return AddReqResult.OTHER
+                    return self._refuse(req, AddReqResult.OTHER, "vision_tail_lost_chunked")
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return self._refuse(req, AddReqResult.OTHER, "trunc_len_zero",
+                                        rem_chunk=self.rem_chunk_tokens)
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
+                        return self._refuse(req, AddReqResult.OTHER, "trunc_align")
                     else:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
@@ -3697,7 +3859,8 @@ class PrefillAdder:
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return self._refuse(req, AddReqResult.OTHER, "trunc_len_zero_page",
+                                        rem_chunk=self.rem_chunk_tokens)
 
                 # P-FORK-CUT: end this chunk at the shared-prefix fork when that is
                 # free, so its anchor lands where the next session reads.
@@ -3734,7 +3897,7 @@ class PrefillAdder:
                 ) and not _trunc_tail:
                     # #967: same guard, second mint site, same instrument.
                     note_second_continuation_refused(req, "add_one_req")
-                    return AddReqResult.OTHER
+                    return self._refuse(req, AddReqResult.OTHER, "second_continuation_chunked")
 
                 # Chunked prefill
                 req.set_extend_range(

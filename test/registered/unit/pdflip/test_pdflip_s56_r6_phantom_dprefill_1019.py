@@ -172,11 +172,11 @@ def test_writer_reports_the_rest_of_every_chunk_under_the_first_start(tmp_path):
     read = lambda: dxb.read_group_full(str(tmp_path), "D", sid, session_of=lambda pid: sid)  # noqa: E731
     w.note_recv(rid="a")
     w.note_extend(rids=["a"], rests=[12000])
-    assert read() == {dxb.rid_key("a"): (t[0], 12000)}
+    assert read() == {dxb.rid_key("a"): (t[0], 12000, -1)}      # v4: no extend_len given -> free unknown
     t0 = t[0]
     t[0] += 10
     w.note_extend(rids=["a"], rests=[5784])                        # second chunk
-    assert read() == {dxb.rid_key("a"): (t0, 5784)}
+    assert read() == {dxb.rid_key("a"): (t0, 5784, -1)}
     assert dxb.rest_of(read(), "a", t0 / 1e9) == 5784
     assert dxb.rest_of(read(), "a", t0 / 1e9 + 1.0) is None         # an extend before the grant: not this grant's
     assert dxb.started(read(), "a", t0 / 1e9)
@@ -192,10 +192,10 @@ def test_rank_agreement_the_reading_does_not_depend_on_the_file_order(tmp_path):
     for w in reversed(ws):
         w.note_extend(rids=["a"], rests=[977])
     one = dxb.read_group_full(str(tmp_path), "D", sid, session_of=lambda pid: sid)
-    assert one == {dxb.rid_key("a"): (3_000_000_000_000, 977)}
+    assert one == {dxb.rid_key("a"): (3_000_000_000_000, 977, -1)}
     ws[1].note_extend(rids=["a"], rests=[978])                     # one rank disagrees: the max, by name of the rule
     two = dxb.read_group_full(str(tmp_path), "D", sid, session_of=lambda pid: sid)
-    assert two[dxb.rid_key("a")] == (3_000_000_000_000, 978)
+    assert two[dxb.rid_key("a")] == (3_000_000_000_000, 978, -1)
 
 
 def test_v1_files_are_read_as_starts_without_a_rest(tmp_path):
@@ -205,7 +205,7 @@ def test_v1_files_are_read_as_starts_without_a_rest(tmp_path):
     struct.pack_into("<Qq", raw, dxb._HDR_SIZE, dxb.rid_key("a"), 5)
     path.write_bytes(bytes(raw))
     got = dxb.read_group_full(str(tmp_path), "D", 4, session_of=lambda pid: 4)
-    assert got == {dxb.rid_key("a"): (5, -1)}
+    assert got == {dxb.rid_key("a"): (5, -1, -1)}
     assert dxb.rest_of(got, "a", 0.0) is None and dxb.started(got, "a", 0.0)
 
 

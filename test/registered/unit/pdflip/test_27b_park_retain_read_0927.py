@@ -379,7 +379,10 @@ def test_park_running_reads_only_what_the_resume_can_take(monkeypatch, caplog):
     s = _Sched([a], {"pdflip-154-176": 72271})
     s.ps = types.SimpleNamespace(tp_size=3, attn_tp_rank=0)
     s.tree_cache = types.SimpleNamespace(is_eagle=True)
-    monkeypatch.setattr(wrd, "park_depths", lambda tree, reqs, ps, **_k: {str(r.rid): 72191 for r in reqs})
+    # #59c (parkl3 3b0a461f63): park_running asks park_depths_split for (raw read clamp, secured answer) -- the
+    # stub patched the old park_depths, which park_running no longer calls (then the real reduce ran: no TP group)
+    monkeypatch.setattr(wrd, "park_depths_split", lambda tree, reqs, ps, **_k: (
+        {str(r.rid): 72191 for r in reqs}, {str(r.rid): 72191 for r in reqs}))
     with caplog.at_level("INFO", logger=rt.logger.name):
         out = _park(s)
     assert out.success and out.pdflip_resumable_depth == {"pdflip-154-176": 72191}

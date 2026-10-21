@@ -246,6 +246,8 @@ X_EXACT_VERDICT_NOTE = ("; X-EXACT: uncached, est_prompt and carrier_est are the
 #: argparse default -- the runtime reads ``Front.drain_deadline_s``.
 DRAIN_DEADLINE_DEFAULT_S = 120.0
 #: y3k-korr 09292034: the park cause (and D reason) of a POST /pdflip/flip from D
+#: SOLL R6k: ``_wait_bound_park``'s answer while a running kurz D prefill ends on D before the flip
+R6K_HOLD = "r6k-hold"
 MANUAL_FLIP_PARK_CAUSE = "manual-flip"  # == phase_policy.PARK_REASON_MANUAL (27B FLIPWAIT)
 #: Spec C10/K5: the recorded PRE-BARLINK break-even inputs (record 1l/1o
 #: weg2zr2 pair) that produce X's fallback.  Only the FRONT's default; the
@@ -3742,7 +3744,8 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
                         extra=None, poll_s: float = 0.0, dual_wake: bool = False, cap_exempt=None, lane_held=None,
-                        lane_take=None, lane_take_wait=None, pick=None, on_pool_hold=None) -> int:
+                        lane_take=None, lane_take_wait=None, pick=None, on_pool_hold=None,
+                        shared=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3807,8 +3810,16 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     it waits for P's device room, not for P's compute -- so its stored prefix can be read L3 -> L2 meanwhile
     (pdflip/l2_read_ahead.py). Called on every hold (the callee keeps its own once-per-request mark); an error in
     it never stops the drain. ``None`` = off.
+
+    P-POOL-SHARED (rc29 pphase 21.10., ``shared``): ``shared(item, in_flight_items)`` returns ``(credit, giver)`` -- the
+    tokens of ``item``'s cost that P's pool already holds for the in-flight ``giver`` (its loaded prefix is ``item``'s
+    prefix, :func:`phase_policy.p_continuation_credit`). The overlap plan then books ``cost - credit``. The credit lives
+    only while the giver is in flight: when the giver finishes first, the taker's booking goes back to its full cost
+    (the shared nodes are the taker's alone from then on). ``stats`` then also counts ``shared_credit`` (tokens) and
+    ``shared_dispatched``. ``None`` = off (full cost, as before).
     """
     inflight: Dict[Any, int] = {}
+    credit_of: Dict[Any, Tuple[Any, int]] = {}  # P-POOL-SHARED: taker task -> (giver task, credited tokens)
     inflight_tokens = 0
     dispatched_total = 0
     # Dispatch sequence per task. `asyncio.wait` returns a SET, and a P batch
@@ -3822,7 +3833,7 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     rounds = 0
     if stats is not None:
         for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched",
-                  "short_rides"):
+                  "short_rides", "shared_credit", "shared_dispatched"):
             stats.setdefault(k, 0)
 
     def _exempt_index() -> Optional[int]:
@@ -3874,6 +3885,18 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                     break
                 ride = True
             c = int(cost(queue[idx])) if (cost is not None and budget > 0) else 0
+            giver_t, cred = None, 0
+            if shared is not None and c > 0 and items:
+                try:
+                    _cr, _gv = shared(queue[idx], list(items.values()))
+                    _cr = max(0, min(int(_cr or 0), c))
+                    if _cr > 0 and _gv is not None:
+                        giver_t = next((t_ for t_, it_ in items.items() if it_ is _gv), None)
+                        if giver_t is not None:
+                            cred = _cr
+                except Exception:  # noqa: BLE001 - a credit error never stops the drain: the full cost stands
+                    giver_t, cred = None, 0
+            c -= cred
             if not phase_policy.p_overlap_admits(inflight_tokens - _th, len(inflight) - _nh, c, budget):
                 if stats is not None:
                     stats["pool_holds"] += 1
@@ -3894,6 +3917,11 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
             t = asyncio.ensure_future(one(item))
             inflight[t] = c
             items[t] = item
+            if cred > 0:
+                credit_of[t] = (giver_t, cred)
+                if stats is not None:
+                    stats["shared_credit"] += cred
+                    stats["shared_dispatched"] += 1
             seq[t] = dispatched_total
             inflight_tokens += c
             dispatched_total += 1
@@ -3956,6 +3984,13 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
             timeout=(0.1 if lane_held is not None else _timeout))
         for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
+            credit_of.pop(t, None)
+            for _tk, (_gt, _cr) in list(credit_of.items()):
+                if _gt is t:   # P-POOL-SHARED: the giver left first -- the taker holds the shared nodes alone now
+                    del credit_of[_tk]
+                    if _tk in inflight:
+                        inflight[_tk] += _cr
+                        inflight_tokens += _cr
             seq.pop(t, None)
             items.pop(t, None)
             if t in taken and t.cancelled():
@@ -5984,7 +6019,7 @@ class Front:
             while len(pbook) > 4096:
                 pbook.popitem(last=False)
             Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
-                ids=_np.asarray(ans.ids, dtype=_np.int64), spans=tuple(ans.mm_spans),
+                ids=_np.asarray(ans.ids, dtype=_np.int64), spans=tuple(ans.mm_spans), rows=tuple(ans.mm_rows),
                 extra_key=(extra_key if ids is not None else ans.extra_key),
                 extra_key_known=(True if ids is not None else bool(ans.extra_key_known)),
                 path=("/generate" if ids is not None else str(path or "")),
@@ -6456,6 +6491,11 @@ class Front:
         """
         if self._park_attempt_epoch == self.epoch:
             return "already"
+        if cause != MANUAL_FLIP_PARK_CAUSE and Front._r6k_finish_hold(self):
+            # SOLL R6k: a running kurz D prefill ends on D first -- admission closes (the flip is decided, R1a: waiting
+            # kurz requests ride it), the park waits for the next controller tick; the attempt is not spent
+            self.admit_d = False
+            return R6K_HOLD
         self._park_attempt_epoch = self.epoch
         D = self.groups["D"]
         if _lctl.enabled():
@@ -7829,7 +7869,7 @@ class Front:
                 while len(_pbook) > 4096:
                     _pbook.popitem(last=False)
                 Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
-                    ids=ans.ids, spans=tuple(ans.mm_spans), extra_key=ans.extra_key,
+                    ids=ans.ids, spans=tuple(ans.mm_spans), rows=tuple(ans.mm_rows), extra_key=ans.extra_key,
                     extra_key_known=bool(ans.extra_key_known), path=str(path),
                     payload=(None if (ans.extra_key_known and ns_known) else payload),
                     ns_known=bool(ns_known), ns=ns, t=time.monotonic(), price=_xp))
@@ -8099,7 +8139,7 @@ class Front:
                 _pbook.popitem(last=False)
             # S63 F1: the key of this price, for the re-probe right before a set verdict that flips or assigns P
             Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
-                ids=_probe.ids, spans=tuple(_probe.mm_spans), extra_key=_probe.extra_key,
+                ids=_probe.ids, spans=tuple(_probe.mm_spans), rows=tuple(_probe.mm_rows), extra_key=_probe.extra_key,
                 extra_key_known=bool(_probe.extra_key_known), path=str(path),
                 # the body is kept only where a re-probe must send it again (no D namespace in the answer / LoRA):
                 # a media payload is megabytes, D's ids + namespace are the key itself
@@ -8108,12 +8148,12 @@ class Front:
             if _xp.image_in_tail:
                 self.counters["d_probe_image_in_tail"] += 1
             logger.info("PDFLIP D-PROBE rid=%s n=%d device=%d host=%d store=%d tier=%s covered=%d uncached_d=%d "
-                        "uncached_p=%d image_in_tail=%d images=%d class_u=%d ledger_pending=%d ledger_src=%s "
+                        "uncached_p=%d image_in_tail=%d tail_rows=%d images=%d class_u=%d ledger_pending=%d ledger_src=%s "
                         "front_n=%s tokenize_ms=%.1f handle_ms=%.1f probe_ms=%.1f (S56: the class from D's exact "
                         "numbers, R11 -- the front decides)",
                         rid, int(c.n), int(_probe.device_tokens), int(_probe.host_tokens), int(_xp.store_tokens),
                         tier, int(_xp.covered), int(_xp.uncached), int(_xp.uncached_p), int(_xp.image_in_tail),
-                        len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
+                        int(_xp.tail_rows), len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
                         (int(_c_front.n) if _c_front is not None else "-"), _probe.tokenize_ms,
                         _probe.handle_ms, _probe.total_ms)
         # NF-NEXT-1006-21: which entry (its rid, its kind) the credit came from --
@@ -13861,6 +13901,21 @@ class Front:
                 # the younger head would overtake it. It waits at the semaphore behind it, as before F5.
                 self.counters["arrival_seat_age_credit_older_in_line"] += 1
                 return False
+        # NF-C-SITZ 1021 (rc27 _1021_020616 2277 seat=7/6, rc29 8/6, rc27 _023225 02:44:53 taken=11 n=6): AT MOST ONE
+        # open credit, and only while the seats this phase owes WITHOUT this head do not exceed n -- the credit path
+        # alone never lifts the owed seats past n+1. A head refused here waits for its seat (R5) as before F5; the open
+        # credit is settled by the next freed permit (Seat._pass_permit) or ends with its leg 2 (Seat.release).
+        open_credit = [s.rid for s in (getattr(self, "_d_seats_live", ()) or ()) if getattr(s, "on_credit", False)]
+        taken, n = self._arrival_seat_taken(for_rid=rid)
+        own = 1 if rid in (st.get("granted") or {}) else 0
+        if open_credit or taken - own > int(n):
+            self.counters["arrival_seat_age_credit_refused"] = self.counters.get("arrival_seat_age_credit_refused", 0) + 1
+            c = self.counters["arrival_seat_age_credit_refused"]
+            if c <= 24 or c % 256 == 0:
+                logger.info("PDFLIP SEAT-AGE CREDIT-REFUSED rid=%s open_credit=%s taken=%d (without this head %d) n=%d "
+                            "(n=%d): at most one open credit and never past n+1 owed seats -- the head waits for its seat "
+                            "(NF-C-SITZ, R5)", rid, open_credit[:4], int(taken), int(taken) - own, int(n), c)
+            return False
         self.counters["arrival_seat_age_seat_on_credit"] += 1
         logger.info("PDFLIP SEAT-AGE ON-CREDIT rid=%s victims=%s seats_live=%d d_bs=%d -- every front seat is held: "
                     "the AGE PLAN head goes to D now, D's SEAT-AGE displaces the youngest for it (no wait at the "
@@ -13910,7 +13965,7 @@ class Front:
         return self.__dict__.setdefault("_d_pf", _dpf.DPrefillInflight())
 
     def _d_pf_pending_tokens(self, started_only: bool = False, unstarted_only: bool = False,
-                             d_rest: bool = False) -> int:
+                             d_rest: bool = False, skip_kurz: bool = False) -> int:
         """The uncached tokens D has been granted to prefill as SHORT and has
         not finished (no first content yet). DECODE-COLLECT used to look only
         at D's DECODES, so a burst arriving on an idle D went in one by one --
@@ -13921,7 +13976,10 @@ class Front:
         ``unstarted_only``: only the rows D has NOT begun (their granted price).
         ``d_rest`` (S56, with ``started_only``): a started row counts D's REAL
         rest from the D-EXTEND-BEACON, and only when the front can redirect it
-        to P (``_r6_tokens_of``) -- never the front's arrival price."""
+        to P (``_r6_tokens_of``) -- never the front's arrival price.
+        ``skip_kurz`` (rc30 R8 fix, SOLL R2 + R6k): a row whose request went to D as kurz (``_r6k_note_class``) is not
+        counted -- a kurz request runs on D at once and its tokens are never part of a set's S, neither running (R6k) nor
+        granted-not-begun (R2); counted rows with no class known count as before (named ``xsum_class_unknown``)."""
         book = self.__dict__.get("_d_pf")  # created by the first SHORT grant
         if book is None or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
@@ -13939,10 +13997,21 @@ class Front:
         ls = self.__dict__.get("_lane_state_obj")
         floor = int(getattr(ls, "lane_floor", 0) or 0) if ls is not None else 0
 
+        classes = (self.__dict__.get("_r6k_class") or {}) if skip_kurz else {}
+
         def _idle(rid: str) -> bool:
             if rid in D.outstanding and rid not in running:
                 return True
-            return floor > 0 and ls.lane_for(rid) < floor
+            if floor > 0 and ls.lane_for(rid) < floor:
+                return True
+            if skip_kurz:
+                got = classes.get(rid)
+                if got is None:
+                    self.counters["xsum_class_unknown"] += 1
+                elif got[0] == phase_policy.CLASS_KURZ:
+                    self.counters["xsum_kurz_grant_skipped"] += 1
+                    return True
+            return False
 
         started = Front._d_ext_started_pred(self) if (started_only or unstarted_only) else None
         if unstarted_only and started is not None:
@@ -13979,6 +14048,7 @@ class Front:
         box: List[Optional[Dict[int, Any]]] = []
         counted: Dict[str, int] = {}
         self.__dict__["_r6_counted"] = counted
+        self.__dict__["_r6_in_flight"] = {}
 
         def _tok(rid: str, t_grant: float, _granted: int) -> int:
             if not box:
@@ -13993,15 +14063,22 @@ class Front:
                 # into S. Before v3 the record kept the rest of the batch START and R6 counted a computed prefill.
                 self.counters["r6_rest_computed"] += 1
                 return 0
-            if str(rid) in (self.__dict__.get("_r6k_kurz") or ()):
-                # SOLL R6k (user 20.10. 21:30Z "b"): a running KURZ D prefill (u < halbX at its arrival, R2) runs on D
-                # to its end -- its rest is no part of S, it neither triggers nor pulls a flip; R6 is halb/gross only
-                self.counters["r6k_kurz_stays_on_d"] += 1
-                if self.__dict__.get("_r6k_last") != (rid, rest):
-                    self.__dict__["_r6k_last"] = (rid, rest)
-                    logger.info("PDFLIP R6K-KURZ-STAYS-ON-D rid=%s d_rest=%d granted=%d epoch=%d -- a kurz D prefill runs "
-                                "on D to its end; its rest is not in S, no flip by it (SOLL R6k, user 20.10. \"b\")",
-                                rid, rest, int(_granted), self.epoch)
+            if Front._r6k_kurz_stays(self, rid, rest, _granted):
+                return 0
+            # NF-RC30-R6STALE (SOLL R6 + R7, R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): S counts what goes to P --
+            # the tokens no forward of D has been launched for (beacon v4 ``free``). A chunk D has handed to a forward ends on
+            # D (the abort lands at D's next loop top, after it) and P reads it from the store: counted, it flipped for tokens P
+            # never computes (NF _1021_063252 pdflip-48-687 counted 3280 -> P 16, 42-671 4681 -> 9, 46-680 5151 -> 2911)
+            free = _dxb.free_of(box[0], rid, t_grant)
+            free = int(rest) if free is None else int(free)
+            if free <= 0:
+                self.counters["r6_rest_in_flight"] += 1
+                if self.__dict__.get("_r6_if_last") != (rid, rest):
+                    self.__dict__["_r6_if_last"] = (rid, rest)
+                    logger.info("PDFLIP R6-REST-IN-FLIGHT rid=%s d_rest=%d free=0 granted=%d epoch=%d -- D has handed the whole "
+                                "rest of this prefill to forwards it runs now: they end on D, nothing of it reaches P, R6 "
+                                "neither counts nor redirects it (SOLL R6, R7: no flip for tokens P never computes)",
+                                rid, int(rest), int(_granted), self.epoch)
                 return 0
             if not Front._r6_redirectable(self, rid):
                 self.counters["r6_rest_not_redirectable"] += 1
@@ -14011,10 +14088,149 @@ class Front:
                                 "to its end (stream committed or no D-prefill leg): it is no part of what P would get, "
                                 "R6 does not count it (S56, SOLL R6)", rid, rest, int(_granted), self.epoch)
                 return 0
-            counted[str(rid)] = int(rest)
-            return int(rest)
+            if free < rest:
+                self.counters["r6_rest_in_flight_part"] += 1
+                (self.__dict__.setdefault("_r6_in_flight", {}))[str(rid)] = int(rest) - free
+            counted[str(rid)] = free
+            return free
 
         return _tok
+
+    def _r6k_clear_class(self, rid: str) -> None:
+        """SOLL R6k (review K1): forget the class of ``rid`` (a D refusal): unknown -> R6 as before, named."""
+        (self.__dict__.get("_r6k_class") or {}).pop(str(rid), None)
+
+    def _r6k_note_class(self, rid: str, klass: str, src: str, half_x: int = 0) -> None:
+        """SOLL R6k (user decision 20.10. 21:30:15Z, "b"): the class a request was put on D with -- the arrival's exact
+        CLASSIFY (R2/R3/R4/R9), D's barrier for a measured arrival (u < halfX), D's measured class after a refusal.
+        Bounded like the other per-rid books."""
+        book = self.__dict__.setdefault("_r6k_class", collections.OrderedDict())
+        book.pop(str(rid), None)
+        book[str(rid)] = (str(klass), str(src), int(half_x or 0))
+        while len(book) > 4096:
+            book.popitem(last=False)
+
+    def _r6k_kurz_stays(self, rid: str, rest: int, granted: int) -> bool:
+        """SOLL R6k (user decision 20.10. 21:30:15Z, verbatim "b": "Kurze bleiben auf D: Ein laufender kurzer D-Prefill
+        (u < halbX) läuft nach R2 auf D zu Ende; sein Rest zählt nicht zu S und löst keinen Flip aus. R6 gilt dann nur für
+        halbe und große laufende Prefills."): True = a RUNNING D prefill whose class is kurz -- its rest is not in S, it
+        is not counted for the redirect (no PARK-HANDBACK, no R6-REDIRECT). The class is the one it went to D with
+        (``_r6k_note_class``), never re-derived from a number. No class known: named (``r6k_class_unknown``) and R6 applies
+        as before. R11: the front decides alone, nothing is asked of D here."""
+        got = (self.__dict__.get("_r6k_class") or {}).get(str(rid))
+        if got is None:
+            self.counters["r6k_class_unknown"] += 1
+            return False
+        klass, src = got[0], got[1]
+        if klass != phase_policy.CLASS_KURZ:
+            return False
+        if Front._r6k_contradicted(self, rid, rest, got):
+            return False
+        self.counters["r6k_kurz_stays_on_d"] += 1
+        if self.__dict__.get("_r6k_last") != (rid, rest):
+            self.__dict__["_r6k_last"] = (rid, rest)
+            logger.info("PDFLIP R6K-KURZ-STAYS-ON-D rid=%s d_rest=%d granted=%d class=kurz src=%s epoch=%d -- a running kurz D "
+                        "prefill runs to its end on D: its rest is not in S, it makes no flip and pulls none forward, it "
+                        "is not redirected to P (SOLL R6k, user 20.10. \"b\"; R2)", rid, int(rest), int(granted), src,
+                        self.epoch)
+        return True
+
+    def _r6k_contradicted(self, rid: str, rest: int, got: Tuple) -> bool:
+        """SOLL R6k + user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN" (review K1): D's exact rest of the running prefill is
+        never larger than D's u -- a rest >= the halfX the kurz class stood on PROVES u >= halfX: the request is not kurz,
+        R6 applies as before. Named once per (rid, rest): ``r6k_kurz_contradicted``. No halfX noted: not provable, no
+        contradiction."""
+        hx = int(got[2]) if len(got) > 2 else 0
+        if hx <= 0 or int(rest) < hx:
+            return False
+        self.counters["r6k_kurz_contradicted"] += 1
+        if self.__dict__.get("_r6k_contra_last") != (rid, rest):
+            self.__dict__["_r6k_contra_last"] = (rid, rest)
+            logger.warning("PDFLIP R6K-KURZ-CONTRADICTED rid=%s d_rest=%d halfX=%d src=%s epoch=%d -- D's exact rest proves "
+                           "u >= halfX: not kurz, R6 applies (SOLL R6k; user 19.10. exact numbers)", rid, int(rest), hx,
+                           got[1], self.epoch)
+        return True
+
+    def _r6k_running_kurz(self, now: float) -> List[Tuple[str, int, int, float]]:
+        """SOLL R6k: the RUNNING kurz D prefills with a rest left -- ``(rid, rest, granted, t_first_extend_s)``. Running =
+        posted to D (``outstanding``) and D's own D-EXTEND-BEACON record at/after the grant with rest > 0 (v3 + the poll at
+        the forward's device end: rest 0 = computed). Class = the one it went to D with (``_r6k_note_class``). No reading:
+        nothing is proven running, nothing is held."""
+        if not _dxb.enabled():
+            return []
+        book = self.__dict__.get("_d_pf")
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        if book is None or D is None:
+            return []
+        classes = self.__dict__.get("_r6k_class") or {}
+        rows = [(rid, row) for rid, row in list(getattr(book, "_rows", {}).items())
+                if rid in D.outstanding and (classes.get(rid) or ("",))[0] == phase_policy.CLASS_KURZ]
+        if not rows:
+            return []
+        reading = self._d_ext_reading_full()
+        if not reading:
+            return []
+        out = []
+        for rid, row in rows:
+            e = _dxb._entry(reading, rid)
+            if e is None or e[0] < int(float(row.t_grant) * 1e9) or e[1] <= 0:
+                continue
+            if Front._r6k_contradicted(self, rid, int(e[1]), classes[rid]):
+                continue                               # review K1: not kurz -> R6's, not held
+            out.append((str(rid), int(e[1]), int(row.tokens), e[0] / 1e9))
+        return out
+
+    def _r6k_finish_hold(self, now: Optional[float] = None) -> bool:
+        """SOLL R6k (user 20.10. "b": "läuft nach R2 auf D zu Ende"; planner decision 20.10.: finished on D BEFORE the flip,
+        never parked at a chunk boundary): True = the D->P flip (its park / quiesce) waits this controller tick, because a
+        running kurz D prefill still has a rest. No sync, no busy wait: the controller's own tick asks again, D reports the
+        end through its beacon (rest 0 at the forward's device end). Bounded: the deadline is 2x the time the measured rest
+        needs at this prefill's OWN measured rate (computed tokens / time since its first extend), never longer than T_halb
+        (the SOLL flag); no rate measured yet (first chunk in flight) -> T_halb. After the deadline the flip goes as before,
+        named. R11: the front decides, the D group follows the park it then gets."""
+        now = time.time() if now is None else float(now)
+        st = self.__dict__.get("_r6k_hold")
+        if st is not None and st.get("epoch") != self.epoch:
+            st = None
+            self.__dict__["_r6k_hold"] = None
+        if st is not None and st.get("timed_out"):
+            return False
+        run = Front._r6k_running_kurz(self, now)
+        if not run:
+            if st is not None and not st.get("closed"):
+                st["closed"] = True
+                self.counters["r6k_finish_before_flip_done"] += 1
+                logger.info("PDFLIP R6K-FINISH-BEFORE-FLIP outcome=done wait_ms=%d rids=%s epoch=%d -- the running kurz D "
+                            "prefill(s) ended on D, the flip begins now (SOLL R6k, R2)", int(round((now - st["t0"]) * 1000)),
+                            ",".join(st["rids"]), self.epoch)
+            return False
+        if st is None or st.get("closed"):
+            t_half = float(Front._set_cfg()[1])
+            exp = []
+            for _rid, rest, granted, t_first in run:
+                done_tok, el = max(0, int(granted) - int(rest)), max(0.0, now - float(t_first))
+                exp.append(rest * el / done_tok if done_tok > 0 and el > 0 else None)
+            if exp and all(e is not None for e in exp):
+                limit, basis = min(t_half, 2.0 * max(exp)), "measured"
+            else:
+                limit, basis = t_half, "t_half"
+            st = {"epoch": self.epoch, "t0": now, "deadline": now + limit, "rids": [r[0] for r in run]}
+            self.__dict__["_r6k_hold"] = st
+            self.counters["r6k_finish_before_flip_held"] += 1
+            logger.info("PDFLIP R6K-FINISH-BEFORE-FLIP outcome=hold rids=%s rests=%s limit_ms=%d basis=%s epoch=%d -- the flip "
+                        "waits for the running kurz D prefill(s) to end on D, not parked at a chunk boundary (SOLL R6k: "
+                        "\"läuft nach R2 auf D zu Ende\"; R11)", ",".join(r[0] for r in run),
+                        ",".join(str(r[1]) for r in run), int(round(limit * 1000)), basis, self.epoch)
+            return True
+        if now >= st["deadline"]:
+            st["timed_out"] = True
+            self.counters["r6k_finish_before_flip_timeout"] += 1
+            logger.warning("PDFLIP R6K-FINISH-BEFORE-FLIP outcome=timeout wait_ms=%d rids=%s rests=%s epoch=%d -- the deadline "
+                           "passed with a kurz rest left: the flip goes as before (D parks it at its chunk boundary)",
+                           int(round((now - st["t0"]) * 1000)), ",".join(r[0] for r in run), ",".join(str(r[1]) for r in run),
+                           self.epoch)
+            return False
+        return True
 
     def _r6_redirect(self, why: str) -> List[str]:
         """S56 (SOLL R6 "auch ein laufender D prefill wird dann geflippt"): a REROUTE_P verdict MOVES the running D
@@ -14025,9 +14241,12 @@ class Front:
             return []
         moved = self._park_handback(list(counted), started=list(counted))
         self.counters["r6_redirected"] += len(moved)
-        logger.info("PDFLIP R6-REDIRECT epoch=%d why=%s counted=%s moved=%s -- the running D prefill(s) R6 counted go "
-                    "to P with the set (S56, SOLL R6)", self.epoch, why,
-                    ",".join("%s:%d" % kv for kv in counted.items()), moved)
+        in_flight = self.__dict__.get("_r6_in_flight") or {}
+        logger.info("PDFLIP R6-REDIRECT epoch=%d why=%s counted=%s moved=%s in_flight=%s -- the running D prefill(s) R6 counted "
+                    "go to P with the set (S56, SOLL R6); counted = the tokens no D forward was launched for, in_flight = the "
+                    "chunk(s) D ends itself (NF-RC30-R6STALE)", self.epoch, why,
+                    ",".join("%s:%d" % kv for kv in counted.items()), moved,
+                    ",".join("%s:%d" % (r, int(in_flight.get(r, 0))) for r in counted))
         return moved
 
     def _d_ext_reading_full(self) -> Optional[Dict[int, Any]]:
@@ -14100,6 +14319,7 @@ class Front:
         (D-EXTEND-BEACON). A big member then waits its T_halb (R4); a kurz request never triggers a flip (R2).
         ``_d_carried_tokens`` (the X-SUM price of the kurz path) is unchanged: it prices every granted row."""
         self.__dict__["_r6_counted"] = {}  # S56: only this reading's counted rows may be redirected
+        self.__dict__["_r6_in_flight"] = {}
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
         # S56: a started row counts D's REAL rest, and only when the front redirects it to P (``_r6_tokens_of``)
@@ -14281,6 +14501,40 @@ class Front:
                 cache.clear()
             cache[key] = int(_st.common_prefix(ia, ib))
         return cache[key]
+
+    def _p_pool_shared(self, p: Any, others: Sequence[Any]) -> Tuple[int, Any]:
+        """P-POOL-SHARED (rc29 pphase 21.10.; SOLL R1a, R1u, R11): ``(credit, giver)`` for the P overlap plan -- the
+        largest loaded prefix of a leg in flight on P (``others``) that is ``p``'s own prefix
+        (:func:`phase_policy.p_continuation_credit` over the front token ids, :meth:`_set_common`, and the legs' priced
+        store depth, :meth:`_set_depth_of`). ``(0, None)`` when no in-flight leg's loaded prefix is ``p``'s prefix or the
+        ids are not kept (then the full cost stands). Metal rc27 _023225: pdflip-0-21 continued pdflip-0-17 (depth
+        147712) and was held 23.2 s for 149741 tokens of "P's device room" while P's pool usage read 0.17-0.43; the P
+        commit at 02:37:20-25 ran with queue 0 (COMMIT-WARTEN-P-OHNE-QUEUE). Never raises."""
+        try:
+            best, giver = 0, None
+            for q in others:
+                if q is p or getattr(q, "skip_leg1", False):
+                    continue
+                d = Front._set_depth_of(self, str(q.rid), q)
+                if d <= best:
+                    continue
+                cr = phase_policy.p_continuation_credit([(Front._set_common(self, str(p.rid), str(q.rid)), d)])
+                if cr > best:
+                    best, giver = cr, q
+            if best > 0:
+                self.counters["p_pool_shared_credit"] = self.counters.get("p_pool_shared_credit", 0) + 1
+                seen = self.__dict__.setdefault("_p_pool_shared_told", set())
+                if str(p.rid) not in seen:
+                    if len(seen) > 4096:
+                        seen.clear()
+                    seen.add(str(p.rid))
+                    full = phase_policy.p_request_cost(p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1)
+                    logger.info("PDFLIP P-POOL-SHARED rid=%s giver=%s credit=%d cost=%d->%d epoch=%d -- the in-flight "
+                                "leg's loaded prefix is this leg's prefix: P's pool holds it once (SOLL R1a, R1u)",
+                                p.rid, giver.rid, best, full, max(0, full - best), self.epoch)
+            return best, giver
+        except Exception:  # noqa: BLE001 -- a credit never breaks the drain: the full cost stands
+            return 0, None
 
     def _set_discount(self, items: Sequence[Tuple[str, int, float, Any]]) -> Dict[str, int]:
         """H16V F1: ``items`` = ``(rid, uncached, t_arrive, pending-or-None)`` -> the set's per-member NEW tokens
@@ -14771,6 +15025,18 @@ class Front:
             _n_exact = str(getattr(xx, "n_src", "")) == "front_ids"
             Front._measure_arm(self, rid, x_set, n_prompt if _n_exact else 0, int(getattr(xx, "uncached_p", -1)),
                                p_upper=bool(p_upper and not measure))
+        # SOLL R6k (review K2): the class R6 reads for a running D prefill is noted BEFORE any instrument call, outside the
+        # instrument's ``except`` (like the barrier above, review B4). A measured arrival is prefilled by D only under its
+        # barrier halfX-1 (kurz); a refusal names the measured class or clears the note (``_measure_return``)
+        try:
+            _x6 = int(x_set) if x_set else int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            _f6 = Front._set_cfg()[0]
+            _k6 = (phase_policy.CLASS_KURZ if measure
+                   else phase_policy.classify_arrival(int(remainder), _x6, _f6, bool(p_only)))
+            Front._r6k_note_class(self, rid, _k6, "measure_barrier" if measure else "arrival",
+                                  phase_policy.half_x_of(_x6, _f6))
+        except Exception:  # noqa: BLE001 -- no class: R6 applies as before, named (r6k_class_unknown)
+            Front._r6k_clear_class(self, rid)
         try:
             now = time.monotonic()
             frac = Front._set_cfg()[0]
@@ -14850,6 +15116,9 @@ class Front:
         class is deleted (the state path takes it as before). The caller sets the owner (kurz -> D, halb -> the set,
         gross -> R4/R8) from the returned class. ``n_prompt`` is the PROMPT length (the depth of the class is
         ``n_prompt - u``), never the requeue counter."""
+        # SOLL R6k (review K1): D refused this request -- a kurz note no longer stands (with an extent the measured class
+        # is noted below; without one the class is unknown and R6 applies as before, named)
+        Front._r6k_clear_class(self, rid)
         try:
             sent = (self.__dict__.get("_measure_sent") or {}).pop(str(rid), None)
             if not envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
@@ -14878,6 +15147,7 @@ class Front:
             page = Front._d_page_size(self)
             self.counters["measure_return_" + klass] += 1
             p.measured_u, p.measure_src, p.measure_class = u, _dn.SRC_D_EXTENT, klass
+            Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT, hx)  # SOLL R6k: D's measured class
             if reclass:
                 self.counters["measure_reclass_" + klass] += 1
             under = klass == _dn.CLASS_KURZ
@@ -15025,8 +15295,10 @@ class Front:
             # EZ-S2a: ONE decision. S49's granted-not-started term is an INPUT of the verdict (NS:S49), not a second pass
             unstarted = _fd.granted_unstarted(
                 self, running, beacon=_dxb.enabled(),
-                d_pf_unstarted=(Front._d_pf_pending_tokens(self, unstarted_only=True) if _dxb.enabled() else 0),
-                d_pf_pending=(0 if _dxb.enabled() else Front._d_pf_pending_tokens(self)))
+                # rc30 R8 fix (SOLL R2 + R6k): a kurz grant is never part of S -- only halb/big grants D has not begun
+                d_pf_unstarted=(Front._d_pf_pending_tokens(self, unstarted_only=True, skip_kurz=True)
+                                if _dxb.enabled() else 0),
+                d_pf_pending=(0 if _dxb.enabled() else Front._d_pf_pending_tokens(self, skip_kurz=True)))
             _dec = phase_policy.decide(
                 "set", members=members, x_tokens=x_tok, half_frac=frac, t_half_s=t_half,
                 now=now, t_open=min(st["t_open"], now),
@@ -15048,25 +15320,30 @@ class Front:
                 d_decoding=decoding, seats_free=seats,
                 d_prefill_running_uncached=running,  # R6: what D REALLY prefills right now counts into S (S49)
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
-            sv = Front._set_xsum_hold(self, sv, x_tok, running)
+            sv = Front._set_xsum_hold(self, sv, x_tok, running, decoding=decoding)
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
         return members, sv, kw
 
-    def _set_xsum_hold(self, sv: "phase_policy.SetVerdict", x_tok: int, running: int) -> "phase_policy.SetVerdict":
+    def _set_xsum_hold(self, sv: "phase_policy.SetVerdict", x_tok: int, running: int,
+                       decoding: bool = True) -> "phase_policy.SetVerdict":
         """S49 (SOLL R6 after the user's decision 18.10. "Nur echt laufend zählt", with X-SUM-PRICE, user 05.10.
         "pending token werden gesammelt und als SUMME bepreist"): a granted D prefill D has NOT begun is no flip
         reason (R6 does not count it) -- but D is not handed a set on top of it either when the two together pass X.
         Before S49 that set was rerouted at once (R6 counted the grant: the NF int23xsum burst of 09.10.); now it WAITS
         (COLLECT, no flip, R7): once D begins the grant, R6 counts it as really running and decides; once D has
         finished it, the set goes to D under X. Only a D verdict (D_AFTER_TIMER) is held; every flip verdict stands.
-        Switch FLLIPER_PDFLIP_D_EXTEND_BEACON off: nothing to hold (R6 counts the book as before)."""
+        Switch FLLIPER_PDFLIP_D_EXTEND_BEACON off: nothing to hold (R6 counts the book as before).
+        rc30 R8 fix: never held when nothing decodes on D (``decoding`` False, SOLL R8 "sofort entschieden"), and a kurz
+        grant is never part of the term (SOLL R2 + R6k)."""
         if sv.verdict != phase_policy.V_D_AFTER_TIMER or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return sv
+        if not decoding:
+            return sv
         # S56: the rows D has not begun, at their granted price (``running`` is D's rest of the started ones now)
-        unstarted = max(0, Front._d_pf_pending_tokens(self, unstarted_only=True)) if _dxb.enabled() \
-            else max(0, Front._d_pf_pending_tokens(self) - int(running))
+        unstarted = max(0, Front._d_pf_pending_tokens(self, unstarted_only=True, skip_kurz=True)) if _dxb.enabled() \
+            else max(0, Front._d_pf_pending_tokens(self, skip_kurz=True) - int(running))
         if unstarted <= 0 or sv.s_tokens + unstarted <= int(x_tok):
             return sv
         self.counters["set_xsum_hold_unstarted"] += 1
@@ -15177,7 +15454,7 @@ class Front:
             return None, "no exact D number by the deadline"
         if not _dmp.reprobe_same_key(e, ans):
             return None, "identity: D answered n=%d for the arrival's n=%d" % (ans.n, e.n)
-        ans = _dmp.with_spans(ans, e.spans)
+        ans = _dmp.with_spans(ans, e.spans, e.rows)
         store = 0
         if e.ns_known:
             tmo = envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
@@ -15806,7 +16083,12 @@ class Front:
         if for_rid is not None and ready and Front._short_gate_by_age_on(self):
             _k = Front._sa_key(self, for_rid)
             ready = [p for p in ready if Front._sa_key(self, p) < _k]
-        running = [r for r in self._flip_ledger(D) if r not in parked]
+        # NF-C-SITZ-H 1021 (SOLL R5; rc27 _1021_023225 02:44:53 'ARRIVAL-SEAT rid=pdflip-2-30 verdict=flip_now ...
+        # taken=11 n=6'): a RESUME-VIA-P hold is a rid D keeps while P prefills its context -- it runs no D work and
+        # holds no D seat until its leg comes back (S87 ``_seat_leg_unseated`` excludes it for the same reason). Counted
+        # here it double-booked the owed seats and steered flip/park verdicts on a number D does not hold.
+        rvp = getattr(self, "_rvp_inflight", None) or ()
+        running = [r for r in self._flip_ledger(D) if r not in parked and r not in rvp]
         # a grant between this rule's verdict and its Seat (the caller still
         # awaits the store-budget reading) holds its seat already: no second
         # waiter may take it in that window. Settled once the rid runs or holds
@@ -15957,10 +16239,13 @@ class Front:
         # after its own await (no await in between) and hands it on -- the shared slot is overwritten by every other
         # waiter's KV test during the caller's later awaits (``_asr_older_blocked``, the other waiters of the tick).
         _rr = reading.get("running_rids") if reading else None
+        _dr = reading.get("displaceable_rids") if reading else None
         self._asr_st()["last_kv_basis"] = {
             "unread": not reading,
             "wall": _asr.backup_wall(reading),
             "running": set(str(r) for r in _rr) if isinstance(_rr, (list, tuple)) else None,
+            # NF-C-SITZ 1021: the decodes D can park NOW (spec decode: the batch's back) -- None = an old D
+            "displaceable": set(str(r) for r in _dr) if isinstance(_dr, (list, tuple)) else None,
         }
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
@@ -15982,7 +16267,8 @@ class Front:
         """S94 review A2: the basis of the KV test that JUST returned (call it with no await after that test): D gave a
         number (``unread``), its backup wall (``wall``), the decodes it runs (``running``, None = an old D)."""
         b = self._asr_st().get("last_kv_basis")
-        return dict(b) if isinstance(b, dict) else {"unread": True, "wall": False, "running": None}
+        return dict(b) if isinstance(b, dict) else {"unread": True, "wall": False, "running": None,
+                                                    "displaceable": None}
 
     def _asr_note_need_terms(self) -> None:
         """Counters for the two honest terms of the verdict just granted."""
@@ -16092,6 +16378,13 @@ class Front:
             # (rc19 07:15:49 pdflip-262-3339 for 3338) -- planning on those handed heads to a D that could not seat
             # them. D's own reading decides; an old D without the field: unchanged.
             running = [r for r in running if r in d_running]
+        d_disp = basis.get("displaceable")
+        if d_disp is not None:
+            # NF-C-SITZ 1021 (rc27 front 2271 victims=['pdflip-2-29'] vs D 19679 DISPLACE-WAIT youngest=pdflip-2-28):
+            # the victim is one D CAN park now (``d_park_runtime.displaceable``: under speculative decoding only the
+            # batch's back) -- the same set D's SEAT-AGE chooses from, so front and D name the same victim (R11 spirit:
+            # one rule) and no head goes to D for a displacement D then cannot do.
+            running = [r for r in running if r in d_disp]
         arrivals = {}
         for r in running:
             t = self._asr_arrival_of(r)
@@ -23406,6 +23699,10 @@ class Front:
                 # S53 L2-READ-AHEAD: the head the pool plan holds is read L3 -> L2 on P meanwhile
                 on_pool_hold=((lambda p: Front._maybe_l2_read_ahead(self, p))
                               if _l2ra.enabled() else None),
+                # P-POOL-SHARED (rc29 pphase 21.10., ported to 27B 21.10.): a leg continuing an in-flight leg's loaded
+                # prefix books only what lies beyond it (SOLL R1a: the flip takes every pending prefill; R1u: a shared
+                # prefix once)
+                shared=(lambda p, others: Front._p_pool_shared(self, p, others)),
                 # FLIPCYCLE H5: the phase cap never strands a SHORT
                 # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader), switch-independent;
                 # SEAT-AT-HAND-OFF: no seat cap on this phase, so no seat condition on the exemption either
@@ -23440,6 +23737,11 @@ class Front:
                             self.epoch, _phase_stats["overlap_dispatched"],
                             _phase_stats["dispatched"], _phase_stats["peak_n"],
                             self.p_concurrency + _ahead)
+            if _phase_stats.get("shared_dispatched"):
+                logger.info("PDFLIP P-POOL-SHARED-PHASE epoch=%d shared_dispatched=%d shared_credit=%d dispatched=%d "
+                            "pool_tokens=%d (legs that continued an in-flight leg's loaded prefix, booked beyond it)",
+                            self.epoch, _phase_stats["shared_dispatched"], _phase_stats["shared_credit"],
+                            _phase_stats["dispatched"], _p_pool_budget)
             if passes and (self.p_phase_max_requests or _p_pool_budget):
                 _cap_hit = phase_policy.phase_cap_reached(
                     _phase_stats["dispatched"], self.p_phase_max_requests)
@@ -23610,7 +23912,8 @@ class Front:
                         # per D phase; admission to D closes). A hand-off in
                         # flight is waited for first -- it registers within
                         # ms, bounded by the W36 barrier -- so the park sees it.
-                        await self._wait_bound_park(wait_s, immediate=immediate)
+                        if await self._wait_bound_park(wait_s, immediate=immediate) == R6K_HOLD:
+                            continue  # SOLL R6k: the running kurz D prefill ends on D first (next tick asks again)
                     # H91 part C rule 2: D's work is exhausted only when it
                     # runs nothing (the wait-bound-parked ones excepted), holds
                     # no hand-off AND no prefilled request still waits in
@@ -23649,8 +23952,14 @@ class Front:
                         # fired; parked, they resume first after the flip back.
                         if (getattr(self, "d_park_immediate", False) and self.queue
                                 and self._flip_ledger(D)):
-                            await self._wait_bound_park(None, immediate=self.queue[0],
-                                                        cause="before-flip")
+                            if await self._wait_bound_park(None, immediate=self.queue[0],
+                                                           cause="before-flip") == R6K_HOLD:
+                                continue  # SOLL R6k: finished on D before the flip
+                        elif Front._r6k_finish_hold(self):
+                            # SOLL R6k: no park on this path -- the flip still begins only after the kurz rest; admission closes
+                            # (review N1, R1a: a new kurz request rides the decided flip instead of starting on D now)
+                            self.admit_d = False
+                            continue
                         await self.flip("D", "P")
                     continue
                 # P-BATCH-ALL: prefill queued for D before this P phase joins it

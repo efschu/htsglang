@@ -2687,7 +2687,7 @@
       "anchor": "refuse_short_drain_above_x(int(ns.d_short_drain_tokens",
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
-      "row_note": 25570,
+      "row_note": 25461,
       "zeile": 26205
      },
      "quelle": "catalog+curated",
@@ -2706,7 +2706,7 @@
       "anchor": "both must be >= 0",
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
-      "row_note": 25567,
+      "row_note": 25458,
       "zeile": 26202
      },
      "quelle": "catalog",
@@ -2867,7 +2867,7 @@
       "anchor": "p_split=p_split, chunk_layers=chunk_layers)\n        d_ratio = d_tp_ratio_decision(",
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
-      "row_note": 27456,
+      "row_note": 27340,
       "zeile": 28095
      },
      "quelle": "catalog+curated",
@@ -43493,7 +43493,7 @@
      "source": {
       "file": "mem_cache/unified_radix_cache.py",
       "kind": "os.environ",
-      "line": 739
+      "line": 740
      }
     }
    },
@@ -58450,7 +58450,7 @@
      "source": {
       "file": "managers/pdflip_store_told.py",
       "kind": "os.environ",
-      "line": 699
+      "line": 705
      }
     }
    },
@@ -59662,6 +59662,37 @@
     "27b"
    ],
    "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_D_ADMIT_REFUSAL": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_D_ADMIT_REFUSAL",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/d_admit_refusal.py:70"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_ADMIT_REFUSAL",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/d_admit_refusal.py",
+    "kind": "os.environ",
+    "line": 70,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
   },
   "FLLIPER_PDFLIP_D_ADOPT": {
    "bare": false,
@@ -60878,6 +60909,34 @@
     "nf"
    ],
    "type": "EnvInt"
+  },
+  "FLLIPER_PDFLIP_D_MEM_SHARE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "D-MEM-SHARE (20.10., nf-decode-host-1020): the D-MEM-SCHED census counts a prompt prefix two requests hold in ONE set of tree pages once (group-agreed credit, pdflip/d_mem_share.py). rc28 D (1020_174205): 106 of 116 KV-stage grows were held by the stage they left once the matched prefix counted once -- each a live move (and an end-event shrink) inside a decode pause. False = the plain sums byte for byte.",
+   "id": "FLLIPER_PDFLIP_D_MEM_SHARE",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_MEM_SHARE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4208,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
   },
   "FLLIPER_PDFLIP_D_NOFUND_REROUTE_N": {
    "bare": false,
@@ -63717,6 +63776,37 @@
    "text": "",
    "trees": [
     "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_EVICT_FIT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_EVICT_FIT",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/evict_fit.py:41"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_EVICT_FIT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/evict_fit.py",
+    "kind": "os.environ",
+    "line": 41,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
     "nf"
    ],
    "type": "os.environ"
@@ -68074,7 +68164,8 @@
    "status": "unexplained",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -75467,6 +75558,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_SPILL_STATE_MEMO": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/spill_memo.py:55"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/spill_memo.py",
+    "kind": "os.environ",
+    "line": 55,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_STANDARD_FORM": {
    "bare": false,
    "choices": null,
@@ -75731,7 +75853,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1006
+      "line": 1008
      }
     }
    },
@@ -77799,6 +77921,37 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_UD_LAST": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_UD_LAST",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/ud_last.py:56"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_UD_LAST",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/ud_last.py",
+    "kind": "os.environ",
+    "line": 56,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_UNION_DIR": {
    "bare": false,
    "choices": null,
@@ -78220,6 +78373,68 @@
    "text": "",
    "trees": [
     "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_VISION_ROWS_DIR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_VISION_ROWS_DIR",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/vision_row_store.py:108"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_VISION_ROWS_DIR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/vision_row_store.py",
+    "kind": "os.environ",
+    "line": 108,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_VISION_ROWS_MB": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_VISION_ROWS_MB",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/vision_row_store.py:89"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_VISION_ROWS_MB",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/vision_row_store.py",
+    "kind": "os.environ",
+    "line": 89,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
     "nf"
    ],
    "type": "os.environ"
@@ -91434,28 +91649,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2898,
-  "envs": 2019,
+  "entries": 2905,
+  "envs": 2026,
   "explained": 310,
   "flags": 864,
-  "harvested": 1793,
+  "harvested": 1794,
   "trees": {
    "abweichung": 23,
-   "beide": 2696,
-   "nur_27b": 180,
-   "nur_nf": 4
+   "beide": 2697,
+   "nur_27b": 179,
+   "nur_nf": 11
   },
-  "unexplained": 670
+  "unexplained": 676
  },
- "tree_rev": "27b=b780ba0033+nf=c6c0e942c2",
+ "tree_rev": "27b=b5588c97aa+nf=58e1022250",
  "trees": {
   "27b": {
    "entries": 2876,
-   "rev": "b780ba0033"
+   "rev": "b5588c97aa"
   },
   "nf": {
-   "entries": 2700,
-   "rev": "c6c0e942c2"
+   "entries": 2708,
+   "rev": "58e1022250"
   }
  },
  "warnungen": []

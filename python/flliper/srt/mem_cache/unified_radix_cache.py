@@ -3160,6 +3160,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return DecLockRefResult()
         for component in self._components_tuple:
             component.release_component_lock(node=node, params=params, lock_host=True)
+        # NF-RC31 B: a host lock let go is a SPILL-MEMO term (pdflip/spill_memo.HOST_LOCK_GEN) -- the W3 spill's
+        # memo of "released nothing" is forgotten, the next spill walks
+        self.__dict__["_pdflip_host_lock_release_gen"] = int(
+            self.__dict__.get("_pdflip_host_lock_release_gen", 0) or 0) + 1
 
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
@@ -4964,10 +4968,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # eviction the node goes down KV-only and loses just the
                 # anchor (a later match resumes at a shallower anchor, the
                 # same state as a node that never carried one).
-                written = self.write_backup(
+                from flliper.srt.pdflip import ud_last as _udl
+
+                # UD-LAST pass 2: a leaf pass 1 of THIS peel held had its backup refused moments ago (and the
+                # demotions since free no arena slot) -- straight to the UD branch, no second claim
+                _udl_again = _udl.refused_in_peel(self, node)
+                written = 0 if _udl_again else self.write_backup(
                     node, write_back=True, kv_only_if_mamba_refused=True
                 )
-                if written == 0 and self.ongoing_write_through:
+                if written == 0 and self.ongoing_write_through and not _udl_again:
                     # #1426 (xsn184/185/186): upstream's write-back eviction is
                     # SYNCHRONOUS -- the host has room because the acks that
                     # free it are waited for. Here the 1 GB staging ring fills
@@ -4993,6 +5002,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # paid, and its parent becomes the next leaf.
                     from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
+                    if _sf.unbacked_drop_floor(self, node):
+                        # UD-LAST (NF rc27 1021_023225 P PP0 02:37:15, pdflip/ud_last.py): in the peel's pass 1 a
+                        # leaf UD would drop is HELD on the device (fresh KV/anchor kept, its host-only children
+                        # untouched -- no UD-H yet); the peel pays from backed leaves and comes back to it in pass 2
+                        # only if it must
+                        if _udl.hold(self, node):
+                            return
                     self._ud_h_refusal = None
                     if _sf.unbacked_drop_floor(self, node) and node.children:
                         # UD-H: the leaf's only children are host-only nodes
@@ -6226,11 +6242,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # S108 review A2: a turn end claims an anchor slot only into FREE room -- no H19
             # displacement (_pdflip_release_anchor -> drop_unreferenced -> _secure_before_drop ->
             # arena_secure_to_disk: stat, 56 MiB write + fsync), no park spill. No room = None.
-            return self._s108_mamba_free_claim(mp, last_hash)
+            mrows = self._s108_mamba_free_claim(mp, last_hash)
+            UnifiedRadixCache._s109r_note_written(self, last_hash, mrows)
+            return mrows
         mrows = self._pdflip_mamba_claim_h19(node, mp, last_hash)
         if mrows is None and self._pdflip_park_first_node(node) and self._pdflip_park_spill_room(node, mp):
             mrows = mp.alloc_write([last_hash])
+        UnifiedRadixCache._s109r_note_written(self, last_hash, mrows)
         return mrows
+
+    #: S109R-MISS: how many anchor keys this rank remembers having written (memory only; oldest leave first)
+    S109R_WRITTEN_CAP = 65536
+
+    def _s109r_note_written(self, last_hash, mrows) -> None:
+        """S109R-MISS witness: the anchor keys this rank claimed an arena slot for in THIS boot (a miss on one of them
+        is an anchor that existed and was lost, not one that never was). Bookkeeping only, never raises."""
+        if mrows is None or last_hash is None:
+            return
+        try:
+            w = self.__dict__.get("_s109r_written")
+            if w is None:
+                from collections import OrderedDict
+
+                w = self._s109r_written = OrderedDict()
+            w[last_hash] = True
+            w.move_to_end(last_hash)
+            while len(w) > UnifiedRadixCache.S109R_WRITTEN_CAP:
+                w.popitem(last=False)
+        except Exception:  # noqa: BLE001 - an instrument never breaks a claim
+            pass
 
     def _s108_mamba_free_claim(self, mp, last_hash):
         """S108 A2: the anchor slot from FREE room only (``claim_needs_room``: no reap, no evict, no
@@ -6769,6 +6809,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             except (KeyError, IndexError, TypeError):
                 full = None
             if full is not None and getattr(full, "host_value", None) is None:
+                if getattr(full, "value", None) is not None:
+                    # S109R: the KV is on the device without a host copy -- the shape S109c leaves behind (its aux
+                    # round releases the Full host rows AND the anchor once both are on L3). A host attach is
+                    # forbidden here; the anchor is read from the store straight into a DEVICE mamba slot (S90b's
+                    # device attach) instead of the match falling back to the last state and recomputing the rest.
+                    return self._s109r_device_read(req, node, depth, site)
                 return 0
         last_hash = node.get_last_hash_value()
         if last_hash is None:
@@ -6803,14 +6849,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 host_lru = self.host_lru_lists[ComponentType.MAMBA]
                 if not host_lru.in_list(node):
                     host_lru.insert_mru(node)
-        UnifiedRadixCache._pdflip_anchor_only_n += 1
-        n = UnifiedRadixCache._pdflip_anchor_only_n
-        if n <= 16 or n % 64 == 0:
+        # E1-WITNESS (rc30 21.10.): the read has its OWN counter -- it shared ``_pdflip_anchor_only_n`` with the
+        # ANCHOR-ONLY BACKUP line, so after 16 backups no read was printed any more (rc30 D: one read line in 20 min);
+        # a miss is named like S109R's (held / written_here / branch point), every miss printed
+        n = getattr(UnifiedRadixCache, "_pdflip_aor_read_n", 0) + 1
+        UnifiedRadixCache._pdflip_aor_read_n = n
+        how = "attach"
+        held = written = None
+        if not ok:
+            held = UnifiedRadixCache._s109r_anchor_held(self, last_hash)
+            written = last_hash in (self.__dict__.get("_s109r_written") or ())
+            how = UnifiedRadixCache._s109r_miss_class(node, req, int(depth), held, bool(written))
+        if n <= 16 or n % 64 == 0 or not ok:
             logger.info(
-                "PDFLIP ANCHOR-ONLY-READ n=%d rid=%s depth=%d anchor_was=%d attached=%d row=%s site=%s "
-                "(the KV was in the tree, its Mamba anchor only in the store: only the blob is read)",
+                "PDFLIP ANCHOR-ONLY-READ n=%d rid=%s depth=%d anchor_was=%d attached=%d row=%s site=%s how=%s "
+                "defect=%d held=%s written_here=%s (the KV was in the tree, its Mamba anchor only in the store: only "
+                "the blob is read; defect=1 only where an anchor existed)",
                 n, getattr(req, "rid", "?"), int(depth), int(anchor_was), int(ok),
-                int(idx[0]) if ok else -1, site)
+                int(idx[0]) if ok else -1, site, how,
+                int((not ok) and how in UnifiedRadixCache.S109R_DEFECT_HOWS),
+                "-" if held is None else int(bool(held)), "-" if written is None else int(bool(written)))
         return int(depth) if ok else 0
 
     def pdflip_anchor_only_read_at(self, req, depth: int, site: str = "tf_floor") -> int:
@@ -6898,24 +6956,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return self._s90b_follower_note(req, told, "kv_absent")
         return self._s90b_device_attach(req, node, told, site)
 
-    def _s90b_device_attach(self, req, node, told: int, site: str) -> int:
-        """S90b: the anchor of ``node`` (device KV, no state) read from the store into a device mamba slot."""
+    def _s90b_device_attach(self, req, node, told: int, site: str, note=None) -> int:
+        """S90b: the anchor of ``node`` (device KV, no state) read from the store into a device mamba slot.
+        ``note`` (S109R): the caller's witness line; default the S90b follower line."""
+        note = note if note is not None else self._s90b_follower_note
         cc = self.cache_controller
         backend = getattr(cc, "storage_backend", None) if cc is not None else None
         if backend is None or not hasattr(backend, "batch_get_v2"):
-            return self._s90b_follower_note(req, told, "no_store")
+            return note(req, told, "no_store")
         try:
             from flliper.srt.managers.cache_controller import rank_holds_gdn_state
 
             if not rank_holds_gdn_state(cc):
-                return self._s90b_follower_note(req, told, "no_gdn_state")
+                return note(req, told, "no_gdn_state")
         except Exception:  # noqa: BLE001 - an unanswerable rank form reads nothing
-            return self._s90b_follower_note(req, told, "no_gdn_state")
+            return note(req, told, "no_gdn_state")
         comp = (getattr(self, "components", None) or {}).get(ComponentType.MAMBA)
         mp = getattr(comp, "_mamba_pool_host", None)
         entry = (getattr(getattr(cc, "mem_pool_host", None), "entry_map", None) or {}).get(PoolName.MAMBA)
         if mp is None or not callable(getattr(mp, "alloc_read", None)) or entry is None:
-            return self._s90b_follower_note(req, told, "no_mamba_pool")
+            return note(req, told, "no_mamba_pool")
         tried = getattr(req, "_pdflip_s90b_tried_at", None)
         if not isinstance(tried, set):
             tried = set()
@@ -6928,10 +6988,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tried.add(told)
         last_hash = node.get_last_hash_value()
         if last_hash is None:
-            return self._s90b_follower_note(req, told, "no_hash")
+            return note(req, told, "no_hash")
         host_indices = mp.alloc_read(1)
         if host_indices is None:
-            return self._s90b_follower_note(req, told, "no_read_row")
+            return note(req, told, "no_read_row")
         from flliper.srt.mem_cache.hicache_storage import PoolHitPolicy
 
         transfer = PoolTransfer(name=PoolName.MAMBA, host_indices=host_indices, keys=[last_hash],
@@ -6947,7 +7007,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ok = False
         if not ok:
             self._s90b_free_rows(mp, idx)
-            return self._s90b_follower_note(req, told, "store_miss")
+            return note(req, told, "store_miss")
         # S90b review A2 (OWNERSHIP MARKS): ``dst_owned`` -- this call holds the device slot (allocated, neither freed
         # nor handed to the tree); ``rows_owned`` -- it holds the read row. Every exit releases exactly what it still
         # holds, once: a raising ``free(dst)`` on the node-changed exit is not followed by a second free in the handler,
@@ -6961,7 +7021,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if dst is None:
                 rows_owned = False
                 self._s90b_free_rows(mp, idx)
-                return self._s90b_follower_note(req, told, "no_device_slot")
+                return note(req, told, "no_device_slot")
             dst_owned = True
             if (node.component_data[ComponentType.MAMBA].value is not None
                     or node.component_data[BASE_COMPONENT_TYPE].value is None):
@@ -6971,7 +7031,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.req_to_token_pool.mamba_allocator.free(dst)
                 rows_owned = False
                 self._s90b_free_rows(mp, idx)
-                return self._s90b_follower_note(req, told, "node_changed")
+                return note(req, told, "node_changed")
             io_backend = getattr(cc, "io_backend", "direct")
             hp = entry.host_pool
             try:
@@ -7008,14 +7068,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if rows_owned:
                 rows_owned = False
                 self._s90b_free_rows(mp, idx)
-            return self._s90b_follower_note(req, told, "copy_failed")
+            return note(req, told, "copy_failed")
         rows_owned = False
         self._s90b_free_rows(mp, idx)
         try:
             self._update_evictable_leaf_sets(node)
         except Exception:  # noqa: BLE001 - bookkeeping only
             pass
-        return self._s90b_follower_note(req, told, "device_attach", told)
+        return note(req, told, "device_attach", told)
 
     @staticmethod
     def _s90b_free_rows(mp, idx) -> None:
@@ -7031,6 +7091,114 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.info("S90b FOLLOWER-STATE-AT-TOLD n=%d rid=%s told=%d how=%s attached=%d (the follower holds the KV "
                         "past PP0's told but no state AT told: the anchor of told is read from the store instead of "
                         "acking a shallower depth)", n, getattr(req, "rid", "?"), int(told), how, int(bool(got)))
+        return int(got)
+
+    def _s109r_device_read(self, req, node, depth: int, site: str) -> int:
+        """S109R (NF rc29 follow-up of the H105g death, 21.10.): the anchor of a device-KV node whose host copies the
+        S109c aux round released (``_s109c_aux_device_round``: KV pages and anchor leave L2 only when the write-behind's
+        record holds the L3 copy of both, ``_secure_child_anchors`` None) is read back from L3 at the hit. Before, the
+        e1 read refused that node silently (AUX-HOST-LAW: no host state without a Full host copy), the match fell back
+        to the last state above it and the tokens behind it were recomputed. The read reuses S90b's device attach (one
+        blob by the node's last page hash: arena slot, L3 fill or ANCHOR-BYPASS row; the H2D copy is the load-back's);
+        nothing is written, no collective: like e1 it only raises THIS rank's match, the group's MIN stays the verdict."""
+        if not UnifiedRadixCache._s109r_rank_alone(self):
+            # a TP group whose peers hold mamba replicas: a rank-local device slot (and the eviction behind it) would
+            # leave the tombstone sets unequal (#639b) -- named, not taken
+            return self._s109r_note(req, depth, "peer_replicas", 0)
+        last_hash = node.get_last_hash_value() if callable(getattr(node, "get_last_hash_value", None)) else None
+        held = UnifiedRadixCache._s109r_anchor_held(self, last_hash)
+        written = last_hash is not None and last_hash in (self.__dict__.get("_s109r_written") or ())
+        extra = "held=%s written_here=%d" % ("-" if held is None else int(bool(held)), int(written))
+        # the read is attempted whatever ``held`` says (an index gap must never cost tokens); ``held`` only names a miss
+
+        def _note(req_, depth_, how, got=0):
+            if how == "store_miss":
+                how = UnifiedRadixCache._s109r_miss_class(node, req, int(depth), held, written)
+            return self._s109r_note(req_, depth_, how, got, extra)
+
+        return self._s90b_device_attach(req, node, int(depth), site, note=_note)
+
+    def _s109r_anchor_held(self, last_hash):
+        """S109R-MISS: ``ArenaMambaPoolHost.anchor_held`` (a COMPLETE arena slot, else the #1459 L3 index -- memory
+        only); None = cannot tell (then the read is attempted as before)."""
+        if last_hash is None:
+            return None
+        try:
+            mp = self._pdflip_mamba_pool() if hasattr(self, "_pdflip_mamba_pool") else None
+        except Exception:  # noqa: BLE001
+            mp = None
+        if mp is None:
+            comp = (getattr(self, "components", None) or {}).get(ComponentType.MAMBA)
+            mp = getattr(comp, "_mamba_pool_host", None)
+        probe = getattr(mp, "anchor_held", None)
+        if not callable(probe):
+            return None
+        try:
+            return probe(last_hash)
+        except Exception:  # noqa: BLE001 - cannot tell: read as before
+            return None
+
+    @staticmethod
+    def _s109r_miss_class(node, req, depth: int, held=None, written: bool = False) -> str:
+        """S109R-MISS (NF rc30 1d822bd150, boot 1021_063252, D TP0): what a store miss at ``node`` means.
+
+        METAL: ``S109R ... how=store_miss attached=0`` three times (06:37:29 pdflip-2-15 depth=62656, 06:37:58
+        pdflip-2-21 depth=77376, 06:38:17 pdflip-2-26 depth=62912) in a boot WITHOUT a single ``S109c W3-AUX-DEVICE
+        SPILL`` -- and each time ``MATCH-CENSUS-DEEP ... reached=<depth> ... branching=<depth>``: the KV walk ended at
+        a BRANCH POINT. That node is the parent half of a split (a sibling diverged there); a split gives its parent
+        no state (``MambaComponent.redistribute_on_node_split``) and no turn ended there, so no anchor was ever
+        written under its page hash -- in no boot, on no tier. The read finds nothing because nothing exists; the
+        tokens past the last state (128 / 320 / 128) are the branch's own, bounded below one chunk (#939) and carried
+        by the branching track (#59). The two attaches of the same boot (n=1 62528, n=2 18752) prove the store and
+        its keys (P's writes, earlier boots) work.
+
+        ``held_unread`` = the arena or the L3 index HOLDS the key and the read still returned nothing -- a read-path
+        defect. ``store_miss`` = an anchor existed (released with its L3 copy proven, ``pdflip_anchor_secured``: S25
+        probe / S109c, or claimed by THIS rank in this boot, ``written_here``) and is gone from every tier -- lost.
+        Both are what the monitor counts. ``branch_point_never_anchored`` = the match's branching depth, never written.
+        ``store_miss_unsecured`` = no tier holds it and nothing says it ever existed (a state dropped without a backup
+        is its own class, not S109c's)."""
+        if held is True:
+            return "held_unread"
+        if bool(getattr(node, "pdflip_anchor_secured", False)) or written:
+            return "store_miss"
+        branching = getattr(req, "mamba_branching_seqlen", None)
+        if isinstance(branching, int) and not isinstance(branching, bool) and int(branching) == int(depth):
+            return "branch_point_never_anchored"
+        return "store_miss_unsecured"
+
+    def _s109r_rank_alone(self) -> bool:
+        """S109R: True where no peer holds a mamba replica of this tree -- TP0 of a Form A group (the workers hold no
+        recurrent state, K23 host role) or the local-PP floor (a TP group of one). The forms S109c runs on."""
+        from flliper.srt.pdflip import host_only_spill as _hos
+        from flliper.srt.pdflip import pp_slot_fidelity as _sf
+
+        try:
+            if _sf.enabled() and getattr(self, _sf.FLOOR_LOCAL_PP_ATTR, False):
+                return True
+        except Exception:  # noqa: BLE001 - no floor reading: ask the Form A role
+            pass
+        return bool(_hos.form_a_host(self))
+
+    #: S109R-MISS: the refusals the monitor counts as tokens recomputed although a secured anchor existed
+    #: (the same set as the monitor's S109R_VERMEIDBAR, deskq/wacht/nf_scharf.py)
+    S109R_DEFECT_HOWS = ("store_miss", "held_unread", "copy_failed", "no_device_slot", "node_changed",
+                         "peer_replicas")
+
+    def _s109r_note(self, req, depth: int, how: str, got: int = 0, extra: str = "") -> int:
+        """S109R live witness: one line per attach (``attached=1``) and per refusal (rate-limited); a monitor counts
+        ``attached=0 how=store_miss|copy_failed|no_device_slot`` as tokens recomputed although L3 held the anchor."""
+        n = getattr(UnifiedRadixCache, "_s109r_n", 0) + 1
+        UnifiedRadixCache._s109r_n = n
+        defect = (not got) and how in UnifiedRadixCache.S109R_DEFECT_HOWS
+        if n <= 32 or n % 64 == 0 or got or defect:
+            logger.info("S109R ANCHOR-DEVICE-READ n=%d rid=%s depth=%d how=%s attached=%d defect=%d%s (a device-KV node "
+                        "without a host copy and without a state at the hit: its mamba anchor is read from the store "
+                        "into a device mamba slot instead of recomputing from the last state; defect=1 only where a "
+                        "secured anchor was not served -- branch_point_never_anchored / store_miss_unsecured had no "
+                        "anchor on any tier)",
+                        n, getattr(req, "rid", "?"), int(depth), how, int(bool(got)), int(defect),
+                        (" " + extra) if extra else "")
         return int(got)
 
     def pdflip_lane_rank_on(self) -> bool:
@@ -7900,9 +8068,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from flliper.srt.pdflip import w3_room_set as _w3rs
 
         if _w3rs.armed(self):
+            # SPILL-MEMO (NF rc27 1021_023225 PP1 18488-18508 / PP2 18561-18606: RETAIN-PUBLISH issue_ms 498-827 for
+            # 20 skipped nodes, each running this whole walk again with the same answer 0; pdflip/spill_memo.py): a
+            # spill that released nothing (decided) is not walked again until the arena or the tree changed
+            from flliper.srt.pdflip import spill_memo as _smemo
+
+            if _smemo.unchanged(self, pool):
+                self._w3_room_undecided = False
+                return 0
+            _t_sm = time.perf_counter()
             # F1: a PP group spills ONE slot set -- PP0 decides from the arena order, every stage
             # gives back exactly these slots (a slot frees only when all stages let go)
             _rel = _w3rs.spill(self, pool, int(need_pages), want, released_out, claimer=claimer)
+            _smemo.note(self, pool, _rel, _w3rs.undecided(self), _t_sm)
             if _rel == 0 and _w3rs.backoff_ok(self):
                 # review F1 A4: an UNDECIDED spill (PP0 waits for a follower's acknowledgement, a
                 # follower holds debts of PP0's set) is no empty answer -- no backoff
@@ -8172,7 +8350,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from flliper.srt.pdflip import forma_l3_subtree as _fls
         from flliper.srt.pdflip.read_room import l3_complete as _rr_l3_complete
 
-        out = {"released": 0, "spilled": 0, "on_disk": 0, "pending": 0, "slots": []}
+        out = {"released": 0, "spilled": 0, "on_disk": 0, "pending": 0, "slots": [], "ids": []}
         if role == "worker" or not aux_cands:
             return out
         base = self.components.get(BASE_COMPONENT_TYPE)
@@ -8205,11 +8383,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             out["released"] += int(host_freed or 0) // P
             out["on_disk"] += int(sec.get("on_disk", 0))
             out["spilled"] += 1
+            try:   # instrument only: a depth that cannot be read never breaks the spill
+                out["ids"].append("%s@%d" % (getattr(node, "id", "?"), int(self.pdflip_node_depth(node))))
+            except Exception:  # noqa: BLE001
+                out["ids"].append("%s@?" % (getattr(node, "id", "?"),))
         if out["spilled"] or out["pending"]:
-            logger.info("S109c W3-AUX-DEVICE SPILL want=%d released_pages=%d nodes=%d pending=%d (device nodes whose "
-                        "only host-only aux state is the mamba anchor: KV and anchor leave L2 only with their L3 copy "
-                        "by the write-behind's record; pending = queued for it, kept)", int(want), out["released"],
-                        out["spilled"], out["pending"])
+            # S109R: the released nodes by id@depth -- a later ``S109R ANCHOR-DEVICE-READ ... depth=`` names the read
+            # that brought such an anchor back from L3 (the monitor pairs them)
+            logger.info("S109c W3-AUX-DEVICE SPILL want=%d released_pages=%d nodes=%d pending=%d ids=%s (device nodes "
+                        "whose only host-only aux state is the mamba anchor: KV and anchor leave L2 only with their L3 "
+                        "copy by the write-behind's record; pending = queued for it, kept; the anchor comes back from "
+                        "L3 at the next hit, S109R)", int(want), out["released"], out["spilled"], out["pending"],
+                        ",".join(out["ids"][:16]) or "-")
         return out
 
     def _w3_keep_payable_state(self):
@@ -9599,6 +9784,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _t_sweep0 = time.perf_counter()
         _issue_s = 0.0
         _walked = 0
+        from flliper.srt.pdflip import spill_memo as _smemo
+
+        _sm0 = _smemo.counters(self)   # SPILL-MEMO instrument: W3 spill walks / skips / ms inside THIS sweep
         self._pdflip_sweep_last_refusal = None
         self._s73_sweep_why = {}   # S73: refusal reasons of THIS sweep (the line's refused_by=)
         # SWEEP-FULL-ARENA: armed for this sweep; engaged by its first arena_claim refusal
@@ -9745,6 +9933,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _full_arena = _full_arena or (
                     _full_arena_armed and self._pdflip_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
+        _sm1 = _smemo.counters(self)
+        if _sm1 != _sm0:
+            stats["spill_walks"] = _sm1[0] - _sm0[0]
+            stats["spill_memo_skips"] = _sm1[1] - _sm0[1]
+            stats["spill_ms"] = round(_sm1[2] - _sm0[2], 1)
         stats["refused_by"] = dict(sorted((getattr(self, "_s73_sweep_why", None) or {}).items()))
         self._s73_sweep_why = None
         stats["issue_ms"] = round(_issue_s * 1000.0, 1)

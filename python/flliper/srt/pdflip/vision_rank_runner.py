@@ -359,8 +359,33 @@ def _tower_width(scheduler) -> Optional[int]:
     return int(w) * (1 + len(deep))
 
 
+def _publish_rows(items: Sequence[Any]) -> int:
+    """VISION-ROWS (rc30 visiontail, ``pdflip/vision_row_store.py``): the same rows, published to the host store
+    group D reads -- so D computes a known image's positions in a partial page itself (pdflip-10-516: a second
+    flip to P for 179 tokens). Never raises into the stage: a row that is not published is a D miss, P-only as
+    before."""
+    try:
+        from flliper.srt.pdflip import vision_row_store as vrs
+        from flliper.srt.runtime_context import get_server_args
+
+        d = vrs.store_dir_for(get_server_args())
+        if d is None:
+            return 0
+        t0 = time.perf_counter()
+        n = vrs.publish(items, d)
+        if n:
+            logger.info("%s PUT items=%d published=%d dir=%s ms=%.1f (P's rows by (content hash, grid) for D)",
+                        vrs.TAG, len(items), n, d, (time.perf_counter() - t0) * 1e3)
+        return n
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("VISION-ROWS PUT-FAILED %s: %s -- D keeps refusing these images (P-only)",
+                       type(exc).__name__, exc)
+        return 0
+
+
 def emb_cache_store(items: Sequence[Any]) -> int:
     """After an attach: keep each item's rows under its content hash. Returns how many."""
+    _publish_rows(items)
     cache = emb_cache()
     if cache is None:
         return 0

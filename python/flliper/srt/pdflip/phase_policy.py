@@ -102,6 +102,26 @@ def p_request_cost(est_prompt: int, leg1_prompt_tokens: int = 0,
     return max(0, int(leg1_prompt_tokens or 0), int(est_prompt or 0))
 
 
+def p_continuation_credit(pairs: Iterable[Tuple[int, int]]) -> int:
+    """P-POOL-SHARED (rc29 pphase 21.10.): tokens of a dispatch candidate that P's pool already holds for a leg in flight.
+
+    ``pairs`` = ``(common, depth)`` per leg in flight on P: ``common`` = the token prefix the candidate shares with that
+    leg (front token ids), ``depth`` = the cached prefix that leg loads into P's device pool (its store depth, the told
+    point, anchor-aligned). When ``common >= depth`` the leg's whole loaded prefix IS the candidate's prefix: P's radix
+    tree matches it there (the leg's told point carries the anchor), so the candidate occupies only what lies beyond.
+    A shorter common prefix credits NOTHING -- where the candidate's match would end needs an anchor below ``common``
+    that the front does not know (conservative: never under-count P's pool). The largest credit wins (one leg's
+    nodes). Metal rc27 _023225: pdflip-0-21 (prompt 149741, u 2029) continues pdflip-0-17 (store depth 147712, in
+    flight) -- counted as 149741 it was held 23.2 s by the overlap plan while P's pool usage read 0.17-0.43.
+    """
+    best = 0
+    for common, depth in pairs:
+        c, d = int(common or 0), int(depth or 0)
+        if d > 0 and c >= d and d > best:
+            best = d
+    return best
+
+
 def p_overlap_admits(inflight_tokens: int, inflight_n: int, next_cost: int,
                      pool_tokens: int) -> bool:
     """May the next request's leg 1 start while ``inflight_n`` run?
@@ -632,11 +652,15 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     F2): the X the members are CLASSIFIED with (their own X at arrival, R2a) when ``x_tokens`` is the larger X of a set
     of k members (P fixed costs of the further members included); default: ``x_tokens``.
 
-    EZ-S2a (plan §2.6 / review S49, tag ``NS:S49``): ``d_granted_unstarted`` = tokens of D prefills D has been GRANTED
-    but has not BEGUN. They are no R6 reason (user 18.10. "Nur echt laufend zaehlt": only ``d_prefill_running_uncached``
-    reaches R6), but a set that would go to D (``D_AFTER_TIMER``) while ``S + granted > X`` WAITS (COLLECT, no flip, R7)
-    until D begins or finishes the grant. Only a D verdict is held, every flip verdict stands. 0 (default) = nothing held:
-    the verdicts are byte-identical to before S2a (the section-4 compatibility test pins it)."""
+    EZ-S2a (plan §2.6 / review S49, tag ``NS:S49``): ``d_granted_unstarted`` = tokens of halb/big D prefills D has been
+    GRANTED but has not BEGUN (a kurz grant never reaches this term: R2 "sofort auf D", R6k "sein Rest zählt nicht zu S";
+    the front leaves kurz rows out). They are no R6 reason (user 18.10. "Nur echt laufend zaehlt": only
+    ``d_prefill_running_uncached`` reaches R6), but a set whose T_halb ran out WHILE D DECODES (R3 timer end) and that
+    would go to D while ``S + granted > X`` WAITS (COLLECT, no flip, R7) until D begins or finishes the grant. Only that D
+    verdict is held, every flip verdict stands. R8 (nothing decodes on D) is NEVER held: "ohne Decode auf D wird sofort
+    entschieden: D bei S < X, P bei S >= X" -- a COLLECT at d_decoding=0 is the rc30 06:36:19Z violation (pdflip-0-4,
+    S=3821 + 2226 kurz grants). 0 (default) = nothing held: the verdicts are byte-identical to before S2a (the section-4
+    compatibility test pins it)."""
     x = int(x_tokens)
     xc = int(class_x_tokens) if class_x_tokens else x
     hx = half_x_of(xc, half_frac)
@@ -673,7 +697,8 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     if not d_decoding:
         if big or s >= x:
             return _flip("R8 no decode on D: decided now, S=%d >= X=%d or a big member" % (s, x))
-        return _d_verdict("R8 no decode on D: decided now, S=%d < X=%d" % (s, x), 0.0)
+        # R8: decided NOW -- never the S49 hold (a grant D has not begun is not in S: R1, R6 user 18.10.; kurz: R2/R6k)
+        return SetVerdict(V_D_AFTER_TIMER, "R8 no decode on D: decided now, S=%d < X=%d" % (s, x), 0.0, s, hx)
     if big:
         if len(members) >= 2:
             return _flip("R4 a big member and company (n=%d, S=%d, new=%d)" % (len(members), s, new))

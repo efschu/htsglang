@@ -38,6 +38,11 @@ THE RULE.
 * No collective, no timer, no reserve: the decision is a file next to the shared arena, the apply is
   rank-local and idempotent. Form A (R12) keeps its own TP0-decides protocol (SPILL events).
 
+* An EMPTY decision is named (PARK-L3, rc27 P 02:37:12/15: none of PP0's empty decisions printed anything, the
+  first PUBLISH came at 02:37:25): counted always, and at most every ``EMPTY_CENSUS_EVERY_S`` one ``W3-ROOM-SET
+  EMPTY`` line names every node holding a host copy by the first rule that keeps it (``empty_census``). Never a
+  decision.
+
 Switch ``FLLIPER_PDFLIP_W3_ROOM_SET`` (default on; 0 = the per-rank choice as before). Page cap per call
 ``FLLIPER_PDFLIP_W3_ROOM_SET_MAX_SECURE_PAGES`` (default 128; the L3 write is synchronous on the
 scheduler thread)."""
@@ -357,6 +362,95 @@ def _candidates(cache: Any, pool: Any, ctx: _Ctx) -> List[Any]:
     return nodes
 
 
+#: W3-ROOM-SET EMPTY (PARK-L3 task 3): seconds between two census lines of an empty decision (the count always moves)
+EMPTY_CENSUS_EVERY_S = 5.0
+
+
+def _device_exclusion(cache: Any, node: Any, pool: Any, ctx: _Ctx) -> Optional[str]:
+    """Why ``_device_candidate`` says no for a device-resident node with a host copy -- the same checks in the same
+    order, named (the census only; None = it is a candidate)."""
+    from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, _aux_components
+
+    if id(node) in ctx.skip:
+        return "claimer_chain"
+    if id(node) in ctx.told:
+        return "told_head"
+    cd = node.component_data[BASE_COMPONENT_TYPE]
+    if int(getattr(cd, "lock_ref", 0) or 0) > 0:
+        return "running"
+    if node.id in cache.ongoing_write_through:
+        return "write_pending"
+    if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
+        return "host_locked"
+    if any(node.component_data[c.component_type].host_value is not None
+           and node.component_data[c.component_type].value is None for c in _aux_components(cache)):
+        return "aux_host_only"
+    if int(cd.host_value.min()) < int(getattr(pool, "staging_rows", 0)):
+        return "staging"
+    if node.children and not ctx.payable(node):
+        return "keep_payable"
+    return None
+
+
+def empty_census(cache: Any, pool: Any, ctx: _Ctx) -> Dict[str, List[int]]:
+    """``reason -> [nodes, pages]`` over every node holding a host copy that ``decide`` could not take: a device node's
+    reason (``_device_exclusion``), a host-only node's ``host_only:<host_only_spill reason>``, and ``incomplete`` for
+    a candidate with a slot not COMPLETE (L3-COMPLETE A1). Never a decision."""
+    from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
+    from flliper.srt.pdflip import host_only_spill as _hos
+
+    out: Dict[str, List[int]] = {}
+    cands = []
+    for node in cache._collect_all_nodes():
+        if node is cache.root_node:
+            continue
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        hv = cd.host_value
+        if hv is None or hv.numel() == 0:
+            continue
+        if cd.value is not None:
+            r = _device_exclusion(cache, node, pool, ctx)
+        else:
+            r = _hos._reason(cache, node, pool, ctx.skip)
+            r = None if r is None else "host_only:" + r
+        if r is None:
+            cands.append(node)
+            continue
+        e = out.setdefault(r, [0, 0])
+        e[0] += 1
+        e[1] += len(node_slots(pool, node)) or int(hv.numel())
+    if cands:
+        keys = cache._w3_spill_keys(pool, cands)
+        inc = getattr(keys, "incomplete", None)
+        for node in cands:
+            r = "incomplete" if callable(inc) and inc(node) else "candidate"
+            e = out.setdefault(r, [0, 0])
+            e[0] += 1
+            e[1] += len(node_slots(pool, node))
+    return out
+
+
+def _note_empty(cache: Any, pool: Any, want: int, ctx: _Ctx) -> Optional[str]:
+    """PP0's decision found no slot: counted always, named (census) at most every ``EMPTY_CENSUS_EVERY_S`` -- before
+    this an empty decision printed nothing (rc27 P 02:37:12/15: why no candidate stayed unproven). Never raises."""
+    _N["empty"] = _N.get("empty", 0) + 1
+    now = time.monotonic()
+    if now - float(_N.get("empty_t", -1e9)) < EMPTY_CENSUS_EVERY_S:
+        return None
+    _N["empty_t"] = now
+    try:
+        cen = empty_census(cache, pool, ctx)
+        why = ",".join("%s:%d/%d" % (k, v[0], v[1]) for k, v in sorted(cen.items(), key=lambda kv: -kv[1][1])) or "-"
+    except Exception as exc:  # noqa: BLE001 - an instrument never breaks the spill
+        why = "census_failed:%s" % type(exc).__name__
+    line = ("W3-ROOM-SET EMPTY pp_rank=%s want=%d n=%d reasons=%s (PP0's decision found no candidate: every node "
+            "holding a host copy, by the first rule that keeps it -- reason:nodes/pages; running = a running "
+            "request's node, host_locked = a load / a read's told window, host_only:<why> = the host-leaf rules, "
+            "incomplete = a slot not COMPLETE yet)") % (getattr(cache, "pp_rank", "?"), int(want), _N["empty"], why)
+    logger.info(line)
+    return line
+
+
 def decide(cache: Any, pool: Any, want: int, claimer: Any = None, ctx: Optional[_Ctx] = None) -> List[int]:
     """PP0: the slots of its candidates in group-equal order until ``want`` pages (at most the cap)."""
     ctx = ctx or _Ctx(cache, pool, claimer)
@@ -674,6 +768,7 @@ def spill(cache: Any, pool: Any, need_pages: int, want: int, released_out: Optio
                                WAIT_TIMEOUT_S)
         slots = decide(cache, pool, want, ctx=ctx)
         if not slots:
+            _note_empty(cache, pool, want, ctx)   # PARK-L3: an empty decision names its exclusion reasons
             return released
         gen = publish(arena, slots, cache)
         cache._w3_room_pub_t = time.monotonic()

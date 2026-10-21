@@ -3920,17 +3920,14 @@ class HiCacheFile(HiCacheStorage):
 
     @staticmethod
     def _l3wb_direct_min_bytes() -> int:
-        """27B INT8 metal 21.10. 01:26Z (rc29b on c77da494f9): O_DIRECT only for pages of at least this many bytes
-        (``FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB``, default 1024 KiB). An O_DIRECT write leaves (and on XFS
-        drops) the page cache for its range, so every later read of that page goes to the NVMe. With 27B's KV pages of
-        ONE token (32 KiB, page_size=1) P's L3 fill read thousands of 32 KiB files cold: 4392 pages in 34.6 s on PP2
-        (0.58 ms/page at boot start, up to 8.7 ms/page once D's write-behind had written them O_DIRECT) -- a P phase of
-        over 6 min, 11 clients gone. Small pages go buffered as before the merge (they stay in the page cache for the
-        reader); big pages (NF's 64-token KV pages, the mamba anchors) keep O_DIRECT."""
+        """L3TOUCH-1021: O_DIRECT only for pages of at least this many bytes (``FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB``,
+        default 256 KiB). An O_DIRECT write leaves (on XFS: drops) the page cache for its range; for one-token 32 KiB KV
+        pages (27B, page_size=1) every later read went to the NVMe (27B INT8 rc29b: up to 8.7 ms per page). NF's KV pages
+        (64 tokens, 768 KiB) and every mamba anchor stay O_DIRECT exactly as before (S36)."""
         try:
-            return max(0, int(os.environ.get("FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB", "") or 1024)) << 10
+            return max(0, int(os.environ.get("FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB", "") or 256)) << 10
         except ValueError:
-            return 1024 << 10
+            return 256 << 10
 
     @staticmethod
     def _l3_write_behind_budget() -> int:
@@ -4992,11 +4989,11 @@ class HiCacheFile(HiCacheStorage):
         touch = getattr(arena, "touch_progress", None)
         slots = [t[1] for t in todo]
         gens = [t[2] for t in todo]
-        # 27B INT8 metal 21.10. 01:26Z (rc29b): every worker touched ALL claims of the batch after every 16 pages, and
-        # each touch rebuilt two ctypes arrays of the whole batch under the GIL -- quadratic in the page count. With
-        # 27B's one-token KV pages a fill is thousands of pages (PP2: 14042 pages, 91.5 s; 4392 pages, 34.6 s). The
-        # arrays are built ONCE per read and the clock is moved at most every L3_TOUCH_MIN_S (well inside the 1 s
-        # JOIN-IDLE bound the touch exists for); the first and the last touch always run.
+        # L3TOUCH-1021 (27B INT8 rc29b metal 21.10., port of 27B ec8f6fca34): every worker touched ALL claims of the batch
+        # after every L3_TOUCH_PAGES pages and rebuilt two ctypes arrays of the whole batch per touch under the GIL --
+        # quadratic in the page count (measured on the shm arena: 8.6 ms per touch of 32768 claims, 17.6 s for a 32768-
+        # page fill). The arrays are built ONCE per read and the clock moves at most every L3_TOUCH_MIN_S (well inside the
+        # 1 s JOIN-IDLE bound the touch exists for); the first and the last touch always run.
         _prep = {}
         _last = [0.0]
 
@@ -7112,7 +7109,7 @@ def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int, progress=None):
 #: bound even on a cold disk (metal: 65 pages 1189 ms = 18 ms/page, 16 pages = ~0.3 s) -- while the batch keeps the
 #: full parallelism of ``l3_read_pages_parallel`` (no chunk barriers, no serial tail chunk below L3_PARALLEL_MIN_PAGES).
 L3_TOUCH_PAGES = 16
-#: 27B port fix 21.10.: the reader moves its claims' progress clock at most this often (JOIN-IDLE bound 1 s)
+#: L3TOUCH-1021: the reader moves its claims' progress clock at most this often (JOIN-IDLE bound 1 s)
 L3_TOUCH_MIN_S = 0.1
 _L3_PROGRESS = threading.local()    # the caller's progress callback, read by ``l3_read_pages_parallel`` in the caller thread
 

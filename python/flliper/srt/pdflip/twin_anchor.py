@@ -23,9 +23,9 @@ THE REPAIR -- two halves, one rule (``B = floor_page(shared - 1)``):
   eviction, no reserve; none free = no anchor, counted), inserted into the
   tree as its own node in position order before the step's insert, then
   published like every chunk anchor. The bounds are a pure function of the
-  source's and the queued requests' token ids, and a follower plans PP0's
-  pass-m batch with PP0's pass-m requests (the #1400 wire lag), so every
-  stage plans the same tracks without transport.
+  source's and the queued requests' token ids -- decided by PP0 ALONE
+  (NF-TWIN-ROW 1021, below): the followers adopt PP0's bounds from the pass's
+  proxy frame, they never derive them from their own waiting queue.
 * the TWIN (PP0, pdflip/p_twin_defer.py): it waits only for a source that has
   PROMISED an anchor at or below ``shared`` -- its end anchor, a chunk end,
   or ``B`` while the source has not yet planned past it. A source that cannot
@@ -38,6 +38,37 @@ overlap) and the twin deferral is. Host cost: the shared length of each
 (source, queued twin) pair once (cached), per prefill batch O(batch x queue)
 dict reads. Device: one gather row per boundary, inside a forward that runs
 anyway -- no forward, no decode step, no flip is touched.
+
+NF-TWIN-ROW 1021 (rc27 893d09fa3f, P log ..._1021_020616) -- THE BOUNDS ARE PP0'S,
+THE FOLLOWERS ADOPT THEM. The rule above ("a follower plans PP0's pass-m batch with
+PP0's pass-m requests, so every stage plans the same tracks without transport") held
+for the batch MEMBERSHIP (the #631 row rides the frame) but not for the QUEUE the
+bounds were drawn from: each rank read its OWN ``waiting_queue``. A follower plans
+pass m when PP0's frame m lands -- seconds after PP0 planned it -- and by then it has
+absorbed requests PP0 received only after its plan:
+
+  02:09:27 PP0 P-FORK-CUT SKIP rid=pdflip-0-1 site=add_one_req ... (PP0 plans step [18432,34816))
+  02:09:28 PP0 FORK-ANCHOR TRACK rid=pdflip-0-1 at=18688            (no twin queued on PP0)
+  02:09:31 PP0 REQ-TRACE r9 ... rids=['pdflip-0-4', ...]           (the twin, after the plan)
+  02:09:31 PP1 REQ-TRACE r10 ... rids=['pdflip-0-4', ...]          (the same chain hop)
+  02:09:31 PP1 ROW-DELIVER d1 ... -> TWIN-ANCHOR TRACK at=18688 / at=18880
+  02:09:34 PP2 TWIN-ANCHOR TRACK at=18688 / at=18880
+
+PP1/PP2 wrote an anchor at 18880 PP0 never wrote: pdflip-0-4 resumed at PP0's 18688
+(192 tokens again), and the split tree outlived the request -- pdflip-1-22 matched
+``accepted=18688`` on PP0 against ``accepted=18880`` on PP1/PP2 and the TF verdict
+fell to 18688 (120320 tokens, NF-TF-GAP in pdflip_told_fidelity).
+
+THE RULE: PP0 computes the bounds of its pass (:func:`batch_bounds`, unchanged) and
+puts them on that pass's proxy frame (:data:`ROW_KEY`, the ``__stamp__`` / admission
+row / W2C precedent: a non-tensor entry popped by the receiver before anything maps
+over the dict). A follower pops the row at its receive (:func:`note_frame`), the
+#631 pre-plan block hands it to exactly the plan of that slot (:func:`plant_for_plan`)
+and :func:`plan_bounds` returns PP0's bounds for the follower's batch -- never a
+rank-local derivation. A middle rank relays what it adopted (its batch's bounds ARE
+the row). A frame without the key means PP0 planned no twin track for the pass; a
+follower plan without a planted row (no #631 row authority on the boot) plans none
+and says so (RAENGE-NIE-UNEINS: no rank-local substitute).
 """
 
 from __future__ import annotations
@@ -46,6 +77,13 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
+
+#: NF-TWIN-ROW: the proxy-frame key PP0's twin bounds ride under
+ROW_KEY = "__pdflip_twin_bounds__"
+#: scheduler attributes: the row popped at the last receive / planted for ONE plan
+RECV_ATTR = "_pdflip_twin_row_recv"
+PLAN_ATTR = "_pdflip_twin_row_plan"
+_ROW_N: Dict[str, int] = {"sent": 0, "adopted": 0, "differs": 0, "absent": 0}
 
 #: tracks per request and step (one mamba slot each)
 MAX_BOUNDS_PER_REQ = 4
@@ -138,6 +176,132 @@ def batch_bounds(reqs: Sequence[Any], queued: Sequence[Any], *, page: int) -> Op
     return out or None
 
 
+# -- NF-TWIN-ROW: PP0 decides, the followers adopt (rank-uniform) -----------------
+def _pp_rank_size(scheduler: Any) -> Tuple[int, int]:
+    ps = getattr(scheduler, "ps", None)
+    try:
+        return int(getattr(ps, "pp_rank", 0) or 0), int(getattr(ps, "pp_size", 1) or 1)
+    except (TypeError, ValueError):
+        return 0, 1
+
+
+def encode(bounds: Optional[Dict[str, Sequence[int]]]) -> Tuple[Tuple[str, Tuple[int, ...]], ...]:
+    """Plain tuples on the wire (the admission-row form), sorted by rid."""
+    return tuple(
+        (str(r), tuple(sorted({int(b) for b in bs})))
+        for r, bs in sorted((bounds or {}).items())
+        if bs
+    )
+
+
+def decode(raw: Any) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = {}
+    for item in raw or ():
+        try:
+            rid, bs = item
+            vals = sorted({int(b) for b in bs})
+        except (TypeError, ValueError):
+            continue
+        if vals:
+            out[str(rid)] = vals
+    return out
+
+
+def frame_extra(scheduler: Any, batch: Any, base: Optional[dict]) -> Optional[dict]:
+    """Sender, at the proxy send of ``batch``'s slot: PP0 (its decision) and a middle
+    rank (the row it adopted -- its batch's bounds ARE the row) put the batch's twin
+    bounds into the frame extras. ``base`` unchanged when there are none (an absent key
+    reads as "PP0 planned no twin track"). Never raises into the send."""
+    try:
+        rank, size = _pp_rank_size(scheduler)
+        if size <= 1 or rank >= size - 1:
+            return base
+        row = encode(getattr(batch, "pdflip_twin_bounds", None))
+        if not row:
+            return base
+        out = dict(base) if base else {}
+        out[ROW_KEY] = row
+        _ROW_N["sent"] += 1
+        return out
+    except Exception as exc:  # noqa: BLE001 - the frame must go
+        logger.warning("PDFLIP TWIN-ROW frame_extra skipped (%s: %s)", type(exc).__name__, exc)
+        return base
+
+
+def note_frame(scheduler: Any, raw: Any) -> Dict[str, List[int]]:
+    """Receiver: pop the row off a proxy frame (BEFORE anything maps over the dict)
+    and keep it for the plan of this slot. Absent key = {} (PP0 planned none)."""
+    val = raw.pop(ROW_KEY, None) if isinstance(raw, dict) else None
+    row = decode(val)
+    try:
+        setattr(scheduler, RECV_ATTR, row)
+    except Exception:  # noqa: BLE001
+        pass
+    return row
+
+
+def plant_for_plan(scheduler: Any) -> None:
+    """#631 pre-plan block, right after this slot's frame was received: the row of
+    THAT frame is the one the next plan call adopts (moved, so a later receive on
+    another path can never feed a plan it does not belong to)."""
+    row = getattr(scheduler, RECV_ATTR, None)
+    try:
+        setattr(scheduler, PLAN_ATTR, {} if row is None else row)
+        setattr(scheduler, RECV_ATTR, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def clear_after_plan(scheduler: Any) -> None:
+    try:
+        setattr(scheduler, PLAN_ATTR, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def plan_bounds(scheduler: Any, reqs: Sequence[Any], queued: Sequence[Any], *,
+                page: int) -> Optional[Dict[str, List[int]]]:
+    """Scheduler, before ``prepare_for_extend``: the twin bounds of the new prefill
+    batch. PP0 and every non-PP group: :func:`batch_bounds` over its own queue (the
+    decision). A PP follower: PP0's bounds from this pass's frame, restricted to the
+    batch's rids -- never its own queue (NF-TWIN-ROW)."""
+    rank, size = _pp_rank_size(scheduler)
+    if size <= 1 or rank == 0:
+        return batch_bounds(reqs, queued, page=page)
+    if not reqs or not armed():
+        return None
+    row = getattr(scheduler, PLAN_ATTR, None)
+    if row is None:
+        _ROW_N["absent"] += 1
+        n = _ROW_N["absent"]
+        if n <= 3 or n % 1000 == 0:
+            logger.warning(
+                "PDFLIP TWIN-ROW ABSENT pp=%d n=%d: a follower plan without PP0's frame row "
+                "(no #631 row authority on this path) -- no twin track, never a rank-local "
+                "derivation (NF-TWIN-ROW, RAENGE-NIE-UNEINS)", rank, n)
+        return None
+    rids = {_rid(r) for r in reqs}
+    out = {r: list(bs) for r, bs in row.items() if r in rids and bs}
+    try:
+        local = batch_bounds(reqs, queued, page=page) or {}
+    except Exception:  # noqa: BLE001 - instrument only
+        local = out
+    _ROW_N["adopted"] += 1
+    if {r: list(b) for r, b in local.items()} != out:
+        _ROW_N["differs"] += 1
+        n = _ROW_N["differs"]
+        if n <= 24 or n % 256 == 0:
+            logger.info(
+                "PDFLIP TWIN-ROW ADOPT pp=%d n=%d adopted=%s own_queue_would=%s (NF-TWIN-ROW: "
+                "PP0's bounds, not this rank's queue -- a twin PP0 received after its plan "
+                "gets no track on any stage)", rank, n, out, local)
+    return out or None
+
+
+def row_stats() -> Dict[str, int]:
+    return dict(_ROW_N)
+
+
 # -- the promise ledger (per process; PP0's is the one the twin reads) -----------
 def _set(rid: str, b: int, status: str) -> None:
     d = _STATUS.get(rid)
@@ -200,3 +364,5 @@ def _reset_for_test() -> None:
     _ARMED = None
     _SHARED.clear()
     _STATUS.clear()
+    for k in _ROW_N:
+        _ROW_N[k] = 0

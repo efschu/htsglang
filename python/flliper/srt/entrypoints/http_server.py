@@ -1576,6 +1576,19 @@ async def pdflip_match_probe(raw_request: Request):
                 except Exception:  # noqa: BLE001 -- the scheduler hashes it then, as for a leg
                     pass
             _sched_mm = mm
+        # VISION-ROWS (pdflip/vision_row_store.py): the image spans whose tower rows P published -- the front
+        # counts only the OTHER images of the uncached tail as P-only (R9); D attaches these at its admission
+        _mm_rows: List[List[int]] = []
+        if _sched_mm is not None:
+            try:
+                from flliper.srt.pdflip import vision_d_guard as _vdg2
+                from flliper.srt.pdflip import vision_row_store as _vrs
+
+                if _vdg2.d_guard_armed(tm.model_config):
+                    _mm_rows = _vrs.available_spans(getattr(_sched_mm, "mm_items", None) or (),
+                                                    _vrs.store_dir_for(tm.server_args))
+            except Exception:  # noqa: BLE001 -- no answer is no rows: the image stays P-only
+                _mm_rows = []
         req = PdFlipMatchProbeReqInput(
             rid=str(tokenized.rid),
             input_ids=_array_q(tokenized.input_ids),
@@ -1606,6 +1619,7 @@ async def pdflip_match_probe(raw_request: Request):
             "host_tokens": int(out.host_tokens),
             "key_match_depth": int(out.key_match_depth),
             "mm_spans": [list(x) for x in (out.mm_spans or ())],
+            "mm_rows": _mm_rows,
             # S63 F1: D's namespace of this prompt -- with D's ids the admission key, so the front's re-probe at the
             # set verdict asks the tree again without a second tokenization here
             "extra_key": getattr(tokenized, "extra_key", None),

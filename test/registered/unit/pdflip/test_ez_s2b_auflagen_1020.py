@@ -24,7 +24,7 @@ RID_0_1, RID_0_2, RID_0_5 = "pdflip-0-1", "pdflip-0-2", "pdflip-0-5"
 
 
 # ---------------------------------------------------------------------------------------------------- A2 (a) pdflip-0-1/0-2/0-5
-def _front_a(now, tmp_path, *, done):
+def _front_a(now, tmp_path, *, done, ext_len=1517):
     """rc19 23:06:43: pdflip-0-1 (D prefill, 1517 tokens, extend began 23:06:37.720, forward ended .498) and the halb member
     pdflip-0-2 (3596) waiting; the verdict fell .576 (78 ms after the forward end)."""
     f = _fake_front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
@@ -39,7 +39,7 @@ def _front_a(now, tmp_path, *, done):
     f._leg2_lookahead.add(RID_0_1)
     F.Front._note_x_decision(f, RID_0_1, X_A, 1517)
     F.Front._front_x_headers(f, RID_0_1, None, False)               # leg2's POST pops the record
-    _beacon_reading(f, tmp_path, RID_0_1, now - 5.85, 1517, 1517, done=done)
+    _beacon_reading(f, tmp_path, RID_0_1, now - 5.85, 1517, ext_len, done=done)
     f._set_st()["shorts"][RID_0_2] = (now - 1.0, 3596, X_A)         # halb member, S alone 3596 < X
     return f
 
@@ -65,11 +65,20 @@ def test_a_the_rest_of_a_computed_prefill_makes_no_flip_below_x_and_the_kurz_arr
 
 
 def test_a_while_the_forward_runs_r6_counts_and_flips(monkeypatch, tmp_path):
-    """SOLL R6 side of the same fixture: the 1517 are being computed -> S = 5113 > X -> REROUTE_P (the SOLL fixtures stay)."""
+    """SOLL R6 side of the same fixture. NF-RC30-R6STALE (R6 + R7): S counts what no D forward was launched for -- the whole 1517
+    in ONE launched forward reach P with nothing (it ends on D): no flip; a first chunk of 500 in flight leaves 1017 for P ->
+    S = 3596 + 1017 = 4613 > X -> REROUTE_P (the SOLL fixtures stay)."""
     _on(monkeypatch)
     now = time.time()
     f = _front_a(now, tmp_path, done=False)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._decode_collect(now) == "hold" and f.counters["set_reroute_p"] == 0
+        assert f.counters["r6_rest_in_flight"] >= 1
+    d2 = tmp_path / "chunked"
+    d2.mkdir()
+    f = _front_a(now, d2, done=False, ext_len=500)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 1017
         assert f._decode_collect(now) == "P" and f.counters["set_reroute_p"] == 1
 
 
@@ -264,14 +273,15 @@ def test_a6_a_kurz_arrival_behind_a_committed_flip_never_waits_for_ever(monkeypa
 # ---------------------------------------------------------------------------------------------------- A2 wiring (rank side)
 def test_a2_the_scheduler_reports_the_rest_after_the_forward_ends():
     """The rank hook: ``process_batch_result`` calls ``note_extend_done`` for an extend batch (never a skip batch) and the extend
-    start hands the beacon the batch's ``extend_len``; the file layout version is 3 and v1/v2 readers' files stay readable."""
+    start hands the beacon the batch's ``extend_len``; the file layout version is 4 (NF-RC30-R6STALE: ``free``) and v1-v3 files
+    stay readable."""
     import inspect
     from flliper.srt.managers import scheduler as S
 
     src = inspect.getsource(S.Scheduler.process_batch_result)
     assert "note_extend_done(rids=" in src       # review A2c: skip batches report too
     assert "extend_lens=[_pdflip_d_ext.req_extend_len(req)" in inspect.getsource(S.Scheduler._run_batch_forward)
-    assert dxb._VERSION == 3 and dxb.req_extend_len(type("R", (), {"extend_input_len": 7})()) == 7
+    assert dxb._VERSION == 4 and dxb.req_extend_len(type("R", (), {"extend_input_len": 7})()) == 7
 
 
 # ---------------------------------------------------------------------------------------------------- A2a / A2b (review of the Auflagen)
@@ -289,7 +299,7 @@ def test_a2a_overlap_chunked_done_of_chunk1_after_chunk2_started_keeps_chunk2_re
     bc.note_recv(rid=_RID9)
     bc.note_extend(rids=[_RID9], rests=[7000], extend_lens=[4096])
     bc.note_extend(rids=[_RID9], rests=[2904], extend_lens=[2904])
-    assert _read9(tmp_path) == 2904
+    assert _read9(tmp_path) == 7000      # review A1 (NF-R6-REST-EXAKT): chunk 1 not done -> its start rest (FIFO head)
     bc.note_extend_done(rids=[_RID9])
     assert _read9(tmp_path) == 2904
     bc.note_extend_done(rids=[_RID9])
@@ -327,7 +337,8 @@ def _front_r1u(now, tmp_path, *, sess_a="s1", sess_b="s1", common_len=10000, dep
     f._rvp_state()
     f.__dict__.setdefault("_d_prefill_legs", {})[ra] = now - 2.0
     f._leg2_lookahead.add(ra)
-    _beacon_reading(f, tmp_path, ra, now - 1.5, 2911, 1000, done=False)       # chunk running: rest 2911 counts
+    # chunk of 1000 running, NF-RC30-R6STALE: the 2911 no forward was launched for count (D's rest 3911 includes the chunk)
+    _beacon_reading(f, tmp_path, ra, now - 1.5, 3911, 1000, done=False)
     ids_a = np.arange(10000, dtype=np.int32)
     ids_b = np.concatenate([ids_a[:common_len], np.arange(50000, 50000 + (7000 + 3068 - common_len), dtype=np.int32)])
     f.__dict__["_set_ids"] = {ra: ids_a, rb: ids_b}
@@ -406,7 +417,7 @@ def test_r1u_two_running_prefills_on_the_real_path(monkeypatch, tmp_path):
     bc = dxb2.DExtendBeacon(str(tmp_path / "D-pid9.bin"), clock_ns=lambda: clock["t"])
     bc.note_recv(rid=rb)
     clock["t"] = int((now - 1.4) * 1e9)
-    bc.note_extend(rids=[rb], rests=[1500], extend_lens=[100])
+    bc.note_extend(rids=[rb], rests=[1600], extend_lens=[100])               # NF-RC30-R6STALE: 1500 unlaunched
     f._d_ext_reading = lambda: dxb2.read_group_full(str(tmp_path), "D", 7, session_of=lambda pid: 7)
     f._set_st()["shorts"].clear()
     f._set_st()["shorts"]["pdflip-10-90"] = (now - 1.0, 2400, 5229)
