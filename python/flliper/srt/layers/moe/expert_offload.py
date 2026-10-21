@@ -1033,6 +1033,38 @@ def pool_em_prefetch_enabled() -> bool:
 
 def pool_em_prefetch_reset_for_tests() -> None:
     _POOL_EM_PREFETCH.update({"on": None, "defect": None})
+    _POOL_EM_PREFETCH_PROGRAMS["n"] = None
+    from flliper.jit_kernel import marlin_sm_share
+
+    marlin_sm_share.reset_for_tests()
+
+
+#: EM-PREFETCH-SM default: persistent programs of the prefetch's side-stream row copy. Little's law on the slowest
+#: card the copy must still saturate: 4 programs x 16 KiB in flight = 64 KiB against link x round trip (x8 13.4 GB/s
+#: x ~2 us = 27 KiB; x4 6.5 GB/s: 13 KiB). 32 (the synchronous copies' grid) is 47 % of a 3080's 68 SMs.
+EM_PREFETCH_PROGRAMS_DEFAULT = 4
+_POOL_EM_PREFETCH_PROGRAMS: Dict[str, Optional[int]] = {"n": None}
+
+
+def em_prefetch_copy_programs() -> int:
+    """EM-PREFETCH-SM (21.10.): how many persistent programs the EM-PREFETCH side-stream row copy launches
+    (FLLIPER_MOE_POOL_EM_PREFETCH_PROGRAMS, default 4, clamped to [1, COPY_PROGRAMS]); the synchronous copies keep
+    COPY_PROGRAMS. rc31b D (``..._1021_202608``): with 32 programs the forward stream lost ~0.7 ms per ms of
+    prefetch copy (rest +170..230 ms per pass at equal rows_on) -- each copy block closes its SM to every
+    full-shared-memory kernel (a prefill Marlin block takes 99 KB + 1 KB reserved = the SM). The copy is link-bound,
+    not SM-bound (pf link 5.3-5.5 GB/s on the x4 card, 11-11.9 on x8 = the synchronous copies' rate), so a narrow
+    grid keeps its rate and gives the SMs back. Read once per process, the same value on every rank."""
+    if _POOL_EM_PREFETCH_PROGRAMS["n"] is None:
+        from flliper.srt.layers.moe.expert_pool_device import COPY_PROGRAMS
+
+        try:
+            from flliper.srt.environ import envs
+
+            n = int(envs.FLLIPER_MOE_POOL_EM_PREFETCH_PROGRAMS.get() or EM_PREFETCH_PROGRAMS_DEFAULT)
+        except Exception:  # noqa: BLE001 -- no environ (bare harness): the default
+            n = EM_PREFETCH_PROGRAMS_DEFAULT
+        _POOL_EM_PREFETCH_PROGRAMS["n"] = max(1, min(int(n), int(COPY_PROGRAMS)))
+    return int(_POOL_EM_PREFETCH_PROGRAMS["n"])
 
 
 def stamp_predicted_rows(tables, lanes) -> None:
@@ -3896,6 +3928,7 @@ class MoEExpertOffloadCache:
     _em_pf_pending = None
     _em_pf_landed = False
     _em_pf_end_ev = None
+    _em_pf_sm_open = False
     _pool_pf_armed = False
     _pool_pf_buffers = None
     _pool_pf_begin = None
@@ -4040,6 +4073,8 @@ class MoEExpertOffloadCache:
         self._em_pf_pending = None
         self._em_pf_landed = False
         self._em_pf_end_ev = None  # review A4: the side stream's copy end of the prefetch in flight
+        # EM-PREFETCH-SM: this layer is the target of a copy in flight whose Marlin SM window is open
+        self._em_pf_sm_open = False
         # #276 heat record (FLLIPER_DEBUG_MOE_HEAT, default off): the device
         # histogram of the captured step's routed ids (layers/moe/pool_heat).
         # None = off: prepare_pool then adds no op to the captured step.
@@ -5713,6 +5748,12 @@ class MoEExpertOffloadCache:
         self._pool_pf_armed = False
         end_ev = self._em_pf_end_ev
         self._em_pf_end_ev = None
+        if self._em_pf_sm_open:
+            # EM-PREFETCH-SM: from here on (host order) no copy holds SMs for this target: Marlin gets its full grid
+            self._em_pf_sm_open = False
+            from flliper.jit_kernel import marlin_sm_share
+
+            marlin_sm_share.close_window()
         done = self._pool_pf_done
         if done is not None:
             import torch
@@ -5825,6 +5866,16 @@ class MoEExpertOffloadCache:
                 self._pool_pf_done.record(side)
         self._em_pf_end_ev = end_ev
         self._em_pf_landed = True  # only a body that did not raise lands (review A1)
+        # EM-PREFETCH-SM: the copy's programs hold SMs until this layer joins it; every Marlin GEMM the forward
+        # stream launches in between (the source layer's last apply, this layer's attention projections, the
+        # shared expert) takes a grid of sms - programs -- one wave beside the copy instead of two
+        from flliper.jit_kernel import marlin_sm_share
+
+        if not self._em_pf_sm_open:
+            self._em_pf_sm_open = True
+            marlin_sm_share.open_window(em_prefetch_copy_programs())
+            if probe is not None:
+                probe.prefetch_sm_reserve(marlin_sm_share.sm_reserve())
         return True
 
     def _em_prefetch_streams(self) -> bool:
@@ -5834,10 +5885,11 @@ class MoEExpertOffloadCache:
     def _em_prefetch_body(self, lanes, waves: int, probe=None) -> None:
         """EM-PREFETCH: the side stream's work (stamp, prefetch step, row copy); the current stream is the side
         stream on CUDA."""
-        from flliper.srt.layers.moe.expert_pool_device import copy_rows, step
+        from flliper.srt.layers.moe.expert_pool_device import copy_grid, copy_rows, step
 
         t = self._pool_tables
         pf = self._pool_pf_buffers
+        programs = em_prefetch_copy_programs()
         # review A1 (B-1): nothing that can raise sits between the step and its copy -- the start event before the
         # step, and a raise after the step takes its filled rows back before it propagates (no table entry for a
         # row whose bytes did not arrive). Returns the copy's end event (A4), or None without a probe.
@@ -5845,14 +5897,17 @@ class MoEExpertOffloadCache:
         stamp_predicted_rows(t, lanes)
         step(t, lanes, pf, prefetch=True, waves=waves)
         try:
-            copy_rows(self._pool_srcs, self._pool_dsts, pf.gather_src, pf.gather_dst, pf.gather_count)
+            # EM-PREFETCH-SM: the side-stream copy runs on a narrow grid (em_prefetch_copy_programs) -- link-bound
+            # at a few programs, and every program it does not launch is an SM the forward stream keeps
+            with copy_grid(programs):
+                copy_rows(self._pool_srcs, self._pool_dsts, pf.gather_src, pf.gather_dst, pf.gather_count)
         except BaseException:
             revoke_prefetched_rows(t)
             raise
         if probe is None:
             return None
         e1 = probe.mark()
-        probe.prefetch_copy(e0, e1)
+        probe.prefetch_copy(e0, e1, programs=programs, row_bytes=self._em_fetch_row_bytes())
         return e1
 
     def em_prefetch_prebuild(self) -> bool:
@@ -5863,6 +5918,8 @@ class MoEExpertOffloadCache:
         live launch hits the compiled kernel. False when the prefetch is off or the width does not hold E."""
         from flliper.srt.layers.moe.expert_pool_device import (
             allocate_step_buffers,
+            copy_grid,
+            copy_rows,
             pool_row_capacity,
             pool_waves_for,
             resident_count,
@@ -5882,6 +5939,11 @@ class MoEExpertOffloadCache:
         pf.ids[:E].fill_(-1)
         step(t, pf.ids[:E], pf, prefetch=True,
              waves=pool_waves_for(E, E, resident_count(t), pool_row_capacity(t, 0)))
+        # EM-PREFETCH-SM: the copy kernel's narrow-grid specialisation (PROGRAMS is a constexpr) is built here too --
+        # a copy of ZERO rows (count forced to 0 on the device: no byte moves whatever the step left), same tensors
+        pf.gather_count.zero_()
+        with copy_grid(em_prefetch_copy_programs()):
+            copy_rows(self._pool_srcs, self._pool_dsts, pf.gather_src, pf.gather_dst, pf.gather_count)
         return True
 
     def eager_device_limit(self) -> int:

@@ -964,7 +964,8 @@ void moe_wna16_marlin_gemm(
     int64_t group_size,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    int64_t sm_reserve) {
   using namespace host;
 
   ScalarType const b_q_type = ScalarType::from_id(b_q_type_id);
@@ -1030,6 +1031,13 @@ void moe_wna16_marlin_gemm(
   // below rather than run. A narrower grid is always safe.
   if (int sms_override = device::marlin_moe::marlin_moe_sms_override(); sms_override > 0 && sms_override < sms) {
     sms = sms_override;
+  }
+  // EM-PREFETCH-SM (21.10.): while a side-stream prefetch copy holds `sm_reserve` SMs, launch one full wave on
+  // the others (flliper/jit_kernel/marlin_sm_share.py). With blocks_per_sm == 1 a block takes the SM's whole
+  // shared memory (99 KB opt-in + 1 KB reserved): an SM hosting the copy is closed to Marlin, and `sms` blocks
+  // would run a second wave. Same rule as the override above: only DOWNWARD, before the workspace bound.
+  if (sm_reserve > 0 && sm_reserve < sms) {
+    sms -= static_cast<int>(sm_reserve);
   }
 
   // Verify c (allocation done in Python)

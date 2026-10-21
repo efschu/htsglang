@@ -112,6 +112,8 @@ With ``seat_rows`` = 0 every table, bound and layout is the one before H95c.
 """
 from __future__ import annotations
 
+import contextlib
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -1550,23 +1552,48 @@ def _word_rows(tensor):
     return rows
 
 
+_COPY_GRID = threading.local()
+
+
+def copy_programs() -> int:
+    """The grid ``copy_rows`` launches with on THIS thread: ``COPY_PROGRAMS`` unless a :func:`copy_grid`
+    block narrowed it."""
+    return int(getattr(_COPY_GRID, "programs", 0) or COPY_PROGRAMS)
+
+
+@contextlib.contextmanager
+def copy_grid(programs: int):
+    """EM-PREFETCH-SM (21.10.): ``copy_rows`` inside this block launches ``programs`` persistent programs instead
+    of ``COPY_PROGRAMS`` (clamped to [1, COPY_PROGRAMS]). Same kernel, same bytes, same stream order -- only the
+    number of SMs a SIDE-STREAM copy occupies while the forward stream computes. Thread-local, so a copy another
+    thread launches meanwhile keeps the full grid; the call signature of ``copy_rows`` is unchanged."""
+    prev = getattr(_COPY_GRID, "programs", 0)
+    _COPY_GRID.programs = max(1, min(int(programs), COPY_PROGRAMS))
+    try:
+        yield
+    finally:
+        _COPY_GRID.programs = prev
+
+
 def copy_rows(sources, destinations, src_rows, dst_rows, count) -> None:
     """Copy ``count`` (src, dst) row pairs of every tensor; ``count`` is a
     device scalar read by a fixed small grid (one launch per tensor), so an
-    empty step costs a few programs and nothing synchronizes."""
+    empty step costs a few programs and nothing synchronizes. The grid is
+    ``copy_programs()`` (``COPY_PROGRAMS`` outside a :func:`copy_grid` block)."""
     if destinations[0].device.type != "cuda":
         n = int(count.reshape(-1)[0].item())
         pairs = [(int(src_rows[i]), int(dst_rows[i])) for i in range(n)]
         copy_rows_reference(sources, destinations, pairs)
         return
     kern = _copy_kernel()
+    programs = copy_programs()
     for src, dst in zip(sources, destinations):
         s, d = _word_rows(src), _word_rows(dst)
         if s.shape[1] != d.shape[1]:
             raise ValueError("pool copy: row size differs between source and bank")
-        kern[(COPY_PROGRAMS,)](
+        kern[(programs,)](
             s, d, src_rows, dst_rows, count, d.shape[1], s.stride(0), d.stride(0),
-            PROGRAMS=COPY_PROGRAMS, BLOCK=COPY_WORDS, num_warps=4,
+            PROGRAMS=programs, BLOCK=COPY_WORDS, num_warps=4,
         )
 
 
@@ -1597,7 +1624,7 @@ def _copy_kernel():
 
 __all__ = [
     "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers", "SyncReport",
-    "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
+    "allocate_pool_tables", "allocate_step_buffers", "copy_rows", "copy_grid", "copy_programs",
     "plan_width_for", "pool_max_step_ids", "step_row_demand",
     "bijection_breaks", "copy_rows_reference", "seed_lru_rows", "step", "step_reference", "sync_tables",
     "take_report",
