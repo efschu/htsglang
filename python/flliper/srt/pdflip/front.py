@@ -12776,6 +12776,21 @@ class Front:
                 # the younger head would overtake it. It waits at the semaphore behind it, as before F5.
                 self.counters["arrival_seat_age_credit_older_in_line"] += 1
                 return False
+        # NF-C-SITZ 1021 (rc27 _1021_020616 2277 seat=7/6, rc29 8/6, rc27 _023225 02:44:53 taken=11 n=6): AT MOST ONE
+        # open credit, and only while the seats this phase owes WITHOUT this head do not exceed n -- the credit path
+        # alone never lifts the owed seats past n+1. A head refused here waits for its seat (R5) as before F5; the open
+        # credit is settled by the next freed permit (Seat._pass_permit) or ends with its leg 2 (Seat.release).
+        open_credit = [s.rid for s in (getattr(self, "_d_seats_live", ()) or ()) if getattr(s, "on_credit", False)]
+        taken, n = self._arrival_seat_taken(for_rid=rid)
+        own = 1 if rid in (st.get("granted") or {}) else 0
+        if open_credit or taken - own > int(n):
+            self.counters["arrival_seat_age_credit_refused"] = self.counters.get("arrival_seat_age_credit_refused", 0) + 1
+            c = self.counters["arrival_seat_age_credit_refused"]
+            if c <= 24 or c % 256 == 0:
+                logger.info("PDFLIP SEAT-AGE CREDIT-REFUSED rid=%s open_credit=%s taken=%d (without this head %d) n=%d "
+                            "(n=%d): at most one open credit and never past n+1 owed seats -- the head waits for its seat "
+                            "(NF-C-SITZ, R5)", rid, open_credit[:4], int(taken), int(taken) - own, int(n), c)
+            return False
         self.counters["arrival_seat_age_seat_on_credit"] += 1
         logger.info("PDFLIP SEAT-AGE ON-CREDIT rid=%s victims=%s seats_live=%d d_bs=%d -- every front seat is held: "
                     "the AGE PLAN head goes to D now, D's SEAT-AGE displaces the youngest for it (no wait at the "
@@ -14751,7 +14766,12 @@ class Front:
         if for_rid is not None and ready and Front._short_gate_by_age_on(self):
             _k = Front._sa_key(self, for_rid)
             ready = [p for p in ready if Front._sa_key(self, p) < _k]
-        running = [r for r in self._flip_ledger(D) if r not in parked]
+        # NF-C-SITZ-H 1021 (SOLL R5; rc27 _1021_023225 02:44:53 'ARRIVAL-SEAT rid=pdflip-2-30 verdict=flip_now ...
+        # taken=11 n=6'): a RESUME-VIA-P hold is a rid D keeps while P prefills its context -- it runs no D work and
+        # holds no D seat until its leg comes back (S87 ``_seat_leg_unseated`` excludes it for the same reason). Counted
+        # here it double-booked the owed seats and steered flip/park verdicts on a number D does not hold.
+        rvp = getattr(self, "_rvp_inflight", None) or ()
+        running = [r for r in self._flip_ledger(D) if r not in parked and r not in rvp]
         # a grant between this rule's verdict and its Seat (the caller still
         # awaits the store-budget reading) holds its seat already: no second
         # waiter may take it in that window. Settled once the rid runs or holds
@@ -14902,10 +14922,13 @@ class Front:
         # after its own await (no await in between) and hands it on -- the shared slot is overwritten by every other
         # waiter's KV test during the caller's later awaits (``_asr_older_blocked``, the other waiters of the tick).
         _rr = reading.get("running_rids") if reading else None
+        _dr = reading.get("displaceable_rids") if reading else None
         self._asr_st()["last_kv_basis"] = {
             "unread": not reading,
             "wall": _asr.backup_wall(reading),
             "running": set(str(r) for r in _rr) if isinstance(_rr, (list, tuple)) else None,
+            # NF-C-SITZ 1021: the decodes D can park NOW (spec decode: the batch's back) -- None = an old D
+            "displaceable": set(str(r) for r in _dr) if isinstance(_dr, (list, tuple)) else None,
         }
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
@@ -14927,7 +14950,8 @@ class Front:
         """S94 review A2: the basis of the KV test that JUST returned (call it with no await after that test): D gave a
         number (``unread``), its backup wall (``wall``), the decodes it runs (``running``, None = an old D)."""
         b = self._asr_st().get("last_kv_basis")
-        return dict(b) if isinstance(b, dict) else {"unread": True, "wall": False, "running": None}
+        return dict(b) if isinstance(b, dict) else {"unread": True, "wall": False, "running": None,
+                                                    "displaceable": None}
 
     def _asr_note_need_terms(self) -> None:
         """Counters for the two honest terms of the verdict just granted."""
@@ -15037,6 +15061,13 @@ class Front:
             # (rc19 07:15:49 pdflip-262-3339 for 3338) -- planning on those handed heads to a D that could not seat
             # them. D's own reading decides; an old D without the field: unchanged.
             running = [r for r in running if r in d_running]
+        d_disp = basis.get("displaceable")
+        if d_disp is not None:
+            # NF-C-SITZ 1021 (rc27 front 2271 victims=['pdflip-2-29'] vs D 19679 DISPLACE-WAIT youngest=pdflip-2-28):
+            # the victim is one D CAN park now (``d_park_runtime.displaceable``: under speculative decoding only the
+            # batch's back) -- the same set D's SEAT-AGE chooses from, so front and D name the same victim (R11 spirit:
+            # one rule) and no head goes to D for a displacement D then cannot do.
+            running = [r for r in running if r in d_disp]
         arrivals = {}
         for r in running:
             t = self._asr_arrival_of(r)

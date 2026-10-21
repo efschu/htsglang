@@ -22344,6 +22344,12 @@ class Scheduler(
             # ranks (one schedule); capped -- D's bs is single digits.
             ret["pdflip_kv"]["running_rids"] = [str(r.rid) for r in list(
                 getattr(getattr(self, "running_batch", None), "reqs", None) or ())[:64]]
+            # NF-C-SITZ 1021: the decodes D's SEAT-AGE CAN park this round (under speculative decoding only the
+            # batch's back) -- the front's AGE PLAN victim comes from this set, D's own victim too (one rule,
+            # d_park_runtime.displaceable).
+            from flliper.srt.pdflip.d_park_runtime import displaceable_rids as _disp_rids
+
+            ret["pdflip_kv"]["displaceable_rids"] = _disp_rids(getattr(self, "running_batch", None))[:64]
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
             pass
         # PDFLIP MODE-PARITY (h16m 1014, N4): this group's priority mode for the
