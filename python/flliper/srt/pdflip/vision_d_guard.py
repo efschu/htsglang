@@ -54,12 +54,27 @@ def d_guard_armed(model_config: Any, env: Optional[Dict[str, str]] = None) -> bo
     return bool(getattr(hf, "language_model_only", False))
 
 
-def image_spans(req: Any) -> List[Tuple[int, int]]:
-    """Every multimodal placeholder span of the request, (start, end) inclusive."""
+def _items(req: Any) -> List[Any]:
     mm = getattr(req, "multimodal_inputs", None)
-    spans: List[Tuple[int, int]] = []
     items = getattr(mm, "mm_items", None)
-    for it in (() if items is None else items):
+    return [it for it in (() if items is None else items) if it is not None]
+
+
+def _tower_needed(it: Any) -> bool:
+    """VISION-ROWS (rc30 visiontail): an item carrying the rows P's tower computed (``vision_row_store``) needs no
+    tower on D -- its positions are computed like text from those rows. Only P-side items never carry them."""
+    from flliper.srt.pdflip.vision_row_store import has_rows
+
+    return not has_rows(it)
+
+
+def image_spans(req: Any) -> List[Tuple[int, int]]:
+    """Every multimodal placeholder span of the request that D would need a tower for, (start, end) inclusive.
+    An item with attached rows (VISION-ROWS) is not one."""
+    spans: List[Tuple[int, int]] = []
+    for it in _items(req):
+        if not _tower_needed(it):
+            continue
         offs = getattr(it, "offsets", None)  # a list today; never truth-tested
         for off in (() if offs is None else offs):
             spans.append((int(off[0]), int(off[1])))
@@ -67,9 +82,21 @@ def image_spans(req: Any) -> List[Tuple[int, int]]:
 
 
 def image_end(req: Any) -> int:
-    """One past the last placeholder position, 0 without images."""
+    """One past the last placeholder position D would need a tower for, 0 without such images."""
     spans = image_spans(req)
     return (max(end for _, end in spans) + 1) if spans else 0
+
+
+def items_past(req: Any, bound: int) -> List[Any]:
+    """VISION-ROWS: the items without rows whose placeholders reach at or past ``bound`` (D would compute them)."""
+    out = []
+    for it in _items(req):
+        if not _tower_needed(it):
+            continue
+        offs = getattr(it, "offsets", None)
+        if any(int(off[1]) + 1 > int(bound) for off in (() if offs is None else offs)):
+            out.append(it)
+    return out
 
 
 def admitted_covered(head: int, floor: Optional[int], floor_credit: bool) -> int:

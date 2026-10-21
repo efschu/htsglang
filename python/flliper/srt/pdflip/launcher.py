@@ -244,6 +244,10 @@ SHM_OWN_PREFIXES = (
     # holder refuses the boot as for every other entry.
     "pdflip-seq-",
     f"sem.{weight_exchange_region.REGION_PREFIX}",  # "sem.pdflip-xchg-"
+    # rc30 visiontail (A4): the tower rows P publishes for D (`/dev/shm/pdflip-vrows-<tower id>`,
+    # pdflip/vision_row_store.py, bounded at FLLIPER_PDFLIP_VISION_ROWS_MB). Content-keyed and valid across boots,
+    # but a dead line's residue is swept and archived as a manifest like every other family here.
+    "pdflip-vrows-",
     # fnFL2x16 (2026-09-23): the shared HiCache page arena of every boot
     # (`/dev/shm/pdflip-arena-<tag>`, FLLIPER_HICACHE_ARENA_DIR below, one
     # directory per boot tag). MEASURED after a 259k needle: 4 GiB of tmpfs,

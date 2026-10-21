@@ -279,6 +279,9 @@ class ProbeAnswer:
     #: of a D build without the field (the re-probe then sends the arrival's own body)
     extra_key: Optional[str] = None
     extra_key_known: bool = False
+    #: VISION-ROWS (rc30 visiontail): the image spans ([start, end), as ``mm_spans``) whose tower rows P published
+    #: to the shared store (``vision_row_store``) -- D computes those positions itself, so they are no P-only tail
+    mm_rows: Tuple[Tuple[int, int], ...] = ()
 
     @property
     def n(self) -> int:
@@ -296,6 +299,7 @@ def parse_answer(body: Any) -> Optional[ProbeAnswer]:
     try:
         ids = ids_from_b64(str(body["ids"]))
         spans = tuple((int(a), int(b)) for a, b in (body.get("mm_spans") or ()))
+        rows = tuple((int(a), int(b)) for a, b in (body.get("mm_rows") or ()))
         return ProbeAnswer(ids=ids, device_tokens=int(body.get("device_tokens", 0) or 0),
                            host_tokens=int(body.get("host_tokens", 0) or 0),
                            key_match_depth=int(body.get("key_match_depth", 0) or 0), mm_spans=spans,
@@ -303,7 +307,7 @@ def parse_answer(body: Any) -> Optional[ProbeAnswer]:
                            handle_ms=float(body.get("handle_ms", 0.0) or 0.0),
                            total_ms=float(body.get("total_ms", 0.0) or 0.0),
                            extra_key=(None if body.get("extra_key") is None else str(body.get("extra_key"))),
-                           extra_key_known="extra_key" in body)
+                           extra_key_known="extra_key" in body, mm_rows=rows)
     except (TypeError, ValueError, KeyError):
         return None
 
@@ -332,6 +336,8 @@ class ReprobeEntry:
     #: exists for this decision; without this stamp a store read or a slower member > _FRESH_MS made the number
     #: "old" again at the very look it was asked for, and the set re-probed forever (no verdict, a hang)
     landed: Optional[float] = None
+    #: VISION-ROWS: the arrival's spans with published rows (a re-probe on D's ids carries no mm items)
+    rows: Tuple[Tuple[int, int], ...] = ()
 
     @property
     def n(self) -> int:
@@ -358,11 +364,14 @@ def reprobe_same_key(e: ReprobeEntry, ans: ProbeAnswer) -> bool:
         return False
 
 
-def with_spans(ans: ProbeAnswer, spans: Sequence[Sequence[int]]) -> ProbeAnswer:
-    """A re-probe on D's ids carries no mm items, so D names no spans; the ids are the arrival's, so are the spans."""
+def with_spans(ans: ProbeAnswer, spans: Sequence[Sequence[int]],
+               rows: Sequence[Sequence[int]] = ()) -> ProbeAnswer:
+    """A re-probe on D's ids carries no mm items, so D names no spans; the ids are the arrival's, so are the spans
+    -- and the arrival's spans with published rows (VISION-ROWS)."""
     if ans.mm_spans or not spans:
         return ans
-    return dataclasses.replace(ans, mm_spans=tuple((int(a), int(b)) for a, b in spans))
+    return dataclasses.replace(ans, mm_spans=tuple((int(a), int(b)) for a, b in spans),
+                               mm_rows=tuple((int(a), int(b)) for a, b in rows))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -374,9 +383,12 @@ class ExactPrice:
     covered: int
     tree_tokens: int
     store_tokens: int
-    #: an image item ends past ``covered``: D cannot take it (no tower, W123) -- P-only (SOLL R9)
+    #: an image item ends past ``covered`` and D cannot get its rows: D cannot take it (no tower, W123) -- P-only
+    #: (SOLL R9)
     image_in_tail: bool
     src: str
+    #: VISION-ROWS: images ending past ``covered`` whose rows P published -- D computes them, no P-only
+    tail_rows: int = 0
 
 
 def exact_price(ans: ProbeAnswer, store_tokens: int) -> ExactPrice:
@@ -386,10 +398,16 @@ def exact_price(ans: ProbeAnswer, store_tokens: int) -> ExactPrice:
     tree = ans.tree_tokens
     store = max(0, min(int(store_tokens), n))
     covered = max(tree, store)
-    tail = any(int(b) > covered for _a, b in ans.mm_spans)
+    # VISION-ROWS (rc30 visiontail, pdflip-10-516: covered 127808 = 1997 full pages, the image of the previous turn
+    # ending ~127827 inside the partial page): an image whose tower rows P published is computed by D from those
+    # rows -- it is no P-only tail (R9 is for an image D cannot compute); only the other images decide
+    rows = set((int(a), int(b)) for a, b in getattr(ans, "mm_rows", ()) or ())
+    past = [(int(a), int(b)) for a, b in ans.mm_spans if int(b) > covered]
+    tail = any(s not in rows for s in past)
     src = "d_tree" if tree >= store and tree > 0 else ("store" if store > 0 else "none")
     return ExactPrice(uncached=max(0, n - covered), uncached_p=max(0, n - store), covered=covered,
-                      tree_tokens=tree, store_tokens=store, image_in_tail=bool(tail), src=src)
+                      tree_tokens=tree, store_tokens=store, image_in_tail=bool(tail), src=src,
+                      tail_rows=sum(1 for s in past if s in rows))
 
 
 def class_uncached(price: ExactPrice) -> int:
