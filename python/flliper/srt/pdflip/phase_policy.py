@@ -808,6 +808,56 @@ def shared_prefix_discount(entries: Sequence[Tuple[str, int, int, float, str]],
 
 def running_overlap(runs: Sequence[Tuple[str, int, int, str]], members: Sequence[Tuple[str, int, str]],
                     common: Callable[[str, str], int]) -> int:
+    """SOLL R1u: the overlap taken out of the counted RESTS (see :func:`running_overlap_split`, its first figure)."""
+    return running_overlap_split(runs, members, common)[0]
+
+
+def running_overlap_split(runs: Sequence[Tuple], members: Sequence[Tuple[str, int, str]],
+                          common: Callable[[str, str], int]) -> Tuple[int, int]:
+    """SOLL R1u (+ NF-RC30-R6STALE review A3): ``(off_runs, off_members)``. ``off_runs`` = the running prefills' counted rest
+    tokens a member brings too (taken out of the rests, as :func:`running_overlap` always did). A run may carry a 5th field
+    ``inflight`` = the chunk(s) D has already launched for it right before its counted rest ``[depth_A - inflight, depth_A)``:
+    D computes them and P reads them from the store, so a member's share of THAT piece is no new token either --
+    ``off_members`` (the union over the members, once per run) is taken off the members' side. Exact from ids and depths."""
+    off_runs, off_members = 0, 0
+    for r in runs:
+        if len(r) >= 5 and int(r[4]) > 0:
+            arid, adepth, _rest, asess, inflight = r[0], int(r[1]), int(r[2]), r[3], int(r[4])
+            if not asess:
+                continue
+            lo0, hi0 = adepth - inflight, adepth
+            spans = []
+            for brid, bdepth, bsess in members:
+                if bsess != asess:
+                    continue
+                try:
+                    c = int(common(arid, brid))
+                except Exception:  # noqa: BLE001
+                    c = 0
+                lo, hi = max(lo0, int(bdepth)), min(c, hi0)
+                if hi > lo:
+                    spans.append((lo, hi))
+            off_members += _union_len(spans)
+    off_runs = _running_overlap_rest([tuple(r[:4]) for r in runs], members, common)
+    return off_runs, off_members
+
+
+def _union_len(spans: Sequence[Tuple[int, int]]) -> int:
+    covered, cur_lo, cur_hi = 0, None, None
+    for lo, hi in sorted(spans):
+        if cur_hi is None or lo > cur_hi:
+            if cur_hi is not None:
+                covered += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+        else:
+            cur_hi = max(cur_hi, hi)
+    if cur_hi is not None:
+        covered += cur_hi - cur_lo
+    return covered
+
+
+def _running_overlap_rest(runs: Sequence[Tuple[str, int, int, str]], members: Sequence[Tuple[str, int, str]],
+                          common: Callable[[str, str], int]) -> int:
     """SOLL R1u (user decision 20.10.): how many of the running D prefills' REST tokens a member of the set brings too (counted
     ONCE in S). ``runs`` = ``(rid, depth_A, rest, session)`` of a running prefill A: its uncached positions are
     ``[depth_A, depth_A + rest)`` (depth_A = N_A - rest); ``members`` = ``(rid, depth_B, session)``. A member B of the same

@@ -4541,6 +4541,9 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            # NF-RC30-R6STALE review A1 (SOLL R6/R7): the recv step is over -- the next chunk of the running chunked prefill
+            # is fixed for this iteration; the front sees COMMITTED until its start record
+            self._pdflip_d_ext_commit()
 
             # Multi-group runtime (#274): one lane tick per loop iteration,
             # BEFORE the serving batch (PD priority: in a conflict the lane
@@ -4556,6 +4559,7 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            self._pdflip_d_ext_resolve(batch)  # review A1: a committed rid this batch does not launch is released now
 
             # Launch the current batch
             if batch:
@@ -4620,6 +4624,9 @@ class Scheduler(
             _pdflip_d_decode_gap.span(self, "recv", _h58_t0)  # nf-decode-host-1020: D-DECODE-GAP spans
             if self._engine_paused:
                 continue
+            # NF-RC30-R6STALE review A1 (SOLL R6/R7): the recv step is over -- the next chunk of the running chunked prefill
+            # is fixed for this iteration; the front sees COMMITTED until its start record
+            self._pdflip_d_ext_commit()
 
             # Multi-group runtime (#274): serial lane tick, PD priority
             # (see event_loop_normal). Runs on the default stream before the
@@ -4649,6 +4656,7 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            self._pdflip_d_ext_resolve(batch)  # review A1: a committed rid this batch does not launch is released now
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
@@ -20473,6 +20481,35 @@ class Scheduler(
                 key=int(batch.forward_iter), rids=[req.rid for req in batch.reqs], ready=ev.query
             )
         except Exception:  # noqa: BLE001 -- no event: the result path writes the after-rest as before
+            pass
+
+    def _pdflip_d_ext_commit(self) -> None:
+        """NF-RC30-R6STALE review A1 (SOLL R6/R7, R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): called at the END of
+        the recv step (aborts applied). A running chunked prefill (``chunked_req``) is continued by this iteration's batch:
+        its next chunk is fixed now, before a probe answer sent in this recv step can lead the front to a verdict. The beacon
+        marks it COMMITTED until that chunk's start record. Rank-local, no collective, no sync; the front decides."""
+        b = self.pdflip_d_ext_beacon
+        if b is None:
+            return
+        try:
+            cr = getattr(self, "chunked_req", None)
+            rid = getattr(cr, "rid", None) if cr is not None else None
+            if rid:
+                b.commit_next(rids=[rid])
+        except Exception:  # noqa: BLE001 -- an instrument never stops the scheduler
+            pass
+
+    def _pdflip_d_ext_resolve(self, batch) -> None:
+        """NF-RC30-R6STALE review A1: the batch is built -- a committed rid it does not launch (held, parked, aborted) gets
+        its real free back, so the marker never outlives its iteration."""
+        b = self.pdflip_d_ext_beacon
+        if b is None:
+            return
+        try:
+            launched = ([req.rid for req in batch.reqs]
+                        if batch is not None and batch.forward_mode.is_extend() else [])
+            b.resolve_commit(launched=launched)
+        except Exception:  # noqa: BLE001
             pass
 
     def _pdflip_d_ext_poll(self) -> None:

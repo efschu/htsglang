@@ -7,8 +7,8 @@ minus the batch's gpu-ms): +6 ms, none (abort landed during chunk 1), +1 ms, +36
 after the verdict and D took every abort only after its next forward.
 
 Green tests pin what the fix guarantees (R6 danger direction "rest too small -> flip missing", SOLL example 7 both ways).
-``xfail(strict=True)`` tests name the open findings (Auflagen A1-A4 of the review): they turn red-on-pass when a fix lands, so
-the fixer has to flip them consciously.
+The tests named after Auflagen A1-A4 were ``xfail(strict=True)`` at f79f763480; the author's fix (21.10.) turned them green and
+removed the markers (A1: the test now also models D's COMMITTED marker of its recv step, the fix's D signal).
 """
 from __future__ import annotations
 
@@ -108,9 +108,7 @@ def test_ranks_launch_skew_min_free_is_the_launched_chunk(tmp_path):
     assert got[1:] == (2185, 0)
 
 
-# ------------------------------------------------------------------------------------------- xfail: open findings (Auflagen)
-@pytest.mark.xfail(strict=True, reason="Auflage A1 (review): chunk-boundary window -- D launches the last chunk before any abort "
-                                       "can land (live 42-671: +6 ms), R6 still counts it")
+# ------------------------------------------------------------------------------------------- Auflagen A1-A4 (fixed 21.10., markers removed)
 def test_a1_chunk_boundary_last_chunk_counts_nothing(monkeypatch, caplog, tmp_path):
     """Live 42-671 (07:51:27,475): u=4681 halb, chunk 1 = 2496 ended (TP0 87.424, polled), chunk 2 = 2185 = the whole remainder,
     not yet noted; the gross member 42-673 (6792 at X 6247) arrived on a D-probe answered at D's pass end. D's next pass launches
@@ -122,14 +120,29 @@ def test_a1_chunk_boundary_last_chunk_counts_nothing(monkeypatch, caplog, tmp_pa
     f = _front_live(now, tmp_path, member_u=6792, ended=False, rest_start=4681, ext_len=2496, x=6247, half_x=3123,
                     klass="halb")
     end_forward(f, RID_K)                                       # chunk 1 done, chunk 2 not launched yet: the pass boundary
+    # Fix A1 (author, 21.10.): D's recv step is over -- its running chunked_req's next chunk is fixed for this iteration, the
+    # rank marks it COMMITTED (Scheduler._pdflip_d_ext_commit) before the probe answer can lead to a verdict
+    ws, _ev = f._test_running[RID_K]
+    for w in ws:
+        w.commit_next(rids=[RID_K])
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
         running = f._dc_carried_running()
-        f._decode_collect(now)
+        got = f._decode_collect(now)
     assert running == 0, running
+    assert got == "hold", (got, _sv(caplog))                    # the final verdict waits for the start record (one D iteration)
     assert not any("R6-REDIRECT" in m for m in caplog.messages)
+    assert f.counters["r6_commit_pending"] == 1          # (the gross member's R4 wait is COLLECT anyway: nothing to hold)
+    # D launches chunk 2 (= the whole remainder): its start record gives free 0 -> nothing of it is counted, no redirect;
+    # the gross member alone waits its T_halb (R4, 3.9 s < 4.5 s)
+    _launch_next_chunk(f, RID_K, rest=2185, ext_len=2185)
+    caplog.clear()
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        assert f._decode_collect(now) == "hold"
+    assert not any("R6-REDIRECT" in m for m in caplog.messages) and f.counters["r6_redirected"] == 0
+    assert f.counters["r6_rest_in_flight"] >= 1
 
 
-@pytest.mark.xfail(strict=True, reason="Auflage A2 (review): MIN over ranks takes a lagging rank's record of an EARLIER leg")
 def test_a2_free_min_ignores_a_rank_record_from_before_the_grant(tmp_path):
     """Park-handback / resume re-grant of the same rid: leg 1 ended on both ranks (free 0). Leg 2 granted at t=2 s; rank A noted its
     first extend (rest 3000, chunk 1000 -> free 2000), rank B (ms behind in the same iteration) still holds its leg-1 record.
@@ -149,7 +162,6 @@ def test_a2_free_min_ignores_a_rank_record_from_before_the_grant(tmp_path):
     assert dxb.free_of(reading, "r", 2.0) == 2000
 
 
-@pytest.mark.xfail(strict=True, reason="Auflage A3 (review): R1u ignores the member's share of the IN-FLIGHT chunk")
 def test_a3_r1u_member_share_of_the_in_flight_chunk_is_not_new(monkeypatch, caplog, tmp_path):
     """R1u ("S = die neu zu rechnenden Token"): run A (N=10000, D's rest 3911: chunk [6089,7089) in flight, free [7089,10000) =
     2911) and halb member B of the same session probed at depth 6089 (before A's chunk), common prefix 7089, N_B 9089 -> u_B 3000.
@@ -184,8 +196,6 @@ def test_a3_r1u_member_share_of_the_in_flight_chunk_is_not_new(monkeypatch, capl
     assert dc == "hold", (dc, _sv(caplog))
 
 
-@pytest.mark.xfail(strict=True, reason="Auflage A4 (review): R6-NOT-STARTED says 'D has not begun' for a STARTED prefill whose "
-                                       "chunk is in flight (granted > free)")
 def test_a4_r6_not_started_is_not_logged_for_a_started_prefill(monkeypatch, caplog, tmp_path):
     """Live 48-687 at 11,134: granted 3280, chunk 1 (2496) in flight, free 784. The row HAS begun on D; v4 makes running (784) <
     granted (3280), so ``_dc_carried_running`` names it ``R6-NOT-STARTED ... D has not begun`` (counter r6_not_started_skipped) --

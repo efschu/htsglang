@@ -176,4 +176,120 @@ def test_r1u_uses_the_counted_free_piece(monkeypatch, tmp_path):
         f._dc_carried_running()
     assert f._r6_counted == {RID_RUN: U_RUN - CHUNK1}
     assert f._r6_in_flight == {RID_RUN: CHUNK1}
-    assert "len(ia) - int(rest)" in __import__("inspect").getsource(F.Front._r1u_running)
+    assert "len(ia) - free" in __import__("inspect").getsource(F.Front._r1u_running)
+
+
+# ------------------------------------------------------------------------------------------------ review Auflage A1 (D commit)
+def test_a1_live_48_687_at_14_395_commit_marker_holds_the_d_verdict_until_chunk2_starts(monkeypatch, caplog, tmp_path):
+    """Review A1, live 48-687: the SET-REPROBE answer left D's recv step at 14.395 -- chunk 1 had ended (polled: free 784), chunk
+    2 (784) not yet launched (device start 14.403). D's recv step marked the chunked_req COMMITTED: the front counts nothing of
+    it and HOLDS the final verdict (here D_AFTER_TIMER, T_halb over) one tick instead of deciding on a free that D is about to
+    launch; chunk 2's start record (free 0) then lets the set go to D (R3) -- no flip under X (R7), no redirect."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_48(now, tmp_path, chunk2_launched=False, waited=6.8)
+    ws, ev = f._test_running[RID_RUN]
+    ev["done"] = True
+    for w in ws:
+        w.poll_done()                                   # chunk 1 ended: free 784 (the v4 reading the review measured)
+        w.commit_next(rids=[RID_RUN])                   # end of D's recv step: chunk 2 is fixed
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        assert f._decode_collect(now) == "hold"
+    sv = _verdicts(caplog)
+    assert sv and all("verdict=COLLECT" in m and "R6 commit pending" in m for m in sv), sv
+    assert f.counters["set_r6_commit_hold"] >= 1 and f.counters["r6_commit_pending"] == 1
+    assert any("R6-COMMIT-PENDING rid=%s" % RID_RUN in m for m in caplog.messages)
+    for w in ws:                                        # D launches chunk 2 = the whole remainder
+        w.note_extend(rids=[RID_RUN], rests=[CHUNK2], extend_lens=[CHUNK2])
+    caplog.clear()
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        f._decode_collect(now)
+    sv = _verdicts(caplog)
+    assert any("verdict=D_AFTER_TIMER" in m and "S=%d" % U_SET in m for m in sv), sv
+    assert f.counters["r6_redirected"] == 0
+
+
+def test_a1_commit_marker_is_released_when_the_batch_does_not_launch_the_rid(tmp_path):
+    """Review A1: the rank's built batch does NOT continue the committed rid (held / parked / aborted): ``resolve_commit`` gives
+    the real free back at once -- the marker never outlives its D iteration. Launched: the start record replaces it."""
+    w = dxb.DExtendBeacon(str(tmp_path / "D-pid1.bin"), clock_ns=lambda: 10**9)
+    w.note_recv(rid=RID_RUN)
+    w.note_extend(rids=[RID_RUN], rests=[U_RUN], extend_lens=[CHUNK1])
+    w.commit_next(rids=[RID_RUN])                       # recv step ends while chunk 1's done is not written yet
+    assert _read_full(tmp_path)[1:] == (U_RUN, dxb.COMMITTED)
+    w.note_extend_done(rids=[RID_RUN])                  # the poll after recv writes chunk 1's done: the marker stays
+    assert _read_full(tmp_path)[1:] == (CHUNK2, dxb.COMMITTED)
+    w.resolve_commit(launched=[])
+    assert _read_full(tmp_path)[1:] == (CHUNK2, CHUNK2)
+    w.commit_next(rids=[RID_RUN])
+    w.resolve_commit(launched=[RID_RUN])
+    assert _read_full(tmp_path)[2] == dxb.COMMITTED     # launched: kept until the start record
+    w.note_extend(rids=[RID_RUN], rests=[CHUNK2], extend_lens=[CHUNK2])
+    assert _read_full(tmp_path)[2] == 0
+    w.commit_next(rids=["never-extended"])              # a rid this leg never extended is not marked
+    assert dxb.rid_key("never-extended") not in dxb.read_group_full(str(tmp_path), "D", SID, session_of=lambda pid: SID)
+
+
+def test_a1_ranks_any_committed_among_the_most_launched_is_committed(tmp_path):
+    """R11: rank 1 has committed chunk 2 at the end of its recv step, rank 2 is a few ms behind (still chunk 1 done): COMMITTED.
+    Rank 2 launched chunk 2 already while rank 1 still shows the marker: rank 2 has more launches -> its exact free decides."""
+    ws = [dxb.DExtendBeacon(str(tmp_path / ("D-pid%d.bin" % (r + 1))), clock_ns=lambda: 10**9) for r in range(2)]
+    for w in ws:
+        w.note_recv(rid=RID_RUN)
+        w.note_extend(rids=[RID_RUN], rests=[U_RUN], extend_lens=[CHUNK1])
+        w.note_extend_done(rids=[RID_RUN])
+    ws[0].commit_next(rids=[RID_RUN])
+    reading = dxb.read_group_full(str(tmp_path), "D", SID, session_of=lambda pid: SID)
+    assert dxb.free_of(reading, RID_RUN, 0.5) == dxb.COMMITTED
+    ws[1].commit_next(rids=[RID_RUN])
+    ws[1].note_extend(rids=[RID_RUN], rests=[CHUNK2], extend_lens=[CHUNK2])
+    reading = dxb.read_group_full(str(tmp_path), "D", SID, session_of=lambda pid: SID)
+    assert dxb.free_of(reading, RID_RUN, 0.5) == 0
+
+
+def test_a1_scheduler_marks_at_the_end_of_recv_and_releases_after_the_build():
+    """The rank hooks: both loops call ``_pdflip_d_ext_commit`` after the recv step (after the paused check) and
+    ``_pdflip_d_ext_resolve(batch)`` right after ``get_next_batch_to_run``; the commit marks the scheduler's ``chunked_req``."""
+    import inspect
+    from flliper.srt.managers import scheduler as S
+
+    for loop in (S.Scheduler.event_loop_normal, S.Scheduler.event_loop_overlap):
+        src = inspect.getsource(loop)
+        i_recv, i_c = src.index("self.process_input_requests(recv_reqs)"), src.index("self._pdflip_d_ext_commit()")
+        i_b, i_r = src.index("self.get_next_batch_to_run("), src.index("self._pdflip_d_ext_resolve(batch)")
+        assert i_recv < src.index("self._engine_paused") < i_c < i_b < i_r
+    calls = []
+    fake = type("Sch", (), {})()
+    fake.pdflip_d_ext_beacon = type("B", (), {"commit_next": lambda self, rids: calls.append(("c", rids)),
+                                              "resolve_commit": lambda self, launched: calls.append(("r", launched))})()
+    fake.chunked_req = type("R", (), {"rid": RID_RUN})()
+    S.Scheduler._pdflip_d_ext_commit(fake)
+    batch = type("Bt", (), {"reqs": [type("R", (), {"rid": "x"})()],
+                            "forward_mode": type("M", (), {"is_extend": lambda self: True})()})()
+    S.Scheduler._pdflip_d_ext_resolve(fake, batch)
+    S.Scheduler._pdflip_d_ext_resolve(fake, None)
+    fake.chunked_req = None
+    S.Scheduler._pdflip_d_ext_commit(fake)
+    assert calls == [("c", [RID_RUN]), ("r", ["x"]), ("r", [])]
+
+
+def test_a1_a_stale_commit_marker_holds_nothing_and_is_named(monkeypatch, caplog, tmp_path):
+    """Liveness guard (not a decision clock): a COMMITTED marker D never resolves (its loop stopped between recv and launch) holds
+    the verdict no longer than ``R6_COMMIT_STALE_S``; then it is named (warning) and counts as nothing P can get."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_48(now, tmp_path, chunk2_launched=False, waited=6.8)
+    ws, ev = f._test_running[RID_RUN]
+    ev["done"] = True
+    for w in ws:
+        w.poll_done()
+        w.commit_next(rids=[RID_RUN])
+    monkeypatch.setattr(F.Front, "R6_COMMIT_STALE_S", -1.0)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        f._decode_collect(now)
+    assert f.counters["r6_commit_stale"] >= 1 and f.counters["set_r6_commit_hold"] == 0
+    assert any("R6-COMMIT-STALE rid=%s" % RID_RUN in m for m in caplog.messages)
+    assert any("verdict=D_AFTER_TIMER" in m for m in _verdicts(caplog))

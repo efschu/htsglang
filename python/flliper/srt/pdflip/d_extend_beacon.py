@@ -69,6 +69,21 @@ page). v4 adds ``free`` to every record: the tokens of the request NO forward ha
 ``rest`` keeps its meaning for the readers that ask "does D still compute it" (R6k finish hold, NF-1b ``_d_extending_rids``).
 Over the ranks ``free`` is the MIN: chunk boundaries are group-agreed (#794 GROUP-NARROWED, every rank cuts the same number) and
 a forward one rank launched runs on every rank (its collectives), so those tokens are D's on all of them.
+
+Review NF-RC30-R6STALE (21.10., Auflagen A1/A2; the v4 layout below was never booted, it replaces the first v4 draft):
+- A1 (chunk-boundary window): D answers a probe in its recv step, BEFORE it builds and launches the next chunk of a running
+  chunked prefill (``Scheduler.event_loop_*``: recv -> poll -> get_next_batch_to_run -> run_batch/note_extend). A verdict made
+  on that answer saw ``free`` = the rest after chunk k while D launched chunk k+1 in the same iteration, before any abort could
+  land (live 42-671: +6 ms, 48-687: +1 ms, 50-698: +36 ms). Now the rank marks, at the END of its recv step (aborts applied),
+  every rid whose next chunk is fixed (``commit_next``: the scheduler's ``chunked_req``): its records carry ``free`` =
+  ``COMMITTED`` (-2) until that chunk's start record (``note_extend``) writes the exact free; a rid the built batch does NOT
+  launch is released at once (``resolve_commit``). The front counts and redirects nothing of a committed rid and holds a final
+  set verdict for that one D iteration (R11: D reports a fact, the front decides).
+- A2: every record carries ``n_launch`` (extend batches launched for the rid in this leg); the reader keeps the per-rank values
+  (``_Entry.ranks``) and ``free_of``/``rest_of`` merge ONLY the ranks whose record is of the asked grant (``t_first >=
+  t_grant``) -- a lagging rank's record of an EARLIER leg (park-handback / resume re-grant) no longer pulls free to 0.
+  Merge of ``free``: the ranks with the highest ``n_launch`` decide (the others have not noted the newest chunk yet); any of
+  them COMMITTED -> COMMITTED, else the MIN of their known values.
 """
 from __future__ import annotations
 
@@ -91,8 +106,11 @@ _MAGIC = 0x44455842  # "DEXB"
 _VERSION = 4
 #: one record (v4): rid key (u64, 0 = empty), FIRST extend start (epoch ns), rest tokens D has not computed at the
 #: batch start (-1 = not known), the rank's write counter (newest record of a key wins), free = tokens no forward has been
-#: launched for (NF-RC30-R6STALE; -1 = not known)
-_REC_FMT = "<Qqqqq"
+#: launched for (NF-RC30-R6STALE; -1 = not known, -2 = COMMITTED: the next chunk is fixed, its start record follows),
+#: n_launch = extend batches launched for the rid in this leg on this rank
+_REC_FMT = "<Qqqqqq"
+#: ``free`` of a rid whose next chunk the rank has fixed in its recv step and not launched yet (review A1)
+COMMITTED = -2
 #: v2/v3 record (read only): the v4 record without ``free``
 _REC_FMT_V2 = "<Qqqq"
 #: v1 record (read only): rid key, extend start
@@ -143,6 +161,10 @@ class DExtendBeacon:
         self._after: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         #: v4 (NF-RC30-R6STALE): rid -> the tokens no forward has been launched for (the NEWEST launched batch's after-rest)
         self._free: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+        #: review A1/A2: rid -> extend batches launched in this leg; rids whose next chunk is fixed (COMMITTED); last rest written
+        self._nl: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+        self._committed: set = set()
+        self._last_rest: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         #: NF-R6-REST-EXAKT: batch key (the rank's forward counter) -> (rids, ready) armed behind its forward, oldest first
         self._pending: "collections.OrderedDict[int, Tuple[list, Callable[[], bool]]]" = collections.OrderedDict()
         #: keys whose done the poll already wrote (the result path then writes nothing)
@@ -191,6 +213,7 @@ class DExtendBeacon:
                 self._live[rid] = t_first
                 while len(self._live) > ARMED_CAP:
                     self._live.popitem(last=False)
+                self._nl.pop(rid, None)
             elif rid in self._live:
                 t_first = self._live[rid]
             else:
@@ -231,12 +254,13 @@ class DExtendBeacon:
                 except (TypeError, ValueError):
                     pass
             rest = report
-            try:
-                off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
-                self._head += 1
-                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(rest), int(self._head), int(free))
-                struct.pack_into("<q", self.mm, 12, self._head)
-            except Exception:  # noqa: BLE001
+            # review A1/A2: this launch fixes the chunk the recv step committed -> the exact free replaces the marker
+            self._committed.discard(rid)
+            n = self._nl.pop(rid, 0) + 1
+            self._nl[rid] = n
+            while len(self._nl) > ARMED_CAP:
+                self._nl.popitem(last=False)
+            if not self._put(rid, t_first, rest, free, n):
                 return
 
     def arm_done(self, *, key: int, rids: Iterable[str], ready: Callable[[], bool]) -> None:
@@ -303,22 +327,62 @@ class DExtendBeacon:
             after = q.popleft()[1]
             if not q:
                 self._after.pop(rid, None)
-            # v4: a later launched chunk keeps its own (smaller) free; with none launched it is this batch's after-rest
-            free = self._free.get(rid, after)
-            try:
-                off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
-                self._head += 1
-                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(after), int(self._head),
-                                 int(free))
-                struct.pack_into("<q", self.mm, 12, self._head)
-            except Exception:  # noqa: BLE001
+            # v4: a later launched chunk keeps its own (smaller) free; with none launched it is this batch's after-rest; a rid
+            # whose next chunk the recv step fixed stays COMMITTED (review A1)
+            free = COMMITTED if rid in self._committed else self._free.get(rid, after)
+            if not self._put(rid, t_first, after, free, self._nl.get(rid, 0)):
                 return
+
+    def _put(self, rid: str, t_first: int, rest: int, free: int, n: int) -> bool:
+        """One record of ``rid``; False = the mmap failed (the beacon then writes nothing more this call)."""
+        try:
+            off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
+            self._head += 1
+            struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(rest), int(self._head), int(free),
+                             int(n))
+            struct.pack_into("<q", self.mm, 12, self._head)
+        except Exception:  # noqa: BLE001
+            return False
+        self._last_rest.pop(rid, None)
+        self._last_rest[rid] = int(rest)
+        while len(self._last_rest) > ARMED_CAP:
+            self._last_rest.popitem(last=False)
+        return True
+
+    def commit_next(self, *, rids: Iterable[str]) -> None:
+        """Review A1 (SOLL R6/R7, R11): the END of the rank's recv step -- aborts applied, the next chunk of every ``rids``
+        (the scheduler's running ``chunked_req``) is fixed for this iteration. Its record says COMMITTED until that chunk's
+        start record (``note_extend``) or until ``resolve_commit`` finds it was not launched. Only rids this leg extended."""
+        if self.mm is None:
+            return
+        for rid in rids:
+            t_first = self._live.get(rid)
+            if t_first is None or rid in self._committed:
+                continue
+            self._committed.add(rid)
+            self._put(rid, t_first, self._last_rest.get(rid, -1), COMMITTED, self._nl.get(rid, 0))
+
+    def resolve_commit(self, *, launched: Iterable[str]) -> None:
+        """Review A1: the batch is built. A committed rid it launches keeps the marker until its start record (written in
+        ``run_batch`` a few statements later); a committed rid it does NOT launch (held, parked, aborted) gets its real free
+        back now -- the marker never outlives the iteration that set it."""
+        if self.mm is None or not self._committed:
+            return
+        go = set(launched)
+        for rid in [r for r in self._committed if r not in go]:
+            self._committed.discard(rid)
+            t_first = self._live.get(rid)
+            if t_first is not None:
+                self._put(rid, t_first, self._last_rest.get(rid, -1), self._free.get(rid, -1), self._nl.get(rid, 0))
 
     def note_done(self, *, rid: str) -> None:
         """The rid left this rank (finished, aborted): no later extend re-reports it."""
         self._live.pop(rid, None)
         self._after.pop(rid, None)
         self._free.pop(rid, None)
+        self._nl.pop(rid, None)
+        self._committed.discard(rid)
+        self._last_rest.pop(rid, None)
         self._armed.pop(rid, None)
 
 
@@ -364,6 +428,7 @@ def read_group_full(directory: str, group: str, sid: int,
     if session_of is None:
         from flliper.srt.pdflip.front_health import pid_session as session_of
     out: Dict[int, Tuple[int, int, int]] = {}
+    per: Dict[int, list] = {}
     seen = False
     for path in sorted(glob.glob(os.path.join(directory, f"{group}-pid*.bin"))):
         try:
@@ -375,36 +440,76 @@ def read_group_full(directory: str, group: str, sid: int,
         if magic != _MAGIC or ver not in (1, 2, 3, _VERSION) or session_of(int(pid)) != int(sid):
             continue
         seen = True
-        own: Dict[int, Tuple[int, int, int, int]] = {}  # key -> (seq, t_first, rest, free)
+        own: Dict[int, Tuple[int, int, int, int, int]] = {}  # key -> (seq, t_first, rest, free, n_launch)
         if ver == 1:
             rs = struct.calcsize(_REC_FMT_V1)
             n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // rs))
             for key, t_ns in struct.iter_unpack(_REC_FMT_V1, raw[_HDR_SIZE:_HDR_SIZE + n * rs]):
                 if key and (key not in own or t_ns > own[key][1]):
-                    own[key] = (0, int(t_ns), -1, -1)
+                    own[key] = (0, int(t_ns), -1, -1, 0)
         elif ver in (2, 3):
             rs = struct.calcsize(_REC_FMT_V2)
             n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // rs))
             for key, t_ns, rest, seq in struct.iter_unpack(_REC_FMT_V2, raw[_HDR_SIZE:_HDR_SIZE + n * rs]):
                 if key and (key not in own or seq > own[key][0]):
-                    own[key] = (int(seq), int(t_ns), int(rest), -1)
+                    own[key] = (int(seq), int(t_ns), int(rest), -1, 0)
         else:
             n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // _REC_SIZE))
-            for key, t_ns, rest, seq, free in struct.iter_unpack(_REC_FMT, raw[_HDR_SIZE:_HDR_SIZE + n * _REC_SIZE]):
+            for key, t_ns, rest, seq, free, nl in struct.iter_unpack(_REC_FMT, raw[_HDR_SIZE:_HDR_SIZE + n * _REC_SIZE]):
                 if key and (key not in own or seq > own[key][0]):
-                    own[key] = (int(seq), int(t_ns), int(rest), int(free))
-        for key, (_seq, t_ns, rest, free) in own.items():
-            prev = out.get(key)
-            # review A2b (R11): the start stamp and the rest are merged SEPARATELY -- the later start never decides the rest;
-            # the MAX rest over the ranks does (a rank that has not finished keeps it alive). v4: ``free`` is the MIN over the
-            # ranks that report one (chunk boundaries are group-agreed; a launched forward runs on every rank)
-            if prev is None:
-                out[key] = (t_ns, rest, free)
-            else:
-                pf = prev[2]
-                mf = free if pf < 0 else (pf if free < 0 else min(pf, free))
-                out[key] = (max(prev[0], t_ns), max(prev[1], rest), mf)
+                    own[key] = (int(seq), int(t_ns), int(rest), int(free), int(nl))
+        for key, (_seq, t_ns, rest, free, nl) in own.items():
+            per.setdefault(key, []).append((t_ns, rest, free, nl))
+    for key, ranks in per.items():
+        # review A2b (R11): the start stamp and the rest are merged SEPARATELY -- the later start never decides the rest;
+        # the MAX rest over the ranks does (a rank that has not finished keeps it alive). ``free``: ``_merge_free``. The
+        # per-rank values ride along (``ranks``) so a reader can keep only the ranks of ITS grant (review A2)
+        out[key] = _Entry((max(r[0] for r in ranks), max(r[1] for r in ranks), _merge_free(ranks)), ranks)
     return out if seen else None
+
+
+class _Entry(tuple):
+    """``(first extend start ns, rest, free)`` -- a plain tuple to every reader -- plus ``ranks``: the per-rank
+    ``(t_first, rest, free, n_launch)`` it was merged from (review A2)."""
+
+    def __new__(cls, vals, ranks):
+        obj = super().__new__(cls, vals)
+        obj.ranks = tuple(ranks)
+        return obj
+
+
+def _merge_free(ranks) -> int:
+    """Review A1/A2 (R11): the ranks that noted the most chunks of this leg decide (a rank with fewer has not noted the newest
+    launch yet; chunk boundaries are group-agreed, #794); any of them COMMITTED -> COMMITTED, else the MIN of their known
+    values; nothing known -> -1."""
+    if not ranks:
+        return -1
+    top = max(int(r[3]) for r in ranks)
+    cands = [r for r in ranks if int(r[3]) == top]
+    if any(int(r[2]) == COMMITTED for r in cands):
+        return COMMITTED
+    known = [int(r[2]) for r in cands if int(r[2]) >= 0]
+    return min(known) if known else -1
+
+
+def _of_grant(reading, rid: str, t_grant_s: float):
+    """Review A2: ``(rest, free)`` of ``rid`` over the ranks whose record is of the grant at ``t_grant_s`` (first extend at or
+    after it); None = no such rank. A reading without per-rank values (a stub, a caller's tuple) uses the merged entry."""
+    v = reading.get(rid_key(rid)) if reading else None
+    if v is None:
+        return None
+    t0 = int(float(t_grant_s) * 1e9)
+    ranks = getattr(v, "ranks", None)
+    if ranks:
+        mine = [r for r in ranks if int(r[0]) >= t0]
+        if not mine:
+            return None
+        return max(int(r[1]) for r in mine), _merge_free(mine)
+    if not isinstance(v, tuple):
+        return None if int(v) < t0 else (-1, -1)
+    if int(v[0]) < t0:
+        return None
+    return int(v[1]), (int(v[2]) if len(v) >= 3 else -1)
 
 
 def read_group(directory: str, group: str, sid: int,
@@ -430,9 +535,12 @@ def free_of(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) ->
     rest = rest_of(reading, rid, t_grant_s)
     if rest is None:
         return None
-    v = reading.get(rid_key(rid)) if reading else None
-    if isinstance(v, tuple) and len(v) >= 3 and int(v[2]) >= 0:
-        return min(int(v[2]), int(rest))
+    g = _of_grant(reading, rid, t_grant_s)
+    free = -1 if g is None else int(g[1])
+    if free == COMMITTED:
+        return COMMITTED  # review A1: the next chunk is fixed on D, its exact free follows with its start record
+    if free >= 0:
+        return min(free, int(rest))
     return int(rest)
 
 
@@ -445,7 +553,7 @@ def started(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) ->
 def rest_of(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) -> Optional[int]:
     """S56: D's REAL rest of ``rid`` (tokens not yet computed, as the newest extend batch saw it) when D began it at or
     after its grant; None = not started, or started without a reported rest."""
-    e = _entry(reading, rid)
-    if e is None or e[0] < int(float(t_grant_s) * 1e9) or e[1] < 0:
+    g = _of_grant(reading, rid, t_grant_s)
+    if g is None or g[0] < 0:
         return None
-    return int(e[1])
+    return int(g[0])
