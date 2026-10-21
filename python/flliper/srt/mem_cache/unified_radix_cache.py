@@ -6173,14 +6173,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 host_lru = self.host_lru_lists[ComponentType.MAMBA]
                 if not host_lru.in_list(node):
                     host_lru.insert_mru(node)
-        UnifiedRadixCache._pdflip_anchor_only_n += 1
-        n = UnifiedRadixCache._pdflip_anchor_only_n
-        if n <= 16 or n % 64 == 0:
+        # E1-WITNESS (rc30 21.10.): the read has its OWN counter -- it shared ``_pdflip_anchor_only_n`` with the
+        # ANCHOR-ONLY BACKUP line, so after 16 backups no read was printed any more (rc30 D: one read line in 20 min);
+        # a miss is named like S109R's (held / written_here / branch point), every miss printed
+        n = getattr(UnifiedRadixCache, "_pdflip_aor_read_n", 0) + 1
+        UnifiedRadixCache._pdflip_aor_read_n = n
+        how = "attach"
+        held = written = None
+        if not ok:
+            held = UnifiedRadixCache._s109r_anchor_held(self, last_hash)
+            written = last_hash in (self.__dict__.get("_s109r_written") or ())
+            how = UnifiedRadixCache._s109r_miss_class(node, req, int(depth), held, bool(written))
+        if n <= 16 or n % 64 == 0 or not ok:
             logger.info(
-                "PDFLIP ANCHOR-ONLY-READ n=%d rid=%s depth=%d anchor_was=%d attached=%d row=%s site=%s "
-                "(the KV was in the tree, its Mamba anchor only in the store: only the blob is read)",
+                "PDFLIP ANCHOR-ONLY-READ n=%d rid=%s depth=%d anchor_was=%d attached=%d row=%s site=%s how=%s "
+                "defect=%d held=%s written_here=%s (the KV was in the tree, its Mamba anchor only in the store: only "
+                "the blob is read; defect=1 only where an anchor existed)",
                 n, getattr(req, "rid", "?"), int(depth), int(anchor_was), int(ok),
-                int(idx[0]) if ok else -1, site)
+                int(idx[0]) if ok else -1, site, how,
+                int((not ok) and how in UnifiedRadixCache.S109R_DEFECT_HOWS),
+                "-" if held is None else int(bool(held)), "-" if written is None else int(bool(written)))
         return int(depth) if ok else 0
 
     def pdflip_anchor_only_read_at(self, req, depth: int, site: str = "tf_floor") -> int:
