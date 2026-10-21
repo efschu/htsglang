@@ -151,7 +151,7 @@ def pp0_verdicts_at_admit(scheduler, rids: Sequence[str], skip_verdict) -> List[
     """PP0, ``pdflip_store_told.pp0_publish``, right after this pass's Admits are formed and BEFORE the chain
     send: the verdicts of the image requests admitted in this pass whose told covers every image position.
     ``skip_verdict(scheduler, req)`` is ``vision_rank_runner.stage_skip_verdict`` (the plan's own SKIP rule,
-    injected so this module stays import-light). Each verdict is marked sent and absorbed on PP0 here (PP0
+    injected so this module stays import-light). Each verdict is marked sent and released on PP0 here (PP0
     does not dispatch its own wire tail); the caller appends them to the chain. Never raises into the pass."""
     if not getattr(scheduler, "_pdflip_vision_gate", False) or getattr(scheduler, "pdflip_dormant", False):
         return []
@@ -175,17 +175,28 @@ def pp0_verdicts_at_admit(scheduler, rids: Sequence[str], skip_verdict) -> List[
             continue
         if not verdict or verdict[0] != "skip":
             continue
-        sent.add(rid)
+        # review A2/H1: PP0 released <=> the verdict is on the wire. Only non-raising container ops between the
+        # append and the release (no absorb() call, no log line): whatever leaves this function released on PP0
+        # is in ``out``, and the caller appends ``out`` unconditionally.
         item = PdFlipVisionVerdict(rid=rid)
-        absorb(scheduler, item)
         out.append(item)
+        sent.add(rid)
+        released.add(rid)
+        _log_at_admit(scheduler, rid, verdict)
+    return out
+
+
+def _log_at_admit(scheduler, rid: str, verdict) -> None:
+    """The VERDICT-AT-ADMIT line; a failing log never undoes the release (review A2)."""
+    try:
         n = getattr(scheduler, "_pdflip_vision_at_admit_n", 0) + 1
         scheduler._pdflip_vision_at_admit_n = n
         logger.info("%s rid=%s covered=%s src=%s (n=%d): the admitted told covers every image position -- the "
                     "verdict rides THIS pass's chain beside the Admit, every stage admits it in this pass",
                     W_AT_ADMIT, rid, verdict[1] if len(verdict) > 1 else "?",
                     verdict[2] if len(verdict) > 2 else "?", n)
-    return out
+    except Exception:  # noqa: BLE001 -- an instrument
+        pass
 
 
 def take_verdicts(scheduler) -> List[PdFlipVisionVerdict]:

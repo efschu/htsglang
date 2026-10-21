@@ -14,9 +14,9 @@ the same pass, nor the Admit variants other than the plain paced one. Pinned her
       verdict follows PP0's RECORDED told (``_pdflip_store_told``), never the wire object's number alone;
   R4. a raise inside the injected SKIP rule: no verdict, no ``sent``/``released`` mark, the plan's vision pass queues it
       as before (one pass later, never never);
-  R5. HARDENING (xfail strict, review note H1): PP0 must never keep a rid released whose verdict did not reach the wire;
-      today ``pp0_verdicts_at_admit`` absorbs on PP0 BEFORE the caller appended the verdict, so a raise after the
-      absorb (only the log call follows it -- practically unreachable) would split PP0 from the followers;
+  R5. HARDENING (review note H1, fixed by A2): PP0 must never keep a rid released whose verdict did not reach the wire;
+      before A2 ``pp0_verdicts_at_admit`` absorbed on PP0 BEFORE the verdict was in the returned list, so a raise after
+      the absorb (only the log call followed it) would have split PP0 from the followers;
   R6. #PDRAIN: an entry whose after-commit never ran (the receive raised) never produces a stale line on a later
       non-blocking pass, and a later blocking pass logs its own numbers.
 """
@@ -202,8 +202,6 @@ def test_r4_skip_rule_raises_old_path_takes_over():
 # R5. hardening H1 (not a live defect: only the log call follows the absorb)
 
 
-@pytest.mark.xfail(strict=True, reason="review H1: absorb on PP0 precedes the wire append; a raise in between "
-                                       "leaves PP0 released and the followers without a verdict")
 def test_r5_pp0_released_implies_verdict_on_the_wire(monkeypatch):
     req = base._vision_req()
     s = base._sched(req)
