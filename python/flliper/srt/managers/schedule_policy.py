@@ -1024,7 +1024,7 @@ _H105D_REFUSED = {"n": 0}
 _H105G_DROPPED = {"n": 0}
 
 
-def _h105g_load_back_target_lost(tree_cache, best_match_node) -> str | None:
+def _h105g_load_back_target_lost(tree_cache, best_match_node, req=None) -> str | None:
     """H105g: why ``best_match_node`` is no load-back source any more, or None while it still is.
 
     THE METAL (NF rc29 a773b4ebc4, D log boot_..._a773b4ebc4_1021_022209.D.log 45873-45937, TP0 02:31:11-13Z,
@@ -1040,7 +1040,13 @@ def _h105g_load_back_target_lost(tree_cache, best_match_node) -> str | None:
     kept it as a side effect).
 
     The same walk ``FullComponent.build_hicache_transfers(LOAD_BACK)`` asserts on: every evicted node from
-    ``best_match_node`` up to the first device node must still be in the tree and carry its Full host rows."""
+    ``best_match_node`` up to the first device node must still be in the tree and carry its Full host rows.
+
+    S109R (``req`` given): the match accepted ``best_match_node``'s mamba state on the HOST
+    (``mamba_host_hit_length > 0``, set by ``MambaComponent`` exactly when that node's state is host-only); the S109c
+    aux round of the same room step can release it from a DEVICE-KV node (``anchor_dropped``). The load-back would
+    then restore no anchor and the prefix would be clamped and recomputed; the next pass's match reads it from L3
+    instead (``S109R ANCHOR-DEVICE-READ``)."""
     from flliper.srt.mem_cache.unified_cache_components.tree_component import (
         BASE_COMPONENT_TYPE,
     )
@@ -1064,6 +1070,16 @@ def _h105g_load_back_target_lost(tree_cache, best_match_node) -> str | None:
         if cur.component_data[BASE_COMPONENT_TYPE].host_value is None:
             return "no_host_value"
         cur = parent
+    mhit = getattr(req, "mamba_host_hit_length", 0) if req is not None else 0
+    if isinstance(mhit, int) and not isinstance(mhit, bool) and mhit > 0 and best_match_node is not None:
+        from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+        try:
+            mcd = best_match_node.component_data[ComponentType.MAMBA]
+        except (KeyError, IndexError, TypeError, AttributeError):
+            mcd = None   # no mamba component on this tree: no anchor to lose
+        if mcd is not None and getattr(mcd, "value", None) is None and getattr(mcd, "host_value", None) is None:
+            return "anchor_dropped"
     return None
 
 
@@ -1077,7 +1093,7 @@ def _h105g_target_kept(adder, req, has_extent, site: str) -> bool:
     Never a rank-local exit: the answer rides the vote the caller gathers."""
     if not has_extent:
         return True
-    why = _h105g_load_back_target_lost(adder.tree_cache, req.best_match_node)
+    why = _h105g_load_back_target_lost(adder.tree_cache, req.best_match_node, req)
     if why is None:
         return True
     _H105G_DROPPED["n"] += 1

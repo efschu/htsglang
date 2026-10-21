@@ -106,6 +106,64 @@ def _wire(adder, req, *, drops: bool):
     tc.init_load_back.side_effect = _metal_init_load_back(tc, tc.init_load_back.side_effect)
 
 
+def _wire_anchor(adder, req, *, gdn: bool, drops: bool):
+    """S109R/S109c in the window: the match accepted the load-back source's mamba state on the HOST
+    (``mamba_host_hit_length`` 1 on the GDN rank TP0; the Form A workers hold no recurrent state, 0), and TP0's room
+    eviction runs the S109c aux round, which releases that host anchor (its L3 copy proven). The KV stays intact."""
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+    tc = adder.tree_cache
+    leaf = req.best_match_node
+    mcd = SimpleNamespace(value=None, host_value=torch.tensor([5], dtype=torch.int64))
+    leaf.component_data[ComponentType.MAMBA] = mcd
+    req.mamba_host_hit_length = 1 if gdn else 0
+    tc.anchor_lost_loads = 0
+    real_evict = tc.evict.side_effect
+
+    def _evict(params):
+        res = real_evict(params)
+        if drops:
+            mcd.host_value = None
+        return res
+
+    tc.evict.side_effect = _evict
+    inner = tc.init_load_back.side_effect
+
+    def _ilb(params):
+        if int(getattr(params.req, "mamba_host_hit_length", 0) or 0) > 0 and mcd.value is None \
+                and mcd.host_value is None:
+            tc.anchor_lost_loads += 1   # MambaComponent restores nothing: the prefix is clamped and recomputed
+        return inner(params)
+
+    tc.init_load_back.side_effect = _ilb
+
+
+def _group_anchor():
+    gather = H._Gather()
+    out, adders, reqs = {}, {}, {}
+    with patch(H.TOKEN_CUT, return_value=True):
+        for r in range(3):
+            adders[r] = H._adder(r, gather, deliverable=H.REPORTED_EVICTABLE)
+            reqs[r] = H._req(r)
+            _wire_anchor(adders[r], reqs[r], gdn=r == 0, drops=r == 0)
+
+        def _run(r):
+            try:
+                out[r] = adders[r].add_one_req(reqs[r], truncation_align_size=None)
+            except BaseException as e:  # noqa: BLE001
+                out[r] = e
+
+        with patch.object(sp, "_pp_load_back_extent", side_effect=lambda q: q._h105d_extent), patch(
+            "flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"
+        ):
+            ts = [threading.Thread(target=_run, args=(r,)) for r in range(3)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+    return out, adders, gather
+
+
 def _group(*, drop_on=(0,)):
     """One add_one_req for the rid on TP0/1/2 at once (room makeable on every rank); TP ranks in ``drop_on``
     drop the load-back source inside their room eviction."""
@@ -179,9 +237,45 @@ class LoadBackTargetDroppedTest(unittest.TestCase):
     def test_mutant_every_evicted_source_counts_as_lost_never_admits(self):
         """Danger direction 2: a predicate that names a LIVE host-backed source lost (e.g. ``node.evicted``
         alone) keeps every host hit queued forever -- the kept-source test must catch it."""
-        with patch.object(sp, "_h105g_load_back_target_lost", side_effect=lambda tc, n: "evicted"):
+        with patch.object(sp, "_h105g_load_back_target_lost", side_effect=lambda tc, n, req=None: "evicted"):
             out, _adders, _reqs, _gather = _group(drop_on=())
         self.assertEqual(set(out.values()), {AddReqResult.NO_TOKEN}, out)
+
+
+class AnchorDroppedInWindowTest(unittest.TestCase):
+    def setUp(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        sp._H105D_REFUSED["n"] = 0
+        if hasattr(sp, "_H105G_DROPPED"):
+            sp._H105G_DROPPED["n"] = 0
+
+    def test_s109c_releases_the_matched_host_anchor_in_the_room_step_the_group_waits(self):
+        """RED before the S109R extension: TP0 loads back with its anchor gone (the prefix is clamped and recomputed,
+        ``anchor_lost_loads`` 1). GREEN: TP0 votes NO_TOKEN (``why=anchor_dropped``), every rank keeps the rid; the
+        next pass's match reads the anchor from L3 (S109R)."""
+        out, adders, gather = _group_anchor()
+        for r in range(3):
+            self.assertEqual(out[r], AddReqResult.NO_TOKEN, f"TP{r}: {out[r]!r}")
+            self.assertEqual(adders[r].tree_cache.load_backs, [])
+            self.assertEqual(adders[r].tree_cache.anchor_lost_loads, 0)
+        self.assertEqual(gather.calls, {0: 2, 1: 2, 2: 2})
+        self.assertEqual(sp._H105G_DROPPED["n"], 1)
+
+    def test_predicate_names_only_a_matched_host_anchor_that_is_gone(self):
+        from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+        tc = SimpleNamespace(root_node=object(), page_size=1)
+        dev = SimpleNamespace(evicted=False, parent=None, component_data={})
+        m = SimpleNamespace(value=None, host_value=None)
+        node = SimpleNamespace(evicted=False, parent=dev, component_data={ComponentType.MAMBA: m})
+        self.assertEqual(sp._h105g_load_back_target_lost(tc, node, SimpleNamespace(mamba_host_hit_length=1)),
+                         "anchor_dropped")
+        # the false-positive direction: no host hit on the anchor (a worker, or a device state) -> never lost
+        self.assertIsNone(sp._h105g_load_back_target_lost(tc, node, SimpleNamespace(mamba_host_hit_length=0)))
+        m.host_value = torch.tensor([3])
+        self.assertIsNone(sp._h105g_load_back_target_lost(tc, node, SimpleNamespace(mamba_host_hit_length=1)))
+        m.host_value, m.value = None, torch.tensor([4])
+        self.assertIsNone(sp._h105g_load_back_target_lost(tc, node, SimpleNamespace(mamba_host_hit_length=1)))
 
 
 # ---- the predicate on a real UnifiedRadixCache ------------------------------------------------------------------

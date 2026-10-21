@@ -1715,6 +1715,31 @@ def _pdflip_prefetch_span_start(sched, req, matched_len: int) -> int:
     return int(anchor)
 
 
+def _s109r_admission_anchor_read(sched, req) -> bool:
+    """S109R (NF rc29, 21.10.): at the ADMISSION match, an anchor that lives only on L3 -- the S109c aux round released
+    the host copy of a device-KV node after both its KV pages and its anchor had their L3 copy -- is read back (e1 /
+    ``UnifiedRadixCache.pdflip_anchor_only_read``, for that node shape the S109R device read) and the request is matched
+    again. Without it the match fell back to the last state above the node and every token behind it was recomputed
+    whenever the loss stayed under X (above X, S59 re-reads; below, nobody did). e1 asked only at intake and at the
+    deferral retry; a request waiting for D room lost the anchor in between (H105g ``anchor_dropped``) and never asked.
+
+    Group D (no PP) only -- the PP form's floors are PP0's told (S43/S90b read there). Rank-local like e1: only a
+    GDN-holding rank reads, it only raises its own match, the group MIN stays the verdict (SOLL R11). One read per
+    depth per request (e1's own mark). Returns True when the request was matched again."""
+    ps = getattr(sched, "ps", None)
+    if ps is not None and int(getattr(ps, "pp_size", 1) or 1) > 1:
+        return False
+    tc = getattr(sched, "tree_cache", None)
+    fn = getattr(tc, "pdflip_anchor_only_read", None)
+    if not callable(fn):
+        return False
+    got = fn(req)
+    if not isinstance(got, int) or isinstance(got, bool) or got <= 0:
+        return False   # nothing attached (a double that answers every call is no attach either)
+    req.init_next_round_input(tc)
+    return True
+
+
 _PRESENCE_PROBE_N = [0]
 
 
@@ -18057,6 +18082,9 @@ class Scheduler(
 
             _ir_t0 = time.perf_counter()  # xsn326: the match/load_back of a re-admission
             req.init_next_round_input(self.tree_cache)
+            # S109R: the admission match itself reads an anchor only L3 still holds (S109c released its host copy
+            # while the request waited) -- before, only intake and the deferral retry asked (e1)
+            _s109r_admission_anchor_read(self, req)
             if getattr(self, "_pdflip_post_wake_pass_n", None) is not None:
                 _irl = getattr(self, "_pdflip_gnbp_initr", None)
                 if _irl is None:
