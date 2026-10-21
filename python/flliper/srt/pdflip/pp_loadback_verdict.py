@@ -168,8 +168,13 @@ class _State:
         self.wait_n = 0
 
 
+# 27B DUAL (port fix 21.10., metal 00:39:28Z dual NVFP4 PP1 AgreedRoomShort "LB-VERDICT ROW-ROOM SHORT"): an NF-only P-group
+# PP protocol; the 27B dual layout ran without it. Under FLLIPER_PDFLIP_DUAL_LAYOUT=1 (rank-uniform env) an UNSET switch is OFF.
 def enabled() -> bool:
-    return (os.environ.get(ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    raw = (os.environ.get(ENV, "") or "").strip().lower()
+    if not raw:
+        return (os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() != "1"
+    return raw not in ("0", "false", "no", "off")
 
 
 def arm(scheduler) -> bool:

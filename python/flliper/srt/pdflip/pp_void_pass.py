@@ -74,9 +74,14 @@ SEEN_ATTR = "_pp_void_pass_seen"  # census
 QUEUE0_ATTR = "_pp_void_pass_queue0"  # the waiting queue's rid order right before this pass's plan
 
 
+# 27B DUAL (port fix 21.10., metal 00:39:28Z dual NVFP4 PP1 AgreedRoomShort "LB-VERDICT ROW-ROOM SHORT"): an NF-only P-group
+# PP protocol; the 27B dual layout ran without it. Under FLLIPER_PDFLIP_DUAL_LAYOUT=1 (rank-uniform env) an UNSET switch is OFF.
 def enabled(env=None) -> bool:
     e = os.environ if env is None else env
-    return (e.get(ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+    raw = (e.get(ENV, "") or "").strip().lower()
+    if not raw:
+        return (e.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() != "1"
+    return raw not in ("0", "false", "no", "off")
 
 
 class VoidPassLate(RuntimeError):

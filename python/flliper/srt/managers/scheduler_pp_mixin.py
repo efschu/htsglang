@@ -7081,6 +7081,8 @@ class SchedulerPPMixin:
         """PR: one non-blocking step of the PP room vote (pdflip/pp_room_vote.py)."""
         if int(getattr(self.ps, "pp_size", 1) or 1) <= 1 or not self._pdflip_vote_is_wire_rank():
             return
+        if (os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+            return  # 27B DUAL (port fix 21.10.): the dual P keeps its 27B admission, no NF room vote (rank-uniform env)
         from flliper.srt.managers.pdflip_told_fallback import GlooAckChannel, _world_ranks
         from flliper.srt.pdflip import pp_room_vote as _pr
         from flliper.srt.pdflip.pp_slot_fidelity import FLOOR_LOCAL_PP_ATTR

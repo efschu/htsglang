@@ -135,3 +135,34 @@ class DualDefaultsKept(unittest.TestCase):
         s = _src(os.path.join(_PY, "pdflip", "d_park_runtime.py"))
         self.assertIn('elif str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "")).strip() == "1":   # rank-uniform env\n'
                       '        avail = sched.uniform_min_avail()', s)
+
+
+class DualPGroupProtocolsOff(unittest.TestCase):
+    """Dual NVFP4 metal 21.10. 00:39:28Z: PP1 died with AgreedRoomShort 'LB-VERDICT ROW-ROOM SHORT' (an NF-only P-group
+    protocol that came with the merge). Under the dual layout the NF-only P-group PP protocols are off unless set."""
+
+    def test_nf_p_group_protocols_default_off_under_dual(self):
+        from unittest import mock
+
+        from flliper.srt.pdflip import group_min_strict as gms
+        from flliper.srt.pdflip import pp_loadback_verdict as lbv
+        from flliper.srt.pdflip import pp_void_pass as vp
+        from flliper.srt.pdflip import prefill_oom_retreat as oom
+
+        for env, want in (({}, True), ({"FLLIPER_PDFLIP_DUAL_LAYOUT": "1"}, False)):
+            with mock.patch.dict(os.environ, env, clear=False):
+                for k in (lbv.ENV, vp.ENV, oom.ENV, gms.ENV):
+                    os.environ.pop(k, None)
+                if not env:
+                    os.environ.pop("FLLIPER_PDFLIP_DUAL_LAYOUT", None)
+                self.assertEqual(lbv.enabled(), want)
+                self.assertEqual(vp.enabled(), want)
+                self.assertEqual(oom.enabled(), want)
+                self.assertEqual(gms.enabled(), want)
+        with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", lbv.ENV: "1"}):
+            self.assertTrue(lbv.enabled())   # an explicit switch still wins
+
+    def test_pr_room_vote_hook_is_a_no_op_under_dual(self):
+        s = _src(os.path.join(_PY, "managers", "scheduler_pp_mixin.py"))
+        i = s.index("def _pdflip_pp_room_pass_hook(")
+        self.assertIn('if (os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":\n            return', s[i:i + 800])
