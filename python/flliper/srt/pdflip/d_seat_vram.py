@@ -4078,6 +4078,10 @@ def _kv_streams(sched) -> list:
 
 #: S112b: the survey snapshot of this rank (``d_kv_compact.Snapshot``)
 KV_SNAP_ATTR = "_pdflip_kv_compact_snapshot"
+#: NF-RC31 A: the last STAGED KV-COMPACT pass of this rank's MemSched state (``fr``): ``digest`` (agreed,
+#: replicated -- the only field a decision reads), ``handoff_nodes``, ``queued_here`` (TP0's S39 count, rank-local:
+#: instrument only), ``n``, ``repeats``
+KV_STAGED_MEMO = "compact_staged_memo"
 
 
 def _kv_compact_rank_survey(sched, floor_page: int, snap=None):
@@ -4535,7 +4539,17 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     run_now = _kv_compact_running(sched)
     evicted = (0, 0)
     waits_evict = waits_move = 0
-    if plan.evict_first:
+    # NF-RC31 A (rc30 review Folgefix A; live 07:31:33/07:31:38 TP0 queued_here=1, TP1/TP2 0, one digest): a
+    # STAGED plan whose agreed digest equals the last staged pass's has gained no stage -- had TP0's broadcast
+    # dropped the hand-off on every rank, the handed-off content would have left every device and the agreed
+    # split (part of the digest) would differ. Repeating its ``st == 1`` evictions only clears the device again
+    # for nothing. The decision reads the AGREED digest (dlo == dhi above: replicated), never TP0's queue count
+    # (rank-local: workers queue nothing) -- every rank takes the same branch (SOLL R11 spirit, RAENGE-NIE-UNEINS).
+    memo = fr.get(KV_STAGED_MEMO)
+    staged_repeat = bool(plan.staged and isinstance(memo, dict) and memo.get("digest") == int(digest))
+    if not plan.staged:
+        fr.pop(KV_STAGED_MEMO, None)
+    if plan.evict_first and not staged_repeat:
         # 3. the agreed evictions first (content-agreed; with rank-local page ids "is it
         # room?" is a local question, "always first" is replicated)
         try:
@@ -4553,6 +4567,32 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
                 "%s n=%d: the agreed evictions for S%d did not go through on every rank "
                 "(here: %s) -- device presence of the tree differs" % (
                     KV_COMPACT_MARK, n, jj, "ok" if ok else "failed"))
+    if staged_repeat:
+        # NF-RC31 A: no device clearing again; the hand-off is re-offered to TP0's S39 queue (idempotent, a
+        # worker queues nothing, no device effect) so a node S39 dropped from its queue gets its next chance.
+        # No refusal memo either: the next pass looks again (a landed drop changes the digest).
+        queued = 0
+        try:
+            from flliper.srt.pdflip import forma_l3_subtree as _s39
+
+            queued = int(_s39.queue_for_room(tree, [m.node for m in plan.handoff], "kv_compact") or 0)
+        except Exception as exc:  # noqa: BLE001 -- the hand-off is TP0's queue; a failure stages nothing
+            logger.warning("%s n=%d S39 re-hand-off failed here: %s: %s", KV_COMPACT_MARK, n,
+                           type(exc).__name__, exc)
+        fr["floor"] = None
+        rp_n = int(fr.get("compact_staged_repeat", 0)) + 1
+        fr["compact_staged_repeat"] = rp_n
+        memo["repeats"] = int(memo.get("repeats", 0)) + 1
+        if rp_n <= 16 or (rp_n & (rp_n - 1)) == 0:
+            logger.info(
+                "%s n=%d verdict=staged-repeat want=S%d target=S%d digest=%d skipped_evict_nodes=%d "
+                "handoff_nodes=%d queued_here=%d last_staged_n=%d last_queued_here=%d repeats=%d total=%d -- the "
+                "last staged pass with this digest brought no stage (the hand-off has not left every device: "
+                "the agreed split is unchanged); its st==1 evictions are NOT repeated (decided from the agreed "
+                "digest, the same on every rank -- never from TP0's queue count)",
+                KV_COMPACT_MARK, n, int(want), jj, digest, len(plan.evicts), len(plan.handoff), queued,
+                int(memo.get("n", 0)), int(memo.get("queued_here", 0)), int(memo["repeats"]), rp_n)
+        return None
     if plan.staged:
         # KVZIEL-1021: the room needs store-backed content -- it leaves through the S39 drop at
         # TP0's next broadcast (every rank follows there); this pass evicted what could go now
@@ -4570,6 +4610,10 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         fr.pop("compact_refused", None)
         st_n = int(fr.get("compact_staged", 0)) + 1
         fr["compact_staged"] = st_n
+        # NF-RC31 A: what this staged pass did -- only ``digest`` decides the next pass (replicated); the hand-off
+        # length and TP0's queue count are kept for the instrument
+        fr[KV_STAGED_MEMO] = {"digest": int(digest), "handoff_nodes": len(plan.handoff),
+                              "queued_here": int(queued), "n": int(n), "repeats": 0}
         if st_n <= 16 or (st_n & (st_n - 1)) == 0:
             full_ct = int(KC._full_ct().FULL)
             logger.info(
