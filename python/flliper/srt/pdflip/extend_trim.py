@@ -341,6 +341,16 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 post_mib = cuda.mem_get_info()[0] / MIB
                 cap_post = torch_cap - int(cuda.memory_reserved()) / MIB
             post_mib = min(post_mib, cap_post)
+        # 27B INT8 rc29 metal 21.10. 00:26Z (D TP1 3080: driver free 19.8 MiB, torch allocated 17043 / reserved 18650 MiB):
+        # the chunk's growth is served from torch's OWN free cache first -- reserved-but-unallocated bytes are as fundable
+        # as driver-free ones (the rate is the measured RESERVED growth per row, i.e. what a chunk adds beyond the cache).
+        # Read only, no sync: counting driver free alone voted width 63 with 1.6 GiB idle in the cache, refused every
+        # fresh D extend (Q-710) and -- with no flip under X (SOLL R7) -- hung the server.
+        try:
+            cache_free_mib = max(0.0, (float(cuda.memory_reserved()) - float(cuda.memory_allocated())) / MIB)
+        except Exception:  # noqa: BLE001 -- no reading: driver free alone, as before
+            cache_free_mib = 0.0
+        post_mib = post_mib + cache_free_mib
         cap = rows_cap(post_mib, rate, page_size)
         if cap >= int(configured):
             _CACHE["logged_cap"] = None
@@ -350,7 +360,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
             _CACHE["logged_cap"] = cap
             logger.info(
                 f"{CHUNKING_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
-                f"post={post_mib:.0f} rate={rate:.4f} floor={CHUNKING_FLOOR_MIB:.0f}"
+                f"post={post_mib:.0f} cache_free={cache_free_mib:.0f} rate={rate:.4f} floor={CHUNKING_FLOOR_MIB:.0f}"
                 + ("" if cap_post is None else f" torch_cap={torch_cap:.0f} cap_post={cap_post:.0f}")
                 + ("" if not measure_armed(rank) else
                    f" rate_src={'measured' if rate > start_rate else 'start'} start_rate={start_rate:.4f}")

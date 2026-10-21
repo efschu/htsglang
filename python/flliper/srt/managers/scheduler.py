@@ -15474,7 +15474,20 @@ class Scheduler(
         # `X=` stays the STATIC value (the old readers of this line parse it);
         # `front_x=`/`front_priced=`/`limit=` name what the verdict compared to.
         limit, _front_x, _front_priced = _pdflip_front_x.resolve_limit(req, x, getattr(self, "page_size", None))
+        if _pdflip_front_x.is_measure_barrier(_front_x, _front_priced):
+            _spent_x = _pdflip_front_x.spent_barrier_x(req)
+            if _spent_x is not None:
+                # 27B port fix 21.10.: the measure barrier was refused once (the measure is taken); this re-offer is
+                # bounded by the front's decision X, never the barrier again (SOLL R7: a request under X is D's).
+                # resolve_limit already applied it; named here once per pass.
+                logger.info(
+                    "PDFLIP X-GATE MEASURE-BARRIER-SPENT rid=%s barrier=%s front_x_now=%d limit=%d uncached=%d -- the "
+                    "barrier's own refusal took the measure; the re-offer is bounded by the front's X (SOLL R7)",
+                    str(getattr(req, "rid", "?"))[:16], _front_x, _spent_x, limit, uncached,
+                )
         verdict = "W31" if uncached > limit else "admit"
+        if verdict == "W31" and _pdflip_front_x.is_measure_barrier(_front_x, _front_priced):
+            setattr(req, _pdflip_front_x.ATTR_MEASURE_SPENT, True)   # every rank, same pass (replicated verdict)
         # FORK ANCHOR (Q-360): the generation-prompt tail a fork-cut P leg
         # leaves to D is D's own extend, not a prefill over X -- admitted when
         # the GROUP match reaches the fork (uncached <= N - F). Both terms are

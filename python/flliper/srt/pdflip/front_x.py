@@ -229,6 +229,45 @@ def resolve_limit(req: Any, static_x: int, page_size: Optional[int]) -> Tuple[in
         fx, priced = request_front_x(req)
         if fx is None:
             return int(static_x), None, None
+        if is_measure_barrier(fx, priced):
+            sx = spent_barrier_x(req)
+            if sx is not None:   # 27B port fix 21.10.: a spent MEASURE barrier binds no re-offer (see ATTR_MEASURE_SPENT)
+                return limit_for(static_x, sx, page_size), fx, priced
         return limit_for(static_x, fx, page_size), fx, priced
     except Exception:  # noqa: BLE001 - a limit helper may never break admission
         return int(static_x), None, None
+
+
+#: 27B INT8 rc29 metal 21.10. 00:24Z (pdflip-4-40 u=5815, pdflip-4-42 u=5953, front X=10000, halbX=5000): a request sent
+#: to D UNPRICED carries the MEASURE barrier (front_x = halbX-1, front_priced=0). D refused it there by name -- the measure
+#: was taken (D's exact extent went to the front, which classes it: halb). D kept the stream and re-offers the parked
+#: request every 30 s; the barrier stayed on the Req, so every re-offer was refused again (W31 limit=4999) while P slept
+#: (no flip under X, SOLL R7): the six D seats stayed held, the server hung. A barrier is spent by its own refusal: from
+#: the re-offer on, the request is bounded by the front's decision X (2 x halbX / frac), never by the barrier again.
+ATTR_MEASURE_SPENT = "_pdflip_measure_spent"
+
+
+def is_measure_barrier(front_x: Optional[int], front_priced: Optional[int]) -> bool:
+    """The MEASURE barrier: a front X carried with ``front_priced == 0`` (no exact number at dispatch)."""
+    return front_x is not None and front_priced is not None and int(front_priced) == 0
+
+
+def spent_barrier_x(req: Any, half_frac: Optional[float] = None) -> Optional[int]:
+    """The front's decision X for a request whose MEASURE barrier was already refused at D (``None``: not spent, or
+    no halbX carried). Replicated terms only (the broadcast halbX, a mark set on every rank in the same pass)."""
+    try:
+        if not getattr(req, ATTR_MEASURE_SPENT, False):
+            return None
+        hx = getattr(req, ATTR_HALFX, None)
+        if hx is None or int(hx) <= 0:
+            return None
+        if half_frac is None:
+            import os
+
+            half_frac = float(os.environ.get("FLLIPER_PDFLIP_HALF_X_FRAC", "0.5") or 0.5)
+        frac = float(half_frac)
+        if frac <= 0.0:
+            return None
+        return int(round(int(hx) / frac))
+    except Exception:  # noqa: BLE001 -- no reading: the barrier stands
+        return None
