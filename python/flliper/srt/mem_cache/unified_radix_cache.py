@@ -4730,10 +4730,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # eviction the node goes down KV-only and loses just the
                 # anchor (a later match resumes at a shallower anchor, the
                 # same state as a node that never carried one).
-                written = self.write_backup(
+                from flliper.srt.pdflip import ud_last as _udl
+
+                # UD-LAST pass 2: a leaf pass 1 of THIS peel held had its backup refused moments ago (and the
+                # demotions since free no arena slot) -- straight to the UD branch, no second claim
+                _udl_again = _udl.refused_in_peel(self, node)
+                written = 0 if _udl_again else self.write_backup(
                     node, write_back=True, kv_only_if_mamba_refused=True
                 )
-                if written == 0 and self.ongoing_write_through:
+                if written == 0 and self.ongoing_write_through and not _udl_again:
                     # #1426 (xsn184/185/186): upstream's write-back eviction is
                     # SYNCHRONOUS -- the host has room because the acks that
                     # free it are waited for. Here the 1 GB staging ring fills
@@ -4759,6 +4764,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # paid, and its parent becomes the next leaf.
                     from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
+                    if _sf.unbacked_drop_floor(self, node):
+                        # UD-LAST (NF rc27 1021_023225 P PP0 02:37:15, pdflip/ud_last.py): in the peel's pass 1 a
+                        # leaf UD would drop is HELD on the device (fresh KV/anchor kept, its host-only children
+                        # untouched -- no UD-H yet); the peel pays from backed leaves and comes back to it in pass 2
+                        # only if it must
+                        if _udl.hold(self, node):
+                            return
                     self._ud_h_refusal = None
                     if _sf.unbacked_drop_floor(self, node) and node.children:
                         # UD-H: the leaf's only children are host-only nodes
