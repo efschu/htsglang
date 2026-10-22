@@ -4137,11 +4137,14 @@ def _kv_compact_vote(sv, why, floor_page: int, top_page: int,
 
     bounds = [int(floor_page)] if boundaries is None else [int(b) for b in boundaries]
     if sv is None or not ready:
-        return [0, 1 if ready else 0] + [-(1 << 30)] * len(bounds) + [0] * (3 * KC.BITMAP)
+        return [0, 1 if ready else 0] + [-(1 << 30)] * len(bounds) + [0] * (5 * KC.BITMAP)
     ok = 1 if (why is None and sv.why is None) else 0
-    # KVZIEL-1021: the SECURED map (L2 or store) rides at the end of the same vector -- one collective
+    # KVZIEL-1021: the SECURED map (L2 or store) rides at the end of the same vector -- one collective.
+    # KVLEITER-1022 (F2): the MIXED profile map twice -- as is (MIN) and negated (MIN of the negation = MAX):
+    # still the one collective of the survey step; a mixed segment is room only where MIN == MAX == its profile
+    mixed = KC.local_mixed_map(sv)
     return ([ok, 1] + [-g for g in _kv_compact_local_gaps(sv, bounds)] + KC.local_bitmap(sv)
-            + KC.local_sizes(sv) + KC.local_secured_bitmap(sv))
+            + KC.local_sizes(sv) + KC.local_secured_bitmap(sv) + mixed + [-x for x in mixed])
 
 
 def _kv_compact_group_vote(sched, vec: List[int]) -> List[int]:
@@ -4160,9 +4163,14 @@ def _kv_compact_agreement(group: List[int], top_page: int, boundaries: Sequence[
     k = len(boundaries)
     gaps = {int(b): -int(group[2 + i]) for i, b in enumerate(boundaries)}
     sec = group[2 + k + 2 * KC.BITMAP:2 + k + 3 * KC.BITMAP]
+    mlo = group[2 + k + 3 * KC.BITMAP:2 + k + 4 * KC.BITMAP]
+    mhi = group[2 + k + 4 * KC.BITMAP:2 + k + 5 * KC.BITMAP]
+    full = len(mlo) == KC.BITMAP and len(mhi) == KC.BITMAP
     return KC.Agreement(bitmap=[int(x) for x in group[2 + k:2 + k + KC.BITMAP]], gaps=gaps,
                         sizes=[int(x) for x in group[2 + k + KC.BITMAP:2 + k + 2 * KC.BITMAP]],
-                        secured=[int(x) for x in sec] if len(sec) == KC.BITMAP else None)
+                        secured=[int(x) for x in sec] if len(sec) == KC.BITMAP else None,
+                        mixed_lo=[int(x) for x in mlo] if full else None,
+                        mixed_hi=[-int(x) for x in mhi] if full else None)
 
 
 def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page: int,

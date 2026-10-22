@@ -220,8 +220,10 @@ def test_a_store_backed_leaf_is_room_through_the_s39_hand_off():
 
 
 def test_split_a_mixed_chain_is_no_room_pure_chains_split_now_and_handoff():
-    """KVPLAN-1021: a single-child chain of L2 and store nodes is ONE segment of mixed kind -- never room
-    (its kind boundary is rank-local); a pure L2 branch goes now, a pure store branch is handed to S39."""
+    """KVPLAN-1021: a single-child chain of L2 and store nodes is ONE segment of mixed kind; a pure L2 branch
+    goes now, a pure store branch is handed to S39. KVLEITER-1022 (F2): the mixed segment is room once its
+    profile is agreed (single-rank form: its own) -- run by run: the store tail handed off, the L2 head waits
+    (code 1000 + 3*4 + 2); in the group it needs MIN == MAX of the profile (test_kvleiter_mixed_room_1022)."""
     alloc, tree = _world()
     _take(alloc, list(range(1, 17)))
     a = _node(tree, alloc, [17, 18], P)                    # L2-backed parent
@@ -232,10 +234,13 @@ def test_split_a_mixed_chain_is_no_room_pure_chains_split_now_and_handoff():
     kinds = {tuple(g.pages): g.kind for g in sv.segments}
     assert kinds[(17, 18, 19, 20)] == 3
     ag = KC.Agreement(None)
-    segs, _w = KC.choose_evictions(sv, ag, 4)
+    segs, _w = KC.choose_evictions(sv, ag, 8)
     st = {tuple(g.pages): s for g, s in KC.split_evictions(segs, ag)}
-    assert (17, 18, 19, 20) not in st
+    assert st[(17, 18, 19, 20)] == KC.mixed_code([3, 2])
     assert st[(21, 22)] == 1 and st[(23, 24)] == 2
+    # the group form without a mixed agreement (a vote that carries no profile maps): never room
+    ag0 = KC.Agreement(bitmap=[1] * KC.BITMAP, secured=[1] * KC.BITMAP)
+    assert not ag0.agreed(next(g for g in sv.segments if g.kind == 3))
 
 
 def _vote_world(store_here):
