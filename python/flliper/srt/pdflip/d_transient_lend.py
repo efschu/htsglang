@@ -510,22 +510,29 @@ def short_extend_need_mib(rank: int, rows: int) -> Optional[float]:
 
     try:
         floor = dsv.lend_floor_mib_for_rank(int(rank))
-        price = extend_trim.chunk_need_mib(int(rank), int(rows))
+        # EXTEND-KORRIDOR (22.10.): the short extend is priced on the SAME line the #794 width vote funds
+        # chunks to -- the corridor law (extend_trim.corridor_line_mib), no longer the 300 MiB HALT line. NF rc33
+        # TP0 06:17:02: 900 rows kept at need 1042 = 300 + 742 (class 1024) with 1094 free, the card ended at 471
+        # under the 767 law. Same line in vote and price = the short request still runs in one chunk.
+        line = extend_trim.corridor_line_mib(int(rank))
+        old_price = extend_trim.chunk_need_mib(int(rank), int(rows))   # 300 + rate x rows (the rc12g model)
     except Exception:  # noqa: BLE001 -- unpriced: the full return
         return None
-    if floor is None or price is None:
+    if floor is None or old_price is None:
         return None
+    price = float(old_price) + (float(line) - extend_trim.CHUNKING_FLOOR_MIB)   # line + rate x rows
     # LEND-COST (21.10.): the card cost MEASURED on this rank for the extend's row class (target + draft
-    # extend, ratchet up; None = the class has no reading yet) -- priced on the 300 MiB HALT line, nothing on top
+    # extend, ratchet up; None = the class has no reading yet) -- priced on the corridor line, nothing on top
     cost = measured_cost_mib(int(rank), int(rows))
     if cost is not None:
-        return max(float(floor), float(price), extend_trim.CHUNKING_FLOOR_MIB + float(cost))
+        return max(float(floor), float(price), float(line) + float(cost))
     if not rate_measured(int(rank)):
         # review A (20.10.): a rank that prices with the START rate only (NF: TP0 keeps its recorded rate,
         # FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS) or has not measured yet keeps the S78 sum -- the floor
         # covers the fixed part a start rate does not see (rc28 _201023 TP0 20:43:30, 2139 rows: card use
-        # 1596 MiB against max-price 1556) -- until LEND-COST has measured the row class (above)
-        return float(floor) + float(price)
+        # 1596 MiB against max-price 1556) -- until LEND-COST has measured the row class (above). The sum keeps
+        # its 300 term (floor + 300 + rate x rows); never under the corridor price.
+        return max(float(floor) + float(old_price), float(price))
     return max(float(floor), float(price))
 
 

@@ -178,3 +178,19 @@ def test_a_second_target_extend_before_a_settle_loses_a_reading_never_lowers_one
             extend_trim.measure_close(runner, A._fb(5), cuda, rank=0)
         extend_trim.lend_cost_settle(0, cuda)
     assert extend_trim.lend_cost_mib(5) == 300.0
+
+
+# EXTEND-KORRIDOR (NF rc33 22.10.): the width vote, the short-extend price and the HALT/after-extend trim keep the card's
+# corridor law (extend_trim.corridor_line_mib); this module pins the arithmetic it was written for at the old 300 MiB
+# halt line -- the law cases are pinned in test_nf_rc33_extendkorridor_1022.
+import pytest as _pytest_line300  # noqa: E402
+
+
+@_pytest_line300.fixture(autouse=True)
+def _extend_line_300_for_this_module(monkeypatch):
+    from flliper.srt.pdflip import extend_trim as _et
+
+    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
+    _et._CACHE["line"] = getattr(_et, "_UNSET", None)
+    yield
+    _et._CACHE["line"] = getattr(_et, "_UNSET", None)

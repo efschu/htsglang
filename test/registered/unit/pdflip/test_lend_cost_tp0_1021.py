@@ -225,8 +225,11 @@ def test_danger_a_class_never_prices_an_extend_wider_than_its_widest_reading():
     with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS), \
             envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override(RATE):
         _extend(2100, transient=1300)
-        assert dtl.short_extend_need_mib(0, 2100) == pytest.approx(max(767, 300 + 0.5871 * 2100, 1600))
-        assert dtl.short_extend_need_mib(0, 4000) == pytest.approx(767 + 300 + 0.5871 * 4000)
+        # EXTEND-KORRIDOR (22.10.): a reading of >= 2048 rows also prices the rate (1300 / 2100 = 0.6191 MiB/row,
+        # extend_trim.lend_rate) -- the class still never prices wider than its widest reading
+        lr = 0.6191
+        assert dtl.short_extend_need_mib(0, 2100) == pytest.approx(max(767, 300 + lr * 2100, 1600))
+        assert dtl.short_extend_need_mib(0, 4000) == pytest.approx(767 + 300 + lr * 4000)
         _extend(4000, transient=2900)
         assert dtl.short_extend_need_mib(0, 4000) == pytest.approx(3200.0)
         assert dtl.short_extend_need_mib(0, 2100) == pytest.approx(3200.0)   # the class maximum
@@ -490,3 +493,19 @@ def test_the_verdicts_never_read_the_measured_cost():
         assert dtl.short_pending_rows(s) == 5
         gate = dtl.LendGate(2)
         assert [gate.step(k) for k in ("decode", "decode", "extend")] == ["hold", "lend", "return"]
+
+
+# EXTEND-KORRIDOR (NF rc33 22.10.): the width vote, the short-extend price and the HALT/after-extend trim keep the card's
+# corridor law (extend_trim.corridor_line_mib); this module pins the arithmetic it was written for at the old 300 MiB
+# halt line -- the law cases are pinned in test_nf_rc33_extendkorridor_1022.
+import pytest as _pytest_line300  # noqa: E402
+
+
+@_pytest_line300.fixture(autouse=True)
+def _extend_line_300_for_this_module(monkeypatch):
+    from flliper.srt.pdflip import extend_trim as _et
+
+    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
+    _et._CACHE["line"] = getattr(_et, "_UNSET", None)
+    yield
+    _et._CACHE["line"] = getattr(_et, "_UNSET", None)
