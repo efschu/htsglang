@@ -24,7 +24,8 @@ What must hold:
 (4) the LEND-COST reading ratchets the wide-extend per-row cost (rows >= 2048 only, no factor) into the rate.
 (5) after an extend batch that ends under the line the cache goes back to the driver at the next pass (trim),
     and the HALT instrument names the corridor line (not 300).
-(6) the short-extend price uses the same line: 900 rows kept at 1042 on 1094 free (card ended 471) now return.
+(6) REVIEW 22.10. (planner decision): the short-extend price does NOT move -- A4 of 21.10. stands, the 300 MiB HALT
+    line and the rc33 rate (the wide-extend cost prices the vote only): 900 rows still keep at 1042.
 """
 from __future__ import annotations
 
@@ -216,7 +217,8 @@ def test_lend_rate_ratchets_on_wide_extends_only():
     assert ET.lend_rate(0) == pytest.approx(0.7529)
     _extend(2752, 1852, free_end=218.0)                        # 0.673: under the maximum, no move
     assert ET.lend_rate(0) == pytest.approx(0.7529)
-    assert ET.effective_rate(START, 0) == pytest.approx(0.7529)
+    assert ET.vote_rate(START, 0) == pytest.approx(0.7529)
+    assert ET.effective_rate(START, 0) == pytest.approx(START)   # review 22.10.: the price's rate stays rc33
 
 
 def test_lend_rate_needs_lend_cost_armed():
@@ -224,7 +226,7 @@ def test_lend_rate_needs_lend_cost_armed():
     ET._CACHE["lend_rate"] = 0.75
     with mock.patch.object(ET, "lend_cost_armed", lambda rank=None: False):
         assert ET.lend_rate(0) is None
-        assert ET.effective_rate(START, 0) == pytest.approx(START)
+        assert ET.vote_rate(START, 0) == pytest.approx(START)
 
 
 # ---- (5) after the extend: the cache goes back, HALT names the corridor line -------------------------
@@ -248,16 +250,15 @@ def test_over_the_line_no_trim_no_halt():
     assert line is None or "HALT" not in line
 
 
-# ---- (6) the short-extend price keeps the same line ----------------------------------------------------
+# ---- (6) review 22.10.: the short-extend price stays on the rc33 line (A4) ---------------------------------
 
-def test_short_price_0617_02_900_rows_returns_instead_of_keeping():
+def test_short_price_0617_02_900_rows_keeps_the_rc33_price():
     _extend(901, 742, free_end=370.0)                          # class 1024 measured at 742 MiB (06:16:27)
     need = dtl.short_extend_need_mib(0, 900)
-    assert need == pytest.approx(LAW + 742.0)                  # HEAD: 300 + 742 = 1042 -> kept on 1094
-    assert need > 1094.0
+    assert need == pytest.approx(max(LAW, 300.0 + START * 900, 300.0 + 742.0))   # 1042, rc33 byte for byte
 
 
 def test_short_price_tiny_extend_without_reading_stays_the_floor_sum():
-    # TP0 start-rate rank, no class reading: review A's sum floor + 300 + rate x rows, never under line + rate x rows
+    # TP0 start-rate rank, no class reading: review A's sum floor + 300 + rate x rows (rc33)
     need = dtl.short_extend_need_mib(0, 5)
-    assert need == pytest.approx(max(767 + 300 + START * 5, LAW + START * 5))
+    assert need == pytest.approx(767 + 300 + START * 5)

@@ -250,19 +250,3 @@ def test_a_held_member_does_not_turn_a_short_pending_extend_into_the_full_return
         assert got == "keep", got
         assert ctl.lent_from == 32 and ctl.rows_on == 40, "the held member forced the full return of the lend"
         assert any("keep rows_on 40 (short extend pending rid=pdflip-1-15" in m for m in caplog.messages)
-
-
-# EXTEND-KORRIDOR (NF rc33 22.10.): the width vote, the short-extend price and the HALT/after-extend trim keep the card's
-# corridor law (extend_trim.corridor_line_mib); this module pins the arithmetic it was written for at the old 300 MiB
-# halt line -- the law cases are pinned in test_nf_rc33_extendkorridor_1022.
-import pytest as _pytest_line300  # noqa: E402
-
-
-@_pytest_line300.fixture(autouse=True)
-def _extend_line_300_for_this_module(monkeypatch):
-    from flliper.srt.pdflip import extend_trim as _et
-
-    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)
-    yield
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)

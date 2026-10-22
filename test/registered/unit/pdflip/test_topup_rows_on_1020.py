@@ -140,19 +140,3 @@ def test_a_top_up_with_nothing_to_add_moves_nothing():
         assert dtl.on_batch(r.sched, decode) is None
         assert dtl.on_batch(r.sched, decode) is None              # settle: nothing fits -> no move
         assert ctl.rows_on == 36 and ctl.lent_rows == before + 4
-
-
-# EXTEND-KORRIDOR (NF rc33 22.10.): the width vote, the short-extend price and the HALT/after-extend trim keep the card's
-# corridor law (extend_trim.corridor_line_mib); this module pins the arithmetic it was written for at the old 300 MiB
-# halt line -- the law cases are pinned in test_nf_rc33_extendkorridor_1022.
-import pytest as _pytest_line300  # noqa: E402
-
-
-@_pytest_line300.fixture(autouse=True)
-def _extend_line_300_for_this_module(monkeypatch):
-    from flliper.srt.pdflip import extend_trim as _et
-
-    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)
-    yield
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)

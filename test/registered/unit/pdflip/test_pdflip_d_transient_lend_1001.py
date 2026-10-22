@@ -219,19 +219,3 @@ def test_the_launcher_writes_the_ledger_floor():
 
     ledger = types.SimpleNamespace(floor_mib=(766.2, 700.0, 701.0))
     assert launcher.d_lend_floor_env(ledger) == "767,700,701"
-
-
-# EXTEND-KORRIDOR (NF rc33 22.10.): the width vote, the short-extend price and the HALT/after-extend trim keep the card's
-# corridor law (extend_trim.corridor_line_mib); this module pins the arithmetic it was written for at the old 300 MiB
-# halt line -- the law cases are pinned in test_nf_rc33_extendkorridor_1022.
-import pytest as _pytest_line300  # noqa: E402
-
-
-@_pytest_line300.fixture(autouse=True)
-def _extend_line_300_for_this_module(monkeypatch):
-    from flliper.srt.pdflip import extend_trim as _et
-
-    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)
-    yield
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)

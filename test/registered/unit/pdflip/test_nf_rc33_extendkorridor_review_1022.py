@@ -190,3 +190,106 @@ def test_group_min_funds_every_rank_at_its_own_line_and_rate(posts):
 def test_card_at_the_line_votes_one_page_not_zero(post):
     ET._CACHE["lend_rate"] = 0.7547
     assert ET.width_vote(Cuda(free=post, reserved=31092.0), 0, 4096, PAGE, True) == PAGE
+
+
+# ---- (R5) planner 22.10.: the short-extend price is rc33 byte for byte; the vote cuts at the corridor -------
+# A4 of 21.10. stands: the price keeps the 300 MiB HALT line and the rc33 rate (start / Q-694b x 1.15). Neither the
+# corridor line nor the wide-extend cost (lend_rate, its recorded start) may move it.
+
+def _rc33_price(rank, rows, floor, rate, measured_rate_rank, cost=None):
+    if cost is not None:
+        return max(floor, 300.0 + rate * rows, 300.0 + cost)
+    if not measured_rate_rank:
+        return floor + 300.0 + rate * rows
+    return max(floor, 300.0 + rate * rows)
+
+
+@pytest.mark.parametrize("rows", [1, 5, 64, 129, 512, 900, 1400])
+@pytest.mark.parametrize("lend", [None, 0.7547, 1.2])
+def test_short_price_is_rc33_whatever_the_vote_knows(rows, lend):
+    with envs.FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB.override("0.7547,0,0"):
+        ET.reset_for_tests()
+        if lend is not None:
+            ET._CACHE["lend_rate"] = lend
+        assert ET.vote_rate(START, 0) >= 0.7547                       # the vote knows the wide cost
+        assert ET.corridor_line_mib(0) == 767.0                        # and the corridor line
+        assert dtl.short_extend_need_mib(0, rows) == pytest.approx(_rc33_price(0, rows, 767.0, START, False))
+        assert ET.chunk_need_mib(0, rows) == pytest.approx(300.0 + START * rows)
+
+
+def test_short_price_with_a_class_reading_is_rc33():
+    with envs.FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB.override("0.7547,0,0"):
+        ET.reset_for_tests()
+        ET._CACHE["lend_cost"] = {1024: (742, 901)}
+        ET._CACHE["lend_rate"] = 0.7547
+        assert dtl.short_extend_need_mib(0, 900) == pytest.approx(_rc33_price(0, 900, 767.0, START, False, 742))
+        assert dtl.short_extend_need_mib(0, 900) == pytest.approx(1042.0)   # 06:17:02: kept on 1094, A4
+
+
+def test_short_price_measured_rate_rank_is_rc33():
+    ET._CACHE["measured"] = 0.5164                                     # TP1 Q-694b
+    ET._CACHE["lend_rate"] = 0.9                                       # a wide reading may not leak into the price
+    rate = max(START, math.ceil(0.5164 * 1.15 * 1e4) / 1e4)
+    assert dtl.short_extend_need_mib(1, 600) == pytest.approx(_rc33_price(1, 600, 700.0, rate, True))
+    assert ET.vote_rate(START, 1) == pytest.approx(0.9)
+
+
+# ---- (R6) planner 22.10.: TP0 starts the vote at the recorded wide-extend cost --------------------------------
+
+def test_the_recorded_start_prices_the_first_wide_extend_after_the_boot():
+    # rc33 06:14:15: TP0 post 2137, no reading yet; the 2880-row extend cost 0.6702 MiB/row (1930 MiB)
+    with envs.FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB.override("0.7547,0,0"):
+        ET.reset_for_tests()
+        assert ET.lend_rate(0) == pytest.approx(0.7547)
+        cap = ET.width_vote(Cuda(free=2137.0, reserved=31092.0), 0, 4096, PAGE, True)
+        assert cap == 1792                                             # floor((2137 - 767) / 0.7547) = 1815 -> page
+        assert 2137.0 - cap * (1930 / 2880) >= 767.0                   # ends ~936, not ~593 (start 0.5871: cap 2304)
+        assert 2137.0 - cap * 0.7547 >= 767.0
+
+
+def test_the_start_is_a_floor_the_boots_readings_ratchet_over():
+    with envs.FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB.override("0.7547,0,0"):
+        ET.reset_for_tests()
+        ET._CACHE["lend_rate"] = 0.70                                  # a cheaper own reading never lowers it
+        assert ET.lend_rate(0) == pytest.approx(0.7547)
+        ET._CACHE["lend_rate"] = 0.80
+        assert ET.lend_rate(0) == pytest.approx(0.80)
+
+
+def test_the_3080_ranks_get_no_recorded_start():
+    with envs.FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB.override("0.7547,0,0"):
+        ET.reset_for_tests()
+        assert ET.lend_rate(1) is None and ET.lend_rate(2) is None
+        assert ET.vote_rate(START, 1) == pytest.approx(START)
+
+
+def test_no_start_where_lend_cost_is_not_armed():
+    with envs.FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB.override("0.7547,0,0"):
+        ET.reset_for_tests()
+        with mock.patch.object(ET, "lend_cost_armed", lambda rank=None: False):
+            assert ET.lend_rate(0) is None
+
+
+def test_the_launcher_writes_the_start_from_the_nextflash_record():
+    from flliper.srt.pdflip import launcher as L
+
+    rec, src = L.d_extend_lend_rate_record("nextflash")
+    assert rec == [0.7547, None, None] and "dkrnfint4h6ablxcw3spmlrhlvwflbar1dauer10220606" in src
+    ns = types.SimpleNamespace(profile="nextflash", env_d="")
+    lines = []
+    assert L.d_extend_lend_rate_start_env(ns, lines.append, "D", 3) == "0.7547,0,0"
+    assert L.parse_group_env(ns.env_d)[L.EXTEND_LEND_RATE_START_ENV] == "0.7547,0,0"
+    assert "Vorrang" not in lines[-1]
+    # a second solve pass sees its own write: not a user value
+    L.d_extend_lend_rate_start_env(ns, lines.append, "D", 3)
+    assert "Vorrang" not in lines[-1]
+    # a user value wins
+    ns2 = types.SimpleNamespace(profile="nextflash", env_d=f"{L.EXTEND_LEND_RATE_START_ENV}=0.8,0,0")
+    assert L.d_extend_lend_rate_start_env(ns2, lines.append, "D", 3) is None
+    assert L.parse_group_env(ns2.env_d)[L.EXTEND_LEND_RATE_START_ENV] == "0.8,0,0" and "Vorrang" in lines[-1]
+    # another inventory length writes nothing
+    ns3 = types.SimpleNamespace(profile="nextflash", env_d="")
+    assert L.d_extend_lend_rate_start_env(ns3, lines.append, "D", 2) is None and ns3.env_d == ""
+    # the 27B profile has no record: nothing
+    ns4 = types.SimpleNamespace(profile="qwen27b", env_d="")
+    assert L.d_extend_lend_rate_start_env(ns4, lines.append, "D", 3) is None and ns4.env_d == ""

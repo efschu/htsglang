@@ -253,19 +253,3 @@ def test_gate_stage_keep_on_an_unmeasured_rank_is_the_sum():
         extend_trim.reset_for_tests()
         with mock.patch.object(dtl, "short_pending_rows", lambda s: 5):
             assert dtl.stage_keep_need_bytes(_price_sched([object()]), ctl) == int((700 + 300 + 0.5871 * 5) * MIB)
-
-
-# EXTEND-KORRIDOR (NF rc33 22.10.): the width vote, the short-extend price and the HALT/after-extend trim keep the card's
-# corridor law (extend_trim.corridor_line_mib); this module pins the arithmetic it was written for at the old 300 MiB
-# halt line -- the law cases are pinned in test_nf_rc33_extendkorridor_1022.
-import pytest as _pytest_line300  # noqa: E402
-
-
-@_pytest_line300.fixture(autouse=True)
-def _extend_line_300_for_this_module(monkeypatch):
-    from flliper.srt.pdflip import extend_trim as _et
-
-    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)
-    yield
-    _et._CACHE["line"] = getattr(_et, "_UNSET", None)

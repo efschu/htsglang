@@ -14769,6 +14769,45 @@ def d_extend_growth_per_row_record(profile: Optional[str] = None) -> Tuple[Optio
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_EXTEND_GROWTH_PER_ROW_MIB", profile)
 
 
+#: EXTEND-KORRIDOR review 22.10.: the vote's recorded start of the wide-extend per-row card cost
+EXTEND_LEND_RATE_START_ENV = "FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB"
+
+
+def d_extend_lend_rate_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
+    """EXTEND-KORRIDOR review 22.10.: ``D_EXTEND_LEND_RATE_MIB`` of the profile (LEND-COST card cost of one
+    wide target+draft extend per row, measured), or ``(None, "")`` -- no recorded start."""
+    try:
+        vals = list(_pconst("D_EXTEND_LEND_RATE_MIB", profile))
+    except KeyError:
+        return None, ""
+    return [None if v is None else float(v) for v in vals], _pconst_boots("D_EXTEND_LEND_RATE_MIB", profile)
+
+
+def d_extend_lend_rate_start_env(ns, log, label: str, n_ranks: int) -> Optional[str]:
+    """Write ``FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB`` into the D group env from the profile record (a value
+    named in --env-d wins; a record of another length writes nothing). Returns the written text, else None."""
+    from flliper.srt.pdflip import extend_trim as _et
+
+    rec, src = d_extend_lend_rate_record(getattr(ns, "profile", None))
+    if rec is None or len(rec) != int(n_ranks):
+        return None
+    text = _et.launcher_rates(rec)
+    if not text:
+        return None
+    _env_d = getattr(ns, "env_d", "") or ""
+    # a value that differs from the record's came from the user (a second solve pass sees its own write)
+    _have = parse_group_env(_env_d).get(EXTEND_LEND_RATE_START_ENV)
+    given = _have is not None and str(_have).strip() != text
+    if not given:
+        ns.env_d = set_group_env(_env_d, EXTEND_LEND_RATE_START_ENV, text)
+    log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-KORRIDOR {EXTEND_LEND_RATE_START_ENV}="
+        f"{parse_group_env(getattr(ns, 'env_d', '') or '').get(EXTEND_LEND_RATE_START_ENV, text)}"
+        f"{' (aus --env-d, Vorrang)' if given else ''} (Start der Breitenwahl-Rate aus D_EXTEND_LEND_RATE_MIB "
+        f"{rec}, {src}; D kappt breite Extends auf floor((card_free_post - Korridorlinie) / max(Rate, dies)); "
+        f"der Kurzpreis liest es nicht)")
+    return None if given else text
+
+
 #: NF port 1003: the arming variables of the per-rank run-time measurement of the extend rate
 EXTEND_RATE_MEASURE_ENV = "FLLIPER_PDFLIP_EXTEND_RATE_MEASURE"
 EXTEND_RATE_MEASURE_RANKS_ENV = "FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS"
@@ -19897,6 +19936,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     f"Extend-Chunk auf floor((card_free_post - 300) / Rate), MIN ueber TP)")
             if _fill is not None and _rtext and not _given:
                 d_extend_rate_measure_ranks_env(ns, log, label, _fill, _rtext)
+        # EXTEND-KORRIDOR review 22.10. (planner): the recorded wide-extend card cost per row starts the
+        # vote's lend_rate on the ranks the profile measured it on; a value named in --env-d wins
+        d_extend_lend_rate_start_env(ns, log, label, len(_ledger.floor_mib))
     _w = getattr(ns, "_d_kv_stage_written", None) or {}
     _stage_rows = dict((_w.get("worker_rows") or {}))
     if _w:

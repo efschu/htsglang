@@ -1356,6 +1356,12 @@ class Envs:
     # CSV, "0" = no rate). Set by the pdflip launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # EXTEND-KORRIDOR review 22.10. (planner): per-rank recorded START of the wide-extend per-row card
+    # cost (MiB/row, CSV, "0" = none) -- the LEND-COST reading of target + draft extend / rows over extends of
+    # >= 2048 rows. Written by the pdflip launcher from the profile record D_EXTEND_LEND_RATE_MIB (NF:
+    # 0.7547,0,0); the #794 width vote uses max(rc33 rate, this, the boot's own readings) so the FIRST wide
+    # extend after the boot is priced at the recorded cost. The short-extend price never reads it.
+    FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB = EnvStr(None)
     # Q-694b EXTEND-RATE (NF port 1003): the rank MEASURES its own extend
     # transient per row (allocator peak / reserved growth of every target
     # extend of >= 2048 rows) and votes with max(start rate, measured x 1.15),

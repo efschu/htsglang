@@ -123,14 +123,11 @@ the built price is the guard, a return can move from round_start to on_batch (re
 Amount rank-local like every lend amount; no verdict reads it. ``FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE``
 (default ON); off = the old price byte for byte.
 
-EXTEND-KORRIDOR (22.10., nf-rc33-extendkorridor-1022) SUPERSEDES the A4 sentence above: the 300 terms are
-now the card's corridor line (``extend_trim.corridor_line_mib``, TP0 767 / TP1 700 / TP2 701 on NF), so the
-price is ``max(floor, line + rate x rows, line + measured cost)`` and a short extend started at the price
-ends at >= the corridor law on every rank, TP0 included (the start-rate sum without a class reading keeps
-its ``floor + 300 + rate x rows`` form). The price of that: more partial returns before short extends on
-every rank (review replay of rc33 ``_060647``: ~300-600 more on TP0 and ~150-350 on TP1/TP2 per 71 min,
-p50 ~105 ms each) -- the lend fills the card down to the floor, so a short extend whose measured class
-cost does not fit above the line gives cells back.
+EXTEND-KORRIDOR (22.10., nf-rc33-extendkorridor-1022, planner decision on the review): A4 STANDS. The short
+price above is unchanged against rc33 byte for byte (300 MiB HALT line, rc33 rate -- the wide-extend cost of the
+width vote, ``extend_trim.vote_rate``, never enters it): all 28 rc33 corridor breaches were WIDE extends, and the
+corridor-line price would have cost ~300-600 more partial returns per 71 min on TP0 (~105 ms each) without
+preventing a recorded breach. Only the #794 width vote funds down to the corridor line.
 """
 
 from __future__ import annotations
@@ -519,29 +516,22 @@ def short_extend_need_mib(rank: int, rows: int) -> Optional[float]:
 
     try:
         floor = dsv.lend_floor_mib_for_rank(int(rank))
-        # EXTEND-KORRIDOR (22.10.): the short extend is priced on the SAME line the #794 width vote funds
-        # chunks to -- the corridor law (extend_trim.corridor_line_mib), no longer the 300 MiB HALT line. NF rc33
-        # TP0 06:17:02: 900 rows kept at need 1042 = 300 + 742 (class 1024) with 1094 free, the card ended at 471
-        # under the 767 law. Same line in vote and price = the short request still runs in one chunk.
-        line = extend_trim.corridor_line_mib(int(rank))
-        old_price = extend_trim.chunk_need_mib(int(rank), int(rows))   # 300 + rate x rows (the rc12g model)
+        price = extend_trim.chunk_need_mib(int(rank), int(rows))
     except Exception:  # noqa: BLE001 -- unpriced: the full return
         return None
-    if floor is None or old_price is None:
+    if floor is None or price is None:
         return None
-    price = float(old_price) + (float(line) - extend_trim.CHUNKING_FLOOR_MIB)   # line + rate x rows
     # LEND-COST (21.10.): the card cost MEASURED on this rank for the extend's row class (target + draft
-    # extend, ratchet up; None = the class has no reading yet) -- priced on the corridor line, nothing on top
+    # extend, ratchet up; None = the class has no reading yet) -- priced on the 300 MiB HALT line, nothing on top
     cost = measured_cost_mib(int(rank), int(rows))
     if cost is not None:
-        return max(float(floor), float(price), float(line) + float(cost))
+        return max(float(floor), float(price), extend_trim.CHUNKING_FLOOR_MIB + float(cost))
     if not rate_measured(int(rank)):
         # review A (20.10.): a rank that prices with the START rate only (NF: TP0 keeps its recorded rate,
         # FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS) or has not measured yet keeps the S78 sum -- the floor
         # covers the fixed part a start rate does not see (rc28 _201023 TP0 20:43:30, 2139 rows: card use
-        # 1596 MiB against max-price 1556) -- until LEND-COST has measured the row class (above). The sum keeps
-        # its 300 term (floor + 300 + rate x rows); never under the corridor price.
-        return max(float(floor) + float(old_price), float(price))
+        # 1596 MiB against max-price 1556) -- until LEND-COST has measured the row class (above)
+        return float(floor) + float(price)
     return max(float(floor), float(price))
 
 

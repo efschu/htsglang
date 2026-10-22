@@ -53,7 +53,10 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           "lend_cost_on": _UNSET, "lend_cost": None, "lend_cost_tail": None,
           # EXTEND-KORRIDOR (22.10.): this card's corridor line (read once) and the per-row card cost of this
           # rank's own wide extends (LEND-COST reading / rows, rows >= GROWTH_PER_ROW_MIN_ROWS, ratchet up)
-          "line": _UNSET, "lend_rate": None}
+          "line": _UNSET, "lend_rate": None,
+          # review 22.10. (planner): this rank's START of the wide-extend per-row card cost (profile record
+          # D_EXTEND_LEND_RATE_MIB via FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB, read once; vote only)
+          "lend_rate_start": _UNSET}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -107,6 +110,7 @@ def reset_for_tests() -> None:
     _CACHE["lend_cost_tail"] = None
     _CACHE["line"] = _UNSET
     _CACHE["lend_rate"] = None
+    _CACHE["lend_rate_start"] = _UNSET
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -297,6 +301,13 @@ def extend_growth_per_row_mib(windows) -> Optional[float]:
 # Torch's cache is NOT added to the funds (the 27B rc29 double count, a4f4b8fec1 -- that change never reached
 # this line). The rate is a reserved growth, i.e. a driver-free loss.
 #
+# REVIEW 22.10. (planner decision on the review's Auflagen): the SHORT-EXTEND price is NOT part of this -- A4 of
+# 21.10. stands (d_transient_lend.short_extend_need_mib keeps the 300 MiB HALT line and the rc33 rate, byte for
+# byte): every one of the 28 rc33 corridor breaches was a WIDE extend. The wide-extend cost therefore prices the
+# VOTE only (:func:`vote_rate`), never :func:`effective_rate` / :func:`chunk_need_mib`. A rank may start the boot
+# with a recorded wide-extend cost (``D_EXTEND_LEND_RATE_MIB``, NF TP0 0.7547: rc33 06:23:24, 2629 rows, 1984 MiB),
+# so the first wide extend after the boot is priced too (rc33 06:14:15: the start 0.5871 left ~593 MiB).
+#
 # And what the extend leaves in the cache goes back at once: at 06:17:08 the extend's 2024 MiB stood in torch's
 # cache (alloc_cache 2618 MiB) for six seconds of decode at 45 MiB driver free until the NEXT extend's trim
 # released 1970 MiB. :func:`lend_cost_settle` (the next scheduler pass, before any lend move) trims when the
@@ -326,8 +337,8 @@ def _read_corridor_line() -> "tuple[float, str]":
 
 def corridor_line_mib(rank: Optional[int] = None) -> float:
     """The card line an extend must leave free: this card's corridor law (``max(300, verdict floor)``), read once
-    per process and named once. The width vote, the short-extend price, the HALT instrument and the after-extend
-    trim keep this ONE line. No reserve: the law is the corridor, nothing on top."""
+    per process and named once. The width vote, the HALT instrument and the after-extend trim keep this ONE line
+    (the short-extend price keeps the 300 MiB HALT line, A4 21.10.). No reserve: the law is the corridor."""
     line = _CACHE["line"]
     if line is _UNSET:
         try:
@@ -336,7 +347,8 @@ def corridor_line_mib(rank: Optional[int] = None) -> float:
             mib, src = float(CHUNKING_FLOOR_MIB), "halt-line"
         line = _CACHE["line"] = max(float(CHUNKING_FLOOR_MIB), float(mib))
         logger.info(f"{LINE_MARKER} rank={'?' if rank is None else int(rank)} line_mib={line:.0f} source={src} "
-                    f"(width vote, short-extend price, HALT and after-extend trim keep this line; no reserve)")
+                    f"(width vote, HALT and after-extend trim keep this line; the short-extend price keeps 300 (A4); "
+                    f"no reserve)")
     return float(line)  # type: ignore[arg-type]
 
 
@@ -354,10 +366,10 @@ def rows_cap(post_mib: float, rate: float, page_size: int, line_mib: Optional[fl
 
 def chunk_need_mib(rank: int, rows: int, line_mib: Optional[float] = None) -> Optional[float]:
     """S78 KEEP-SHORT: what an extend of ``rows`` rows costs the card by the rc12g
-    chunk model -- the inverse of :func:`rows_cap`: ``line + rate x rows`` MiB with
-    the rate the width vote uses on this rank (:func:`effective_rate`) and ``line``
-    = the vote's line when given (:func:`corridor_line_mib`), else the 300 MiB HALT
-    line. ``None`` when this rank has no rate (no vote, no price: nothing is guessed)."""
+    chunk model: ``line + rate x rows`` MiB with the rc33 rate of this rank
+    (:func:`effective_rate`: start or Q-694b x RATE_SAFETY -- NOT the vote's wide-extend
+    cost, review 22.10.) and ``line`` the 300 MiB HALT line unless given. ``None`` when this
+    rank has no rate (no vote, no price: nothing is guessed)."""
     try:
         rate = threshold_for(int(rank), rates())
         if rate is None or rate <= 0:
@@ -385,7 +397,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         # Q-694b: the start rate (record / derived) or this rank's measured
         # rate x RATE_SAFETY, whichever is larger; off: the start rate itself
         start_rate = rate
-        rate = effective_rate(rate, rank)
+        rate = vote_rate(rate, rank)
         if bool(cuda.is_current_stream_capturing()):
             return None
         if not _CACHE["armed"]:
@@ -504,36 +516,60 @@ def measured_rate() -> Optional[float]:
 
 
 def effective_rate(start: float, rank: Optional[int] = None) -> float:
-    """The rate the vote uses: ``max(start, measured x RATE_SAFETY, lend_rate)`` -- the Q-694b term while that
-    measurement is armed (on this rank) and holds a value; EXTEND-KORRIDOR (22.10.): the LEND-COST per-row card
-    cost of this rank's own wide extends (:func:`lend_rate`, no factor) while LEND-COST is armed on it."""
-    r = float(start)
+    """The rate the vote uses: ``max(start, measured x RATE_SAFETY)`` while the
+    measurement is armed (on this rank) and holds a value, else ``start``.
+    Review 22.10.: this is also the short-extend price's rate (:func:`chunk_need_mib`),
+    byte-identical to rc33 -- the wide-extend cost enters the VOTE only (:func:`vote_rate`)."""
     m = _CACHE["measured"] if measure_armed(rank) else None
-    if m is not None:
-        r = max(r, _ceil4(float(m) * RATE_SAFETY))
+    if m is None:
+        return float(start)
+    return max(float(start), _ceil4(float(m) * RATE_SAFETY))
+
+
+def vote_rate(start: float, rank: Optional[int] = None) -> float:
+    """EXTEND-KORRIDOR: the width vote's rate = ``max(effective_rate, lend_rate)`` -- the LEND-COST per-row
+    card cost of this rank's wide extends (its recorded start and its own readings, no factor) on top of
+    the rc33 rate. The short-extend price never reads it (A4 21.10. stands)."""
+    r = effective_rate(start, rank)
     lr = lend_rate(rank)
     if lr is not None:
         r = max(r, float(lr))
     return r
 
 
+def lend_rate_start(rank: Optional[int] = None) -> Optional[float]:
+    """Review 22.10.: this rank's recorded START of the wide-extend per-row card cost
+    (``FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB``, CSV per rank, "0" = none; the launcher writes it from
+    the profile record ``D_EXTEND_LEND_RATE_MIB``), read once. ``None`` = no start (the boot's own reading)."""
+    if _CACHE["lend_rate_start"] is _UNSET:
+        try:
+            from flliper.srt.environ import envs
+
+            _CACHE["lend_rate_start"] = parse_thresholds(envs.FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB.get())
+        except Exception:  # noqa: BLE001 -- a guard never kills a pass
+            _CACHE["lend_rate_start"] = None
+    v = threshold_for(int(rank or 0), _CACHE["lend_rate_start"])  # type: ignore[arg-type]
+    return None if v is None or v <= 0 else float(v)
+
+
 def lend_rate(rank: Optional[int] = None) -> Optional[float]:
-    """EXTEND-KORRIDOR: the measured card cost per row of this rank's wide extends (LEND-COST), ``None`` before
-    the first reading or where LEND-COST is not armed on this rank."""
-    lr = _CACHE["lend_rate"]
-    if lr is None:
-        return None
+    """EXTEND-KORRIDOR: the card cost per row of this rank's wide extends -- ``max(recorded start, own LEND-COST
+    readings)`` (:func:`lend_rate_start`, ratchet up) -- ``None`` before any of the two or where LEND-COST is not
+    armed on this rank."""
     try:
         if not lend_cost_armed(rank):
             return None
     except Exception:  # noqa: BLE001
         return None
-    return float(lr)
+    lr = _CACHE["lend_rate"]
+    st = lend_rate_start(rank)
+    vals = [float(v) for v in (lr, st) if v is not None]
+    return max(vals) if vals else None
 
 
 def rate_source(start: float, rank: Optional[int] = None) -> str:
-    """Which term set :func:`effective_rate` (for the vote's line): ``lend`` / ``measured`` / ``start``."""
-    eff = effective_rate(start, rank)
+    """Which term set :func:`vote_rate` (for the vote's line): ``lend`` / ``measured`` / ``start``."""
+    eff = vote_rate(start, rank)
     lr = lend_rate(rank)
     if lr is not None and float(lr) >= eff and eff > float(start):
         return "lend"
@@ -679,9 +715,9 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
 # rank-local; nothing structural reads it). An extend prices from its class only up to the widest
 # measured one (rows <= widest): a class doubles its rows, so a 4000-row extend is never priced by a
 # 2100-row reading. A class without a reading, or wider than its widest, prices nothing (``None``):
-# the caller keeps its old price. No safety factor, no reserve: the price adds the card's corridor
-# line (EXTEND-KORRIDOR 22.10.; it was the 300 MiB HALT line) to the measured cost
-# (``d_transient_lend.short_extend_need_mib``). One line per new
+# the caller keeps its old price. No safety factor, no reserve: the price adds the card's 300 MiB
+# HALT line to the measured cost (``d_transient_lend.short_extend_need_mib``; A4 21.10. stands, review
+# 22.10.). One line per new
 # class maximum:
 #
 #     EXTEND-LEND-COST rank=0 rows=5 class=64 cost_mib=.. forward_mib=.. transient_mib=..
@@ -796,8 +832,9 @@ def lend_cost_settle(rank: Optional[int] = None, cuda=None, lend_open: bool = Fa
             if prev_lr is None or lr > float(prev_lr):
                 _CACHE["lend_rate"] = lr
                 logger.info(f"{LEND_COST_MARKER} RATE rank={rk} rows={int(rows)} cost_mib={cost} rate={lr:.4f} "
-                            f"prev={'none' if prev_lr is None else f'{float(prev_lr):.4f}'} (the width vote and "
-                            f"the short-extend price use max(start, measured x {RATE_SAFETY}, this))")
+                            f"prev={'none' if prev_lr is None else f'{float(prev_lr):.4f}'} (the width vote uses "
+                            f"max(start, measured x {RATE_SAFETY}, this, recorded start); the short-extend price "
+                            f"does not)")
         line_mib = corridor_line_mib(rank)
         if free_mib is not None and free_mib < line_mib:
             # the extend's growth stands in torch's cache: give it back to the driver now (the lend moves next and
