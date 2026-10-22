@@ -93,6 +93,79 @@ class TheProfileSwitchArmsEveryRank(unittest.TestCase):
             self.assertEqual(self.res["canon"].get(key), self.res["parent"][key], key)
 
 
+_SPAWN_PROBE = r"""
+import ctypes, json, multiprocessing as mp, os, sys
+import flliper.srt.environ  # noqa: F401  (the launch_server group process imports it; sentinel already set or not)
+KEYS = ("CUDA_ENABLE_COREDUMP_ON_EXCEPTION", "CUDA_COREDUMP_SHOW_PROGRESS",
+        "CUDA_COREDUMP_GENERATION_FLAGS", "CUDA_COREDUMP_FILE")
+
+def scheduler_like(q):
+    # The scheduler hop: Engine._launch_scheduler_processes -> mp.Process (spawn) -> run_scheduler_process,
+    # which renames itself (scheduler.py setproctitle "flliper::scheduler_TP0"). setproctitle reuses the
+    # argv+environ block, so /proc/<pid>/environ of a scheduler is NOT its environment -- the CUDA driver reads
+    # the libc environment (getenv), which setproctitle moved to the heap.
+    import setproctitle
+    setproctitle.setproctitle("flliper::scheduler_TP0")
+    libc = ctypes.CDLL(None)
+    libc.getenv.restype = ctypes.c_char_p
+    got = {k: (libc.getenv(k.encode()) or b"").decode() or None for k in KEYS}
+    proc = open("/proc/self/environ", "rb").read().split(b"\0")
+    q.put({"getenv": got, "proc_has": {k: any(e.startswith(k.encode() + b"=") for e in proc) for k in KEYS}})
+
+if __name__ == "__main__":
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(target=scheduler_like, args=(q,))
+    p.start()
+    res = q.get(timeout=240)
+    p.join(60)
+    res["parent"] = {k: os.environ.get(k) for k in KEYS}
+    print(json.dumps(res))
+"""
+
+
+class EverySchedulerRankGetsThemThroughTheSpawnHop(unittest.TestCase):
+    """22.10. (desk/nf-rc32-cudacore-1022): the live rc32 check read /proc/<scheduler>/environ, found 0 coredump
+    variables and concluded they were stripped between the launch_server group process and its scheduler children.
+    They are not: setproctitle (scheduler.py) overwrites the argv+environ block, so /proc shows zeros for the front of
+    the block (where the early-injected CUDA_* sit) and only its tail (--env-d values appended last by build_env).
+    The authority is the libc environment the CUDA driver reads -- pinned here through the real hop (mp spawn +
+    setproctitle) with FLLIPER_CUDA_COREDUMP=1 as the only switch."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.dump_dir = os.path.join(cls.tmp.name, "evidence", "cudacore")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CUDA_COREDUMP") and k not in (
+                   "CUDA_ENABLE_COREDUMP_ON_EXCEPTION", "CUDA_ENABLE_LIGHTWEIGHT_COREDUMP",
+                   "FLLIPER_CUDA_COREDUMP", "SGLANG_CUDA_COREDUMP", "FLLIPER_CUDA_COREDUMP_DIR",
+                   "SGLANG_CUDA_COREDUMP_DIR", "_FLLIPER_CUDA_COREDUMP_INJECTED")}
+        env.update({"PYTHONPATH": PY, "CUDA_VISIBLE_DEVICES": "",
+                    "FLLIPER_CUDA_COREDUMP": "1", "FLLIPER_CUDA_COREDUMP_DIR": cls.dump_dir})
+        script = os.path.join(cls.tmp.name, "spawn_probe.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(_SPAWN_PROBE)
+        out = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True, timeout=300)
+        assert out.returncode == 0, out.stderr[-2000:]
+        cls.res = json.loads(out.stdout.strip().splitlines()[-1])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_the_renamed_scheduler_child_sees_every_coredump_variable(self):
+        want = {
+            "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
+            "CUDA_COREDUMP_SHOW_PROGRESS": "1",
+            "CUDA_COREDUMP_GENERATION_FLAGS": "skip_nonrelocated_elf_images,skip_global_memory,"
+                                              "skip_shared_memory,skip_local_memory,skip_constbank_memory",
+            "CUDA_COREDUMP_FILE": self.dump_dir + "/cuda_coredump_%h.%p.%t",
+        }
+        self.assertEqual(self.res["parent"], want)
+        self.assertEqual(self.res["getenv"], want)
+
+
 class TheOldProfileSpellingConverts(unittest.TestCase):
     def test_sglang_names_become_the_flliper_names(self):
         sys.path.insert(0, os.path.join(ROOT, "tools", "release"))
