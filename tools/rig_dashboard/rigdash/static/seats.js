@@ -81,7 +81,8 @@
   }
 
   // ------------------------------------------------------------------ live part (browser only)
-  let el = null, shown = false, timer = null, last = "", state = null, busy = false;
+  // ``failed``: the last action was refused -- its line stays until the next action (a state read must not wipe it, review 1022 S1)
+  let el = null, shown = false, timer = null, last = "", state = null, busy = false, failed = false;
 
   function note(msg, bad) {
     const n = document.getElementById("st-msg");
@@ -93,8 +94,10 @@
     try {
       const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const j = await r.json().catch(() => ({}));
+      failed = !r.ok;
       if (!r.ok) note(j.error || ("HTTP " + r.status), true); else note("");
     } catch (e) {
+      failed = true;
       note(String(e), true);
     } finally {
       busy = false;
@@ -122,7 +125,7 @@
       const r = await fetch("api/seats/state", { cache: "no-store" });
       const j = await r.json();
       if (!r.ok) { note(j.error || ("HTTP " + r.status), true); }
-      else { state = j; if (!busy) note(""); draw(); }
+      else { state = j; if (!busy && !failed) note(""); draw(); }
     } catch (e) {
       note("rdx-seatmgr not reachable: " + e, true);
     }

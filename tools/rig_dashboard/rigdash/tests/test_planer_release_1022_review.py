@@ -179,5 +179,48 @@ class R1ClientTextsReachTheMemory(unittest.TestCase):
         self.assertNotIn("sv(esc(CHIP", src)
 
 
+# A refused seat action stays visible (review 1022, S1, found in the review's Playwright run against a read-only rdx-seatmgr stand-in): ``call()`` wrote the
+# error of a refused POST into #st-msg and then ran ``poll()``, whose successful state read cleared the line again 6 ms later -- "Forget" / "Belongs to"
+# refused by rdx-seatmgr looked like it had worked.  The live part is driven in node with a stub DOM and a stub fetch.
+SEATS_HARNESS = r"""
+const listeners = {}, msg = {textContent: "", className: ""}, rootBox = {innerHTML: "", querySelectorAll: () => [], contains: () => false};
+const container = {set innerHTML(v) {}, addEventListener: (k, f) => { listeners[k] = f; }};
+globalThis.document = {hidden: false, activeElement: null, addEventListener: () => {},
+  getElementById: (id) => ({"seats-root": container, "st-msg": msg, "st-root": rootBox})[id] || null};
+let postStatus = %(status)d;
+globalThis.fetch = async (path, opt) => {
+  if (opt && opt.method === "POST") return {ok: postStatus < 400, status: postStatus, json: async () => (postStatus < 400 ? {ok: true} : {ok: false, error: "seatmgr refused"})};
+  return {ok: true, status: 200, json: async () => ({seats: [], devices: []})};
+};
+require(%(js)s);
+const S = globalThis.RigSeats;
+const tick = () => new Promise((r) => setTimeout(r, 30));
+(async () => {
+  S.show(); await tick();
+  const target = {disabled: false, dataset: {act: "forget"}, closest: (sel) => (sel === "button[data-act]" ? target : {dataset: {id: "usb:1-3"}})};
+  listeners.click({target}); await tick(); await tick();
+  const after = msg.textContent;
+  S.hide();
+  process.stdout.write(JSON.stringify({after, cls: msg.className}));
+  process.exit(0);
+})();
+"""
+
+
+@unittest.skipUnless(NODE, "node missing")
+class S1RefusedSeatActionStays(unittest.TestCase):
+    def run_js(self, status):
+        js = SEATS_HARNESS % {"status": status, "js": json.dumps(os.path.join(STATIC, "seats.js"))}
+        return json.loads(subprocess.run([NODE, "-e", js], capture_output=True, text=True, check=True, timeout=30).stdout)
+
+    def test_a_refused_action_keeps_its_error_after_the_next_state_read(self):
+        got = self.run_js(409)
+        self.assertEqual(got["after"], "seatmgr refused")
+        self.assertIn("st-bad", got["cls"])
+
+    def test_a_successful_action_leaves_no_line(self):
+        self.assertEqual(self.run_js(200)["after"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
