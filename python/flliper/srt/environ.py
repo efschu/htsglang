@@ -125,12 +125,17 @@ class EnvField:
         backup_value = os.environ.get(self.name)
         backup_set_to_none = self._set_to_none
         self.set(value)
-        yield
-        if backup_present:
-            os.environ[self.name] = backup_value
-        else:
-            os.environ.pop(self.name, None)
-        self._set_to_none = backup_set_to_none
+        # review nf-rc33-extendkorridor-1022: restore in ``finally`` -- without it an exception inside the ``with``
+        # (a red test body) left the variable set and poisoned every following module of the same pytest run
+        # (22 follow-up failures in the author's first HEAD run)
+        try:
+            yield
+        finally:
+            if backup_present:
+                os.environ[self.name] = backup_value
+            else:
+                os.environ.pop(self.name, None)
+            self._set_to_none = backup_set_to_none
 
     def clear(self):
         os.environ.pop(self.name, None)

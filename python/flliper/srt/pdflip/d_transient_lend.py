@@ -122,6 +122,15 @@ round_start prices the PENDING rows, ``on_batch`` the BUILT extend (often far wi
 the built price is the guard, a return can move from round_start to on_batch (review A3).
 Amount rank-local like every lend amount; no verdict reads it. ``FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE``
 (default ON); off = the old price byte for byte.
+
+EXTEND-KORRIDOR (22.10., nf-rc33-extendkorridor-1022) SUPERSEDES the A4 sentence above: the 300 terms are
+now the card's corridor line (``extend_trim.corridor_line_mib``, TP0 767 / TP1 700 / TP2 701 on NF), so the
+price is ``max(floor, line + rate x rows, line + measured cost)`` and a short extend started at the price
+ends at >= the corridor law on every rank, TP0 included (the start-rate sum without a class reading keeps
+its ``floor + 300 + rate x rows`` form). The price of that: more partial returns before short extends on
+every rank (review replay of rc33 ``_060647``: ~300-600 more on TP0 and ~150-350 on TP1/TP2 per 71 min,
+p50 ~105 ms each) -- the lend fills the card down to the floor, so a short extend whose measured class
+cost does not fit above the line gives cells back.
 """
 
 from __future__ import annotations
@@ -775,6 +784,11 @@ def quiesce_for_sleep(sched) -> None:
         ctl = dsv.controller(sched)
     except Exception:  # noqa: BLE001
         ctl = None
+    # review nf-rc33-extendkorridor-1022: an extend right before the sleep (R6 flips mid-D-prefill) left its
+    # LEND-COST tail open; settled after the wake it would book the wake's reserved delta as draft growth and
+    # ratchet ``extend_trim.lend_rate`` -- the width vote's rate since EXTEND-KORRIDOR -- for the rest of the
+    # boot. Close it here, while ``reserved`` is still the extend batch's own (before the sleep's empty_cache).
+    _settle_lend_cost(sched, ctl)
     try:
         if ctl is not None:
             ctl.settle()
