@@ -15385,11 +15385,13 @@ def dual_d_air_tokens(d_bs: int, chunk: int = CHUNKED_PREFILL_TOKENS,
 def dual_front_kv_tag_env(ns, environ=None) -> dict:
     """#1495: the front env carries the boot's --tag as FLLIPER_PDFLIP_DUAL_KV_TAG so
     its dual P stage-file reads (grant/air/weights/card_room/p_lent, d_signal,
-    ANCHOR-OWED) key the files like the ranks do. Only in the dual layout and only
-    with FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX=1 (default off = {} = front env as before);
+    ANCHOR-OWED) key the files like the ranks do. Only in the dual layout; DEFAULT ON
+    (user order 14.10.: new features on; 27B dual 21.10. 22:57:17Z the blind front
+    resumed P past PP0's refused reclaim and the 5090 ran to driver_free 2.7 MiB) --
+    off only with FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX=0 (then {} = the old front env);
     an operator-set FLLIPER_PDFLIP_DUAL_KV_TAG is never overwritten."""
     environ = os.environ if environ is None else environ
-    if str(environ.get("FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX", "")).strip().lower() not in ("1", "true", "on", "yes"):
+    if str(environ.get("FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX", "")).strip().lower() in ("0", "false", "off", "no"):
         return {}
     if not getattr(ns, "dual_layout", False) or not getattr(ns, "tag", None):
         return {}

@@ -91,8 +91,9 @@ def stage_dir(monkeypatch):
 
 
 def _reading_front(paths):
-    f = types.SimpleNamespace(dual_kv_ledgers=list(paths))
+    f = types.SimpleNamespace(dual_kv_ledgers=list(paths), DUAL_LEND_GATE_LOG_S=FR.Front.DUAL_LEND_GATE_LOG_S)
     f._dual_p_stage_reading = types.MethodType(FR.Front._dual_p_stage_reading, f)
+    f._dual_lend_gate_lent = types.MethodType(FR.Front._dual_lend_gate_lent, f)   # #1480 default on since 22.10.
     return f
 
 
@@ -173,7 +174,7 @@ def test_a_each_wake_guard_has_a_red_mutant(monkeypatch, stage_dir, fixed, back,
 
 def test_a_the_front_without_card_room_mutant_is_red(monkeypatch, stage_dir):
     src = textwrap.dedent(inspect.getsource(FR.Front._dual_p_stage_reading))
-    fixed = '"card_room": card_room if stages else None'
+    fixed = '"card_room": card_room if (stages and card_stages) else None'   # 22.10.: + the #1956 blind case
     assert src.count(fixed) == 1
     ns = dict(vars(FR))
     exec(compile(src.replace(fixed, '"card_room": None'), FR.__file__, "exec"), ns)
@@ -381,7 +382,7 @@ def test_b1_without_the_hold_mutant_is_the_gmps12_retract(monkeypatch):
 
 def _stage_front(paths):
     f = types.SimpleNamespace(dual_kv_ledgers=list(paths), counters=collections.Counter(), queue=[],
-                              _dual_inflight=[])
+                              _dual_inflight=[], DUAL_LEND_GATE_LOG_S=FR.Front.DUAL_LEND_GATE_LOG_S)
     calls = []
 
     async def _sleep():
@@ -392,7 +393,7 @@ def _stage_front(paths):
 
     f._dual_p_sleep, f._dual_p_wake = _sleep, _wake
     f._dual_p_sleep_probe_tick = lambda pressure: False
-    for name in ("_dual_stages", "_dual_p_stage_reading", "_dual_stage_tick"):
+    for name in ("_dual_stages", "_dual_p_stage_reading", "_dual_stage_tick", "_dual_lend_gate_lent"):
         setattr(f, name, types.MethodType(getattr(FR.Front, name), f))
     return f, calls
 

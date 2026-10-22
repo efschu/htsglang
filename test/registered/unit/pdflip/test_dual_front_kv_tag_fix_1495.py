@@ -1,4 +1,4 @@
-"""#1495: the front env gets the boot tag only with the switch, only in the dual layout, never over an operator value."""
+"""#1495: the front env gets the boot tag (default on since 22.10.), only in the dual layout, never over an operator value."""
 from types import SimpleNamespace
 
 from flliper.srt.pdflip.launcher import dual_front_kv_tag_env as F
@@ -8,8 +8,10 @@ def _ns(dual=True, tag="dkr27bX"):
     return SimpleNamespace(dual_layout=dual, tag=tag)
 
 
-def test_default_off_is_empty():
-    assert F(_ns(), {}) == {}
+def test_default_on_exports_the_tag_and_0_switches_it_off():
+    """Default ON since 22.10. (user order 14.10.; 27B dual 21.10.: the blind front resumed P past a refused
+    reclaim). =0 keeps the old front env."""
+    assert F(_ns(), {}) == {"FLLIPER_PDFLIP_DUAL_KV_TAG": "dkr27bX"}
     assert F(_ns(), {"FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX": "0"}) == {}
 
 
@@ -30,4 +32,4 @@ def test_wired_after_the_p_sleep_front_env_and_registered():
     src = inspect.getsource(L)
     assert src.index("fenv.update(dual_p_sleep_front_env(") < src.index("fenv.update(dual_front_kv_tag_env(ns))")
     from flliper.srt.environ import envs
-    assert envs.FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX.get() is False
+    assert envs.FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX.get() is True

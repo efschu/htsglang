@@ -132,26 +132,29 @@ def _b9c(monkeypatch):
     return c, free0
 
 
-# -- default OFF: the B9c reading, byte for byte ------------------------------------
+# -- default ON since 22.10. (user order 14.10.; 27B dual 21.10. 22:57:17Z = B9c again) ----------
 
-def test_default_is_off():
-    assert envs.FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE.get() is False
+def test_default_is_on():
+    assert envs.FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE.get() is True
 
 
-def test_off_reproduces_b9c_resume_after_a_refused_reclaim(monkeypatch):
+def test_off_front_reads_its_own_tag_since_1022(monkeypatch):
+    """B9c pinned p_lent 0 and the resume with the switch off. Since 22.10. the front's stage reading keys
+    the files by its own --tag (front.dual_kv_tag): the loan is seen without the gate as well."""
     c, _ = _b9c(monkeypatch)
-    f, st = c.front()
-    rd = f._dual_p_stage_reading()
-    assert rd["p_lent"] == 0, "B9c: the front reads the stage files under 'pdflip' and finds none"
-    action, line = c.tick(f, st)
-    assert action == "resume" and "from=lend" in line, "B9c 17:02:28.251: resume although PP0's loan is with D"
+    with envs.FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE.override(False):
+        f, st = c.front()
+        rd = f._dual_p_stage_reading()
+        assert rd["p_lent"] == LENDS[0]
+        assert c.tick(f, st) == (None, None) and st.p_state == "reclaiming"
 
 
 def test_off_never_calls_the_gate(monkeypatch):
     c, _ = _b9c(monkeypatch)
-    f, st = c.front()
-    f._dual_lend_gate_lent = lambda *_: pytest.fail("the gate ran with the switch off")
-    assert f._dual_p_stage_reading()["p_lent"] == 0
+    with envs.FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE.override(False):
+        f, st = c.front()
+        f._dual_lend_gate_lent = lambda *_: pytest.fail("the gate ran with the switch off")
+        assert f._dual_p_stage_reading()["p_lent"] == LENDS[0]
 
 
 # -- ON ------------------------------------------------------------------------------
@@ -243,11 +246,16 @@ def test_marker_is_key_value_and_rate_limited(monkeypatch, caplog):
 # -- mutants: each guard has a red form ------------------------------------------------------
 
 def test_mutant_gate_ignored_goes_red(monkeypatch):
-    """Without the gate's override of p_lent the B9c resume comes back."""
+    """Without the gate's override of p_lent AND with the pre-22.10. stage reading (env tag only, no
+    front.dual_kv_tag) the B9c resume comes back. Since 22.10. either reader alone holds it."""
     c, _ = _b9c(monkeypatch)
     with envs.FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE.override(True):
         f, st = c.front()
         f._dual_lend_gate_lent = lambda legacy: legacy                   # mutant: gate computes nothing
+        assert c.tick(f, st) == (None, None), "the stage reading itself sees PP0's loan (22.10.)"
+        monkeypatch.setattr(FR, "dual_kv_tag", lambda front: os.environ.get("FLLIPER_PDFLIP_DUAL_KV_TAG", "")
+                            or os.environ.get("FLLIPER_PDFLIP_TAG", "pdflip"))   # mutant: the pre-22.10. reading
+        st.p_state = "reclaiming"
         with pytest.raises(AssertionError):
             assert c.tick(f, st) == (None, None)
 

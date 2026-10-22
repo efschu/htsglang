@@ -810,12 +810,13 @@ class Envs:
     # made for when a newer instance of the same rid is queued, instead of AbortReq(rid) (prefix: both instances + the
     # new instance's told).
     FLLIPER_PDFLIP_DUAL_POP_KEEPS_TWIN = EnvBool(False)
-    # #1480 LEND-RESUME-GATE (B9c 17:02:28Z): dual FRONT only (the P-stage ladder). DEFAULT OFF = the old code path byte for
-    # byte. On: the front's resume 'from=lend' needs every P stage file at lent==0. The front read the stage files under
+    # #1480 LEND-RESUME-GATE (B9c 17:02:28Z): dual FRONT only (the P-stage ladder). DEFAULT ON (user order 14.10.: new
+    # features on; 27B dual 21.10. 22:57:17Z the same class again: PP0's reclaim refused, 939524096 B lent, P resumed
+    # 200 ms later, the 5090 ran to driver_free 2.7 MiB at 23:10:19Z); =0 = the old code path byte for byte. On: the front's resume 'from=lend' needs every P stage file at lent==0. The front read the stage files under
     # the tag 'pdflip' (its own env carries neither FLLIPER_PDFLIP_DUAL_KV_TAG nor FLLIPER_PDFLIP_TAG, the P ranks' env does), so
     # p_lent was always 0 and P resumed 200 ms after PP0's REFUSED reclaim (1.85 GiB lent, 302 MiB free) -> OOM. On: p_lent is
     # read under the front's own --tag too (max with the old reading); a refused/open reclaim holds the resume.
-    FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE = EnvBool(False)
+    FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE = EnvBool(True)
     # #1495 FRONT-KV-TAG (desk 1495): the front's reads of the dual P stage files
     # (_dual_p_stage_reading: grant/air/weights/card_room/p_lent; d_signal_file;
     # the ANCHOR-OWED read_room) key the file names by FLLIPER_PDFLIP_DUAL_KV_TAG or
@@ -826,8 +827,11 @@ class Envs:
     # On: the launcher exports the boot's --tag as FLLIPER_PDFLIP_DUAL_KV_TAG into the
     # FRONT env (dual layout only). The ladder then SEES the cards: new stalls are
     # possible (P held while a lend is open), so this is its own observed boot.
-    # Default off = front env byte for byte as before.
-    FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX = EnvBool(False)
+    # DEFAULT ON since 22.10. (user order 14.10.: new features on; 27B dual 21.10.: the
+    # blind ladder left PP0's 939524096 B awake loan in the 5090's card budget while P
+    # regrew its cache -- driver_free 2.7 MiB); =0 = front env byte for byte as before.
+    # The launcher reads the raw env (dual_front_kv_tag_env), this entry is its catalog.
+    FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX = EnvBool(True)
     # #1956 WAKE-SEES-LOAN (f9 rc12z30y9f9, 05.10. 05:18:02Z, PP1 W-DUAL-P-WAKE-SHORT): dual FRONT only (the P-stage
     # ladder). DEFAULT OFF = the old code path byte for byte. The front's wake from sleep is guarded per card by
     # card_room (free >= that card's loan + one P step + D's look-ahead); without the env tag (#1495) the front read no

@@ -2892,6 +2892,22 @@ def refusal_status(measured_tokens: Optional[int], static_capacity: int) -> int:
     return 413 if int(measured_tokens) > int(static_capacity) else 503
 
 
+def dual_kv_tag(front) -> str:
+    """The tag the dual P ranks key their stage files (and D its signal file) by.
+
+    The ranks get the boot's --tag as FLLIPER_PDFLIP_DUAL_KV_TAG (launcher.py
+    dual_share_env); the front's own env carries it only with #1495. Without it the
+    front's stage reading looked under 'pdflip', found no stage file and said p_lent 0
+    -- 27B dual 21.10. 22:57:17Z: PP0's awake reclaim was refused (939524096 B lent,
+    671088640 B free), the front resumed P 200 ms later, P regrew its allocator cache
+    into the bytes the card ledger still lent D, and the 5090 ran to driver_free
+    2.7 MiB (23:10:19Z, D-KV GROW +1879048192 B on that loan). Order: the env tag (an
+    operator value wins), the front's own --tag (the same boot tag the ranks were
+    given), then the old fallbacks."""
+    return (os.environ.get("FLLIPER_PDFLIP_DUAL_KV_TAG", "") or str(getattr(front, "tag", "") or "")
+            or os.environ.get("FLLIPER_PDFLIP_TAG", "pdflip"))
+
+
 class FrontTemplateRefused(ValueError):
     """TEMPLATE-GATE: the chat template itself refused the request's messages (a Jinja
     ``raise_exception`` -- e.g. ``Unexpected message role.``). A fault of the REQUEST, the
@@ -22557,7 +22573,7 @@ class Front:
             free = int(st.free) if free is None else min(free, int(st.free))
             # D's unmet request on this card (card_kv_ledger.request: need - grant)
             d_short = max(d_short, int(st.demand.get("D", 0) or 0))
-        tag = os.environ.get("FLLIPER_PDFLIP_DUAL_KV_TAG", "") or os.environ.get("FLLIPER_PDFLIP_TAG", "pdflip")
+        tag = dual_kv_tag(self)
         grant, per_tok, weights, step_tok, lent = 0, 0.0, 0, 0, 0
         stages = []
         # HW-P1c 1003 (DUAL-FRONT-STAGES): one stage file per P stage = per card;
@@ -22630,7 +22646,9 @@ class Front:
             lent = self._dual_lend_gate_lent(lent)
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
                 "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights,
-                "card_room": card_room if stages else None, "d_short": d_short, "p_lent": lent}
+                # #1956: no per-card reading (a rank's stage file missing) is no card_room -- also when the
+                # stage reading found the others under the front's own tag (dual_kv_tag, 22.10.)
+                "card_room": card_room if (stages and card_stages) else None, "d_short": d_short, "p_lent": lent}
 
     #: #1480: seconds between two LEND-RESUME-GATE lines while the gate holds
     DUAL_LEND_GATE_LOG_S = 5.0

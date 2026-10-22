@@ -270,7 +270,8 @@ def test_d_publishes_its_signal_and_the_front_reads_it_as_d_short(monkeypatch):
             sig = json.load(f)
         assert abs(sig["id_frac"] - 0.96) < 1e-9 and sig["arena_complete"] == 112
         path, _d, _p = _ledgers()                              # free ledger bytes, no D demand (y8v)
-        f = types.SimpleNamespace(dual_kv_ledgers=[path])
+        f = types.SimpleNamespace(dual_kv_ledgers=[path], DUAL_LEND_GATE_LOG_S=FR.Front.DUAL_LEND_GATE_LOG_S)
+        f._dual_lend_gate_lent = types.MethodType(FR.Front._dual_lend_gate_lent, f)   # #1480 default on since 22.10.
         rd = FR.Front._dual_p_stage_reading(f)
         assert rd["d_short"] > 0, "D's id space and arena press P although the ledger shows no demand"
         assert rd["p_lent"] == 0

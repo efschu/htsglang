@@ -118,14 +118,22 @@ class _Rig:
 
 
 def test_default_off_is_the_f9_wake_into_the_short():
-    """Default OFF reproduces f9: blind reading, wake at free 3057123328 < loan 3235905536,
-    PP1's wake_reclaim raises W-DUAL-P-WAKE-SHORT (PP0/PP2 get theirs)."""
+    """f9 was the BLIND default: no stage file under 'pdflip', no card_room, wake at free 3057123328 < loan
+    3235905536, PP1's wake_reclaim raised W-DUAL-P-WAKE-SHORT. Since 22.10. the stage reading keys the files
+    by the front's own --tag (front.dual_kv_tag): the default wake (switch off) sees the cards and holds at
+    f9's moment as well; with the pre-22.10. reading (mutant) the f9 wake comes back."""
     assert envs.FLLIPER_PDFLIP_DUAL_WAKE_SEES_LOAN.get() is False
     mp = pytest.MonkeyPatch()
     try:
         rig = _Rig(mp)
         rig.sleep_and_d_grows()
         f, st = rig.front()
+        rd = f._dual_p_stage_reading()
+        assert rd["card_room"] is not None and len(rd["card_room"]) == 3
+        assert rd["card_room"][1][0] == 3057123328 and rd["card_room"][1][1] >= LOANS[1]
+        assert rig.tick(f, st) == (None, None) and st.p_state == "sleeping"
+        mp.setattr(FR, "dual_kv_tag", lambda front: os.environ.get("FLLIPER_PDFLIP_DUAL_KV_TAG", "")
+                   or os.environ.get("FLLIPER_PDFLIP_TAG", "pdflip"))      # mutant: the pre-22.10. reading
         rd = f._dual_p_stage_reading()
         assert rd["card_room"] is None and rd["weights_bytes"] == 0 and rd["p_grant_bytes"] == 0
         action, line = rig.tick(f, st)
@@ -144,7 +152,9 @@ def test_on_holds_until_the_card_has_its_loan_back(monkeypatch):
         f, st = rig.front()
         rd = f._dual_p_stage_reading()
         assert rd["card_room"] is not None and len(rd["card_room"]) == 3
-        assert rd["card_room"][1] == (3057123328, LOANS[1] + STEP_B)
+        # loan + one P grant step + D's look-ahead (one P step without FLLIPER_PDFLIP_DUAL_D_AIR_TOKENS) -- the
+        # look-ahead is priced since the stage reading sees the files (front.dual_kv_tag, 22.10.)
+        assert rd["card_room"][1] == (3057123328, LOANS[1] + STEP_B + STEP_B)
         assert rig.tick(f, st) == (None, None)            # f9's moment: P stays asleep
         assert st.p_state == "sleeping"
         # D's seat end shrinks D's KV (f9 D.log 05:18:03 SHRINK 434176 -> 335872)
