@@ -88,8 +88,11 @@
     const items = (v.items || []).map((i) => `<li><span class="pz-chip ${i.blocked ? "pz-bad" : "pz-warn"}">${i.blocked ? "refused" : "needs force"}</span> <span class="mono">${esc(i.code)}</span>${i.count > 1 ? ` <span class="muted">&times;${i.count}</span>` : ""} ${sv(esc(String(i.text).length > 200 ? String(i.text).slice(0, 198) + "…" : i.text))}</li>`).join("");
     const fit = v.fit && v.fit.level ? ` Fit: <b>${esc(({ ja: "yes", tight: "tight", nein: "no" })[v.fit.level] || v.fit.level)}</b>${v.fit.margin_mib != null ? ", margin " + num(Math.round(v.fit.margin_mib)) + " MiB" : ""}.` : "";
     const groups = (p.felder || []).map((g) => `<section class="pz-g"><h4>${esc(g.titel)}</h4><table class="pz-t"><tbody>${g.zeilen.map((r) => renderRow(r, p.karten)).join("")}</tbody></table></section>`).join("");
+    // PLANER A2 1022: the named hint "startable, slow (estimate)" -- the server derives it from the launcher solver's decode figures (planer_ziel.slow_hint); no lock
+    const slow = v.langsam ? `<div class="pz-verdict slow pz-slow"><span class="pz-chip pz-warn">${sv(esc(v.langsam.label))}</span> <span class="mono">${esc(v.langsam.code)}</span>
+      ${(v.langsam.saetze || []).map((x) => sv(esc(x))).join(" ")}</div>` : "";
     const notes = (p.hinweise || []).length ? `<details class="pz-calc"><summary>${p.hinweise.length} planner note${p.hinweise.length === 1 ? "" : "s"}</summary><ul>${p.hinweise.map((h) => `<li>${sv(esc(h))}</li>`).join("")}</ul></details>` : "";
-    return `${head}${adj}<div class="pz-verdict ${bad ? "bad" : "ok"}"><b>${sv(esc(v.text || ""))}</b>${fit} ${hw}${proof}${items ? `<details class="pz-calc"><summary>${(v.items || []).length} launcher note${(v.items || []).length === 1 ? "" : "s"}</summary><ul class="pz-vi">${items}</ul></details>` : ""}</div>${groups}${notes}`;
+    return `${head}${adj}<div class="pz-verdict ${bad ? "bad" : "ok"}"><b>${sv(esc(v.text || ""))}</b>${fit} ${hw}${proof}${items ? `<details class="pz-calc"><summary>${(v.items || []).length} launcher note${(v.items || []).length === 1 ? "" : "s"}</summary><ul class="pz-vi">${items}</ul></details>` : ""}</div>${slow}${groups}${notes}`;
   }
 
   const api = { esc, shortCard, totalCards, cardsBody, hwChip, renderCards, renderLayouts, renderPlan, renderRow, CHIP, chipOf };

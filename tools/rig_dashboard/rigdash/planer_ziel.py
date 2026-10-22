@@ -23,6 +23,9 @@ the measured hardware ("measured"); otherwise on synthetic catalog cards and eve
 those cards exists.  Card counts other than 3 are honestly "not supported yet" (the parallel track NCARDS builds the topology/launcher for them;
 the files of that track are not touched here).
 
+Slow layouts (PLANER A2 1022): a layout the launcher starts but whose decode the launcher's own solver prices far above the reference rig carries the named hint
+"startable, slow (estimate)" in its verdict (``slow_hint``, ``verdikt.langsam``) -- no lock.
+
 NVFP4 runs on sm86 (3080/3090) with our own kernels (Marlin FP4 W4A16, W4A8 on the INT8 tensor cores; user 21.10.): the card gate below is
 ``kartenplan_catalog.arch_status`` (what the image is built for), never a datasheet "native FP4" flag.
 """
@@ -89,6 +92,18 @@ OVERHEAD_PER_CARD_MIB = 4784
 #: D budgets 27792 + 17384 + 17168 = 62344 MiB - weights 28179 - draft 2072 - state 6 x 74.8 - pool 778980 x 34816 B (25866 MiB) = 5778 MiB = 3 x 1926 MiB.
 #: Only used where the launcher sets no pool flag (27B flip/solo); a pool flag in the argv always wins (review A1/A4).
 D_FIXED_PER_CARD_MIB = 1926
+#: PLANER A2 1022 ("startable, slow (estimate)", review done/planer-nfblock-review-1022.md A2): the bs1 decode round of the REFERENCE RIG as MEASURED, NF Form A,
+#: D log ``Decode rank batch gpu-ms`` p50 over all depths of three boots -- rc12 22.7, rc8 23.2, rc11 27.1 ms (deskq/done/nf-s40-decode-runde-1018.md, table
+#: "Rundenebene", row "1 ALLE").  The page puts the planner's estimate (the launcher's owned solve, ``propose_oracle.d_decode_figures``) next to this range.
+REFERENCE_BS1_ROUND_MS = (22.7, 27.1)
+#: The threshold of the hint: TWICE the upper reference value -- a bs1 decode at half the reference rig's rate.  Why not lower: the estimate is the launcher's
+#: owned-solve instrument, the reference is a measurement, and on the reference rig itself that instrument reads 24.8 ms (profiles_release/nf.env) to 35.6 ms
+#: (this page's proposal for the rig cards, basis nf-int4, dry run 22.10.), i.e. up to 1.31 x the measured 27.1 ms; a threshold under that error would flag the
+#: reference rig.  Twice keeps a margin above it.  Dry runs of this page 22.10. (NF flip, ``ZielPlaner.plan`` with the real oracle): rig 35.6 ms (2 waves),
+#: 3 x RTX 3090 27.3 ms (4 waves), 4 x RTX 3090 Form A kept (no cut solve, 2 waves) stay without the hint; 2 x RTX 3090 73.8 ms (10 waves, the review's case)
+#: gets it.
+SLOW_FACTOR = 2.0
+SLOW_BS1_ROUND_MS = round(SLOW_FACTOR * REFERENCE_BS1_ROUND_MS[1], 1)
 #: defaults of the two inputs (the planner's own defaults, ``ProfilEditor.ZIELE_INT`` / the proposal's ``goals``)
 DEFAULT_SEATS = 6
 DEFAULT_TOKENS = 262144
@@ -195,12 +210,12 @@ def _de_text(s: str) -> str:
 def _de_gib(s: str) -> str:
     """German decimal comma in the server's GiB and MiB figures ("65.5 GiB" -> "65,5 GiB", "74.8 MiB" -> "74,8 MiB"): the page writes its own figures with
     ``toLocaleString("de-DE")``, so a server figure with a point next to them is mixed notation (review 1022; MiB found by the review's Playwright run: the
-    recurrent state per seat "6 Sitze x 74.8 MiB").  Only a point between two digits whose number is followed by " GiB" or " MiB" changes; flags, versions,
-    ratios and MiB integers stay as they are.  No regex: this page reads no log."""
-    if "." not in s or (" GiB" not in s and " MiB" not in s):
+    recurrent state per seat "6 Sitze x 74.8 MiB").  Only a point between two digits whose number is followed by " GiB", " MiB" or " ms" changes (" ms":
+    the decode round of the "slow (estimate)" hint, PLANER A2 1022); flags, versions, ratios and MiB integers stay as they are.  No regex: this page reads no log."""
+    if "." not in s or (" GiB" not in s and " MiB" not in s and " ms" not in s):
         return s
     out = list(s)
-    for unit in (" GiB", " MiB"):
+    for unit in (" GiB", " MiB", " ms"):
         i = 0
         while True:
             j = s.find(unit, i)
@@ -265,6 +280,50 @@ def _cut_text(s: str, n: int) -> str:
 
 def _fmt_gib(mib: float) -> str:
     return "%.1f GiB" % (mib / 1024.0)
+
+
+#: the outcomes of the launcher's dry run under which the layout STARTS (with or without force); a refusal or a crash never gets the "startable, slow" hint
+_STARTABLE = ("geht", "ok", "ok_with_force")
+
+
+def slow_hint(outcome: Optional[str], plan: Optional[dict]) -> Optional[dict]:
+    """PLANER A2 1022: the named hint "startable, slow (estimate)" -- NO lock, the layout stays startable.  Derived from what the launcher's solver chose
+    (``plan.d_decode``, ``propose_oracle.d_decode_figures``), never from the model or the card count:
+
+    * the owned solve's estimated bs1 decode round of the chosen form (max over the D ranks: the round is synchronous) is above ``SLOW_BS1_ROUND_MS``, twice
+      the measured bs1 round of the reference rig; or
+    * the owned solve found no form at the Form-A standard overflow waves and searched again at Form A's own waves (``wave_fallback``): the solver itself chose
+      overflow waves above the standard.
+
+    The overflow waves are not priced in the round (expert_residency prices misses, attention and LSE; each wave is one more sequential pool pass per MoE layer),
+    so where group D runs more waves than the standard the figure is a LOWER bound -- the hint says so.  ``None`` = no hint (fast enough, no owned solve, or not
+    startable)."""
+    if outcome not in _STARTABLE:
+        return None
+    d = (plan or {}).get("d_decode") or {}
+    rnd = [float(x) for x in d.get("round_bs1_ms") or []]
+    est = max(rnd) if rnd else None
+    fb = d.get("wave_fallback") or None
+    over = est is not None and est > SLOW_BS1_ROUND_MS
+    if not over and not fb:
+        return None
+    waves, std = d.get("waves"), d.get("waves_default")
+    saetze: List[str] = []
+    if est is not None:
+        saetze.append("The planner estimates %.1f ms per bs1 decode round on the slowest card, against %.1f ms to %.1f ms measured on the reference rig "
+                      "(the hint starts above %.1f ms, twice the reference)." % (est, REFERENCE_BS1_ROUND_MS[0], REFERENCE_BS1_ROUND_MS[1], SLOW_BS1_ROUND_MS))
+    if fb:
+        saetze.append("No form of the decode group held the standard %d overflow waves; the solver searched again with up to %d, the waves Form A needs."
+                      % (int(fb.get("env_waves") or 0), int(fb.get("form_a_waves") or 0)))
+    if waves is not None and std is not None and int(waves) > int(std):
+        saetze.append("The decode group runs up to %d overflow waves (Form A standard: %d)." % (int(waves), int(std)))
+        saetze.append("The overflow waves are not priced, so the figure is a lower bound.")
+    if "UNMEASURED" in str(d.get("miss_cost_source") or ""):
+        saetze.append("The cost per missed expert row is the unmeasured seed; the first boot is the measurement.")
+    saetze.append("No lock: the layout can be started.")
+    return {"code": "SLOW-ESTIMATE", "label": "startable, slow (estimate)", "saetze": saetze,
+            "round_bs1_ms": est, "reference_ms": list(REFERENCE_BS1_ROUND_MS), "threshold_ms": SLOW_BS1_ROUND_MS,
+            "waves": waves, "waves_default": std, "wave_fallback": fb}
 
 
 class ZielPlaner:
@@ -904,4 +963,5 @@ class ZielPlaner:
                                  "The first boot is the measurement.",
                 "verweigert": "The launcher refuses this combination (see the reasons).", "crash": "The launcher's dry run failed (see the reasons)."}.get(outcome, "No launcher verdict (%s)." % (outcome,))
         fit = prop.get("fit") or {}
-        return {"outcome": outcome, "text": text, "items": items, "fit": {"level": fit.get("level"), "margin_mib": fit.get("margin_mib")}}
+        return {"outcome": outcome, "text": text, "items": items, "fit": {"level": fit.get("level"), "margin_mib": fit.get("margin_mib")},
+                "langsam": slow_hint(outcome, vd.get("plan"))}

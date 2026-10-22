@@ -550,6 +550,64 @@ _KV_RE = re.compile(r"(?<![\w-])([A-Za-z_][\w.-]*)=([^\s;()\[\]]+)")
 #: ``budget P group=P ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 26064 MiB = total 32607 - ...``
 _BUDGET_RE = re.compile(r"^budget (.+?) group=(\w+) ordinal=(\d+) nvml_idx=(\d+) (.+?): (\d+) MiB")
 _TICKET_RE = re.compile(r"^#\d+[a-z]?(?:/#\d+[a-z]?)*$")
+#: PLANER A2 1022 (the decode figures of group D, read where the launcher printed them; :func:`d_decode_figures`):
+#: ``D-POOL-WELLEN (H95): --profile nextflash -> --env-d FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=2 (...)`` -- the launcher's Form-A default
+_D_WAVES_DEFAULT_RE = re.compile(r"^D-POOL-WELLEN \(H95\):.*?FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=(\d+)")
+#: ``PDFLIP-GROUP-ENV D: ...;FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=10;...`` -- the environment group D is started with (what ships)
+_D_GROUP_ENV_RE = re.compile(r"^PDFLIP-GROUP-ENV D: (.*)$")
+_D_WAVES_ITEM_RE = re.compile(r"(?:^|;)FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=(\d+)(?:;|$)")
+#: ``... D-EIGENTUM (#239 S3f): --rank-moe-ratio a -> b, ... Fehlgriff-Zeit bs1 je Rang ['73.84', '73.84'] ms (Form A ['57.35', '106.15']) ...
+#: Kosten je Zeile 0.1/0.2 ms (Saat UNMEASURED (...)), 40 Ids je Schritt`` -- the owned solve's bs1 round per D rank (expert_residency)
+_D_ROUND_RE = re.compile(r"D-EIGENTUM \(#239 S3f\): --rank-moe-ratio .*?Fehlgriff-Zeit bs1 je Rang \[([^\]]*)\] ms \(Form A \[([^\]]*)\]\)")
+_D_MISS_SRC_RE = re.compile(r"Kosten je Zeile (\S+) ms \((.*?)\), \d+ Ids je Schritt")
+#: ``... D-EIGENTUM WELLEN (nfblock 1022): keine Schnittform haelt die Env-Wellen 2 (...); ... Form A braucht 6 (...): neu gesucht mit hoechstens
+#: 6 Wellen -> 12 tragbar`` -- the owned solve left the Env wave cap (expert_residency, the nfblock wave fallback)
+_D_WAVE_FALLBACK_RE = re.compile(r"D-EIGENTUM WELLEN \(nfblock 1022\): keine Schnittform haelt die Env-Wellen (\d+) .*?Form A braucht (\d+) .*?-> (\d+ tragbar|keine tragbare Form)")
+
+
+def _ms_list(text: str) -> List[float]:
+    """``'73.84', '73.84'`` -> ``[73.84, 73.84]`` (the launcher prints the per-rank figures as a Python list of strings)."""
+    return [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
+
+
+def d_decode_figures(lines: Sequence[str]) -> Dict[str, Any]:
+    """PLANER A2 1022: what the launcher printed about group D's decode step -- the INPUT of the planner page's "slow (estimate)" hint.  Every figure is a
+    figure the launcher printed (this parser chooses nothing); a figure the plan does not print stays ``None``.
+
+    * ``waves``: ``FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES`` in the environment group D is STARTED with (the last ``PDFLIP-GROUP-ENV D`` line); ``None`` when
+      the plan ships none (27B: no expert pool).
+    * ``waves_default``: the launcher's Form-A default of that value (``D-POOL-WELLEN (H95)``; ``pdflip.DEFAULT_D_POOL_WAVES_NEXTFLASH``, "x177 form: 2 waves
+      carry n = 1..6 on all three ranks"); ``None`` when the operator stated the waves himself.
+    * ``round_bs1_ms`` / ``form_a_round_bs1_ms``: the owned solve's bs1 decode round per D rank of the form it CHOSE (the last solve printed; a later pass
+      that only checks the pinned form re-solves nothing) and of Form A; ``None`` without an owned solve (27B, or Form A kept: no cut form carried).
+    * ``miss_cost`` / ``miss_cost_source``: the cost per missed expert row those rounds are priced with and its source (``Saat UNMEASURED ...`` = the seed).
+    * ``wave_fallback``: ``{env_waves, form_a_waves, result}`` when the owned solve found no form at the Env wave cap and searched again at Form A's own waves
+      (``D-EIGENTUM WELLEN (nfblock 1022)``), else ``None``.
+    The overflow waves themselves are NOT priced in ``round_bs1_ms`` (expert_residency prices misses, attention and LSE per round; each further wave is one more
+    sequential pool pass per MoE layer): the round is a lower bound wherever ``waves`` exceeds ``waves_default``."""
+    out: Dict[str, Any] = {"waves": None, "waves_default": None, "round_bs1_ms": None, "form_a_round_bs1_ms": None, "miss_cost": None,
+                           "miss_cost_source": None, "wave_fallback": None}
+    for line in lines:
+        body = _PREFIX_RE.sub("", line.strip())
+        m = _D_WAVES_DEFAULT_RE.match(body)
+        if m:
+            out["waves_default"] = int(m.group(1))
+            continue
+        m = _D_GROUP_ENV_RE.match(body)
+        if m:
+            w = _D_WAVES_ITEM_RE.search(m.group(1).strip())
+            out["waves"] = int(w.group(1)) if w else None
+            continue
+        m = _D_ROUND_RE.search(body)
+        if m:
+            out["round_bs1_ms"], out["form_a_round_bs1_ms"] = _ms_list(m.group(1)), _ms_list(m.group(2))
+            c = _D_MISS_SRC_RE.search(body)
+            out["miss_cost"], out["miss_cost_source"] = (c.group(1), c.group(2)) if c else (None, None)
+            continue
+        m = _D_WAVE_FALLBACK_RE.search(body)
+        if m:
+            out["wave_fallback"] = {"env_waves": int(m.group(1)), "form_a_waves": int(m.group(2)), "result": m.group(3)}
+    return out
 
 
 def _kind(body: str) -> str:
@@ -611,7 +669,8 @@ def parse_plan_dump(dump: str) -> Dict[str, Any]:
     * ``group_argv``: ``{"P": [argv,...], "D": [...], "front": [...]}`` -- every printed launch line, split with shlex
       (the launcher prints each pass; the LAST one is what ships); ``group_flags``: ``{group: {flag: value}}`` of the last.
     * ``forced``: ``[{code, text}]`` of the ``FORCED-PAST`` lines.
-    * ``w_codes``: ``{"W19": n, ...}`` -- the W-codes the plan names (``W<nn> PdFlip...``), counted."""
+    * ``w_codes``: ``{"W19": n, ...}`` -- the W-codes the plan names (``W<nn> PdFlip...``), counted.
+    * ``d_decode``: group D's decode figures (overflow waves shipped and default, the owned solve's bs1 round), :func:`d_decode_figures`."""
     import shlex
 
     out: Dict[str, Any] = {"header": {}, "lines": [], "kinds": {}, "kv": {}, "budgets": [], "pp_cut": {},
@@ -651,6 +710,7 @@ def parse_plan_dump(dump: str) -> Dict[str, Any]:
     for g, lst in out["group_argv"].items():
         if lst:
             out["group_flags"][g] = _flags(lst[-1])
+    out["d_decode"] = d_decode_figures(out["lines"])
     return out
 
 

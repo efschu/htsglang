@@ -398,12 +398,13 @@ def _run_summary(res: Any) -> Dict[str, Any]:
 
 
 def plan_summary(res: Any) -> Dict[str, Any]:
-    """The resolved values of the plan the launcher printed (``propose_oracle.parse_plan_dump``): cut, budgets, group flags, W-codes."""
+    """The resolved values of the plan the launcher printed (``propose_oracle.parse_plan_dump``): cut, budgets, group flags, W-codes and group D's decode
+    figures (``d_decode``: overflow waves, the owned solve's bs1 round -- the input of the planner page's "slow (estimate)" hint, PLANER A2 1022)."""
     from flliper.srt.pdflip import propose_oracle as O
 
     p = O.parse_plan_dump(res.dump())
     return {"pp_cut": p["pp_cut"], "budgets": p["budgets"], "group_flags": p["group_flags"], "w_codes": p["w_codes"],
-            "zeilen": len(p["lines"])}
+            "d_decode": p["d_decode"], "zeilen": len(p["lines"])}
 
 
 def build_verdict(n: int, first: Any, second: Any = None, *, lens: Optional[Mapping[str, int]] = None,
