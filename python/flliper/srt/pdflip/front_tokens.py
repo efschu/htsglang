@@ -421,6 +421,10 @@ class FrontTokens:
         self.why = ""
         self.tokenizer_path = ""
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdflip-xexact")
+        #: TITO's own thread (review A3 22.10.): the TitoBook is touched here only,
+        #: so a slow decide (or one past its budget, still finishing) never queues
+        #: in front of the next arrival's count on ``executor``
+        self.tito_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdflip-tito")
         self.ids_by_text: "collections.OrderedDict[str, np.ndarray]" = collections.OrderedDict()
         self._chat = None
         self._anth = None
@@ -435,6 +439,8 @@ class FrontTokens:
         #: FRONT-PREWARM: the dummy render + encode at the end of the load
         self.warm_ms = 0.0
         self.warm_why = ""
+        #: TITO (front_tito.TitoBook): carried sequences; touched in the worker only
+        self.tito = None
 
     # -- loading -------------------------------------------------------------
     def load(self, server_args: Dict[str, Any], is_multimodal: bool = False) -> None:
@@ -458,8 +464,9 @@ class FrontTokens:
                                 trust_remote_code=ns.trust_remote_code,
                                 tokenizer_revision=getattr(ns, "revision", None),
                                 tokenizer_backend=getattr(ns, "tokenizer_backend", "huggingface"))
-            seg = SegmentEncoder(
-                tok, track_round_trip=envs.FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS.get())
+            # FRONT-SEND-IDS: the carrier is always on (user order 22.10., no
+            # off switch) -- every new segment's round trip is checked
+            seg = SegmentEncoder(tok, track_round_trip=True)
             wrapped = _TokWrapper(tok, seg)
             hf = _hf_config_stub(ns.model_path or path)
             mc = SimpleNamespace(
@@ -485,6 +492,11 @@ class FrontTokens:
             cl = getattr(ns, "context_length", None) or getattr(hf, "max_position_embeddings", None)
             self.context_len = int(cl) if cl else None
             self.tokenizer_path = path
+            # TITO (front_tito.py): the byte table of D's tokenizer; not byte-level
+            # = every decision is ``refused tokenizer:<why>`` (the render's ids)
+            from flliper.srt.pdflip import front_tito as _tito
+
+            self.tito = _tito.TitoBook(_tito.TokenBytes(tok))
             self.load_s = time.time() - t0
             self.state = "ready"
             self.why = seg.why
@@ -573,6 +585,41 @@ class FrontTokens:
                      reused=seg.last_reused, encoded=seg.last_encoded,
                      round_trip_ok=seg.last_round_trip_ok), image_data
 
+    # -- TITO (front_tito.py) -- every method runs in ``tito_executor`` ----------------
+    def tito_prepare(self, ids: np.ndarray, ns: Optional[str]) -> Tuple[Optional[bytes], List[str]]:
+        """The render's bytes and the rids whose generated ids D is asked for."""
+        book = self.tito
+        if book is None or not book.tb.ok or not book.tb.in_vocab(ids):
+            return None, []
+        nb = book.tb.bytes_of(ids)
+        return nb, book.need_output(nb, ns)
+
+    def tito_attach(self, items: Dict[str, Any], asked: Sequence[str]) -> Dict[str, str]:
+        """D's answer for ``asked`` -> {rid: what happened} (front_tito.TitoBook.set_output)."""
+        book = self.tito
+        if book is None:
+            return {}
+        return {str(r): book.set_output(str(r), (items or {}).get(str(r))) for r in asked}
+
+    def tito_decide(self, ids: np.ndarray, ns: Optional[str], new_bytes: Optional[bytes]):
+        from flliper.srt.pdflip import front_tito as _tito
+
+        book = self.tito
+        if book is None:
+            return _tito.Decision(_tito.V_REFUSED, ids, why="no_book")
+        return book.decide(ids, ns, new_bytes=new_bytes)
+
+    def tito_note(self, rid: str, ids: np.ndarray, ns: Optional[str]) -> None:
+        if self.tito is not None:
+            self.tito.note(rid, ids, ns)
+
+    def tito_end(self, rid: str, served: bool, rec: Optional[Dict[str, Any]]) -> str:
+        """The request end of ``rid`` (review A4): D's taken record attached
+        when served; the entry becomes supersedable."""
+        if self.tito is None:
+            return "no_book"
+        return self.tito.end(rid, served, rec)
+
     def remember(self, text: str, ids: np.ndarray) -> None:
         key = _sha(text)
         self.ids_by_text.pop(key, None)
@@ -598,10 +645,21 @@ class FrontTokens:
 # per new segment; the first is what the FRONT-IDS / D-IDS shadow lines
 # (FLLIPER_LOG_PDFLIP_PROMPT_IDS_DIGEST) prove on the metal before the switch
 # is turned on.
+#
+# TITO 22.10. (front_tito.py): the shadow lines matched 494/494 on NF rc32
+# (/v1/messages). The carrier is always on (no switch), for the Anthropic wire
+# too, and on EVERY leg of a rid -- P's leg 1, D's leg 2 (after P as well),
+# re-posts and D's probe -- because the ids may now be TITO's (a prefix of a
+# sequence a group computed, generated ids included), which only the legs can
+# carry: P and D must never run one request under two id sequences (R11).
 
 #: the one path whose D leg may carry the front's ids (the brief's scope; the
 #: Anthropic /v1/messages body is converted on D first)
 SEND_IDS_PATH = "/v1/chat/completions"
+#: TITO (22.10.): the paths whose legs carry the front's ids -- the Anthropic
+#: body declares ``input_ids`` and its adapter hands them to the chat layer
+#: (entrypoints/anthropic, the NF agent load is 494/494 /v1/messages on rc32)
+SEND_IDS_PATHS = (SEND_IDS_PATH, "/v1/messages")
 
 
 def payload_has_media(payload: Dict[str, Any]) -> bool:
@@ -614,25 +672,43 @@ def payload_has_media(payload: Dict[str, Any]) -> bool:
     return False
 
 
-def send_ids_eligible(*, path: str, payload: Any, count: Count) -> bool:
-    """May the D leg of this request carry ``count.ids`` instead of its text?
+def send_ids_why(*, path: str, payload: Any, count: Count) -> Optional[str]:
+    """Why the legs of this request may NOT carry ``count.ids`` (None = they may).
 
-    Not when D would render other text than the front counted: a continued
-    final message (its prefix ids are appended by a separate encode, whose
-    round trip the segment bit does not see), and ``reasoning_effort`` inside
-    ``chat_template_kwargs`` (D's ``_convert_to_internal_request`` pops it
-    before ``_process_messages``, the front's count does not)."""
-    if path != SEND_IDS_PATH or not isinstance(payload, dict):
-        return False
+    Not when a group would render other text than the front counted: a
+    continued final message (its prefix ids are appended by a separate encode,
+    whose round trip the segment bit does not see), and ``reasoning_effort``
+    inside ``chat_template_kwargs`` (D's ``_convert_to_internal_request`` pops
+    it before ``_process_messages``, the front's count does not). Never for
+    media (the groups' processors expand images: the front has no ids for
+    them) -- on the Anthropic wire ``tool_use`` / ``tool_result`` / ``thinking``
+    blocks are text, an image inside a ``tool_result`` is media."""
+    if path not in SEND_IDS_PATHS:
+        return "path"
+    if not isinstance(payload, dict):
+        return "payload"
     ctk = payload.get("chat_template_kwargs")
-    return (
-        count.round_trip_ok is True
-        and count.n > 0
-        and payload.get("input_ids") is None
-        and not payload.get("continue_final_message")
-        and not (isinstance(ctk, dict) and "reasoning_effort" in ctk)
-        and not payload_has_media(payload)
-    )
+    if count.round_trip_ok is not True:
+        return "round_trip" if count.round_trip_ok is False else "round_trip_unknown"
+    if count.n <= 0:
+        return "empty"
+    if payload.get("input_ids") is not None:
+        return "ids_given"
+    if payload.get("continue_final_message"):
+        return "continue_final_message"
+    if isinstance(ctk, dict) and "reasoning_effort" in ctk:
+        return "reasoning_effort"
+    from flliper.srt.pdflip import d_match_probe as _dmp
+
+    if (path == SEND_IDS_PATH and payload_has_media(payload)) or _dmp.payload_has_any_media(payload):
+        return "media"
+    return None
+
+
+def send_ids_eligible(*, path: str, payload: Any, count: Count) -> bool:
+    """May the legs of this request carry ``count.ids`` instead of its text?
+    (:func:`send_ids_why` is None.)"""
+    return send_ids_why(path=path, payload=payload, count=count) is None
 
 
 def ids_digest(ids: Sequence[int]) -> str:

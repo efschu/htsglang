@@ -2241,7 +2241,12 @@ class Envs:
     # D neither renders nor encodes it -- only when every segment of the render
     # passed the decode/encode round trip (pdflip/front_tokens.send_ids_eligible).
     # Enable only after the FRONT-IDS / D-IDS shadow lines matched on the metal.
-    FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS = EnvBool(False)
+    # TITO 22.10. (pdflip/front_tito.py): the shadow lines matched 494/494 on NF
+    # rc32 and the carrier is ALWAYS ON for /v1/chat/completions and
+    # /v1/messages, on every leg (P's leg 1, D's leg 2, D's probe) -- user order:
+    # no off switch, guarded per request (send_ids_why). This name is NOT READ
+    # any more; it stays declared only so the profile catalog keeps its entry.
+    FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS = EnvBool(True)
     # MM-PERSIST-1002 (y7t pdflip-10-10: the first image after a restart was
     # priced by chars/3, routed LONG and flipped D->P for 23 new tokens, the
     # image KV in the persistent L3 store): the front keeps the learned image
@@ -2505,7 +2510,7 @@ class Envs:
     # FRONT-SEND-IDS-1007 shadow comparison: the front logs PDFLIP FRONT-IDS (its
     # X-EXACT ids of a text-only request) and group D's tokenizer manager logs
     # PDFLIP D-IDS (the ids it hands the scheduler), each with length and digest,
-    # joined by rid on the metal. Log only.
+    # joined by rid on the metal. Log only. TITO 22.10.: group P logs PDFLIP P-IDS too.
     FLLIPER_LOG_PDFLIP_PROMPT_IDS_DIGEST = EnvBool(False)
     # #540: what the Anthropic front sends downstream for output_config.effort
     # == "xhigh". Default "xhigh" = pass the client's value through unchanged,

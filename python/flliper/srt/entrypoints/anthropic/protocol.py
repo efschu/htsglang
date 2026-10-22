@@ -510,6 +510,13 @@ class AnthropicMessagesRequest(BaseModel):
     #: group disagreed about the namespace.
     cache_salt: Optional[str] = None
     extra_key: Optional[str] = None
+    #: FRONT-SEND-IDS / TITO (pdflip/front_tito.py): the prompt's token ids as
+    #: the Weg-2 front formed them, carried by P's leg 1, D's leg 2 and D's
+    #: probe alike (R11: one set of ids per request). Given, the chat layer
+    #: skips its template render (``ChatCompletionRequest.input_ids``, as on
+    #: ``/v1/chat/completions``). DECLARED for the reason ``rid`` is:
+    #: undeclared, ``extra="ignore"`` would drop it silently.
+    input_ids: Optional[list[int]] = None
 
     @field_validator("priority", mode="before")
     @classmethod

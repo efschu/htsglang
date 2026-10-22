@@ -1615,6 +1615,26 @@ async def pdflip_match_probe(raw_request: Request):
     )
 
 
+@app.api_route("/pdflip/output_ids", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_output_ids(raw_request: Request):
+    """TITO (pdflip/front_tito.py): the generated ids of finished requests of this group, by rid (body
+    {"rids": [...]}). 200 {"success", "items": {rid: {"prompt_sha", "prompt_n", "out_b64"}}}; a rid this group
+    did not finish (or no longer remembers) is absent. Group D only; elsewhere {"success": false}."""
+    book = getattr(_global_state.tokenizer_manager, "pdflip_output_book", None)
+    if book is None:
+        return ORJSONResponse({"success": False, "message": "no output book on this group"}, status_code=200)
+    try:
+        body = await raw_request.json()
+        rids = [str(r) for r in (body.get("rids") or ())][:64]
+        take = bool(body.get("take"))
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:200]}"},
+                              status_code=200)
+    # TITO review A4: "take" (the front's request end) drops what was answered
+    return ORJSONResponse({"success": True, "items": book.answer(rids, take=take)}, status_code=200)
+
+
 @app.api_route("/pdflip/tokenize_ahead", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pdflip_tokenize_ahead(raw_request: Request):

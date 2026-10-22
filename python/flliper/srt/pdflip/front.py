@@ -139,6 +139,12 @@ def _ft_send_ids_eligible(**kw):
     return send_ids_eligible(**kw)
 
 
+def _ft_send_ids_why(**kw):
+    from flliper.srt.pdflip.front_tokens import send_ids_why
+
+    return send_ids_why(**kw)
+
+
 def _ft_ids_digest(ids):
     from flliper.srt.pdflip.front_tokens import ids_digest
 
@@ -7594,6 +7600,9 @@ class Front:
                                      reused=c0.reused, encoded=c0.encoded)
                 else:
                     c = got
+                    if not _media:
+                        # TITO (front_tito.py): the ids every leg and D's probe carry
+                        c = await Front._tito_apply(self, rid, path, payload, c)
             except asyncio.TimeoutError:
                 reason = "timeout"
             except Exception as e:  # noqa: BLE001 -- the estimate stands, named
@@ -7611,8 +7620,11 @@ class Front:
                 _probe_task = Front._d_probe_start(
                     self, rid, "/generate", {"rid": rid, "input_ids_b64": _dmp.ids_to_b64(c.ids)})
             else:
-                # no front count, or a namespace only D forms the key of: D tokenizes it itself
-                _probe_task = Front._d_probe_start(self, rid, path, payload)
+                # no front count, or a namespace only D forms the key of: D tokenizes it itself --
+                # unless the legs carry the front's ids (TITO): then the probe asks with them too
+                _pids = Front._send_ids_carried(self, rid, path, payload, c)
+                _probe_task = Front._d_probe_start(
+                    self, rid, path, payload if _pids is None else dict(payload, input_ids=_pids.tolist()))
         # NF-1b (SOLL R2 "kurz sofort auf D, keine Wartezeit"): D answers its probe only at its scheduler pass boundary;
         # while D computes an extend that is the extend's whole pass (rc27 pdflip-4-53 probe_ms=1714.8, rc26 pdflip-0-4
         # 4175.4). A text prompt whose EXACT store number already decides kurz needs no D number for its class
@@ -7807,42 +7819,247 @@ class Front:
                                # ``members=rid:u/s_p@src/age_ms``
                                t_priced=_t_probe_ans, u_src=("d_probe" if _xp is not None else str(src)))
 
-    #: FRONT-SEND-IDS-1007: priced ids kept for a leg 2 that has not been posted
+    #: FRONT-SEND-IDS-1007: priced ids kept for the legs of a request
     SEND_IDS_KEEP = 256
 
     def _send_ids_note(self, rid: str, path: str, payload: Any, c: Any) -> None:
-        """FRONT-SEND-IDS-1007: the shadow line of this text-only count, and
-        (switch on) its ids kept for the D leg when ``send_ids_eligible``."""
+        """FRONT-SEND-IDS-1007: the shadow line of this text-only count, and its
+        ids kept for EVERY leg of the rid when ``send_ids_eligible`` (TITO 22.10.:
+        always on, no switch). R11: a rid whose ids a leg already carried keeps
+        them -- a re-pricing never hands P and D different ids (P's #1442
+        hand-off keys are keyed by P's ids; D reading them under other ids
+        would load another sequence's KV)."""
         if envs.FLLIPER_LOG_PDFLIP_PROMPT_IDS_DIGEST.get():
             logger.info("PDFLIP FRONT-IDS rid=%s n=%d sha=%s rt_ok=%s path=%s",
                         rid, int(c.n), _ft_ids_digest(c.ids), c.round_trip_ok, path)
-        if not envs.FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS.get():
-            return
-        if not _ft_send_ids_eligible(path=path, payload=payload, count=c):
+        why = _ft_send_ids_why(path=path, payload=payload, count=c)
+        if why is not None:
             self.counters["front_send_ids_ineligible"] += 1
+            self.counters["front_send_ids_ineligible_" + why] += 1
             return
         book = self.__dict__.setdefault("_send_ids", collections.OrderedDict())
+        posted = self.__dict__.setdefault("_send_ids_posted", set())
+        if rid in posted and rid in book:
+            return
         book[rid] = c.ids
         while len(book) > Front.SEND_IDS_KEEP:
-            book.popitem(last=False)
+            old, _ = book.popitem(last=False)
+            if old in posted:
+                # TITO review 22.10.: a leg of ``old`` carried these ids and they are gone -- a later leg
+                # (parked request, re-queue) posts the TEXT, i.e. the render's ids, not the TITO ids P
+                # ran under. Named here; D's #1442 id check (handoff_keys.record_ids_differ) keeps P's
+                # page keys away from it.
+                posted.discard(old)
+                lost = self.__dict__.setdefault("_send_ids_lost", collections.OrderedDict())
+                lost[old] = True
+                while len(lost) > 4096:
+                    lost.popitem(last=False)
+
+    def _send_ids_peek(self, rid: str, path: str) -> "Optional[np.ndarray]":
+        """FRONT-SEND-IDS / TITO: the ids every leg of ``rid`` carries (None =
+        the legs post the text, as before). Marks them fixed for the rid."""
+        from flliper.srt.pdflip.front_tokens import SEND_IDS_PATHS
+
+        if path not in SEND_IDS_PATHS:
+            return None
+        book = self.__dict__.get("_send_ids")
+        ids = None if book is None else book.get(rid)
+        if ids is not None:
+            self.__dict__.setdefault("_send_ids_posted", set()).add(rid)
+        elif rid in (self.__dict__.get("_send_ids_lost") or ()):
+            self.counters["front_send_ids_lost"] += 1
+            logger.warning("PDFLIP FRONT-SEND-IDS-LOST rid=%s path=%s (an earlier leg of this rid carried the "
+                           "front's ids, the book (SEND_IDS_KEEP=%d) evicted them: this leg posts the text; "
+                           "the group renders it again -- D's #1442 id check refuses P's page keys if the "
+                           "ids differ)", rid, path, Front.SEND_IDS_KEEP)
+        return ids
 
     def _send_ids_body(self, rid: str, payload: dict, pending: Optional["Pending"],
-                       single_prefill: bool) -> dict:
-        """FRONT-SEND-IDS-1007: the body D's leg 2 is posted with -- ``payload``
-        itself unless this rid's ids were kept and no P leg 1 ran for it (then
-        D tokenizes from scratch, and the ids take its place). Taken once: a
-        re-queued leg posts the text."""
-        book = self.__dict__.get("_send_ids")
-        ids = None if book is None else book.pop(rid, None)
-        no_p_leg = pending is None or pending.d_direct or pending.skip_leg1 or single_prefill
-        if ids is None or not no_p_leg:
+                       single_prefill: bool, path: str = "/v1/chat/completions") -> dict:
+        """FRONT-SEND-IDS-1007 / TITO: the body D's leg 2 is posted with --
+        ``payload`` itself unless this rid's ids were kept; then the ids take the
+        render's place on EVERY leg 2 (after P's leg 1 too: P carried the same
+        ids, so D's ``input_ids`` equal P's hand-off ids), and on every re-post."""
+        ids = Front._send_ids_peek(self, rid, path)
+        if ids is None:
             return payload
         body = dict(payload)
         body["input_ids"] = ids.tolist()
         self.counters["front_send_ids"] += 1
-        logger.info("PDFLIP FRONT-SEND-IDS rid=%s n=%d (D's leg carries the front's ids; "
-                    "D renders and encodes nothing)", rid, int(ids.size))
+        logger.info("PDFLIP FRONT-SEND-IDS rid=%s n=%d leg=D after_p=%d sha=%s (the leg carries the front's ids; "
+                    "the group renders and encodes nothing)", rid, int(ids.size),
+                    int(not (pending is None or pending.d_direct or pending.skip_leg1 or single_prefill)),
+                    _ft_ids_digest(ids))
         return body
+
+    async def _tito_apply(self, rid: str, path: str, payload: Any, c: Any) -> Any:
+        """TITO (front_tito.py): the arrival's ids re-use, for every byte the
+        prompt shares with an earlier carried sequence (its carried prompt plus
+        the ids group D generated), that sequence's ids. Returns ``c`` or a Count
+        with the new ids; the decision is one ``PDFLIP TITO`` line. Only for a
+        request whose legs carry the ids (``send_ids_why`` None) -- else the
+        groups render the text and the ids must be the render's."""
+        from flliper.srt.pdflip import front_tito as _tito
+
+        ft = self.ftok
+        posted = self.__dict__.get("_send_ids_posted") or set()
+        book = self.__dict__.get("_send_ids") or {}
+        if rid in posted and rid in book:
+            # R11: a leg already carried this rid's ids -- they stay the ids
+            ids = book[rid]
+            self.counters["tito_rid_fixed"] += 1
+            return _FtCount(n=int(ids.size), ids=ids, ms=c.ms, reused=c.reused, encoded=c.encoded,
+                            round_trip_ok=c.round_trip_ok)
+        why = _ft_send_ids_why(path=path, payload=payload, count=c)
+        if why is not None or ft is None or getattr(ft, "tito", None) is None:
+            self.counters["tito_not_carried"] += 1
+            return c
+        ns_known, ns = payload_namespace(payload)
+        if not ns_known:
+            self.counters["tito_not_carried"] += 1
+            return c
+        loop = asyncio.get_running_loop()
+        # review A3 22.10.: TITO's own thread -- a decide past its budget (still
+        # finishing there) never queues in front of the next count on ft.executor
+        ex = getattr(ft, "tito_executor", None) or ft.executor
+        t0 = time.perf_counter()
+        fetched: Dict[str, str] = {}
+
+        async def _run():
+            nb, need = await loop.run_in_executor(ex, ft.tito_prepare, c.ids, ns)
+            if need:
+                items = await Front._tito_fetch(self, need, timeout_s=_tito.FETCH_TIMEOUT_S)
+                if items is None:
+                    # D did not answer inside FETCH_TIMEOUT_S: the turn goes on WITHOUT D's ids of
+                    # the predecessor (its carried prompt -- ids every group already ran -- still
+                    # donates; dropping that too would lose the older turns' splices the cache holds)
+                    self.counters["tito_fetch_timeout"] += 1
+                    fetched.update({str(r): "timeout" for r in need})
+                    items = None
+                if items is not None:
+                    fetched.update(await loop.run_in_executor(ex, ft.tito_attach, items, need))
+            return await loop.run_in_executor(ex, ft.tito_decide, c.ids, ns, nb)
+
+        try:
+            # the HARD bound of the whole step (fetch + decide): over it the render's ids stand
+            d = await asyncio.wait_for(_run(), timeout=_tito.TITO_BUDGET_S)
+        except asyncio.TimeoutError:
+            self.counters["tito_budget_timeout"] += 1
+            d = _tito.Decision(_tito.V_REFUSED, c.ids, why="budget_timeout")
+        except Exception as e:  # noqa: BLE001 -- the render's ids stand, named
+            d = _tito.Decision(_tito.V_REFUSED, c.ids, why=f"error:{type(e).__name__}")
+        d.ms = (time.perf_counter() - t0) * 1e3
+        for r, what in fetched.items():
+            self.counters["tito_output_" + what] += 1
+            if what in ("d_prompt_differs", "out_of_vocab"):
+                logger.warning("PDFLIP TITO-DONOR-DROPPED rid=%s donor=%s why=%s (group D processed other prompt "
+                               "ids than the front carried, or answered ids outside the vocabulary: this "
+                               "sequence is never re-used)", rid, r, what)
+        self.counters["tito_" + d.verdict] += 1
+        if d.verdict == _tito.V_REFUSED:
+            self.counters["tito_refused_" + d.why.split(":", 1)[0]] += 1
+        self.counters["tito_decode_drift_render"] += int(d.drift_canon)
+        self.counters["tito_decode_drift_left"] += int(d.drift_left)
+        logger.info("PDFLIP TITO rid=%s verdict=%s why=%s donor=%s donor_n=%d out_n=%d reused=%d render_lcp=%d "
+                    "reach=%d decode_drift_render=%d decode_drift_left=%d n_render=%d n=%d fetched=%s ms=%.1f",
+                    rid, d.verdict, d.why or "-", d.donor, d.donor_n, d.out_n, d.reused, d.canon, d.reach,
+                    d.drift_canon, d.drift_left, int(c.n), int(d.ids.size),
+                    ",".join(f"{k}:{v}" for k, v in fetched.items()) or "-", d.ms)
+        tally = self.__dict__.setdefault("_tito_tally", _tito.HourTally())
+        hour_line = tally.add(d)
+        if hour_line:
+            logger.info(hour_line)
+        # the request's own ids are the next arrival's donor (TITO thread: ordered after the decide above)
+        loop.run_in_executor(ex, ft.tito_note, rid, d.ids, ns)
+        if d.ids is c.ids:
+            return c
+        return _FtCount(n=int(d.ids.size), ids=d.ids, ms=c.ms, reused=c.reused, encoded=c.encoded,
+                        round_trip_ok=c.round_trip_ok)
+
+    def _send_ids_carried(self, rid: str, path: str, payload: Any, c: Any) -> "Optional[np.ndarray]":
+        """The ids this arrival's legs will carry (``c.ids`` when eligible), for
+        D's probe -- None when the legs post the text."""
+        if c is None or _ft_send_ids_why(path=path, payload=payload, count=c) is not None:
+            return None
+        return c.ids
+
+    async def _tito_fetch(self, rids: List[str], timeout_s: Optional[float] = None,
+                          take: bool = False) -> Optional[Dict[str, Any]]:
+        """TITO: group D's generated ids for ``rids`` (``/pdflip/output_ids``);
+        {} when D has no record, no book, or failed; None when D did not answer
+        inside ``timeout_s`` (review A3: a hard bound -- the arrival never waits
+        longer). ``take``: D drops what it answered (the request end, A4)."""
+        from flliper.srt.pdflip import front_tito as _tito
+
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        if D is None or getattr(self, "session", None) is None:
+            return {}
+        tmo = _tito.FETCH_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        body_out: Dict[str, Any] = {"rids": list(rids)}
+        if take:
+            body_out["take"] = True
+
+        async def _post():
+            async with self.session.post(f"{D.url}{_tito.OUTPUT_PATH}", json=body_out,
+                                         headers=admin_key_mod.auth_headers(self.admin_key),
+                                         timeout=ClientTimeout(total=tmo)) as r:
+                return json.loads((await r.read()).decode(errors="replace")) if r.status == 200 else {}
+
+        try:
+            body = await asyncio.wait_for(_post(), timeout=tmo)
+        except asyncio.TimeoutError:
+            return None
+        except Exception as e:  # noqa: BLE001 -- no answer: the render's ids
+            self.counters["tito_fetch_failed"] += 1
+            logger.info("PDFLIP TITO-FETCH rids=%s failed: %s: %s", ",".join(rids), type(e).__name__, str(e)[:120])
+            return {}
+        items = body.get("items") if isinstance(body, dict) and body.get("success") else None
+        return items if isinstance(items, dict) else {}
+
+    def _tito_rid_end(self, rid: str, status: Any) -> None:
+        """Review A4 22.10.: the request end of ``rid`` -- served, aborted,
+        client gone, failed (every exit of the generate handler, ipc_out_wrap).
+        The carried ids are released here (``_send_ids`` held them for every
+        leg; nothing posts for the rid after its end), and D's record of the
+        generated ids is TAKEN (dropped on D) -- attached to the front's TITO
+        entry when the request was served (the next turn's donor), else
+        discarded. Off the answer's path: a task, bounded by END_FETCH_TIMEOUT_S."""
+        book = self.__dict__.get("_send_ids")
+        if book is not None:
+            book.pop(rid, None)
+        posted = self.__dict__.get("_send_ids_posted")
+        if posted is not None:
+            posted.discard(rid)
+        lost = self.__dict__.get("_send_ids_lost")
+        if lost is not None:
+            lost.pop(rid, None)
+        self.counters["front_send_ids_released"] += 1
+        ft = getattr(self, "ftok", None)
+        if ft is None or getattr(ft, "tito", None) is None:
+            return
+        try:
+            t = asyncio.ensure_future(Front._tito_end_fetch(self, rid, status == 200))
+        except RuntimeError:  # no running loop (a desk double)
+            return
+        tasks = self.__dict__.setdefault("_tito_end_tasks", set())
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+
+    async def _tito_end_fetch(self, rid: str, served: bool) -> str:
+        from flliper.srt.pdflip import front_tito as _tito
+
+        items = await Front._tito_fetch(self, [rid], timeout_s=_tito.END_FETCH_TIMEOUT_S, take=True)
+        if items is None:
+            self.counters["tito_end_fetch_timeout"] += 1
+            items = {}
+        ft = self.ftok
+        ex = getattr(ft, "tito_executor", None) or ft.executor
+        try:
+            what = await asyncio.get_running_loop().run_in_executor(ex, ft.tito_end, rid, served, items.get(rid))
+        except Exception as e:  # noqa: BLE001 -- an instrument of the next turn, never this answer's fault
+            what = f"error_{type(e).__name__}"
+        self.counters["tito_end_" + what] += 1
+        return what
 
     def _d_page_size(self) -> int:
         """IMAGE-CACHED-1002: the groups' KV page size (their server info: NF 64,
@@ -10476,6 +10693,10 @@ class Front:
                 if rid:
                     self._ipc_out_book().end(rid)
                     Front._lane_end(self, rid)  # PRIORITY LANES 1008 (L1): the lane note goes with the rid
+                    try:  # TITO review A4: the rid's carried ids and D's generated ids end here
+                        Front._tito_rid_end(self, rid, status)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("PDFLIP TITO rid-end rid=%s: %s: %s", rid, type(e).__name__, e)
                     try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
                         Front._rb_done(self, rid, status)
                     except Exception as e:  # noqa: BLE001
@@ -17045,6 +17266,14 @@ class Front:
         else:
             payload["max_tokens"] = 1
             payload.pop("max_completion_tokens", None)
+        # FRONT-SEND-IDS / TITO (R11): P's leg 1 carries the ids D's leg 2 will carry -- P's
+        # #1442 hand-off (ids + page keys) is then keyed by the same ids D runs under
+        _p_ids = Front._send_ids_peek(self, p.rid, p.path)
+        if _p_ids is not None and payload.get("input_ids") is None:
+            payload["input_ids"] = _p_ids.tolist()
+            self.counters["front_send_ids_p"] += 1
+            logger.info("PDFLIP FRONT-SEND-IDS rid=%s n=%d leg=P sha=%s (P's leg 1 carries the front's ids)",
+                        p.rid, int(_p_ids.size), _ft_ids_digest(_p_ids))
         g.outstanding[p.rid] = time.time()
         t0 = time.time()
         Front._req_book(self).leg1_dispatch(p.rid, t0)  # DASHBOARD-IPC: queue_ms ends, p_prefill starts
@@ -17551,7 +17780,7 @@ class Front:
             # Feld 2 (Operator 29.09.): the internal hop asks for the tier split;
             # the client gets it only if it asked itself (strip below).
             _strip_tier = not cached_tier_asked(payload) and request.path in CACHED_TIER_ASK_PATHS
-            _d_body = Front._send_ids_body(self, rid, payload, pending, single_prefill)
+            _d_body = Front._send_ids_body(self, rid, payload, pending, single_prefill, request.path)
             # FRONT-X-MIT (15.10.): a D-direct leg carries the X of its dispatch decision
             # (+ what was priced); D's X gate refuses by name above it. Other legs: {}.
             _fx_headers = Front._front_x_headers(self, rid, pending, single_prefill)

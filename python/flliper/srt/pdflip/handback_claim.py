@@ -81,6 +81,45 @@ def p_intake_min_tokens(env=None):
     return 1
 
 
+def d_store_read_min_tokens(env=None):
+    """F3 (NF rc32, 22.10., deskq/done/nf-rc32-storeanker-1022.md SCHWELLE): 1 for
+    every store read of a group-D rank, else None.
+
+    Metal rc32 D: ``#915 PREFETCH REFUSED reason=vote_negative need=192
+    threshold=256`` on TP0 for pdflip-0-7 (store anchor 53632, device floor 53440,
+    ``L3-INDEX-PRESENCE depth=53632``, H108 ``present=True pages=3``) and
+    pdflip-14-369; pdflip-14-401's claim was reduced to ``host_len=192`` (S59
+    CLAIM-END) and then revoked by the controller's copy of the same threshold.
+    4 cases, 640 tokens prefilled again on D although the store held them.
+
+    WHY THE THRESHOLD EXISTS (upstream HiCache ``prefetch_threshold=256``, the
+    comment at ``unified_radix_cache.prefetch_from_storage``): it prices whether
+    OPENING a store read pays against prefilling the tokens. What a read costs
+    here: the #580 participation vote runs on every rank whether the read is
+    eligible or not (``symmetric``: participation is unconditional), so the vote
+    is no saving; the extra cost of the read itself is the host rows for the
+    span plus one host anchor slot, the prefetch thread's ``batch_exists_v2``
+    probe and its rank-uniform MIN all_reduce, and the transfer -- for 192 tokens
+    3 KV pages (3 x 835584 B) plus the anchor (58834944 B). Against that: 192
+    tokens D prefills again, which the user's rule counts as defects ("groesser
+    0 ist fehlerhaft", 15.10.; goal "0 vermeidbare Token").
+
+    THE ANCHOR DECIDES, NOT THIS FUNCTION: the store hit the prefetch thread
+    compares against the floor is ANCHOR-CLAMPED (hybrid controller,
+    ``batch_exists_v2`` with the mamba pool's trailing-pages policy) and
+    MIN-reduced over the group. Without an anchor in the span the hit is 0, and
+    ``0 < floor 1`` revokes the read (``pdflip_min_hit.revoke_threshold``). So
+    a present anchor is read whatever the span's length; a missing one is never
+    read. Same law as P's intake (S73, :func:`p_intake_min_tokens`), the
+    hand-off read, the told read, the store-short tail and the park-retain read.
+    Rank-uniform: a replicated input (the group), every D rank folds the same
+    minimum (a rank-local floor would split the controller's revoke)."""
+    e = os.environ if env is None else env
+    if (e.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper() != "D":
+        return None
+    return 1
+
+
 def handback_line(rid, n_tokens: int, d_prefix: int, d_compute: int, path: str) -> str:
     """One line per hand-off at D's admission: what D holds (``d_prefix``) and
     what its target forward still computes (``d_compute``), by path:

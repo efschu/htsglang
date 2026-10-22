@@ -35,5 +35,16 @@ def d_digest_armed(*, group: str) -> bool:
     return envs.FLLIPER_LOG_PDFLIP_PROMPT_IDS_DIGEST.get() and group.strip().upper() == "D"
 
 
-def log_d_ids(*, rid: str, ids: Sequence[int], src: str) -> None:
-    logger.info("PDFLIP D-IDS rid=%s n=%d sha=%s src=%s", rid, len(ids), ids_digest(ids), src)
+def p_digest_armed(*, group: str) -> bool:
+    """TITO (22.10.): group P prints the same line (``PDFLIP P-IDS``) -- with
+    the legs carrying the front's ids, FRONT-IDS = P-IDS = D-IDS per rid is the
+    metal's proof that P and D ran the same ids (R11)."""
+    return envs.FLLIPER_LOG_PDFLIP_PROMPT_IDS_DIGEST.get() and group.strip().upper() == "P"
+
+
+def ids_marker(group: str) -> str:
+    return "P-IDS" if group.strip().upper() == "P" else "D-IDS"
+
+
+def log_d_ids(*, rid: str, ids: Sequence[int], src: str, marker: str = "D-IDS") -> None:
+    logger.info("PDFLIP %s rid=%s n=%d sha=%s src=%s", marker, rid, len(ids), ids_digest(ids), src)

@@ -6,7 +6,7 @@ store is asked for exactly the pages P wrote. Pure helpers, desk-testable.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 
 def keys_for_span(page_keys: Optional[Sequence[str]], matched_len: int, n_tokens: int,
@@ -113,6 +113,67 @@ def note_record_writer(req, rec, chain) -> None:
         pass
 
 
+#: TITO review 22.10.: rid -> times a hand-off record's ids differed from the
+#: reading request's ids (bounded; the instrument of :func:`note_ids_differ`)
+IDS_DIFFER: "Dict[str, int]" = {}
+
+
+def record_ids_differ(rec, req) -> bool:
+    """True when the hand-off record ``rec`` and ``req`` both carry token ids
+    and they differ over their common length.
+
+    WHY (TITO review 22.10.): P's page keys are a hash chain over P's ids; the
+    readers (controller ``_storage_hit_query``: "P's are used", the tree's
+    fallback slice) take them for the covered prefix WITHOUT comparing ids. As
+    long as D tokenized the same text as P that held by construction. Since the
+    front carries TITO ids (pdflip/front_tito.py) a leg that lost the carried
+    ids (front book eviction, a future path) runs under the render's ids while
+    P's record holds the TITO ids: same bytes, other ids, other KV. Unknown ids
+    on either side = False (the legacy behaviour)."""
+    rids = rec.get("input_ids") if isinstance(rec, dict) else None
+    mine = getattr(req, "origin_input_ids", None)
+    if not rids or mine is None:
+        return False
+    try:
+        m = min(len(rids), len(mine))
+        if m <= 0:
+            return False
+        import numpy as np
+
+        a = np.asarray(rids[:m], dtype=np.int64)
+        b = np.asarray(list(mine[:m]) if not hasattr(mine, "dtype") else mine[:m], dtype=np.int64)
+        return not bool(np.array_equal(a, b))
+    except Exception:  # noqa: BLE001 - an unreadable record: legacy behaviour
+        return False
+
+
+def note_ids_differ(req, rec) -> None:
+    """One warning per rid (and a bounded count) for :func:`record_ids_differ`."""
+    import logging
+
+    rid = str(getattr(req, "rid", None))
+    n = IDS_DIFFER.get(rid, 0) + 1
+    IDS_DIFFER[rid] = n
+    while len(IDS_DIFFER) > 4096:
+        IDS_DIFFER.pop(next(iter(IDS_DIFFER)))
+    if n > 1:
+        return
+    try:
+        from flliper.srt.pdflip import handoff as _ho
+
+        rids = list(rec.get("input_ids") or ())
+        mine = list(getattr(req, "origin_input_ids", None) or ())
+        fd = next((i for i, (x, y) in enumerate(zip(rids, mine)) if int(x) != int(y)), min(len(rids), len(mine)))
+        writer = _ho.record_writer(rec)
+    except Exception:  # noqa: BLE001 - the line is an instrument
+        rids, mine, fd, writer = [], [], -1, "?"
+    logging.getLogger(__name__).warning(
+        "#1442 HANDOFF-IDS-DIFFER rid=%s rec_n=%d req_n=%d first_diff=%d writer=%s (the hand-off record's ids "
+        "are not the ids this request runs under: its page keys would load another sequence's KV -- own "
+        "hashes, chain off for the rid; TITO carrier lost on a leg?)",
+        rid, len(rids), len(mine), fd, writer)
+
+
 def chain_digest(chain: Optional[Sequence[str]]) -> str:
     """"" for no chain; else a short content digest plus the page count."""
     if not chain:
@@ -136,6 +197,19 @@ def resolve_chain(req, reader) -> Optional[List[str]]:
     if not chain:
         rec = reader(getattr(req, "rid", None))
         chain = list(rec.get("page_keys") or []) if rec else None
+        if chain and record_ids_differ(rec, req):
+            # TITO review 22.10.: the record's page keys belong to OTHER ids than
+            # this request runs under -- used, they would load another sequence's
+            # KV into this tree. Own hashes, and no rank reads the chain again
+            # (OFF_ATTR: the scheduler marks PDFLIP_HANDOFF_OFF, so the tree's
+            # fallback slice and a #1400 follower take none either).
+            note_ids_differ(req, rec)
+            try:
+                setattr(req, OFF_ATTR, True)
+                setattr(req, CHAIN_ATTR, None)
+            except Exception:  # noqa: BLE001 - a frozen double
+                pass
+            return None
         if chain:
             setattr(req, CHAIN_ATTR, chain)
             note_record_writer(req, rec, chain)
