@@ -111,12 +111,13 @@ class R3GermanFigures(unittest.TestCase):
         self.assertEqual(Z._de_gib("Reserve 65.5 GiB"), "Reserve 65,5 GiB")
         self.assertEqual(Z._de_gib("72.0 GiB (24.0 GiB + 24.0 GiB)"), "72,0 GiB (24,0 GiB + 24,0 GiB)")
         self.assertEqual(Z._de_gib("es fehlen 0.2 GiB"), "es fehlen 0,2 GiB")
+        self.assertEqual(Z._de_gib("6 Sitze x 74.8 MiB rekurrenter Zustand = 0.4 GiB"), "6 Sitze x 74,8 MiB rekurrenter Zustand = 0,4 GiB")   # Playwright 1022: MiB too
 
     def test_everything_else_stays(self):
-        for s in ("--max-total-tokens 268404", "v1.2.3 GiB", "5. GiB", "Qwen3.8-27B 12 GiB", "1.5 MiB", "x.5 GiB", "Text ohne Zahl"):
+        for s in ("--max-total-tokens 268404", "v1.2.3 GiB", "5. GiB", "Qwen3.8-27B 12 GiB", "1.5 MB", "x.5 MiB", "--mem 16400 MiB", "Text ohne Zahl"):
             self.assertEqual(Z._de_gib(s), s)
         # mutant R3b: only the number right before " GiB" changes, never another figure in the same sentence
-        self.assertEqual(Z._de_gib("Reserve 65.5 GiB, util 0.82 und 1.5 MiB"), "Reserve 65,5 GiB, util 0.82 und 1.5 MiB")
+        self.assertEqual(Z._de_gib("Reserve 65.5 GiB, util 0.82 und 1.5 MiB"), "Reserve 65,5 GiB, util 0.82 und 1,5 MiB")
 
     def test_the_english_view_keeps_the_point(self):
         lay = zp().layouts({"model": "qwen38-nf-int4", "cards": [{"card": "rtx3090-24", "count": 4}]})
@@ -134,12 +135,14 @@ class R3GermanFigures(unittest.TestCase):
         for n in T.NS:
             for m in T.MODELS:
                 txt = json.dumps(Z.localize(T.rec("layouts_%d_%s.json" % (n, m)), "de"), ensure_ascii=False)
-                self.assertNotIn(".0 GiB", txt, (n, m))
-                self.assertNotIn(".5 GiB", txt, (n, m))
+                for d in "0123456789":
+                    for u in ("GiB", "MiB"):
+                        self.assertNotIn(".%s %s" % (d, u), txt, (n, m))
         for n, m, l, _row in T.cells():
             txt = json.dumps(Z.localize(T.plan(n, m, l), "de"), ensure_ascii=False)
             for d in "0123456789":
-                self.assertNotIn(".%s GiB" % d, txt, (n, m, l))
+                for u in ("GiB", "MiB"):
+                    self.assertNotIn(".%s %s" % (d, u), txt, (n, m, l))
 
 
 HARNESS = r"""

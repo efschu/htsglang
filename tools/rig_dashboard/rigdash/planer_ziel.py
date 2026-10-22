@@ -193,24 +193,26 @@ def _de_text(s: str) -> str:
 
 
 def _de_gib(s: str) -> str:
-    """German decimal comma in the server's GiB figures ("65.5 GiB" -> "65,5 GiB"): the page writes its own figures with ``toLocaleString("de-DE")``, so a
-    server figure with a point next to them is mixed notation (review 1022).  Only a point between two digits whose number is followed by " GiB" changes;
-    flags, versions and MiB integers stay as they are.  No regex: this page reads no log."""
-    if " GiB" not in s or "." not in s:
+    """German decimal comma in the server's GiB and MiB figures ("65.5 GiB" -> "65,5 GiB", "74.8 MiB" -> "74,8 MiB"): the page writes its own figures with
+    ``toLocaleString("de-DE")``, so a server figure with a point next to them is mixed notation (review 1022; MiB found by the review's Playwright run: the
+    recurrent state per seat "6 Sitze x 74.8 MiB").  Only a point between two digits whose number is followed by " GiB" or " MiB" changes; flags, versions,
+    ratios and MiB integers stay as they are.  No regex: this page reads no log."""
+    if "." not in s or (" GiB" not in s and " MiB" not in s):
         return s
     out = list(s)
-    i = 0
-    while True:
-        j = s.find(" GiB", i)
-        if j < 0:
-            break
-        k = j - 1
-        while k >= 0 and (s[k].isdigit() or s[k] == "."):
-            k -= 1
-        num = s[k + 1:j]
-        if num.count(".") == 1 and num[0].isdigit() and num[-1].isdigit():
-            out[k + 1 + num.index(".")] = ","
-        i = j + 4
+    for unit in (" GiB", " MiB"):
+        i = 0
+        while True:
+            j = s.find(unit, i)
+            if j < 0:
+                break
+            k = j - 1
+            while k >= 0 and (s[k].isdigit() or s[k] == "."):
+                k -= 1
+            num = s[k + 1:j]
+            if num.count(".") == 1 and num[0].isdigit() and num[-1].isdigit():
+                out[k + 1 + num.index(".")] = ","
+            i = j + len(unit)
     return "".join(out)
 
 
