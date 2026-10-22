@@ -361,9 +361,9 @@ class ZielPlaner:
         * ``unproven`` -- in ``SUPPORTED_N``, the gate refuses with the ONE blocker METAL-UNPROVEN: the launcher dry run calculates the layout, the launcher takes it only
           with force, the first boot is the proof (``topology.plan_topology``: ``HW-COUNT``);
         * ``refused``  -- in ``SUPPORTED_N`` but the gate names another blocker (never offered; the gate text is the reason);
-        * ``off``      -- outside ``SUPPORTED_N``: not calculated here (one card: nothing to flip between; 5..8: no profile and no dry-run golden), with its reason.
+        * ``off``      -- outside ``SUPPORTED_N``: not calculated here (one card: nothing to flip between; 8 cards: no profile and no dry-run golden), with its reason.
 
-        A count the gate cannot be asked for (no editor / no planner gate / no flliper environment) falls back to the constants: ``PROVEN_N`` proven, the rest of
+        Without a planner gate at all the constants decide; a gate that cannot be asked for ONE count does not offer it (``refused``, its notes as the text): ``PROVEN_N`` proven, the rest of
         ``SUPPORTED_N`` unproven."""
         if self._n_states is not None:
             return self._n_states
@@ -384,8 +384,10 @@ class ZielPlaner:
                     refused = self.ed._topology_verdict(n, tp, notes)
                 except Exception:                           # noqa: BLE001 -- a broken gate is "not checkable", never a 500
                     notes.append("topology gate failed")
-            if tp is None or notes:
+            if tp is None:
                 out[n] = {"state": "proven" if n in PROVEN_N else "unproven", "text": ""}
+            elif notes:                                     # the gate exists but could not be asked for this count: not offered (review B4)
+                out[n] = {"state": "refused", "text": "; ".join(notes)[:200]}
             elif not refused:
                 out[n] = {"state": "proven", "text": ""}
             elif self._blocker_codes(refused) == {"METAL-UNPROVEN"}:

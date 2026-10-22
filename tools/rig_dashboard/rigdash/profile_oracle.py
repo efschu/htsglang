@@ -28,9 +28,9 @@ from .profile_recompute import CouplingsService
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(os.path.dirname(HERE), "kartenplan_build", "oracle_worker.py")
 #: ein Trockenlauf bis zum Ende dauerte 16-18 s; zwei Laeufe (ohne Force, dann mit Force) und ein langsamer Host brauchen Luft
-#: A launcher dry run of 5..7 cards (and the NF ownership search) takes minutes: measured 22.10. on the dev box under load, 27B 5 cards 60-107 s, NF 6 cards 253 s, NF 7 cards
-#: and 27B 6/7 cards more than 300 s.  The limit is only the kill switch of a hung worker; ``RIGDASH_ORACLE_TIMEOUT_S`` overrides it.
-TIMEOUT_S = float(os.environ.get("RIGDASH_ORACLE_TIMEOUT_S") or 1500.0)
+#: A launcher dry run of 5..7 cards: measured 22.10. alone on the dev box, 27B 33-39 s, dual 48-60 s, NF 53-70 s (before the class-symmetric ownership search and the bounded P cut field
+#: of 22.10. NF 6 cards took 253 s and 27B 6/7 cards more than 300 s).  The limit stays 300 s: it is the kill switch of a hung worker; ``RIGDASH_ORACLE_TIMEOUT_S`` overrides it.
+TIMEOUT_S = float(os.environ.get("RIGDASH_ORACLE_TIMEOUT_S") or 300.0)
 START_TIMEOUT_S = 180.0
 CACHE_SIZE = 48
 #: Speicherrahmen des Kindprozesses.  GEMESSEN 06.10. (Review AP-D): ein voller NF-Trockenlauf auf dem Referenz-Rig braucht in der Spitze
