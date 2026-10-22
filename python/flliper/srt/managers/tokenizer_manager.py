@@ -2297,6 +2297,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async def abort_request():
             await asyncio.sleep(2)
             if obj.is_single:
+                # Review B1 (NF-RC31-R6REST): this abort fires 2 s after the stream ended (also after a disconnect). A NEWER
+                # request may already reuse the rid -- an R6-stopped D prefill continues on D under its rid (SOLL R6/R7) -- and
+                # on a Weg-2 group the abort reaches every rank: it would abort the continuation. Only the request this
+                # stream served is aborted.
+                _st = self.rid_to_state.get(obj.rid)
+                if _st is not None and getattr(_st, "obj", obj) is not obj:
+                    logger.info("PDFLIP abort_request rid=%s skipped -- the stream that armed this delayed abort ended and a "
+                                "newer request reuses the rid (review B1)", obj.rid)
+                    return
                 self.abort_request(obj.rid)
             else:
                 for rid in obj.rid:

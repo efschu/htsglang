@@ -182,6 +182,8 @@ class DExtendBeacon:
         self._head = 0
         #: NF-RC31-R6REST: this rank applies halts (``announce_halt``) -- the cap record is re-written before the ring wraps it
         self._halt_cap = False
+        #: Review B2: rid -> t_first of the leg whose halt record is written (a later abort of the same leg never overwrites it)
+        self._halted: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         self._cap_at = 0
         self.mm = None
         size = _HDR_SIZE + self._slots * _REC_SIZE
@@ -408,12 +410,25 @@ class DExtendBeacon:
             rest = int(q0[0][0])  # the oldest launched batch whose forward has not ended (review A1): D still computes it
         if free < 0:
             free = rest  # no launch length known (a v2-style caller): the rest is all D has not computed
-        if held_free is not None and int(held_free) >= 0:
+        exact = held_free is not None and int(held_free) >= 0
+        if exact:
             free = rest = int(held_free)
+        elif self._halted.get(rid) == t_first:
+            # Review B2 (SOLL R6/R7, user 19.10. "EXAKTE ZAHLEN"): this leg's halt is written already. A LATER abort of the same
+            # leg -- the leg's own abort (``_requeue_park_handback``), the client-gone abort 2 s after the stream end (on a Weg-2
+            # group dispatched to every rank even for an unknown rid) -- applies at receipt and would overwrite the exact
+            # (tree-held) number with the launch-based free (live 6-401: 2069 -> 2010; on the discarding path a whole chunk)
+            return False
         if rid in self._committed:
             self._committed.discard(rid)
             self._put(rid, t_first, self._last_rest.get(rid, -1), free, n)
-        return self._put_key(halt_key(rid), t_first, rest, free, n)
+        if not self._put_key(halt_key(rid), t_first, rest, free, n):
+            return False
+        self._halted.pop(rid, None)
+        self._halted[rid] = t_first
+        while len(self._halted) > ARMED_CAP:
+            self._halted.popitem(last=False)
+        return True
 
     def commit_next(self, *, rids: Iterable[str]) -> None:
         """Review A1 (SOLL R6/R7, R11): the END of the rank's recv step -- aborts applied, the next chunk of every ``rids``

@@ -278,3 +278,62 @@ def test_a1_not_applicable_falls_back_to_upstreams_pending_abort(monkeypatch, tm
     sched.pdflip_d_ext_beacon = None
     assert not S.Scheduler._pdflip_halt_retain(sched, req, AbortReq(rid=RID))
     assert order == [] and sched.chunked_req is req
+
+
+# ------------------------------------------------------------------------------------------------ Nachprüfung bbe4da9793: B1 / B2
+def test_b2_a_later_abort_of_the_same_leg_never_overwrites_the_exact_halt(tmp_path):
+    """B2: the retaining halt writes the exact number (length - tree-held, live 2069). The leg's own abort and the client-gone
+    abort (2 s after the stream end, on Weg 2 sent to every rank) apply at receipt afterwards -- before the fix they overwrote it
+    with the launch-based free (2010; on the discarding path a whole chunk). A NEW leg of the rid halts again."""
+    clock = {"t": 2 * 10**9}
+    ws = [dxb.DExtendBeacon(str(tmp_path / ("D-pid%d.bin" % (r + 1))), clock_ns=lambda: clock["t"]) for r in range(3)]
+    for w in ws:
+        w.announce_halt()
+        w.note_recv(rid=RID)
+        w.note_extend(rids=[RID], rests=[6550], extend_lens=[2240])
+        w.note_extend(rids=[RID], rests=[4310], extend_lens=[2300])
+    for w in ws:
+        assert w.note_halt(rid=RID, held_free=2069)
+        assert not w.note_halt(rid=RID)                                   # the second abort: no overwrite
+    assert dxb.halted_free(_read(tmp_path), RID, 1.0) == 2069
+    clock["t"] = 9 * 10**9                                                 # the continuation: a new leg of the rid on D
+    for w in ws:
+        w.note_recv(rid=RID)
+        w.note_extend(rids=[RID], rests=[2069], extend_lens=[1024])
+        assert w.note_halt(rid=RID)                                        # its own halt is written
+    assert dxb.halted_free(_read(tmp_path), RID, 5.0) == 2069 - 1024
+
+
+def _tm():
+    from flliper.srt.managers import tokenizer_manager as TM
+
+    tm = TM.TokenizerManager.__new__(TM.TokenizerManager)
+    tm.rid_to_state = {}
+    tm.called = []
+    tm.abort_request = lambda rid="", abort_all=False: tm.called.append(rid)
+    return TM, tm
+
+
+def _run_bg(tm, obj, monkeypatch):
+    import asyncio as _a
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(_a, "sleep", _no_sleep)
+    bg = tm.create_abort_task(obj)
+    _a.run(bg())
+
+
+@pytest.mark.parametrize("owner, aborted", [("same", True), ("none", True), ("newer", False)])
+def test_b1_the_delayed_abort_of_an_ended_stream_spares_a_newer_request_on_the_same_rid(monkeypatch, owner, aborted):
+    """B1: ``create_abort_task`` fires 2 s after a stream ended; the R6-stopped prefill continues on D under its rid (SOLL R6/R7).
+    The delayed abort aborts only the request its stream served -- never a newer one that reuses the rid."""
+    TM, tm = _tm()
+    obj = types.SimpleNamespace(is_single=True, rid=RID)
+    if owner == "same":
+        tm.rid_to_state[RID] = types.SimpleNamespace(obj=obj)
+    elif owner == "newer":
+        tm.rid_to_state[RID] = types.SimpleNamespace(obj=types.SimpleNamespace(is_single=True, rid=RID))
+    _run_bg(tm, obj, monkeypatch)
+    assert tm.called == ([RID] if aborted else [])
