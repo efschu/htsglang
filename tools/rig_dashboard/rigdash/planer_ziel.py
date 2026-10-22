@@ -40,11 +40,16 @@ SCHEMA = "flliper.planer-ziel/1"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planer_data")
 STECKBRIEF_FILE = os.path.join(DATA_DIR, "steckbrief.json")
 DE_FILE = os.path.join(DATA_DIR, "planer_ziel_de.json")
+TM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "i18n_de.json")
 MIB = float(1 << 20)
 
-#: FALLBACK card counts when the topology cannot be asked (no editor / no planner gate): N = 3 is the metal-proven shape.  The page asks the topology itself
-#: (``ZielPlaner.supported_n``: ``plan_topology`` per N), so it follows the track NCARDS without an edit here (review B4).
-SUPPORTED_N = (3,)
+#: The card counts the planning core is CHECKED for: NCARDS 1021 ships 12 release profiles ``{27b, 27b-nvfp4, 27b-nvfp4-dual, nf}-{2,3,4}x3090`` with a launcher dry-run
+#: golden each (the NCARDS goldens ``fixtures/ncards_1021/golden`` of the launcher tests; pinned by ``test_planer_release_1022``).  Fewer (one card: nothing to flip between) or
+#: more (5..8: no profile, no golden) are not calculated here and say why.  Also the FALLBACK when the topology cannot be asked (no editor / no planner gate).
+SUPPORTED_N = (2, 3, 4)
+#: The counts a release boot has PROVEN on metal (``PROVEN_CARD_COUNTS`` of the topology module).  The other counts of ``SUPPORTED_N`` are calculated by the launcher dry run
+#: but carry the named blocker METAL-UNPROVEN (the launcher accepts them only with force; the first boot is the proof) -- the page shows that, it never hides it.
+PROVEN_N = (3,)
 
 #: the three layouts of the page.  ``form`` = the form name of ``ProfilEditor.propose``.  The sentences are the user's words made plain (see profil_planer.FORMS)
 LAYOUTS = [
@@ -61,12 +66,12 @@ _LAYOUT_BY_ID = {l["id"]: l for l in LAYOUTS}
 #: The profile names are internal: start scripts and ``FLLIPER_PROFILE=`` use them, the page never shows them.
 MODELS = [
     {"id": "qwen38-27b-int8", "name": "Qwen3.8-27B INT8", "line": "27b", "format": "int8",
-     "profiles": {"solo": "27b", "flip": "27b", "dual": None},
+     "profiles": {"solo": "27b", "flip": "27b", "dual": None}, "ncards": {"solo": "27b", "flip": "27b"},
      "no_dual": "Dual is calibrated on the NVFP4 weights only (the launcher's dual form has no INT8 reference profile)."},
     {"id": "qwen38-27b-nvfp4", "name": "Qwen3.8-27B NVFP4", "line": "27b", "format": "nvfp4",
-     "profiles": {"solo": "27b-nvfp4", "flip": "27b-nvfp4", "dual": "27b-nvfp4-dual"}},
+     "profiles": {"solo": "27b-nvfp4", "flip": "27b-nvfp4", "dual": "27b-nvfp4-dual"}, "ncards": {"solo": "27b-nvfp4", "flip": "27b-nvfp4", "dual": "27b-nvfp4-dual"}},
     {"id": "qwen38-nf-int4", "name": "Qwen3.8-Flash-Next INT4", "line": "nf", "format": "int4",
-     "profiles": {"solo": "nf-int4", "flip": "nf-int4", "dual": None},
+     "profiles": {"solo": "nf-int4", "flip": "nf-int4", "dual": None}, "ncards": {"solo": "nf", "flip": "nf"},
      "no_dual": "Dual exists only in the 27B line (user decision 07.10.: the NF line has no dual form)."},
 ]
 _MODEL_BY_ID = {m["id"]: m for m in MODELS}
@@ -99,14 +104,18 @@ _DE_RULES: Optional[list] = None
 
 
 def _de_rules() -> list:
-    """The German texts of ``planer_data/planer_ziel_de.json`` as (exact dict, [(regex, template)]) -- a template (printf placeholders) becomes a regex."""
+    """The German texts as (exact dict, [(regex, template)]): ``planer_data/planer_ziel_de.json`` first (a template with printf placeholders becomes a regex), the
+    dashboard's own translation memory (``static/i18n_de.json``, whole texts only) as the second source -- the planner's reason texts that the page already knows
+    (e.g. the X bound) need no second copy."""
     global _DE_RULES
     if _DE_RULES is None:
-        try:
-            with open(DE_FILE, encoding="utf-8") as fh:
-                de = json.load(fh).get("de") or {}
-        except (OSError, ValueError):
-            de = {}
+        de: Dict[str, str] = {}
+        for path, key in ((TM_FILE, "de"), (DE_FILE, "de")):           # the page's own file last: it wins on a clash
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    de.update(json.load(fh).get(key) or {})
+            except (OSError, ValueError):
+                pass
         exact: Dict[str, str] = {}
         pats: List[tuple] = []
         for en, g in de.items():
@@ -127,7 +136,8 @@ def _de_rules() -> list:
     return _DE_RULES
 
 
-def _de_text(s: str) -> str:
+def _de_one(s: str) -> str:
+    """German for one whole text: exact entry, else a template; ``s`` itself when there is none."""
     exact, pats = _de_rules()
     if s in exact:
         return exact[s]
@@ -141,6 +151,44 @@ def _de_text(s: str) -> str:
     return s
 
 
+def _split_parts(s: str) -> List[str]:
+    """``s`` cut into [part, separator, part, ...] at "; " and at ". " before a capital letter or "(" (the planner joins sub-sentences of one reason text with these:
+    each part has its own German text, review B2); no regex: this page reads no log."""
+    out: List[str] = []
+    i = last = 0
+    while i < len(s) - 1:
+        if s.startswith("; ", i) or (s.startswith(". ", i) and i + 2 < len(s) and (s[i + 2].isupper() or s[i + 2] == "(")):
+            out += [s[last:i], s[i:i + 2]]
+            last = i = i + 2
+        else:
+            i += 1
+    out.append(s[last:])
+    return out
+
+
+def _de_text(s: str) -> str:
+    out = _de_one(s)
+    if out != s or not isinstance(s, str):
+        return out
+    # a composed text matches no template as a whole: translate it part by part and keep the separators (a part without a German text stays English, so the
+    # test over the real planner outputs names it)
+    bits = _split_parts(s)
+    if len(bits) < 3:
+        return s
+    got = []
+    for i, b in enumerate(bits):
+        if i % 2:                                           # a separator
+            got.append(b)
+            continue
+        t = _de_one(b)
+        if t == b and i:                                    # entries that start with the separator ("; floor %s = ...")
+            t2 = _de_one(bits[i - 1] + b)
+            if t2 != bits[i - 1] + b and t2.startswith(bits[i - 1]):
+                t = t2[len(bits[i - 1]):]
+        got.append(t)
+    return "".join(got) if any(got[i] != bits[i] for i in range(0, len(bits), 2)) else s
+
+
 def localize(obj, lang: Optional[str]):
     """The answer of the page API in the page language: every string with a German text in ``planer_ziel_de.json`` is replaced (exact text or template), anything
     else stays English (never blank).  ``lang`` other than ``de`` returns ``obj`` unchanged.  The structural keys (``id``, ``key``, ``roh`` = the raw flag, ``intern`` = the start profile that goes back to the server) are not touched."""
@@ -151,7 +199,7 @@ def localize(obj, lang: Optional[str]):
     if isinstance(obj, list):
         return [localize(x, lang) for x in obj]
     if isinstance(obj, dict):
-        return {k: (v if k in ("id", "key", "roh", "code", "schema", "intern", "form", "outcome", "status") else localize(v, lang)) for k, v in obj.items()}
+        return {k: (v if k in ("id", "key", "roh", "code", "schema", "intern", "form", "outcome", "status", "was", "proof") else localize(v, lang)) for k, v in obj.items()}
     return obj
 
 
@@ -179,6 +227,15 @@ def _short_name(name: str) -> str:
     return name.replace("GeForce ", "")
 
 
+def _cut_text(s: str, n: int) -> str:
+    """``s`` cut to at most ``n`` characters at the end of a sentence when there is one (a half sentence has no German text and reads as an error); else hard, with an ellipsis."""
+    s = str(s)
+    if len(s) <= n:
+        return s
+    k = max(s.rfind(". ", 0, n), s.rfind("; ", 0, n))
+    return s[:k + 1] if k >= n // 2 else s[:n - 1] + "\u2026"
+
+
 def _fmt_gib(mib: float) -> str:
     return "%.1f GiB" % (mib / 1024.0)
 
@@ -188,7 +245,7 @@ class ZielPlaner:
         self.ed = editor
         self._steck = steckbrief
         self._steck_file = steckbrief_file
-        self._supported: Optional[tuple] = None
+        self._n_states: Optional[Dict[int, dict]] = None
 
     @property
     def steck(self) -> Dict[str, dict]:
@@ -297,26 +354,92 @@ class ZielPlaner:
                         "nearest measured card. Every figure below is an estimate; the first boot on this hardware is the measurement."}
 
     # ------------------------------------------------------------------ Topologie (B4)
-    def supported_n(self) -> tuple:
-        """The card counts the launcher/topology serve: asked of the planner gate (``ProfilEditor._topology_verdict`` -> ``topology.plan_topology`` per N),
-        so a count that the track NCARDS makes runnable shows up here without an edit.  A count that cannot be checked is NOT offered.  Without an editor
-        or planner gate: the fallback ``SUPPORTED_N``."""
-        if self._supported is not None:
-            return self._supported
-        got = None
+    def n_states(self) -> Dict[int, dict]:
+        """The state of every card count 1..8 on the page, once per process: ``{"state": "proven" | "unproven" | "off" | "refused", "text": ...}``.
+
+        * ``proven``   -- in ``SUPPORTED_N`` and the topology gate lets it through (a release boot proved it);
+        * ``unproven`` -- in ``SUPPORTED_N``, the gate refuses with the ONE blocker METAL-UNPROVEN: the launcher dry run calculates the layout, the launcher takes it only
+          with force, the first boot is the proof (``topology.plan_topology``: ``HW-COUNT``);
+        * ``refused``  -- in ``SUPPORTED_N`` but the gate names another blocker (never offered; the gate text is the reason);
+        * ``off``      -- outside ``SUPPORTED_N``: not calculated here (one card: nothing to flip between; 5..8: no profile and no dry-run golden), with its reason.
+
+        A count the gate cannot be asked for (no editor / no planner gate / no flliper environment) falls back to the constants: ``PROVEN_N`` proven, the rest of
+        ``SUPPORTED_N`` unproven."""
+        if self._n_states is not None:
+            return self._n_states
+        out: Dict[int, dict] = {}
+        tp = None
         try:
             _ci, tp = self.ed.kp._mods()
+        except Exception:                                   # noqa: BLE001 -- no gate to ask: the constants below
+            tp = None
+        for n in range(1, 9):
+            if n not in SUPPORTED_N:
+                out[n] = {"state": "off", "text": self._off_reason(n)}
+                continue
+            notes: List[str] = []
+            refused = None
             if tp is not None:
-                out = []
-                for n in range(1, 9):
-                    notes: List[str] = []
-                    if self.ed._topology_verdict(n, tp, notes) is None and not notes:
-                        out.append(n)
-                got = tuple(out)
-        except Exception:                                   # noqa: BLE001 -- no gate to ask: the fallback below
-            got = None
-        self._supported = got if got else SUPPORTED_N
-        return self._supported
+                try:
+                    refused = self.ed._topology_verdict(n, tp, notes)
+                except Exception:                           # noqa: BLE001 -- a broken gate is "not checkable", never a 500
+                    notes.append("topology gate failed")
+            if tp is None or notes:
+                out[n] = {"state": "proven" if n in PROVEN_N else "unproven", "text": ""}
+            elif not refused:
+                out[n] = {"state": "proven", "text": ""}
+            elif self._blocker_codes(refused) == {"METAL-UNPROVEN"}:
+                out[n] = {"state": "unproven", "text": ""}
+            else:
+                out[n] = {"state": "refused", "text": refused}
+        self._n_states = out
+        return out
+
+    @staticmethod
+    def _blocker_codes(text: str) -> set:
+        """The blocker codes ``[CODE]`` that a topology refusal names (``[3]`` in "(proven: [3])" is not a code)."""
+        out = set()
+        for piece in str(text).split("[")[1:]:
+            code = piece.split("]")[0]
+            if code[:1].isalpha() and code == code.upper() and all(ch.isalnum() or ch == "-" for ch in code):
+                out.add(code)
+        return out
+
+    @staticmethod
+    def _off_reason(n: int) -> str:
+        if n < SUPPORTED_N[0]:
+            return ("%d card: a flip or dual needs two groups over at least two cards, and the single-group mode for one card (the decode group alone behind the front, "
+                    "with a model fit check before load) does not exist yet (plan P4) (not supported yet)." % n)
+        return ("%d cards: the planner is checked for %d to %d cards (a launcher dry run per card count); more cards are not calculated here yet (not supported yet)."
+                % (n, SUPPORTED_N[0], SUPPORTED_N[-1]))
+
+    def supported_n(self) -> tuple:
+        """The card counts the page calculates: the counts of ``SUPPORTED_N`` that the topology gate does not refuse by name (proven or only METAL-UNPROVEN, see
+        ``n_states``).  Without a planner gate: ``SUPPORTED_N``."""
+        got = tuple(n for n, st in sorted(self.n_states().items()) if st["state"] in ("proven", "unproven"))
+        return got if got else SUPPORTED_N
+
+    def _release_block(self, model: dict, layout: str, cards: List[dict]) -> Optional[str]:
+        """The named open defect of the release profile for N identical RTX 3090 (``<stem>-<N>x3090.env``): a profile with ``PROFILE_STATUS=blockiert-<code>`` is not
+        startable (NCARDS 1021: NF on 2 and 4 cards, the launcher's D-EIGENTUM solver finds no sustainable form and the D-BUDGET refusal only passes by name with force).  The
+        page does not offer a layout that its own release profile says cannot start; the answer is the profile's status, never a guess.  ``None`` = no such profile / not blocked."""
+        stem = (model.get("ncards") or {}).get(layout)
+        rdir = getattr(self.ed, "release_dir", None)
+        if not stem or not rdir or len({c["id"] for c in cards}) != 1 or cards[0]["id"] != "rtx3090-24":
+            return None
+        code = ""
+        try:
+            with open(os.path.join(rdir, "%s-%dx3090.env" % (stem, len(cards))), encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("PROFILE_STATUS=blockiert-"):
+                        code = line.split()[0][len("PROFILE_STATUS=blockiert-"):]
+                        break
+        except OSError:
+            return None
+        if not code:
+            return None
+        return ("The release profile for this model on %d cards of this kind is marked blocked (%s): the launcher's decode-ownership solver (D-EIGENTUM, #239 S3f) finds no "
+                "sustainable distribution, and even with force it only passes the D-BUDGET refusal by name. Not startable yet; the cause is open." % (len(cards), code.upper()))
 
     # ------------------------------------------------------------------ Katalog
     def katalog(self, lang: Optional[str] = None) -> dict:
@@ -331,7 +454,7 @@ class ZielPlaner:
             models.append({"id": m["id"], "name": m["name"], "format": m["format"],
                            "layouts": [l["id"] for l in LAYOUTS if m["profiles"].get(l["id"])],
                            "weights_mib": self._weights_mib(m["id"])})
-        return localize({"ok": True, "schema": SCHEMA, "models": models, "cards": cards, "layouts": [dict(l) for l in LAYOUTS], "supported_n": list(self.supported_n()),
+        return localize({"ok": True, "schema": SCHEMA, "models": models, "cards": cards, "layouts": [dict(l) for l in LAYOUTS], "supported_n": list(self.supported_n()), "n_states": {str(n): st["state"] for n, st in sorted(self.n_states().items())},
                 "machine": ({"cards": [{"card": k, "count": v} for k, v in counts.items()], "n": len(mine)} if mine else None),
                 "shortcuts": [dict(x) for x in SHORTCUTS], "defaults": {"seats": DEFAULT_SEATS, "tokens": DEFAULT_TOKENS}, "goals": GOALS,
                 "overhead_per_card_mib": OVERHEAD_PER_CARD_MIB}, lang)
@@ -415,6 +538,7 @@ class ZielPlaner:
             raise ZielError("no model fact sheet for %s (planer_data/steckbrief.json)" % model["id"])
         gate = self._gate(model, cards)
         sup = self.supported_n()
+        nst = self.n_states().get(n) or {"state": "off", "text": self._off_reason(n)}
         out = []
         for l in LAYOUTS:
             calc = self._calc(model, l["id"], cards, seats, tokens)
@@ -423,14 +547,23 @@ class ZielPlaner:
             profile = model["profiles"].get(l["id"])
             if n not in sup:
                 status = "n_unsupported"
-                why.append("%d card%s: the launcher and topology serve %s today; other counts are being built (not supported yet)." % (
-                    n, "" if n == 1 else "s", "exactly %d cards" % sup[0] if len(sup) == 1 else "%s cards" % ", ".join(str(x) for x in sup)))
+                if nst["state"] == "refused":
+                    why.append("%d cards: the topology gate refuses this card count by name (%s)." % (n, nst["text"][:200]))
+                else:
+                    why.append(nst["text"] or self._off_reason(n))
+            elif nst["state"] == "unproven":
+                why.append("%d cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; "
+                           "the launcher takes this layout only with force, and the first boot is the proof." % n)
             if gate:
                 status = "blocked"
                 why += gate
             if not profile:
                 status = "blocked"
                 why.append(model.get("no_dual") or "no reference profile for this layout")
+            blocked_by_profile = self._release_block(model, l["id"], cards) if status == "ok" else None
+            if blocked_by_profile:
+                status = "blocked"
+                why.append(blocked_by_profile)
             if calc["too_small"]:
                 status = "blocked"
                 why.append("too little memory on %s: %d MiB outside the pool alone are more than the card offers" % (", ".join(sorted(set(calc["too_small"]))), OVERHEAD_PER_CARD_MIB))
@@ -442,7 +575,7 @@ class ZielPlaner:
                 why.append("tight: margin %s (%.0f%% of the cards' memory)" % (_fmt_gib(calc["margin_mib"]), 100.0 * calc["margin_mib"] / calc["have_mib"]))
             possible = status in ("ok", "tight")
             out.append({"id": l["id"], "name": l["name"], "satz": l["satz"], "status": status, "possible": possible, "why": why, "calc": calc["lines"],
-                        "margin_mib": calc["margin_mib"]})
+                        "margin_mib": calc["margin_mib"], "proof": "metal" if nst["state"] == "proven" else "dry_run"})
         return {"ok": True, "schema": SCHEMA, "model": {"id": model["id"], "name": model["name"]}, "n": n, "layouts": out,
                 "hw": self._hw_info(cards), "seats": seats, "tokens": tokens,
                 "note": "A rough necessary condition from the model fact sheet and the card data. The planner's computation (next step) decides; "
@@ -466,6 +599,37 @@ class ZielPlaner:
             return dict(base, **{"status": li["status"], "felder": [], "verdikt": None, "hinweise": li["why"]})
         seats = self._int(body.get("seats"), "seats", *GOALS["seats"])
         tokens = self._int(body.get("tokens"), "tokens", *GOALS["tokens"])
+        res = self._propose(model, layout, cards, seats, tokens)
+        out = dict(base, status="ok" if res.get("ok") else "error")
+        if not res.get("ok"):
+            return dict(out, **{"felder": [], "verdikt": None, "hinweise": [res.get("error") or "the planner gave no proposal"] + list(res.get("notes") or [])})
+        out.update(self._summary(model, layout["id"], cards, res, seats, tokens))
+        out["intern"] = {"basis": model["profiles"][layout["id"]], "form": layout["form"], "oracle": res.get("oracle"),
+                         "startprofil": {"doc": (res.get("startprofil") or {}).get("doc"), "name": (res.get("startprofil") or {}).get("name")}}
+        # the ceiling per request is the one input that the cards can refuse outright (W40: no servable pipeline cut holds ONE full-context prompt, e.g. 27B INT8 on
+        # 2 x 24 GB).  Then the page does not stop at the refusal: it asks the launcher again at the next lower ceiling presets and shows the largest one it takes -- real
+        # dry runs, never an estimate -- and says so (``anpassung``).
+        asked = int(tokens or (out.get("goals") or {}).get("kv_tokens") or DEFAULT_TOKENS)       # what the user asked, else what the planner resolved as the default
+        if self._ceiling_refused(out):
+            for t in sorted((x for x in GOALS["token_presets"] if x < asked), reverse=True):
+                res2 = self._propose(model, layout, cards, seats, t)
+                if not res2.get("ok"):
+                    continue
+                out2 = dict(base, status="ok")
+                out2.update(self._summary(model, layout["id"], cards, res2, seats, t))
+                if self._ceiling_refused(out2):
+                    continue
+                out2["intern"] = {"basis": model["profiles"][layout["id"]], "form": layout["form"], "oracle": res2.get("oracle"),
+                                  "startprofil": {"doc": (res2.get("startprofil") or {}).get("doc"), "name": (res2.get("startprofil") or {}).get("name")}}
+                out2["anpassung"] = {"gefragt": asked, "erreicht": t, "was": "tokens",
+                                     "text": "%d tokens per seat do not fit these cards (the launcher refuses with W40: no servable cut holds one full-context prompt). "
+                                             "The figures below are for %d tokens per seat, the largest ceiling the launcher takes (dry runs at the ceiling presets)." % (asked, t)}
+                return out2
+            out["anpassung"] = {"gefragt": asked, "erreicht": None, "was": "tokens",
+                                "text": "%d tokens per seat do not fit these cards, and none of the lower ceiling presets does either (the launcher refuses each with W40)." % asked}
+        return out
+
+    def _propose(self, model: dict, layout: dict, cards: List[dict], seats, tokens) -> dict:
         goals: Dict[str, Any] = {}
         if seats is not None:
             goals["seats"] = seats
@@ -474,14 +638,13 @@ class ZielPlaner:
         req = {"basis": {"kind": "release", "name": model["profiles"][layout["id"]]}, "form": layout["form"],
                "inventory": [{"card": e["id"], "pcie": {"gen": e["pcie_native"]["gen"], "lanes": e["pcie_native"]["lanes"]}} for e in cards],
                "goals": goals}
-        res = self.ed.propose(req)
-        out = dict(base, status="ok" if res.get("ok") else "error")
-        if not res.get("ok"):
-            return dict(out, **{"felder": [], "verdikt": None, "hinweise": [res.get("error") or "the planner gave no proposal"] + list(res.get("notes") or [])})
-        out.update(self._summary(model, layout["id"], cards, res, seats, tokens))
-        out["intern"] = {"basis": model["profiles"][layout["id"]], "form": layout["form"], "oracle": res.get("oracle"),
-                         "startprofil": {"doc": (res.get("startprofil") or {}).get("doc"), "name": (res.get("startprofil") or {}).get("name")}}
-        return out
+        return self.ed.propose(req)
+
+    @staticmethod
+    def _ceiling_refused(out: dict) -> bool:
+        """The launcher refused with a blocked ``PP-CUT`` (W40) item: the ceiling per request is more than a pipeline cut over these cards can serve."""
+        vd = out.get("verdikt") or {}
+        return vd.get("outcome") in ("verweigert", "crash") and any(i.get("code") == "PP-CUT" and i.get("blocked") for i in vd.get("items") or [])
 
     # ------------------------------------------------------------------ Zusammenfassung (Rest berechnet)
     @staticmethod
@@ -695,7 +858,7 @@ class ZielPlaner:
                 if code in seen:
                     seen[code]["count"] += 1          # the launcher repeats a code per card/rank: one line with a count
                     continue
-                seen[code] = {"code": code, "text": (x.get("reason") or x.get("title") or "")[:300], "blocked": bool(blocked), "force": bool(x.get("forcebar")), "count": 1}
+                seen[code] = {"code": code, "text": _cut_text(x.get("reason") or x.get("title") or "", 300), "blocked": bool(blocked), "force": bool(x.get("forcebar")), "count": 1}
                 items.append(seen[code])
         text = {"geht": "The launcher's dry run passes without force.", "ok": "The launcher's dry run passes without force.",
                 "ok_with_force": "The launcher's dry run passes only with force: it does not trust numbers that were not measured on these cards (see the notes). "

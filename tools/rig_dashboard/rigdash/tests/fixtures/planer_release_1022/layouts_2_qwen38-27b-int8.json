@@ -1,0 +1,83 @@
+{
+ "hw": {
+  "label": "estimated",
+  "quelle": "geschaetzt",
+  "text": "No measured hardware profile for these cards yet: memory sizes and bandwidth are catalog (datasheet) values, rates are borrowed from the nearest measured card. Every figure below is an estimate; the first boot on this hardware is the measurement."
+ },
+ "layouts": [
+  {
+   "calc": [
+    "cards: 2 cards = 48.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+    "weights: weights 28179 + draft 2072 MiB = 29.5 GiB",
+    "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 34816 B (fp8, 16 attention layers) = 8.5 GiB (never seats x tokens)",
+    "state: 6 seats x 74.8 MiB recurrent state (48 linear layers) = 0.4 GiB",
+    "per card outside the pool: 2 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 9.3 GiB",
+    "needed 47.8 GiB against 48.0 GiB available: margin 0.2 GiB"
+   ],
+   "id": "solo",
+   "margin_mib": 180,
+   "name": "Solo (TP only)",
+   "possible": true,
+   "proof": "dry_run",
+   "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
+   "status": "tight",
+   "why": [
+    "2 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof.",
+    "tight: margin 0.2 GiB (0% of the cards' memory)"
+   ]
+  },
+  {
+   "calc": [
+    "cards: 2 cards = 48.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+    "weights: weights 28179 + draft 2072 MiB = 29.5 GiB",
+    "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 34816 B (fp8, 16 attention layers) = 8.5 GiB (never seats x tokens)",
+    "state: 6 seats x 74.8 MiB recurrent state (48 linear layers) = 0.4 GiB",
+    "per card outside the pool: 2 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 9.3 GiB",
+    "needed 47.8 GiB against 48.0 GiB available: margin 0.2 GiB"
+   ],
+   "id": "flip",
+   "margin_mib": 180,
+   "name": "Flip",
+   "possible": true,
+   "proof": "dry_run",
+   "satz": "The same cards work alternately as prefill group P (pipeline) and decode group D (tensor-parallel); the weights are exchanged through the host.",
+   "status": "tight",
+   "why": [
+    "2 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof.",
+    "tight: margin 0.2 GiB (0% of the cards' memory)"
+   ]
+  },
+  {
+   "calc": [
+    "cards: 2 cards = 48.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+    "weights: weights 28179 + draft 2072 MiB x (2N-1)/N = x 3/2 (D's tensor-parallel shard and P's pipeline stage are resident at once) = 44.3 GiB",
+    "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 34816 B (fp8, 16 attention layers) = 8.5 GiB (never seats x tokens)",
+    "state: 6 seats x 74.8 MiB recurrent state (48 linear layers) = 0.4 GiB",
+    "per card outside the pool: 2 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 9.3 GiB",
+    "needed 62.6 GiB against 48.0 GiB available: short by 14.6 GiB"
+   ],
+   "id": "dual",
+   "margin_mib": -14945,
+   "name": "Dual",
+   "possible": false,
+   "proof": "dry_run",
+   "satz": "P and D are awake at the same time on the same cards; no switching, but both layouts hold weights at once.",
+   "status": "blocked",
+   "why": [
+    "2 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof.",
+    "Dual is calibrated on the NVFP4 weights only (the launcher's dual form has no INT8 reference profile).",
+    "does not fit by the rough calculation: short by 14.6 GiB"
+   ]
+  }
+ ],
+ "model": {
+  "id": "qwen38-27b-int8",
+  "name": "Qwen3.8-27B INT8"
+ },
+ "n": 2,
+ "note": "A rough necessary condition from the model fact sheet and the card data. The planner's computation (next step) decides; a layout shown as possible can still be refused there, a blocked one cannot be forced here.",
+ "ok": true,
+ "schema": "flliper.planer-ziel/1",
+ "seats": 6,
+ "tokens": 262144
+}

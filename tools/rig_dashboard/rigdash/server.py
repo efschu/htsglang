@@ -263,9 +263,13 @@ class App:
         # this process reads what it published and measures nothing
         self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
         self.pdflip = weg2line.PdFlipLines(cfg["docker_ssh"], args.release_profile or [])
-        self.kartenplaner = kartenplan.Kartenplaner()
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
-        ptree = getattr(args, "profile_tree", None) or None      # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker
+        # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker.  The argparse flag is ``--profil-tree`` (dest ``profil_tree``): the old read of
+        # ``profile_tree`` never saw it, so RIGDASH_PROFIL_TREE was ignored and the planner answered "no planner tree" (release 1022).  ``profile_tree`` stays
+        # as the second name for callers that build the namespace by hand.
+        ptree = getattr(args, "profil_tree", None) or getattr(args, "profile_tree", None) or None
+        # the topology gate of the planner (card counts, ``ZielPlaner.n_states``) reads from the SAME tree
+        self.kartenplaner = kartenplan.Kartenplaner(tree=ptree)
         # AP-D: das Orakel (Launcher-Trockenlauf im Kindprozess + Cache); startet erst bei der ersten Anfrage, nie im Hintergrund
         # eigener cgroup-Scope (Spitze 1,75 GiB RSS > Rest der Unit-Grenze, Review AP-D); args ohne Feld (Tests) = kein Praefix
         opf = getattr(args, "oracle_prefix", None)

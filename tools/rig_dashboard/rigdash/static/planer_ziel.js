@@ -17,7 +17,10 @@
   const num = (v) => (v == null || v === "" || isNaN(Number(v)) ? esc(v) : Number(v).toLocaleString(LOC()));
   const gib = (mib) => (Number(mib) / 1024).toLocaleString(LOC(), { maximumFractionDigits: 1 }) + " GiB";
   const shortCard = (label) => String(label || "").replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "");
-  const CHIP = { ok: ["pz-ok", "possible"], tight: ["pz-warn", "possible, tight"], blocked: ["pz-bad", "not possible"], n_unsupported: ["pz-warn", "not supported yet"] };
+  const CHIP = { ok: ["pz-ok", "possible"], tight: ["pz-warn", "possible, tight"], blocked: ["pz-bad", "not possible"], n_unsupported: ["pz-warn", "not supported yet"],
+                 dry_run: ["pz-warn", "possible, not booted on metal yet"] };
+  // a layout whose card count no release boot has proven yet is calculated by the launcher dry run only: its chip says so (the server sends proof = "dry_run")
+  const chipOf = (l) => (l.possible && l.proof === "dry_run" ? CHIP.dry_run : CHIP[l.status] || CHIP.blocked);
 
   // hardware chip: "measured" only with measured rates; a captured-only profile says "rates estimated" and offers the measurement (review A5)
   function hwChip(hw, msg) {
@@ -50,7 +53,7 @@
   function renderLayouts(lay, selected) {
     if (!lay) return `<div class="muted">Choose a model and at least one card.</div>`;
     const tiles = lay.layouts.map((l) => {
-      const ch = CHIP[l.status] || CHIP.blocked;
+      const ch = chipOf(l);
       const sel = l.id === selected;
       return `<div class="pz-lay${l.possible ? "" : " off"}${sel ? " sel" : ""}">
         <button type="button" data-pz="layout" data-id="${esc(l.id)}" aria-pressed="${sel}"${l.possible ? "" : " disabled"}><b>${esc(l.name)}</b><span>${sv(esc(l.satz))}</span></button>
@@ -78,15 +81,18 @@
       return `${head}<div class="pz-verdict bad"><b>${t}.</b><ul>${(p.hinweise || []).map((h) => `<li>${sv(esc(h))}</li>`).join("")}</ul></div>`;
     }
     const v = p.verdikt || {}, bad = v.outcome === "verweigert" || v.outcome === "crash";
+    // the launcher refused the ceiling per seat (W40) and the server asked again at the lower presets: say what was asked and what the figures are for
+    const adj = p.anpassung ? `<div class="pz-verdict ${p.anpassung.erreicht ? "ok" : "bad"}"><b>${sv(esc(p.anpassung.text))}</b></div>` : "";
     const hw = p.hw ? `<span class="pz-chip ${p.hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(p.hw.text)}">hardware figures: ${sv(esc(p.hw.label))}</span>` : "";   // the button sits in step 2
+    const proof = p.layout_info && p.layout_info.proof === "dry_run" ? ` <span class="pz-chip pz-warn" title="${esc((p.layout_info.why || []).join(" "))}">${sv(esc(CHIP.dry_run[1]))}</span>` : "";
     const items = (v.items || []).map((i) => `<li><span class="pz-chip ${i.blocked ? "pz-bad" : "pz-warn"}">${i.blocked ? "refused" : "needs force"}</span> <span class="mono">${esc(i.code)}</span>${i.count > 1 ? ` <span class="muted">&times;${i.count}</span>` : ""} ${sv(esc(String(i.text).length > 200 ? String(i.text).slice(0, 198) + "…" : i.text))}</li>`).join("");
     const fit = v.fit && v.fit.level ? ` Fit: <b>${esc(({ ja: "yes", tight: "tight", nein: "no" })[v.fit.level] || v.fit.level)}</b>${v.fit.margin_mib != null ? ", margin " + num(Math.round(v.fit.margin_mib)) + " MiB" : ""}.` : "";
     const groups = (p.felder || []).map((g) => `<section class="pz-g"><h4>${esc(g.titel)}</h4><table class="pz-t"><tbody>${g.zeilen.map((r) => renderRow(r, p.karten)).join("")}</tbody></table></section>`).join("");
     const notes = (p.hinweise || []).length ? `<details class="pz-calc"><summary>${p.hinweise.length} planner note${p.hinweise.length === 1 ? "" : "s"}</summary><ul>${p.hinweise.map((h) => `<li>${sv(esc(h))}</li>`).join("")}</ul></details>` : "";
-    return `${head}<div class="pz-verdict ${bad ? "bad" : "ok"}"><b>${sv(esc(v.text || ""))}</b>${fit} ${hw}${items ? `<details class="pz-calc"><summary>${(v.items || []).length} launcher note${(v.items || []).length === 1 ? "" : "s"}</summary><ul class="pz-vi">${items}</ul></details>` : ""}</div>${groups}${notes}`;
+    return `${head}${adj}<div class="pz-verdict ${bad ? "bad" : "ok"}"><b>${sv(esc(v.text || ""))}</b>${fit} ${hw}${proof}${items ? `<details class="pz-calc"><summary>${(v.items || []).length} launcher note${(v.items || []).length === 1 ? "" : "s"}</summary><ul class="pz-vi">${items}</ul></details>` : ""}</div>${groups}${notes}`;
   }
 
-  const api = { esc, shortCard, totalCards, cardsBody, hwChip, renderCards, renderLayouts, renderPlan, renderRow, CHIP };
+  const api = { esc, shortCard, totalCards, cardsBody, hwChip, renderCards, renderLayouts, renderPlan, renderRow, CHIP, chipOf };
   root.PlanerZiel = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 
@@ -141,7 +147,7 @@
     const body = Object.assign(reqBody(), { layout: st.layout }), key = JSON.stringify(body), mine = ++st.seq;
     st.exp = null; st.err = null;
     if (st.cache.has(key)) { st.plan = st.cache.get(key); fillDefaults(); return draw(); }
-    st.plan = null; st.busy = "computing: the planner runs the launcher dry run, about 30 s"; draw();
+    st.plan = null; st.busy = "computing: the planner runs the launcher dry run, about 30 s (longer when it has to ask again at a lower ceiling)"; draw();
     try {
       const j = await call("planer-plan", body);
       if (mine !== st.seq) return;

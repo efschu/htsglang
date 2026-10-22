@@ -1,0 +1,237 @@
+{
+ "defaults": {
+  "seats": 6,
+  "tokens": 262144
+ },
+ "felder": [
+  {
+   "id": "seats",
+   "titel": "Your inputs",
+   "zeilen": [
+    {
+     "einheit": "",
+     "gruppe": "seats",
+     "je_karte": null,
+     "key": "seats",
+     "label": "Max concurrent seats (decode group)",
+     "quelle": "your input / planner default",
+     "roh": "goals.seats",
+     "schaetzung": false,
+     "warum": "--max-running-requests of D and --d-bs of the front",
+     "wert": "6"
+    },
+    {
+     "einheit": "",
+     "gruppe": "seats",
+     "je_karte": null,
+     "key": "tokens",
+     "label": "Max tokens per seat (ceiling for ONE request)",
+     "quelle": "your input / planner default",
+     "roh": "--max-kv-per-request",
+     "schaetzung": false,
+     "warum": "--max-kv-per-request: a ceiling per request; the KV pool is shared by all seats, so this is not multiplied by the seats",
+     "wert": "262144"
+    }
+   ]
+  },
+  {
+   "id": "weights",
+   "titel": "Weight split and memory per card",
+   "zeilen": [
+    {
+     "einheit": "",
+     "gruppe": "weights",
+     "je_karte": null,
+     "key": "d_split",
+     "label": "Decode split (group D, tensor-parallel)",
+     "quelle": "launcher dry run",
+     "roh": "--rank-tp-ratio",
+     "schaetzung": false,
+     "warum": "'auto' = the launcher shares every layer across the 3 cards by their decode-group memory budgets",
+     "wert": "auto"
+    },
+    {
+     "einheit": "MiB",
+     "gruppe": "weights",
+     "je_karte": [
+      "20448",
+      "20448",
+      "20448"
+     ],
+     "key": "d_mem",
+     "label": "Memory budget per card, decode group",
+     "quelle": "launcher dry run",
+     "roh": "--rank-gpu-memory-mib (D)",
+     "schaetzung": false,
+     "warum": "--rank-gpu-memory-mib of group D (weights shard + KV pool + state of the tensor-parallel group)",
+     "wert": null
+    }
+   ]
+  },
+  {
+   "id": "kv",
+   "titel": "KV pool",
+   "zeilen": [
+    {
+     "einheit": "tokens",
+     "gruppe": "kv",
+     "je_karte": null,
+     "key": "d_pool",
+     "label": "KV pool, decode group (shared by all seats)",
+     "quelle": "estimate",
+     "roh": "D budgets - weights - state - fixed posts, / KV bytes per token",
+     "schaetzung": true,
+     "warum": "(D budgets 61344 MiB - weights 30251 MiB - state 449 MiB - fixed posts 3 x 1926 MiB) / 34816 B per token; an estimate calibrated on the measured pool of our rig (27B INT8 flip: 778980 tokens), the launcher sizes the pool at boot",
+     "wert": "748911"
+    }
+   ]
+  },
+  {
+   "id": "host",
+   "titel": "Host memory",
+   "zeilen": [
+    {
+     "einheit": "MiB",
+     "gruppe": "host",
+     "je_karte": null,
+     "key": "mamba_host",
+     "label": "Mamba (recurrent state) host memory",
+     "quelle": "launcher dry run",
+     "roh": "--hicache-mamba-host-mib",
+     "schaetzung": false,
+     "warum": "--hicache-mamba-host-mib: where the recurrent state of parked/evicted seats lives in the host",
+     "wert": "100"
+    },
+    {
+     "einheit": "",
+     "gruppe": "host",
+     "je_karte": null,
+     "key": "host_cache",
+     "label": "Host KV cache (L2) per group",
+     "quelle": "launcher dry run",
+     "roh": "--hicache-size",
+     "schaetzung": false,
+     "warum": "--hicache-size of the groups: the host tier that catches the KV of parked seats",
+     "wert": "D 4 GiB"
+    }
+   ]
+  },
+  {
+   "id": "chunk",
+   "titel": "Chunk and X",
+   "zeilen": [
+    {
+     "einheit": "tokens",
+     "gruppe": "chunk",
+     "je_karte": null,
+     "key": "chunk_d",
+     "label": "Prefill chunk (group D)",
+     "quelle": "launcher dry run",
+     "roh": "--chunked-prefill-size (D)",
+     "schaetzung": false,
+     "warum": "--chunked-prefill-size of D",
+     "wert": "4096"
+    }
+   ]
+  }
+ ],
+ "goals": {
+  "kv_dtype": "fp8_e4m3",
+  "kv_tokens": 262144,
+  "p_cut": "auto",
+  "seats": 6
+ },
+ "hinweise": [
+  "Draft (dense, TP-symmetric D, planner estimate): per rank (weights 26895 + draft 2072 + KV obligation 8704 + Mamba 2843) / 3 = 13505 MiB against the D budgets 21608,21608,21608 MiB: smallest margin 8103 MiB (fits); the launcher prices the real D layout",
+  "Synthetic cards from the catalog (datasheet, synthetic UUID): what the launcher binds to card UUIDs (census) does not know them."
+ ],
+ "hw": {
+  "label": "estimated",
+  "quelle": "geschaetzt",
+  "text": "No measured hardware profile for these cards yet: memory sizes and bandwidth are catalog (datasheet) values, rates are borrowed from the nearest measured card. Every figure below is an estimate; the first boot on this hardware is the measurement."
+ },
+ "intern": {
+  "basis": "27b",
+  "form": "tp",
+  "oracle": {
+   "cache_key": "1901d4a7950251e3",
+   "cached": false,
+   "duration_s": 34.94,
+   "version": {
+    "hw_fit": "4896e1cfe0b97ae5",
+    "launcher": "8728bbefd7d3403f",
+    "propose_oracle": "8af4b0b24e9bb2c9",
+    "refusals": "4d580c430d114481",
+    "topology": "41e859db94f603d8"
+   }
+  },
+  "startprofil": {
+   "doc": null,
+   "name": "27b-proposal"
+  }
+ },
+ "karten": [
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  },
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  },
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  }
+ ],
+ "layout": {
+  "id": "solo",
+  "name": "Solo (TP only)"
+ },
+ "layout_info": {
+  "calc": [
+   "cards: 3 cards = 72.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+   "weights: weights 28179 + draft 2072 MiB = 29.5 GiB",
+   "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 34816 B (fp8, 16 attention layers) = 8.5 GiB (never seats x tokens)",
+   "state: 6 seats x 74.8 MiB recurrent state (48 linear layers) = 0.4 GiB",
+   "per card outside the pool: 3 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 14.0 GiB",
+   "needed 52.5 GiB against 72.0 GiB available: margin 19.5 GiB"
+  ],
+  "id": "solo",
+  "margin_mib": 19972,
+  "name": "Solo (TP only)",
+  "possible": true,
+  "proof": "metal",
+  "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
+  "status": "ok",
+  "why": []
+ },
+ "model": {
+  "id": "qwen38-27b-int8",
+  "name": "Qwen3.8-27B INT8"
+ },
+ "n": 3,
+ "ok": true,
+ "schema": "flliper.planer-ziel/1",
+ "status": "ok",
+ "verdikt": {
+  "fit": {
+   "level": "ja",
+   "margin_mib": 25436.856
+  },
+  "items": [
+   {
+    "blocked": false,
+    "code": "HW-UNCALIBRATED",
+    "count": 6,
+    "force": true,
+    "text": "HW-UNCALIBRATED: profile 'qwen27b' (profile_records_data/qwen27b.json inventory) was measured on the inventory [RTX5090, RTX3080, RTX3080] (card order), this rig is [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (ordinal 0: live RTX3090/24576MiB/sm86 vs calibrated RTX5090;"
+   }
+  ],
+  "outcome": "ok_with_force",
+  "text": "The launcher's dry run passes only with force: it does not trust numbers that were not measured on these cards (see the notes). The first boot is the measurement."
+ }
+}

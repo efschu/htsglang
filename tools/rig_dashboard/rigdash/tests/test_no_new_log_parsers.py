@@ -126,6 +126,9 @@ NON_LOG_ALLOWED = {
     # F0-B (rename R5): the fLLiper flat images of `docker images` (tag schema flliper:<version>-<cu> / flliper:<cu>-<sha10>, make_flat_ctx.sh)
     ("weg2line.py", "0962e4486896"): "parses a repository:tag line of `docker images` (flliper:<version>-<cu>); reads no log line",
     ("weg2line.py", "110301f6e596"): "parses a repository:tag line of `docker images` (flliper:<cu>-<sha10>); reads no log line",
+    # PLANER-ZIELBILD 1021 / release 1022: the German page texts are printf TEMPLATES of the planner page (planer_data/planer_ziel_de.json); this splits a template at its
+    # placeholders to build the matcher for the English text the server built (the zielbild branch carried it without an entry)
+    ("planer_ziel.py", "f909d46c0b63"): "splits an English page-text template (printf placeholders %d %s) into its fixed parts to build the German matcher; reads no log line",
 }
 
 

@@ -1,0 +1,79 @@
+{
+ "hw": {
+  "label": "estimated",
+  "quelle": "geschaetzt",
+  "text": "No measured hardware profile for these cards yet: memory sizes and bandwidth are catalog (datasheet) values, rates are borrowed from the nearest measured card. Every figure below is an estimate; the first boot on this hardware is the measurement."
+ },
+ "layouts": [
+  {
+   "calc": [
+    "cards: 4 cards = 96.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+    "weights: weights 20906 + draft 1478 MiB = 21.9 GiB",
+    "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 34816 B (fp8, 16 attention layers) = 8.5 GiB (never seats x tokens)",
+    "state: 6 seats x 74.8 MiB recurrent state (48 linear layers) = 0.4 GiB",
+    "per card outside the pool: 4 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 18.7 GiB",
+    "needed 49.5 GiB against 96.0 GiB available: margin 46.5 GiB"
+   ],
+   "id": "solo",
+   "margin_mib": 47631,
+   "name": "Solo (TP only)",
+   "possible": true,
+   "proof": "dry_run",
+   "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
+   "status": "ok",
+   "why": [
+    "4 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
+   ]
+  },
+  {
+   "calc": [
+    "cards: 4 cards = 96.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+    "weights: weights 20906 + draft 1478 MiB = 21.9 GiB",
+    "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 34816 B (fp8, 16 attention layers) = 8.5 GiB (never seats x tokens)",
+    "state: 6 seats x 74.8 MiB recurrent state (48 linear layers) = 0.4 GiB",
+    "per card outside the pool: 4 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 18.7 GiB",
+    "needed 49.5 GiB against 96.0 GiB available: margin 46.5 GiB"
+   ],
+   "id": "flip",
+   "margin_mib": 47631,
+   "name": "Flip",
+   "possible": true,
+   "proof": "dry_run",
+   "satz": "The same cards work alternately as prefill group P (pipeline) and decode group D (tensor-parallel); the weights are exchanged through the host.",
+   "status": "ok",
+   "why": [
+    "4 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
+   ]
+  },
+  {
+   "calc": [
+    "cards: 4 cards = 96.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+    "weights: weights 20906 + draft 1478 MiB x (2N-1)/N = x 7/4 (D's tensor-parallel shard and P's pipeline stage are resident at once) = 38.3 GiB",
+    "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 34816 B (fp8, 16 attention layers) = 8.5 GiB (never seats x tokens)",
+    "state: 6 seats x 74.8 MiB recurrent state (48 linear layers) = 0.4 GiB",
+    "per card outside the pool: 4 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 18.7 GiB",
+    "needed 65.9 GiB against 96.0 GiB available: margin 30.1 GiB"
+   ],
+   "id": "dual",
+   "margin_mib": 30843,
+   "name": "Dual",
+   "possible": true,
+   "proof": "dry_run",
+   "satz": "P and D are awake at the same time on the same cards; no switching, but both layouts hold weights at once.",
+   "status": "ok",
+   "why": [
+    "4 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
+   ]
+  }
+ ],
+ "model": {
+  "id": "qwen38-27b-nvfp4",
+  "name": "Qwen3.8-27B NVFP4"
+ },
+ "n": 4,
+ "note": "A rough necessary condition from the model fact sheet and the card data. The planner's computation (next step) decides; a layout shown as possible can still be refused there, a blocked one cannot be forced here.",
+ "ok": true,
+ "schema": "flliper.planer-ziel/1",
+ "seats": 6,
+ "tokens": 262144
+}
