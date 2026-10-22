@@ -5,7 +5,7 @@ What this pins:
 * it moves devices between the seat containers: 403 through the public proxy, 404 in the release edition, 502 with a
   reason when rdx-seatmgr does not answer, 404 for any other path;
 * the tab and seats.js are in the rig edition only;
-* seats.js renders one column per seat plus "Unassigned", blinks an active device, offers no choice for a device the
+* seats.js renders one column per seat plus "Host console", blinks an active device, offers no choice for a device the
   host uses, shows the claim countdown -- and every text it shows has a German entry.
 """
 
@@ -37,13 +37,15 @@ STATE = {
         {"id": "usb:1-3", "kind": "usb", "name": "PixArt USB Optical Mouse", "path": "pci-0000:0a:00.1-usb-0:3",
          "devid": "usb:093a:2510", "roles": ["mouse"], "keys": True, "assignable": True, "host_drivers": ["usbhid"],
          "nodes": [{"dev": "/dev/input/event2"}, {"dev": "/dev/hidraw1"}], "seat": 1, "how": "default (monitor)",
-         "active": True, "last_input_s": 0.4, "rules": []},
+         "active": True, "last_input_s": 0.4, "rules": [],
+         "withheld": "not grabbed by seat 1 for 1 s (no gamescope there, or it ended): the host console's until the container runs a new gamescope"},
         {"id": "sound:0000:0d:00.1", "kind": "sound", "name": "NVidia (0000:0d:00.1)", "path": "pci-0000:0d:00.1",
          "devid": "pci:10de:22e8", "roles": ["sound"], "keys": False, "assignable": True, "host_drivers": [],
          "nodes": [{"dev": "/dev/snd/controlC1"}], "seat": 1, "how": "GPU sound", "active": False, "last_input_s": None, "rules": []},
         {"id": "usb:2-4", "kind": "usb", "name": "Realtek USB LAN", "path": "pci-0000:0a:00.3-usb-0:4",
          "devid": "usb:0bda:8156", "roles": [], "keys": False, "assignable": False, "host_drivers": ["r8152"],
-         "nodes": [{"dev": "/dev/bus/usb/002/003"}], "seat": None, "how": "unassigned", "active": False, "last_input_s": None, "rules": []},
+         "nodes": [{"dev": "/dev/bus/usb/002/003"}], "seat": None, "how": "host console", "active": False, "last_input_s": None, "rules": [],
+         "withheld": None},
         {"id": "usb:3-4", "kind": "usb", "name": "AURA LED Controller", "path": "pci-0000:0a:00.3-usb-0:4",
          "devid": "usb:0b05:18f3", "roles": [], "keys": False, "assignable": True, "host_drivers": ["usbhid"],
          "nodes": [{"dev": "/dev/hidraw0"}], "seat": None, "how": "port rule", "active": False, "last_input_s": None,
@@ -171,8 +173,13 @@ class TestSeatsJs(unittest.TestCase):
 
     def test_columns_blink_locked_claim(self):
         html = self.render(STATE)
-        self.assertEqual(html.count('<section class="st-col'), 3)                        # two seats + Unassigned
+        self.assertEqual(html.count('<section class="st-col'), 3)                        # two seats + Host console
+        self.assertIn("<h3>Host console</h3>", html)
+        self.assertIn('<option value="host" selected>Host console</option>', html)
         self.assertIn('st-dev st-blink" data-id="usb:1-3"', html)
+        mouse = html.split('data-id="usb:1-3"')[1].split('class="st-dev')[0]
+        self.assertIn("Withheld: the seat does not grab this keyboard", mouse)        # grab guard
+        self.assertIn(", the host console has it", mouse)
         lan = html.split('data-id="usb:2-4"')[1].split('class="st-dev')[0]
         self.assertIn("Used by the host", lan)
         self.assertNotIn("<select", lan)
@@ -181,7 +188,7 @@ class TestSeatsJs(unittest.TestCase):
         self.assertIn('data-act="claim" data-seat="1"', html)
         aura = html.split('data-id="usb:3-4"')[1]
         self.assertIn('data-act="forget"', aura)                                          # it has a rule
-        self.assertIn('data-act="port" disabled', aura)                                   # unassigned: nothing to remember
+        self.assertNotIn('data-act="port" disabled', aura)                                # the host console can be remembered too
         virt = html.split('data-id="virtual:input27"')[1].split('class="st-dev')[0]
         self.assertIn("made by this seat itself", virt)                                   # not "used by the host"
         self.assertNotIn("<select", virt)
@@ -200,7 +207,8 @@ class TestSeatsJs(unittest.TestCase):
         p.feed(self.render(STATE) + self.render(st) + self.render({"seats": [], "devices": []}) + self.render(None))
         data = {d["name"] for d in STATE["devices"]} | {s["name"] for s in STATE["seats"]} \
             | {d["path"] for d in STATE["devices"]} | {d["devid"] for d in STATE["devices"]} \
-            | {v["name"] for v in STATE["virtual_pending"]} | {v["why"] for v in STATE["virtual_pending"]}
+            | {v["name"] for v in STATE["virtual_pending"]} | {v["why"] for v in STATE["virtual_pending"]} \
+            | {d["withheld"] for d in STATE["devices"] if d.get("withheld")}
         missing = [t for t in p.found if t not in data and t not in SAME_IN_BOTH and not t.startswith(("/dev/", "CT "))
                    and any(c.isalpha() for c in t) and german(t, mem) == t and not t.endswith(" s")]
         self.assertFalse(missing, missing)
