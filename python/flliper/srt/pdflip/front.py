@@ -22799,44 +22799,73 @@ class Front:
         restore -- tms_csrc/core.cpp) and its KV pool; the bytes go to the card
         pool on every P rank (dual_p_kv_stage.sleep_lend). Its OWN epoch sequence
         ('dps<n>'), never the flip's: the flip counters and the W94 ratchet stay
-        untouched."""
-        n = int(getattr(self, "_dual_p_sleep_n", 0) or 0) + 1
-        self._dual_p_sleep_n = n
-        # the same group-idle witness the flip takes before a sleep (the release
-        # asserts an idle server on every rank; a stage-1 P can still hold an
-        # in-flight hand-off write or prefetch)
-        ok, why = await self.quiesce(self.groups["P"])
-        if not ok:
-            self.counters["dual_kv_pressure_sleep_not_idle"] += 1
-            logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 refused p_not_idle leg=%d: %s -- P stays stopped "
-                           "(stage 1), the next tick asks again", n, str(why)[:300])
+        untouched.
+
+        NACHT2 review of 66b171e36e (22.10.): every wake from sleep now waits for
+        ``sleep_leg_done``; a leg that RAISES instead of answering would leave the
+        ladder in 'sleeping' with the flag down for the rest of the boot -- P held,
+        no line, no wake (before 66b171e36e the same exception ended in the named
+        W29 KeyError at the next seat end). The leg runs as a task, so its
+        exception reached nobody. Now: raised before the release went out =
+        nothing parked, back to 'stopped' (named; the next tick asks again);
+        raised after = P's VRAM state is unknown, the named stop of a refused
+        release."""
+        release_sent = False
+        try:
+            n = int(getattr(self, "_dual_p_sleep_n", 0) or 0) + 1
+            self._dual_p_sleep_n = n
+            # the same group-idle witness the flip takes before a sleep (the release
+            # asserts an idle server on every rank; a stage-1 P can still hold an
+            # in-flight hand-off write or prefetch)
+            ok, why = await self.quiesce(self.groups["P"])
+            if not ok:
+                self.counters["dual_kv_pressure_sleep_not_idle"] += 1
+                logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 refused p_not_idle leg=%d: %s -- P stays stopped "
+                               "(stage 1), the next tick asks again", n, str(why)[:300])
+                st = getattr(self, "_dual_stages_obj", None)
+                if st is not None:
+                    st.p_state = "stopped"
+                    st.sleep_leg_done = True                   # no leg pending: nothing parked, nothing to wake
+                return
+            st = getattr(self, "_dual_stages_obj", None)
+            if st is not None and st.p_state != "sleeping":
+                # 22.10.: the ladder left 'sleeping' while the quiesce ran (it must not, sleep_leg_done gates the wake);
+                # releasing now would park P behind a front that believes it serves
+                self.counters["dual_kv_pressure_sleep_stale"] += 1
+                logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 dropped leg=%d: p_state=%s after the quiesce -- no "
+                               "release", n, st.p_state)
+                st.sleep_leg_done = True
+                return
+            tags = [KV_TAG] + self._dual_p_weights_tags()
+            release_sent = True
+            code, body = await self.leg_rpc(self.groups["P"], "/release_memory_occupation",
+                                            {"tags": tags, "epoch": credit_epoch(self.boot_epoch, "dps%d" % n)},
+                                            RPC_TIMEOUT_S)
+            if code != 200:
+                self.do_stop("W-DUAL-P-SLEEP PdFlipDualPSleepRefused",
+                             f"P's sleep leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
+                return
             st = getattr(self, "_dual_stages_obj", None)
             if st is not None:
-                st.p_state = "stopped"
-                st.sleep_leg_done = True                   # no leg pending: nothing parked, nothing to wake
-            return
-        st = getattr(self, "_dual_stages_obj", None)
-        if st is not None and st.p_state != "sleeping":
-            # 22.10.: the ladder left 'sleeping' while the quiesce ran (it must not, sleep_leg_done gates the wake);
-            # releasing now would park P behind a front that believes it serves
-            self.counters["dual_kv_pressure_sleep_stale"] += 1
-            logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 dropped leg=%d: p_state=%s after the quiesce -- no "
-                           "release", n, st.p_state)
-            st.sleep_leg_done = True
-            return
-        tags = [KV_TAG] + self._dual_p_weights_tags()
-        code, body = await self.leg_rpc(self.groups["P"], "/release_memory_occupation",
-                                        {"tags": tags, "epoch": credit_epoch(self.boot_epoch, "dps%d" % n)},
-                                        RPC_TIMEOUT_S)
-        if code != 200:
+                # #1956: every P rank published its sleep loan (sleep_lend) before the leg answered
+                st.sleep_leg_done = True
+            logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 p_state=sleeping leg=%d tags=%d done", n, len(tags))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the leg never leaves the ladder blind
+            st = getattr(self, "_dual_stages_obj", None)
+            if not release_sent:
+                self.counters["dual_kv_pressure_sleep_raised"] += 1
+                logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 leg raised before the release (%s: %s) -- nothing "
+                               "parked, P stays stopped (stage 1), the next tick asks again",
+                               type(exc).__name__, str(exc)[:300])
+                if st is not None:
+                    st.p_state = "stopped"
+                    st.sleep_leg_done = True
+                return
             self.do_stop("W-DUAL-P-SLEEP PdFlipDualPSleepRefused",
-                         f"P's sleep leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
-            return
-        st = getattr(self, "_dual_stages_obj", None)
-        if st is not None:
-            # #1956: every P rank published its sleep loan (sleep_lend) before the leg answered
-            st.sleep_leg_done = True
-        logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 p_state=sleeping leg=%d tags=%d done", n, len(tags))
+                         f"P's sleep leg raised after the release was sent: {type(exc).__name__}: "
+                         f"{str(exc)[:300]} -- VRAM state undefined")
 
     async def _dual_p_lend(self, action: str, why: str = "") -> None:
         """Q-660 stage 1 completed: P, awake with its KV released, lends its

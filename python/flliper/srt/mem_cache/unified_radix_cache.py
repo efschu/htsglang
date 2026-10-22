@@ -6315,6 +6315,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         mrows = mp.alloc_write([last_hash])
         if mrows is None and not node.pdflip_arena_displaced:
             victim = self._pdflip_full_victim(node, rid, self._pdflip_told_unheld(owned), mp)
+            # NACHT2 review of SPILL-TP (1b7d45edb9, 22.10.): the H19 FULL displacement is the same rank-local release
+            # of a shared slot as the spills SPILL-TP guards -- the claim right after it succeeds only on the LAST
+            # releaser, so on a TP group off Form A one rank backs the node and the others do not (the W65 class).
+            # 0 'DISPLACE why=full' lines in the 27B INT8 rounds 3b/3c (rid cap off there); guarded by the same rule.
+            if victim is not None and UnifiedRadixCache._shared_slot_spill_skipped(self, node, "full"):
+                victim = None
             if victim is not None:
                 node.pdflip_arena_displaced = True
                 self._pdflip_release_anchor(victim, mp, st, why="full", for_rid=rid)
