@@ -8332,7 +8332,8 @@ class Scheduler(
         req: Req,
         rematch: bool = True,
         limit_tokens: Optional[int] = None,
-        _regroup: bool = False,
+        _regroup: int = 0,
+        _regroup_prev_start: Optional[int] = None,
     ) -> str:
         """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
 
@@ -8748,9 +8749,15 @@ class Scheduler(
         _tail_kw.update(pdflip_store_told.told_read_prescribed_kw(self.tree_cache, limit_tokens))
         if group_decides:
             # W65-REGROUP (tp_match_floor, "W65-REGROUP"): armed for exactly this
-            # call, and only an intake-style one that has not been regrouped yet;
-            # every other call keeps the W65 stop.
-            _regroup_armed = (not _regroup) and tp_match_floor.span_regroup_allowed(
+            # call, and only an intake-style one; W65-REGROUP-FIXPOINT (22.10.): a
+            # split that survives the cap is regrouped again at the new, strictly
+            # shallower group start, up to W65_REGROUP_MAX_ROUNDS rounds (the round
+            # count is identical on every rank: every rank regroups on the same
+            # reduced vote); every other call, and the round past the bound, keeps
+            # the W65 stop.
+            _regroup_armed = int(
+                _regroup
+            ) < tp_match_floor.W65_REGROUP_MAX_ROUNDS and tp_match_floor.span_regroup_allowed(
                 rematch=rematch, limit_tokens=limit_tokens, group_decides=group_decides
             )
             if _regroup_armed:
@@ -8782,7 +8789,12 @@ class Scheduler(
             _regroup_mark = tp_match_floor.take_span_regroup(self.tree_cache, req.rid)
             if _regroup_mark is not None:
                 return self._pdflip_prefetch_span_regroup(
-                    req, _regroup_mark, limit_tokens, _matched_len
+                    req,
+                    _regroup_mark,
+                    limit_tokens,
+                    _matched_len,
+                    rounds=int(_regroup) + 1,
+                    prev_start=_regroup_prev_start,
                 )
         else:
             self.tree_cache.prefetch_from_storage(
@@ -8836,7 +8848,13 @@ class Scheduler(
         return f"declined:{_reason}"
 
     def _pdflip_prefetch_span_regroup(
-        self, req, mark, limit_tokens: Optional[int], local_matched: int
+        self,
+        req,
+        mark,
+        limit_tokens: Optional[int],
+        local_matched: int,
+        rounds: int = 1,
+        prev_start: Optional[int] = None,
     ) -> str:
         """W65-REGROUP, the scheduler half (see ``tp_match_floor``): the
         participation vote found the ranks' intake matches split and every rank
@@ -8847,22 +8865,50 @@ class Scheduler(
         The cap is the request's own ``_pdflip_prefix_cap`` (the #1419 hook of
         ``init_next_round_input``), restored afterwards, and the request is
         re-matched uncapped on the way out: it leaves this function matched
-        exactly as the unarmed path leaves it, whatever the retry decided."""
+        exactly as the unarmed path leaves it, whatever the retry decided.
+
+        W65-REGROUP-FIXPOINT (27B INT8 round 3, boot 1022_003738, D 00:47:28,
+        rid pdflip-4-73): the shallowest start is NOT always a depth every rank
+        can realize -- the ranks' mamba host anchors differ per node (the shared
+        arena slot's spill outcome is per releasing rank), so TP0 held its anchor
+        at 51712 while TP1/TP2 had none there ("ANCHOR-ONLY-READ depth=51712
+        anchor_was=50880 how=branch_point_never_anchored") and fell back to
+        50880 under the cap: the second vote split again (13632/14464) and the
+        single retry raised W65. A split that survives the cap carries a group
+        start strictly below the cap (the min of matches that are all <= the
+        cap, and not all equal), so the group regroups again there; this is a
+        fixpoint walk down the ranks' COMMON anchors, every step a reduced
+        (group-uniform) value, bounded by ``W65_REGROUP_MAX_ROUNDS``. A start
+        that does not go strictly down is the W65 stop by name."""
         from flliper.srt.managers import tp_match_floor as _tmf
 
         group_start, span_lo, span_hi, group_len = (int(x) for x in mark)
         tc = self.tree_cache
+        if prev_start is not None and group_start >= int(prev_start):
+            # group-uniform: both values come out of the reduced votes
+            from flliper.srt.mem_cache.hicache_collective import (
+                HiCacheCollectiveDesyncError,
+            )
+
+            raise HiCacheCollectiveDesyncError(
+                f"W65 PdFlipPrefetchSpanSplit REGROUP-NO-PROGRESS rid={req.rid}: "
+                f"round {rounds} asks for group_start={group_start} at or above the "
+                f"previous round's {int(prev_start)} (spans min={span_lo} "
+                f"max={span_hi}); a capped re-match matched deeper than its cap. "
+                "Fix the match divergence; do not reconcile the span here."
+            )
         raw_cap = _tmf.regroup_raw_cap(group_start, bool(getattr(tc, "is_eagle", False)))
         n = getattr(self, "_w65_regroup_n", 0) + 1
         self._w65_regroup_n = n
         if n <= 40 or n % 256 == 0:
             _lhn = getattr(req, "last_host_node", None)
             logger.warning(
-                "W65 REGROUP rid=%s n=%d this_rank: local_match=%d (device %d + host %d) "
+                "W65 REGROUP rid=%s n=%d round=%d/%d this_rank: local_match=%d (device %d + host %d) "
                 "state_anchor_depth=%s key_match_depth=%s last_host_node_backuped=%s "
                 "-> group_start=%d raw_cap=%d (spans min=%d max=%d group_len=%d) "
                 "chain_tail(depth_len:backuped/mamba_dev/mamba_host, deepest first)=%s",
-                str(getattr(req, "rid", "?"))[:16], n, int(local_matched),
+                str(getattr(req, "rid", "?"))[:16], n, int(rounds),
+                _tmf.W65_REGROUP_MAX_ROUNDS, int(local_matched),
                 _len_or_zero(getattr(req, "prefix_indices", None)),
                 int(getattr(req, "host_hit_length", 0) or 0),
                 getattr(req, "state_anchor_depth", None),
@@ -8875,7 +8921,11 @@ class Scheduler(
         req._pdflip_prefix_cap = raw_cap if prev is None else min(int(prev), raw_cap)
         try:
             verdict = self._prefetch_kvcache(
-                req, rematch=True, limit_tokens=limit_tokens, _regroup=True
+                req,
+                rematch=True,
+                limit_tokens=limit_tokens,
+                _regroup=int(rounds),
+                _regroup_prev_start=group_start,
             )
         finally:
             if prev is None:
@@ -8885,7 +8935,11 @@ class Scheduler(
                     pass
             else:
                 req._pdflip_prefix_cap = prev
-        req.init_next_round_input(tc, cow_mamba=False)
+        if int(rounds) <= 1:
+            # the outermost round re-matches uncapped once; an inner round (a
+            # fixpoint step) leaves that to it instead of re-matching under the
+            # outer cap it just restored
+            req.init_next_round_input(tc, cow_mamba=False)
         return verdict
 
     def _note_prefetch_unregistered(self, req, verdict: str) -> None:

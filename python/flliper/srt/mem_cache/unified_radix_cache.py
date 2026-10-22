@@ -11734,7 +11734,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "group_start=%d: the ranks matched different prefix "
                         "depths at intake; nothing is registered on this pass, "
                         "every rank re-matches capped at group_start and asks "
-                        "once more (a second split is the W65 stop).",
+                        "again (W65-REGROUP-FIXPOINT: a split that survives the "
+                        "cap regroups at its strictly shallower start, bounded; "
+                        "past the bound it is the W65 stop).",
                         str(req_id)[:16], int(span_base), int(local_span),
                         span_lo, span_hi, group_len, _group_start,
                     )
