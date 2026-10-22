@@ -869,6 +869,10 @@ class AnthropicServing:
             _ns_val = getattr(anthropic_request, _ns_field, None)
             if _ns_val:
                 request_data[_ns_field] = _ns_val
+        # FRONT-SEND-IDS / TITO: the front's ids for this prompt (the chat layer
+        # then skips the render); absent stays absent -- the render as before.
+        if anthropic_request.input_ids is not None:
+            request_data["input_ids"] = list(anthropic_request.input_ids)
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
