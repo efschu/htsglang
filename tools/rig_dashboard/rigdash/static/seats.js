@@ -1,8 +1,10 @@
 /* SEATS 1022: tab "Seats & devices" -- the UI of rdx-seatmgr (rdma-display multiseat, seat/rdx_seatmgr.py on the Proxmox host).
-   One column per seat container plus "Unassigned".  Every keyboard, mouse, gamepad, USB device and sound card is ONE device
-   that belongs to at most one seat; "Belongs to" moves it now (until it is unplugged), "Remember by port / by device" makes
-   it a rule in /etc/rdx/seatmgr.json, "Assign a device by key press" gives the next key press on an unassigned device to
-   that seat.  A device that was just used (key, button, mouse motion) blinks for 2 s, so one can see which entry is which.
+   One column per seat container plus "Host console".  Every keyboard, mouse, gamepad, USB device and sound card is ONE device
+   that belongs to at most one seat or to the Proxmox host's own console; a newly plugged device belongs to the host console
+   (user 22.10.: "host konsole und seat nur per zuordnung").  "Belongs to" moves it now (until it is unplugged), "Remember by
+   port / by device" makes it a rule in /etc/rdx/seatmgr.json (the host console too), "Assign a device by key press" gives the
+   next key press on a host-console device to that seat.  A seat keyboard nobody in the seat reads (no gamescope, or it
+   did not grab it) is held by rdx-seatmgr (grab guard), so its keys reach neither the seat nor the host's console: a note.  A device that was just used (key, button, mouse motion) blinks for 2 s, so one can see which entry is which.
    Computes nothing itself: state and actions go through /api/seats/* (server.py passes them to rdx-seatmgr).  Rig edition
    and LAN only.  RigSeats.render(state, {now}) returns the HTML as text (no DOM, no network) for tests. */
 (function (root) {
@@ -10,6 +12,10 @@
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const HOW = {
     "default (monitor)": "default: the seat with a monitor",
+    "host console": "host console: the default for a new device",
+    "host console (manual)": "host console, chosen here",
+    "host console (port rule)": "host console, remembered by port",
+    "host console (device rule)": "host console, remembered by device",
     "claim": "taken by key press",
     "manual": "chosen here, until unplugged",
     "port rule": "remembered by port",
@@ -31,7 +37,7 @@
 
   function device(d, seats) {
     const locked = d.assignable === false;
-    const opts = ['<option value=""' + (d.seat == null ? " selected" : "") + ">Unassigned</option>"].concat(
+    const opts = ['<option value="host"' + (d.seat == null ? " selected" : "") + ">Host console</option>"].concat(
       seats.map((s) => '<option value="' + s.seat + '"' + (d.seat === s.seat ? " selected" : "") + ">" + esc(s.name) + "</option>"));
     const hasRule = (d.rules || []).length > 0;
     const nodes = (d.nodes || []).map((n) => esc(n.dev)).join(" ");
@@ -39,14 +45,16 @@
       + '<div class="st-dn"><b>' + esc(d.name || d.id) + "</b> " + chips(d) + "</div>"
       + '<div class="st-how"><span>' + esc(HOW[d.how] || d.how) + "</span>"
       + (d.path ? ' <span class="mono st-path" title="' + esc(d.devid) + '">' + esc(d.path) + "</span>" : "") + "</div>"
+      + (d.withheld ? '<div class="st-note st-warn" title="' + esc(d.withheld) + '">Held by rdx-seatmgr: its keys go nowhere'
+        + " until a gamescope of the seat takes it</div>" : "")
       + (d.kind === "virtual"
         ? '<div class="st-note">Streamed or virtual input made by this seat itself; it stays with it</div>'
         : locked
         ? '<div class="st-note">Used by the host, never handed to a seat</div>'
         : '<div class="st-ctl"><label><span>Belongs to</span> <select data-act="seat">' + opts.join("") + "</select></label>"
-          + '<button type="button" data-act="port"' + (d.seat == null || !d.path ? " disabled" : "") + ">Remember by port</button>"
-          + '<button type="button" data-act="device"' + (d.seat == null || !d.devid ? " disabled" : "") + ">Remember by device</button>"
-          + (hasRule || (d.how !== "unassigned" && d.how !== "GPU sound") ? '<button type="button" data-act="forget">Forget</button>' : "")
+          + '<button type="button" data-act="port"' + (!d.path ? " disabled" : "") + ">Remember by port</button>"
+          + '<button type="button" data-act="device"' + (!d.devid ? " disabled" : "") + ">Remember by device</button>"
+          + (hasRule || (d.how !== "host console" && d.how !== "GPU sound") ? '<button type="button" data-act="forget">Forget</button>' : "")
           + "</div>")
       + '<details class="st-nodes"><summary>' + (d.nodes || []).length + ((d.nodes || []).length === 1 ? " device node" : " device nodes") + "</summary>"
       + '<div class="mono">' + nodes + "</div></details></div>";
@@ -80,8 +88,8 @@
     const free = (state.devices || []).filter((d) => d.seat == null);
     const pend = (state.virtual_pending || []).map((v) => '<div class="st-note" title="' + esc(v.why) + '"><span>Virtual device, its seat is not known yet:</span> '
       + esc(v.name || v.id) + "</div>").join("");
-    cols.push('<section class="st-col st-free"><div class="st-head"><h3>Unassigned</h3>'
-      + '<div class="st-meta muted">reaches no seat</div></div>'
+    cols.push('<section class="st-col st-free"><div class="st-head"><h3>Host console</h3>'
+      + '<div class="st-meta muted">the Proxmox host itself, no seat · every new device starts here</div></div>'
       + (free.length ? free.map((d) => device(d, seats)).join("") : '<div class="muted st-empty">No devices</div>') + pend + "</section>");
     return '<div class="st-cols">' + cols.join("") + "</div>";
   }
@@ -149,14 +157,17 @@
       const t = ev.target;
       if (t.dataset.act !== "seat") return;
       const id = devOf(t);
-      call("api/seats/assign", { id, seat: t.value === "" ? null : Number(t.value), remember: null });
+      call("api/seats/assign", { id, seat: t.value === "host" ? "host" : Number(t.value), remember: null });
       t.blur();
     });
     el.addEventListener("click", (ev) => {
       const t = ev.target.closest("button[data-act]");
       if (!t || t.disabled) return;
       const act = t.dataset.act, id = devOf(t);
-      if (act === "port" || act === "device") call("api/seats/assign", { id, seat: seatOfDev(id), remember: act });
+      if (act === "port" || act === "device") {
+        const s = seatOfDev(id);
+        call("api/seats/assign", { id, seat: s == null ? "host" : s, remember: act });
+      }
       else if (act === "forget") call("api/seats/forget", { id });
       else if (act === "claim") call("api/seats/claim", { seat: Number(t.dataset.seat), seconds: 15 });
       else if (act === "cancel") call("api/seats/claim/cancel", { seat: Number(t.dataset.seat) });
