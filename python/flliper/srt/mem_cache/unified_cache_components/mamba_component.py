@@ -180,7 +180,25 @@ def _obs_match_census_deep(
 _BRANCH_DIVERGE_N = [0]
 
 
-def _obs_branch_diverge(req, key, node, reached: int, accepted: int, branching) -> None:
+def _obs_node_ending_at(root, key, depth: int, page_size: int):
+    """Review of af2a6b9cf6 (R5): the tree node whose path ends exactly at ``depth`` along ``key`` -- the node the
+    match walk ended on (the walk splits a partly matched child there). Walked from ``root`` by child keys, like the
+    match walk; None when no node ends there. Observation only."""
+    n, d = root, 0
+    while d < int(depth):
+        rest = key[d:]
+        if len(rest) == 0:
+            return None
+        c = n.children.get(rest.child_key(page_size))
+        if c is None:
+            return None
+        d += len(c.key)
+        n = c
+    return n if d == int(depth) else None
+
+
+def _obs_branch_diverge(req, key, node, reached: int, accepted: int, branching, *, root=None,
+                        page_size: int = 1) -> None:
     """NF rc32 22.10. (log text only, TP0): the token ids where a request leaves the tree at its branching point.
 
     The rc32 boot's recomputed spans below a branch point (``MATCH-CENSUS-DEEP reached > accepted``, 9 of 9) all forked
@@ -199,6 +217,10 @@ def _obs_branch_diverge(req, key, node, reached: int, accepted: int, branching) 
         _BRANCH_DIVERGE_N[0] = n
         if not (n <= 64 or (n & (n - 1)) == 0):
             return
+        if root is not None:
+            # review R5: the match result's ``last_device_node`` is the ACCEPTED-depth node; its children start at
+            # ``accepted``, not where this request leaves the sibling's path -- walk to the node ending at ``reached``
+            node = _obs_node_ending_at(root, key, reached, page_size) if key is not None else None
         raw = key.raw_token_ids() if key is not None else ()
         lo = max(0, int(reached) - 8)
         mine = [int(x) for x in raw[lo:int(reached) + 40]]
@@ -657,10 +679,12 @@ class MambaComponent(TreeComponent):
         )
         _obs_d_fork_read(req, last_node, sum(len(v) for v in value_chunks[:effective_best_len]))
         _obs_branch_diverge(
-            req, getattr(params, "key", None), getattr(result, "last_device_node", None),
+            req, getattr(params, "key", None), None,
             sum(len(v) for v in value_chunks),
             sum(len(v) for v in value_chunks[:effective_best_len]),
             branching_seqlen,
+            root=getattr(self.cache, "root_node", None),
+            page_size=int(getattr(self.cache, "page_size", 1) or 1),
         )
 
         if zeroed_by_strict_resume:
