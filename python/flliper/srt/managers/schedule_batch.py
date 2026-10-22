@@ -4284,6 +4284,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.mamba_next_track_idx
                     )
                 )
+            if getattr(req, _pdflip_turn.BRANCH_POS_ATTR, None) is not None:
+                setattr(req, _pdflip_turn.BRANCH_POS_ATTR, None)
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -4295,11 +4297,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+                    if _pdflip_turn.d_branch_rides(
+                        server_args,
+                        getattr(getattr(self, "token_to_kv_pool_allocator", None), "page_size", None),
+                        mamba_cache_chunk_size,
+                        len(getattr(req, "output_ids", None) or ()) > 0,
+                    ):
+                        # BRANCH TRACK (NF rc32 22.10., review A2): on group D the
+                        # branching point exists on the state-holding rank only
+                        # (a Form A worker's follow walk drops it), so letting it
+                        # replace this step's track made TP0's main track rank-local:
+                        # the D fork plans split (turn_anchor.step_target) and TP0
+                        # lost the step-end anchor. The step keeps its own track at
+                        # the step-end grid point like every rank; the branching
+                        # point rides the fork-track machinery as a second track
+                        # (turn_anchor.note_step, called right after this setup).
+                        setattr(req, _pdflip_turn.BRANCH_POS_ATTR, int(req.mamba_branching_seqlen))
+                    else:
+                        # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                        # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                        # See _force_track_h() for more details.
+                        mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
+                        mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(

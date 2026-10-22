@@ -177,6 +177,52 @@ def _obs_match_census_deep(
         pass
 
 
+_BRANCH_DIVERGE_N = [0]
+
+
+def _obs_branch_diverge(req, key, node, reached: int, accepted: int, branching) -> None:
+    """NF rc32 22.10. (log text only, TP0): the token ids where a request leaves the tree at its branching point.
+
+    The rc32 boot's recomputed spans below a branch point (``MATCH-CENSUS-DEEP reached > accepted``, 9 of 9) all forked
+    INSIDE a sibling's decode output, below that sibling's last decode track (pdflip-4-121 left pdflip-4-119's answer
+    196 tokens after its prompt end 56892, at 57088). Whether the next prompt re-renders the answer differently (a
+    message part the client changes) or re-tokenizes the same text differently (a non-canonical BPE split the model
+    generated) decides where a decode-side anchor could sit -- the ids at the divergence tell which, nothing else in
+    the log does. One line per deep branching hit: the request's ids around ``reached`` and the first ids of every
+    child of the node the match ended on (the sibling's continuation). Capped like the D fork witnesses."""
+    if req is None or branching is None or reached <= accepted or accepted < _DEEP_CENSUS_MIN_DEPTH:
+        return
+    try:
+        if not _obs_is_tp0():
+            return
+        n = _BRANCH_DIVERGE_N[0] + 1
+        _BRANCH_DIVERGE_N[0] = n
+        if not (n <= 64 or (n & (n - 1)) == 0):
+            return
+        raw = key.raw_token_ids() if key is not None else ()
+        lo = max(0, int(reached) - 8)
+        mine = [int(x) for x in raw[lo:int(reached) + 40]]
+        kids = []
+        for c in list(getattr(node, "children", {}).values())[:3]:
+            ck = getattr(c, "key", None)
+            if ck is None:
+                continue
+            kids.append([int(x) for x in ck.raw_token_ids()[:40]])
+        first = None
+        for kid in kids:
+            ours = mine[int(reached) - lo:]
+            d = next((i for i, (a, b) in enumerate(zip(ours, kid)) if a != b), None)
+            if d is not None and (first is None or d < first):
+                first = d
+        logger.info(
+            "MATCH-BRANCH-DIVERGE n=%d rid=%s reached=%d accepted=%d first_diff=%s req_ids[%d:]=%s tree_children=%s "
+            "(the ids where this request leaves the tree: re-rendered answer or re-tokenized text)",
+            n, getattr(req, "rid", None), int(reached), int(accepted), first, lo, mine, kids,
+        )
+    except Exception:  # noqa: BLE001 - an instrument may never break a match walk
+        pass
+
+
 def _obs_d_fork_read(req, node, accepted: int) -> None:
     """D-FORK-ANCHOR READ witness (log text only, TP0): the match's best node is a fork node group D's track
     put into the tree and its state was accepted. Once per request and depth."""
@@ -610,6 +656,12 @@ class MambaComponent(TreeComponent):
             len(result.device_indices) + int(result.host_hit_length or 0),
         )
         _obs_d_fork_read(req, last_node, sum(len(v) for v in value_chunks[:effective_best_len]))
+        _obs_branch_diverge(
+            req, getattr(params, "key", None), getattr(result, "last_device_node", None),
+            sum(len(v) for v in value_chunks),
+            sum(len(v) for v in value_chunks[:effective_best_len]),
+            branching_seqlen,
+        )
 
         if zeroed_by_strict_resume:
             # Full re-prefill; the branching seqlen still points at the grid

@@ -105,6 +105,13 @@ CLOSE_PENDING_ATTR = "_pdflip_close_pending"
 #: page boundary at or past the end of the step's last image, ``ceil_page(e)``, when the step's
 #: own track lies past it -- one plan of the same shape as PENDING_ATTR's
 IMAGE_PENDING_ATTR = "_pdflip_image_pending"
+#: BRANCH TRACK (NF rc32 22.10., D-FORK-ANCHOR review A2): group D's branching point (the match's
+#: ``mamba_branching_seqlen`` on the state-holding rank) as a SECOND track of the step instead of the
+#: step's own track -- one plan of the same shape as PENDING_ATTR's
+BRANCH_PENDING_ATTR = "_pdflip_branch_pending"
+#: the branching point handed from the extend-track setup (``ScheduleBatch._mamba_radix_cache_v2_req_prepare_
+#: for_extend``) to :func:`note_step` of the same step; consumed (cleared) by note_step
+BRANCH_POS_ATTR = "_pdflip_d_branch_at"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -186,6 +193,39 @@ def d_split_only_rank() -> bool:
     from flliper.srt.rank_role import kv_only_rank
 
     return bool(this_rank_follows()) or bool(kv_only_rank())
+
+
+def d_branch_rides(server_args: Any, page: Any, chunk: Any, has_output: bool) -> bool:
+    """BRANCH TRACK (NF rc32 22.10., review A2 of nf-rc31-forkanchor): True when the step's branching point goes
+    to a SECOND track and the step keeps its own track at the step-end grid point.
+
+    THE MEASURED GAP (rc32 ded00bd5a7, boot ..._1022_030836, D): upstream's extend-track setup lets the match's
+    branching point REPLACE the step's own track (``mamba_track_seqlen_aligned = mamba_branching_seqlen``). The
+    branching point exists only on the state-holding rank (TP0); a Form A worker's follow walk drops it
+    (``follow_rematch``, H98) -- ``#59 FINISH-TRACK ... branching=57088`` on TP0, ``branching=-`` on TP1/TP2
+    for pdflip-4-121. So TP0's main track was rank-local, :func:`step_target` refused every fork position at or
+    above it on TP0 alone, and the D fork plan set split: 7 of 7 branching readers of that boot carried a
+    worker turn plan TP0 never made (pdflip-0-13 / 2-61 / 4-90 / 4-121 / 4-143 / 4-149 / 6-170), and the step-end
+    anchor itself was lost on TP0 (pdflip-4-143 resumed on 4-141's branching anchor 101760 instead of its
+    step-end anchor 102784: 1024 tokens recomputed).
+
+    THE REPAIR: on group D with the fork tracks armed, the step's own track stays where every rank puts it (a pure
+    function of the step's geometry), and the branching point rides the fork-track machinery as one more plan
+    (:func:`_note_branch_step`): a slot when one is free, the node at the branching point in every case. The node
+    needs no worker plan: the branching point is the page-aligned end of the KV match, so every rank's tree has a
+    node boundary there once the step inserts (the divergence split, or the leaf end it extends) -- exact when the
+    page is a multiple of the FLA chunk (``branching = floor_chunk(reached) == reached``); any other geometry keeps
+    upstream's replacement. A request with output (a retracted re-prefill: :func:`note_step` plans nothing for
+    it) keeps upstream's replacement too. Env reads and geometry only: the same answer on every rank."""
+    if has_output:
+        return False
+    if _group() != "D" or armed(server_args) is None:
+        return False
+    try:
+        page, chunk = int(page), int(chunk)
+    except (TypeError, ValueError):
+        return False
+    return page > 0 and chunk > 0 and page % chunk == 0
 
 
 def armed(server_args: Any = None) -> Optional[int]:
@@ -447,6 +487,10 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     ``twin_bounds`` inside it, and (FORK TRACK) one at PP0's told fork
     ``fork_told`` when this step runs through it. Returns the (possibly new)
     batch descriptor."""
+    # BRANCH TRACK: the branching point this step's track setup handed over -- consumed here, never left standing
+    branch_at = getattr(req, BRANCH_POS_ATTR, None)
+    if branch_at is not None:
+        setattr(req, BRANCH_POS_ATTR, None)
     stale = getattr(req, PENDING_ATTR, None)
     if stale is not None:
         # a plan the tree never consumed (a path that skipped the insert):
@@ -488,6 +532,10 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         _free_slot(batch, im_stale[1])
         _decline_unconsumed(req, im_stale[0])
         setattr(req, IMAGE_PENDING_ATTR, None)
+    br_stale = getattr(req, BRANCH_PENDING_ATTR, None)
+    if br_stale is not None:
+        _free_slot(batch, br_stale[1])
+        setattr(req, BRANCH_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     if d_mode():
@@ -512,6 +560,57 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if tok is not None:
         # IMAGE-END TRACK: armed wherever the turn anchor is (``tok``), no own switch
         desc = _note_image_step(batch, desc, req, row, prefix, end, main_track, chunk, page)
+    if branch_at is not None and d_mode():
+        # BRANCH TRACK (review A2): the branching point the step's own track no longer takes, last so that a
+        # fork position another track writes is shared, not doubled
+        desc = _note_branch_step(batch, desc, req, row, prefix, end, main_track, chunk, page, int(branch_at))
+    return desc
+
+
+def _note_branch_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                      prefix: int, end: int, main_track: Optional[int], chunk: int,
+                      page: int, branch_at: int) -> Optional[TurnTracks]:
+    """BRANCH TRACK (NF rc32 22.10., review A2): the match's branching point as a second track of the step whose
+    own track stays at the rank-agreed step end (:func:`d_branch_rides`). The same machinery and verdicts as the
+    turn track: strictly inside the step, below the step's own track, on its FLA grid (``step_target``), page
+    aligned, above the protected prefix, not a position another track already writes; a slot when one is free,
+    split-only otherwise (no eviction, no reserve); inserted as its own node before the step's insert. Only the
+    state-holding rank ever has a branching point, so only it plans one -- the node itself is a boundary on every
+    rank's tree anyway (the KV match ends there), and its state is TP0's like every D fork state (review A4)."""
+    rid = str(getattr(req, "rid", "?"))
+    t = step_target(prefix, end, branch_at, chunk, main_track)
+    if t is None or t % max(1, int(page)) != 0:
+        n = _count("branch_off_step")
+        if _log_due(n):
+            logger.info("PDFLIP BRANCH-ANCHOR SKIP rid=%s reason=off_step at=%d step=[%d,%d) main=%s (n=%d; the "
+                        "step's own track writes it or it is not on the step's grid)", rid, int(branch_at),
+                        prefix, end, main_track, n)
+        return desc
+    if int(getattr(req, "cache_protected_len", 0) or 0) >= t:
+        return desc
+    taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
+    taken.update(int(p[0]) for p in (getattr(req, SYSGRID_PENDING_ATTR, None) or ()))
+    for attr in (PENDING_ATTR, FORK_PENDING_ATTR, GEN_PENDING_ATTR, CLOSE_PENDING_ATTR, IMAGE_PENDING_ATTR):
+        p = getattr(req, attr, None)
+        if p is not None:
+            taken.add(int(p[0]))
+    if t in taken:
+        n = _count("branch_shared")
+        if _log_due(n):
+            logger.info("PDFLIP BRANCH-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; another fork track writes "
+                        "this very position)", rid, t, prefix, end, n)
+        return desc
+    slot, split_ok = _draw_slot(batch)
+    if slot is None and not split_ok:
+        return desc
+    desc = _put_plan(batch, desc, req, row, BRANCH_PENDING_ATTR, t, slot, prefix, end)
+    note_d_planned(req, "branch", t, prefix, end, slot)
+    n = _count("branch_planned")
+    if _log_due(n):
+        logger.info(
+            "PDFLIP BRANCH-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d main=%s state=%s (the match's branching "
+            "point as a second extend track: the step's own track stays at the step end on every rank, review A2)",
+            n, rid, prefix, end, t, main_track, "slot" if slot is not None else "split_only")
     return desc
 
 
@@ -1345,7 +1444,8 @@ def has_pending(req: Any) -> bool:
             or getattr(req, GEN_PENDING_ATTR, None) is not None
             or bool(getattr(req, SYSGRID_PENDING_ATTR, None))
             or getattr(req, CLOSE_PENDING_ATTR, None) is not None
-            or getattr(req, IMAGE_PENDING_ATTR, None) is not None)
+            or getattr(req, IMAGE_PENDING_ATTR, None) is not None
+            or getattr(req, BRANCH_PENDING_ATTR, None) is not None)
 
 
 def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
@@ -1379,6 +1479,10 @@ def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
     if image is not None:
         setattr(req, IMAGE_PENDING_ATTR, None)
         out.append(("image", image))
+    branch = getattr(req, BRANCH_PENDING_ATTR, None)
+    if branch is not None:
+        setattr(req, BRANCH_PENDING_ATTR, None)
+        out.append(("branch", branch))
     out.sort(key=lambda kp: int(kp[1][0]))
     return out
 
@@ -1624,11 +1728,12 @@ def insert_verdict(pend) -> Tuple[bool, str]:
 def _label(kind: str) -> str:
     return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR",
             "gen": "GEN-FORK-ANCHOR", "grid": "SYS-GRID-ANCHOR",
-            "close": "CLOSE-FORK-ANCHOR", "image": "IMAGE-END-ANCHOR"}.get(kind, "TURN-ANCHOR")
+            "close": "CLOSE-FORK-ANCHOR", "image": "IMAGE-END-ANCHOR",
+            "branch": "BRANCH-ANCHOR"}.get(kind, "TURN-ANCHOR")
 
 
 def _kind_prefix(kind: str) -> str:
-    return kind + "_" if kind in ("twin", "fork", "gen", "grid", "close", "image") else ""
+    return kind + "_" if kind in ("twin", "fork", "gen", "grid", "close", "image", "branch") else ""
 
 
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,
@@ -1662,7 +1767,8 @@ def note_skip(req: Any, reason: str, t: int, kind: str = "turn") -> None:
 
 # -- D-FORK-ANCHOR witnesses (21.10.) ------------------------------------------------
 D_FORK_KIND_ATTR = "pdflip_d_fork_kind"
-_ATTR_KIND = {PENDING_ATTR: "turn", CLOSE_PENDING_ATTR: "close", GEN_PENDING_ATTR: "gen", IMAGE_PENDING_ATTR: "image"}
+_ATTR_KIND = {PENDING_ATTR: "turn", CLOSE_PENDING_ATTR: "close", GEN_PENDING_ATTR: "gen", IMAGE_PENDING_ATTR: "image",
+              BRANCH_PENDING_ATTR: "branch"}
 
 
 def _d_role() -> str:
