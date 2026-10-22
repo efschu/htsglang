@@ -69,7 +69,10 @@ def _vote(cuda, law="1024", floor="1"):
             os.environ.pop("FLLIPER_PDFLIP_EXTEND_CAP_FLOOR", None)
         ET.reset_for_tests()
         try:
-            return ET.width_vote(cuda, 1, CONFIGURED, 1, True)
+            # NACHT2 22.10.: the line is the card's derived corridor floor (guard door, extend_trim._read_corridor_line);
+            # here the card's floor is the named law (metal round 3c: TP1 graded 700, MEASURED-D)
+            with mock.patch.object(ET, "_read_corridor_line", lambda: (float(law), "test:law")):
+                return ET.width_vote(cuda, 1, CONFIGURED, 1, True)
         finally:
             ET.reset_for_tests()
 

@@ -49,7 +49,9 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           # measured rate (MiB/row, ratchet up), the open extend's start reading
           "measure": _UNSET, "measure_ranks": _UNSET, "measured": None, "pending": None,
           # Q-710 EXTEND-CAP-FLOOR: the arming switch, the last logged floor line
-          "cap_floor": _UNSET, "logged_floor": None}
+          "cap_floor": _UNSET, "logged_floor": None,
+          # NACHT2 (port of NF rc33 bc9dcc7520): this card's corridor line, read once per process
+          "line": _UNSET}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -101,6 +103,7 @@ def reset_for_tests() -> None:
     _CACHE["pending"] = None
     _CACHE["cap_floor"] = _UNSET
     _CACHE["logged_floor"] = None
+    _CACHE["line"] = _UNSET
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -273,18 +276,55 @@ def extend_growth_per_row_mib(windows) -> Optional[float]:
     return math.ceil(best * 10000.0 - 1e-9) / 10000.0
 
 
-def corridor_line_mib() -> float:
-    """The card line the chunk's growth must leave free: the corridor LAW in force (``corridor_guard.corridor_law_mib``,
-    700 MiB) -- never the old 300 MiB halt line under it. 27B INT8 rc29b metal 21.10. (and 0798c91fcd 00:48-01:01Z alike):
-    D TP1 (3080) breached the law 17x (minimum 3-7 MiB): the vote funded a 4096-row chunk down to 300 MiB, the chunk's
-    reserved growth (0.3091 MiB/row = 1266 MiB) ate the rest. The vote is the actuator of the corridor for the extend; it
-    keeps the law itself instead of a lower private line (no reserve: the law is the corridor, nothing on top)."""
-    try:
-        from flliper.srt.managers.corridor_guard import corridor_law_mib
+LINE_MARKER = "EXTEND-CORRIDOR-LINE"
 
-        return max(float(CHUNKING_FLOOR_MIB), float(corridor_law_mib()))
-    except Exception:  # noqa: BLE001 -- no law reader: the halt line
-        return float(CHUNKING_FLOOR_MIB)
+
+def _read_corridor_line() -> "tuple[float, str]":
+    """(line MiB, source) -- the guard's derived floor for THIS card (its verdict floor: the measured transient peak of
+    the awake group, the same number ``corridor_trace`` grades a breach against), else the stated law graded the same
+    way. Port of NF rc33 bc9dcc7520 / review 91e56eeec1 (``_read_corridor_line``)."""
+    try:
+        from flliper.srt.managers.corridor_guard import corridor_floor_for_current_device
+
+        fl = corridor_floor_for_current_device()
+        return float(fl.verdict_floor_mib), f"{fl.source}:{int(fl.mib)}"
+    except Exception:  # noqa: BLE001 -- no derived floor: the stated law, graded like the guard grades it
+        pass
+    try:
+        from flliper.srt.managers.corridor_guard import corridor_law_mib, verdict_floor_for_mib
+
+        law = int(corridor_law_mib())
+        return float(verdict_floor_for_mib(law, "STATED-LAW")), f"stated-law:{law}"
+    except Exception:  # noqa: BLE001 -- no reader at all: the HALT line
+        return float(CHUNKING_FLOOR_MIB), "halt-line"
+
+
+def corridor_line_mib(rank: Optional[int] = None) -> float:
+    """The card line the chunk's growth must leave free: THIS card's corridor law (``max(300, verdict floor)``), read
+    once per process and named once (``EXTEND-CORRIDOR-LINE``) -- never the old 300 MiB halt line under it, and no
+    reserve on top (the law is the corridor).
+
+    27B INT8 rc29b metal 21.10. (786fe038dc): D TP1 (3080) breached the law 17x (minimum 3-7 MiB) when the vote funded
+    a 4096-row chunk down to 300 MiB; the line became the stated law ``corridor_law_mib()`` (1024 by default).
+    NACHT2 22.10. (port of NF rc33 bc9dcc7520, abgestimmt with this line's own funding fix a4f4b8fec1): the line is the
+    card's DERIVED corridor floor through the guard's one rank-local door, the number the rank's own breach instrument
+    grades against. 27B INT8 round 3c (boot 1022_015348, a4f4b8fec1): the ranks graded 700 (TP1) / 701 (TP2)
+    ("CORRIDOR LAW BREACHED ... the 700 MiB law"; the dual D TP0 5090: 767), while the vote kept 1024 -- 24 of 56
+    logged TP2 votes ``cap=1``, TP1 ``cap=1`` at post 864 MiB, so the group mostly ran the 256-row floor chunk (617 TP0
+    prefill batches ``#new-token: 256``; D prefill ~900 tok/s, night item 5). With the card's own law (page 1):
+    TP1 at post 864 funds floor((864 - 700) / 0.3091) = 530 rows, TP2 at post 1044 (cap 63 under 1024) about 1108 --
+    each still ending at or above the law at the priced rate. Funding stays the DRIVER alone
+    (a4f4b8fec1), the rate stays the measured one; only the line is the card's."""
+    line = _CACHE["line"]
+    if line is _UNSET:
+        try:
+            mib, src = _read_corridor_line()
+        except Exception:  # noqa: BLE001
+            mib, src = float(CHUNKING_FLOOR_MIB), "halt-line"
+        line = _CACHE["line"] = max(float(CHUNKING_FLOOR_MIB), float(mib))
+        logger.info(f"{LINE_MARKER} rank={'?' if rank is None else int(rank)} line_mib={line:.0f} source={src} "
+                    f"(the width vote keeps this card's corridor law; funds = driver free; no reserve)")
+    return float(line)  # type: ignore[arg-type]
 
 
 def rows_cap(post_mib: float, rate: float, page_size: int, line_mib: Optional[float] = None) -> int:
@@ -374,7 +414,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
             cache_free_mib = max(0.0, (float(cuda.memory_reserved()) - float(cuda.memory_allocated())) / MIB)
         except Exception:  # noqa: BLE001 -- the line only
             cache_free_mib = 0.0
-        line_mib = corridor_line_mib()
+        line_mib = corridor_line_mib(rank)
         cap = rows_cap(post_mib, rate, page_size, line_mib)
         if cap >= int(configured):
             _CACHE["logged_cap"] = None

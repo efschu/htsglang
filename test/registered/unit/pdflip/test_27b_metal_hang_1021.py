@@ -62,7 +62,10 @@ def _vote(cuda):
         os.environ.pop("FLLIPER_PDFLIP_TORCH_CACHE_CAP", None)
         ET.reset_for_tests()
         try:
-            return ET.width_vote(cuda, 1, CONFIGURED, 1, True)
+            # NACHT2 22.10.: the line is the card's derived corridor floor (guard door, extend_trim._read_corridor_line);
+            # here the card's floor is the named law (metal round 3c: TP1 graded 700, MEASURED-D)
+            with mock.patch.object(ET, "_read_corridor_line", lambda: (700.0, "test:law")):
+                return ET.width_vote(cuda, 1, CONFIGURED, 1, True)
         finally:
             ET.reset_for_tests()
 
@@ -107,10 +110,18 @@ class WidthVoteKeepsTheCorridorLaw(unittest.TestCase):
         self.assertGreaterEqual(1406 - w * RATE, 700 - 1)
 
     def test_the_line_is_the_law_in_force(self):
-        with mock.patch.dict(os.environ, {"FLLIPER_CORRIDOR_LAW_FLOOR_MIB": "900"}):
-            self.assertEqual(ET.corridor_line_mib(), 900.0)
-        with mock.patch.dict(os.environ, {"FLLIPER_CORRIDOR_LAW_FLOOR_MIB": "100"}):
-            self.assertEqual(ET.corridor_line_mib(), float(ET.CHUNKING_FLOOR_MIB))   # never under the halt line
+        # NACHT2 22.10.: the law in force is THIS card's derived corridor floor (the guard's rank-local door), the
+        # number the rank's breach instrument grades against -- read once per process; never under the halt line
+        from flliper.srt.managers import corridor_guard as CG
+
+        def door(mib, source="MEASURED-D"):
+            return lambda *a, **k: types.SimpleNamespace(mib=mib, source=source, verdict_floor_mib=mib)
+
+        for mib, want in ((900, 900.0), (100, float(ET.CHUNKING_FLOOR_MIB))):
+            ET.reset_for_tests()
+            with mock.patch.object(CG, "corridor_floor_for_current_device", door(mib)):
+                self.assertEqual(ET.corridor_line_mib(), want)
+        ET.reset_for_tests()
 
 
 def _req(output_ids=()):
