@@ -22813,6 +22813,16 @@ class Front:
             st = getattr(self, "_dual_stages_obj", None)
             if st is not None:
                 st.p_state = "stopped"
+                st.sleep_leg_done = True                   # no leg pending: nothing parked, nothing to wake
+            return
+        st = getattr(self, "_dual_stages_obj", None)
+        if st is not None and st.p_state != "sleeping":
+            # 22.10.: the ladder left 'sleeping' while the quiesce ran (it must not, sleep_leg_done gates the wake);
+            # releasing now would park P behind a front that believes it serves
+            self.counters["dual_kv_pressure_sleep_stale"] += 1
+            logger.warning("PDFLIP DUAL-KV-PRESSURE stage=2 dropped leg=%d: p_state=%s after the quiesce -- no "
+                           "release", n, st.p_state)
+            st.sleep_leg_done = True
             return
         tags = [KV_TAG] + self._dual_p_weights_tags()
         code, body = await self.leg_rpc(self.groups["P"], "/release_memory_occupation",

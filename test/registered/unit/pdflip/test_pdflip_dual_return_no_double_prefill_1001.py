@@ -101,6 +101,7 @@ def _return(sleep, intake=None) -> int:
         assert act == "lend"
         act, _ = st.tick(pressure=9, p_committed=0, free_min=0, seats_done=0, **base)
         assert act == "sleep"
+        st.sleep_leg_done = True                              # the front's release RPC answered 200 (22.10.)
         act, _ = st.tick(pressure=0, p_committed=0, free_min=2000, seats_done=1, **base)
         assert act == "wake"
     else:

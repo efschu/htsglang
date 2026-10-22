@@ -306,6 +306,15 @@ class TestCtl:
         assert not st.ok and st.fraction == 1.0 and st.rung == 0
         clk.t += 1.0
         r.read()
+        # 22.10.: a ctl the front has not written yet is the start state (P full), not a fallback (dual round 3
+        # 02:18:51 PP0 read before the front armed at 02:18:56)
+        assert lines == []
+        S.CtlWriter(path).update(self._dec())
+        clk.t += 1.0
+        assert r.read().ok
+        os.unlink(path)                                    # gone AFTER the front wrote: the named fallback
+        clk.t += 1.0
+        assert not r.read().ok
         assert len(lines) == 1 and lines[0].startswith("W-DUAL-SHARE-FALLBACK mech=ctl card=all reason=ctl unreadable")
         S.CtlWriter(path).update(self._dec())
         clk.t += 1.0

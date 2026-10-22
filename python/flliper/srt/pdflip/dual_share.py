@@ -674,6 +674,17 @@ class CtlReader:
             st = os.stat(self.path)
             with open(self.path) as f:
                 txt = f.read(512)
+        except FileNotFoundError:
+            if not self.state.ok and self.state.seq < 0 and not getattr(self, "_ever_ok", False):
+                # boot order (dual round 3 02:18:51 PP0 vs the front's controller armed 02:18:56): the front has not
+                # written its first rung yet -- rung 0 (P full) is the start state, not a fallback
+                if not getattr(self, "_noted_unwritten", False):
+                    self._noted_unwritten = True
+                    logger.info("DUAL-SHARE ctl card=%s not written yet (%s) -- rung 0 (P full) until the front's "
+                                "first rung", self.card, self.path)
+                self.state = CtlState()
+                return self.state
+            return self._fail("ctl unreadable (FileNotFoundError)")
         except OSError as e:
             return self._fail(f"ctl unreadable ({type(e).__name__})")
         age = self._wall() - st.st_mtime
@@ -690,6 +701,7 @@ class CtlReader:
         except (ValueError, KeyError):
             return self._fail("ctl malformed")
         self._named = False
+        self._ever_ok = True
         return self.state
 
 

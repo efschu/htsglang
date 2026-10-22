@@ -1042,7 +1042,7 @@ def box_serving(scheduler) -> Tuple[bool, str]:
         queued = len(scheduler.waiting_queue)
         running = len(scheduler.running_batch.reqs)
         first = float(scheduler.last_first_token_progress_time)
-        threshold = max(1.0, float(_ic._wedge_alarm_threshold()) - _env_float(ENV_WAIT_MARGIN_S, WAIT_MARGIN_S_DEFAULT))
+        threshold = max(1.0, float(_ic._admission_wedge_threshold()) - _env_float(ENV_WAIT_MARGIN_S, WAIT_MARGIN_S_DEFAULT))
         now = _perf()
         prefill_stamp = getattr(scheduler, "last_prefill_progress_time", None)
         since_prefill = None if prefill_stamp is None else now - float(prefill_stamp)

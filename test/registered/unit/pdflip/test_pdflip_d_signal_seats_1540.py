@@ -175,6 +175,8 @@ def _run_b9e(monkeypatch, on):
         for _ in range(n):
             f = _front(seats=seats["live"], ready=0)
             out.append(_tick(st, _reading(f)["d_short"], done, p_committed=0))
+            if out[-1][0] == "sleep":
+                st.sleep_leg_done = True                           # the front's release RPC answered (22.10.)
         return out
 
     acts = [a for a, _ in ticks(8)]

@@ -408,8 +408,9 @@ class PressureStages:
         self.counts = {"stage1": 0, "lend": 0, "stage2": 0, "reclaim": 0, "resume": 0, "wake": 0,
                        "unavailable": 0, "refused": 0}
         #: #1956 WAKE-SEES-LOAN (FLLIPER_PDFLIP_DUAL_WAKE_SEES_LOAN, set by the front; default
-        #: False = the old wake): a wake from sleep needs the per-card reading and the
-        #: sleep leg's answer (the front sets ``sleep_leg_done`` once the release RPC is 200)
+        #: False = the old wake): a wake from sleep needs the per-card reading. The sleep leg's
+        #: answer (the front sets ``sleep_leg_done`` once the release RPC is 200) gates EVERY wake
+        #: since 22.10.
         self.wake_needs_room = False
         self.sleep_leg_done = True
 
@@ -480,8 +481,11 @@ class PressureStages:
                     return None, None
                 self.p_state = "sleeping"
                 self._seat_mark = int(seats_done)
-                if self.wake_needs_room:
-                    self.sleep_leg_done = False
+                # 'sleeping' is entered when the sleep is ISSUED; the leg (quiesce up to 90 s, then the release) runs
+                # after it. Unconditional since 22.10. (dual round 3, 02:35:55 -> 02:35:59Z: the wake went out while
+                # the quiesce still polled, /resume_memory_occupation met unpaused tags -> KeyError 'weights_0' on
+                # all three P ranks, W29); before only under #1956 WAKE-SEES-LOAN (default off).
+                self.sleep_leg_done = False
                 self.counts["stage2"] += 1
                 return "sleep", self._line("2", pressure, int(weights_bytes))
             self._held = 0
@@ -512,6 +516,9 @@ class PressureStages:
                 return "reclaim", self._line("1-reclaim", 0, free_min, " retry")
             return None, None
         # sleeping
+        if not self.sleep_leg_done:
+            # no wake before the sleep leg answered: nothing is parked yet, a resume would meet unpaused tags
+            return None, None
         if self.wake_needs_room:
             # #1956 WAKE-SEES-LOAN: the loan is per card (f9 PP1: 3235905536 B lent, D's waiting
             # group grant took 178782208 B of it). Without that card's reading the total

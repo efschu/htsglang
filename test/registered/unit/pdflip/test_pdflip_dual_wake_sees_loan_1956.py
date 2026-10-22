@@ -203,7 +203,10 @@ def test_off_keeps_the_old_reading_and_ladder(monkeypatch):
     assert st.wake_needs_room is False and st.sleep_leg_done is True
     st.p_state = "lent"
     st.tick(pressure=1, p_committed=0, free_min=0, p_grant_bytes=0, d_air_bytes=0, seats_done=0, host_ok=True)
-    assert st.p_state == "sleeping" and st.sleep_leg_done is True
+    # 22.10. (dual round 3, KeyError 'weights_0'): every wake waits for the sleep leg's answer, with or without #1956
+    assert st.p_state == "sleeping" and st.sleep_leg_done is False
+    assert st.tick(pressure=0, p_committed=0, free_min=0, p_grant_bytes=0, d_air_bytes=0, seats_done=1) == (None, None)
+    st.sleep_leg_done = True                               # the front: release RPC 200
     action, _ = st.tick(pressure=0, p_committed=0, free_min=0, p_grant_bytes=0, d_air_bytes=0, seats_done=1)
     assert action == "wake"                                # the old trivial fallback, unchanged
     src = open(FR.__file__).read()

@@ -145,6 +145,8 @@ def _ticks(st, readings):
                     seats_done=0, weights_bytes=W_B, host_ok=True)
         base.update(r)
         out.append(st.tick(**base))
+        if out[-1][0] == "sleep":
+            st.sleep_leg_done = True        # the front's release RPC answered 200 (every wake waits for it, 22.10.)
     return out
 
 
