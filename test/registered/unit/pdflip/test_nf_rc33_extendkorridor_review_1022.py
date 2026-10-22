@@ -293,3 +293,68 @@ def test_the_launcher_writes_the_start_from_the_nextflash_record():
     # the 27B profile has no record: nothing
     ns4 = types.SimpleNamespace(profile="qwen27b", env_d="")
     assert L.d_extend_lend_rate_start_env(ns4, lines.append, "D", 3) is None and ns4.env_d == ""
+
+
+# ---- (R7) CLASS-VOTE: a measured row class prices its width; nothing unmeasured, never narrower ------------
+
+def _table_0617():
+    # TP0 rc33 by 06:17:04: class maxima and widest readings (EXTEND-LEND-COST lines)
+    ET._CACHE["lend_cost"] = {64: (138, 41), 512: (426, 419), 1024: (742, 901), 2048: (1248, 2024),
+                              4096: (2024, 2880)}
+    ET._CACHE["lend_rate"] = 0.7529
+
+
+def test_class_vote_widens_the_0617_vote_to_the_measured_2048_class():
+    _table_0617()
+    cap = ET.width_vote(Cuda(free=2071.0, reserved=31092.0), 0, 4096, PAGE, True)
+    assert cap == 1984                                                 # linear 1728; class 2048: 767 + 1248 <= 2071
+    assert 2071.0 - ET.lend_cost_mib(cap) >= 767.0
+
+
+def test_class_vote_never_prices_beyond_the_widest_reading():
+    _table_0617()
+    # 4096-class reading reaches 2880 rows at 2024 MiB: it needs post >= 2791
+    assert ET.class_rows_cap(2790.0, 767.0, PAGE, 4096, 0)[0] == 1984
+    assert ET.class_rows_cap(2791.0, 767.0, PAGE, 4096, 0)[0] == 2880
+    # a configured chunk under the widest is capped by the configuration
+    assert ET.class_rows_cap(4000.0, 767.0, PAGE, 2500, 0)[0] == 2496   # page floor of the configured 2500
+
+
+def test_class_vote_never_narrows_the_linear_cap():
+    _table_0617()
+    lin = ET.rows_cap(1400.0, 0.7529, PAGE, 767.0)
+    cap = ET.width_vote(Cuda(free=1400.0, reserved=31092.0), 0, 4096, PAGE, True)
+    assert cap >= lin
+
+
+def test_class_vote_without_readings_is_the_linear_vote():
+    ET._CACHE["lend_rate"] = 0.7529
+    assert ET.width_vote(Cuda(free=2071.0, reserved=31092.0), 0, 4096, PAGE, True) == 1728
+
+
+def test_class_vote_needs_lend_cost_armed():
+    _table_0617()
+    with mock.patch.object(ET, "lend_cost_armed", lambda rank=None: False):
+        assert ET.class_rows_cap(2071.0, 767.0, PAGE, 4096, 0) is None
+
+
+@pytest.mark.parametrize("post", [800, 1000, 1200, 1500, 1800, 2015, 2071, 2400, 2790, 2800, 3500])
+def test_danger_class_vote_leaves_the_line_at_the_measured_class_cost(post):
+    _table_0617()
+    cap = ET.width_vote(Cuda(free=float(post), reserved=31092.0), 0, 4096, PAGE, True)
+    width = 4096 if cap is None else cap
+    if width <= PAGE:
+        return
+    measured = ET.lend_cost_mib(width)
+    lin = ET.rows_cap(float(post), 0.7529, PAGE, 767.0)
+    if measured is not None and width > lin:                          # widened by a class: its reading funds it
+        assert post - measured >= 767.0, (post, width, measured)
+    else:                                                              # linear: the worst per-row cost funds it
+        assert post - width * 0.7529 >= 767.0 - 1e-6, (post, width)
+
+
+def test_class_vote_skips_a_page_floor_that_leaves_the_class():
+    # widest 1030 in class 2048: page floor 1024 falls into class 1024 -- priced by THAT class (here: none)
+    ET._CACHE["lend_cost"] = {2048: (700, 1030)}
+    ET._CACHE["lend_rate"] = 0.7529
+    assert ET.class_rows_cap(4000.0, 767.0, PAGE, 4096, 0) is None
