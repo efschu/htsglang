@@ -45,7 +45,15 @@ CHANGED, each with its reason:
   does not know its input; the check was dropped without replacement
   rather than faked. The byte-level verification at setup time remains.
 * **No round term ``rt``.** Also measurement tooling (it made the payload
-  differ per round so a stale buffer would stand out).
+  differ per round so a stale buffer would stand out). Its loss made the
+  benchmark blind to stale slots; the round term is back in
+  ``scripts/pdflip/barlink_round_bench.py`` (Fix A, 22.10.).
+* **Framed slots (Fix A, 22.10., ``barlink_bar1_frame.py``).** Every slot is
+  written as tiles of 31 data packets + 1 trailer {hash, round}; a receiver
+  consumes a tile only when the trailer carries this round and the hash of
+  the bytes it read, so no PCIe write order is assumed (3080 WRITES_ORDERING
+  = NONE, RO on, PEX switch: switch-p2p-wurzel-1022.md). A tile that never
+  verifies ends the kernel with status 3 instead of a stale number.
 * **Round number in device memory.** The probe passed ``round`` in as a
   value on every launch. That doesn't survive CUDA graph capture -- a
   captured launch would replay the same number forever and every flag
@@ -309,6 +317,11 @@ __device__ __forceinline__ void readFlush(const uint4 *peerRecv, int n4)
                  : "+r"(d) : "l"(peerRecv + (n4 - 1)) : "memory");
 }
 
+// The framed-slot protocol (Fix A, 22.10.): tile hash, sender and receiver
+// tile functions. Spliced in from barlink_bar1_frame.FRAME_CUDA_SRC so the
+// one definition is shared with every kernel file that writes slots.
+// @@BARLINK_FRAME_SRC@@
+
 // ---------------------------------------------------------------------------
 // Element-wise addition WITHIN a 128-bit packet.
 //
@@ -458,88 +471,138 @@ __device__ __forceinline__ void barrier(void)
 // Phases. All kernels use the same ones.
 // ---------------------------------------------------------------------------
 
-// Write own contribution via DMA into the target card's receive slot.
+// FRAMED SLOTS (Fix A, 22.10., barlink_bar1_frame.py). Every phase below
+// works in TILES of 32 packets: 31 data packets + 1 trailer. One warp owns
+// one tile at a time (tiles are warp-strided over the grid), because the
+// tile hash is a warp reduction. Data packet d of a chunk lives in tile
+// d / 31, lane d % 31; the LOCAL buffers (in/out) keep their dense layout,
+// only the slot is framed. A receive phase returns false when a tile never
+// verified (deadline or host abort); the kernel then takes its abort path
+// with status FR_STATUS (3). There is no other way out of a framed receive:
+// a tile that does not carry THIS round's trailer and the matching hash is
+// never consumed, whatever order the PCIe fabric delivered its bytes in.
+//
+// The warp loops need blockDim.x % 32 == 0 (checked host-side): lane = tid & 31
+// must be the hardware lane, and every lane of a warp must reach the shuffles.
+
+// Write own contribution into the target card's receive slot, framed.
 __device__ __forceinline__ void sendPhase(const uint4 *__restrict__ in,
-                                           uint4 *peerRecv,
-                                           int n4, int tid, int nth)
+                                           uint4 *peerSlot, int n4,
+                                           unsigned int salt, u64 round,
+                                           int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) writeV4(peerRecv + j, in[j]);
+    const int lane = tid & 31;
+    const long long nT = ((long long)n4 + FR_DATA - 1) / FR_DATA;
+    for (long long t = (long long)(tid >> 5); t < nT; t += (long long)(nth >> 5)) {
+        const long long d = t * FR_DATA + lane;
+        const bool valid = (lane < FR_DATA) && (d < (long long)n4);
+        const uint4 v = valid ? in[d] : make_uint4(0u, 0u, 0u, 0u);
+        frSendTile(peerSlot, t, lane, valid, v, frKey(round, salt, t), round);
+    }
 }
 
-// One piece to ALL peers, in ONE loop -- so the result is read from local
-// VRAM only once (the probe's distribute phase, generalized from two
-// targets to R-1).
+// One piece to ALL peers, in ONE loop -- the result is read from local VRAM
+// once and the tile hash formed once (the probe's distribute phase,
+// generalized from two targets to R-1).
 __device__ __forceinline__ void scatterPhase(const uint4 *__restrict__ res,
                                               uint4 *const *dst,
-                                              int R, int rank,
-                                              int n4, int tid, int nth)
+                                              int R, int rank, int n4,
+                                              unsigned int salt, u64 round,
+                                              int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) {
-        const uint4 v = res[j];
-        for (int z = 0; z < R; ++z) {
-            if (z == rank) continue;
-            writeV4(dst[z] + j, v);
-        }
+    const int lane = tid & 31;
+    const long long nT = ((long long)n4 + FR_DATA - 1) / FR_DATA;
+    for (long long t = (long long)(tid >> 5); t < nT; t += (long long)(nth >> 5)) {
+        const long long d = t * FR_DATA + lane;
+        const bool valid = (lane < FR_DATA) && (d < (long long)n4);
+        const uint4 v = valid ? res[d] : make_uint4(0u, 0u, 0u, 0u);
+        frSendTileN<BARLINK_BAR1_MAX_RANKS>(dst, R, rank, t, lane, valid, v,
+                                            frKey(round, salt, t), round);
     }
 }
 
-// Reduce locally over the own contribution and ALL R-1 received ones.
-// (the probe's reduce3 phase, generalized.)
+// Reduce locally over the own contribution and ALL R-1 received ones, each
+// received tile verified before it is added (the probe's reduce3 phase,
+// generalized). `canon` != 0: the canonical rank order 0..R-1 on every rank
+// (FLLIPER_BARLINK_BAR1_CANON_ORDER), see bar1_oneshot_kernel. Peer q's slot
+// stream is salted with (kind, step, q).
 template<typename T>
-__device__ __forceinline__ void reduceNPhase(const uint4 *__restrict__ in,
-                                                uint4 *out,
-                                                const uint4 *const *recv,
-                                                int R, int rank,
-                                                int n4, int tid, int nth)
+__device__ __forceinline__ bool reduceNPhase(const uint4 *__restrict__ in,
+                                             uint4 *out,
+                                             const uint4 *const *recv,
+                                             int R, int rank, int n4,
+                                             unsigned int kind, int step, u64 round,
+                                             int canon, u64 cap,
+                                             const unsigned int *abortHost,
+                                             int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) {
-        uint4 s = in[j];
+    const int lane = tid & 31;
+    const long long nT = ((long long)n4 + FR_DATA - 1) / FR_DATA;
+    for (long long t = (long long)(tid >> 5); t < nT; t += (long long)(nth >> 5)) {
+        const long long d = t * FR_DATA + lane;
+        const bool valid = (lane < FR_DATA) && (d < (long long)n4);
+        const uint4 own = valid ? in[d] : make_uint4(0u, 0u, 0u, 0u);
+        uint4 s = own;
+        bool first = true;
         for (int q = 0; q < R; ++q) {
-            if (q == rank) continue;
-            s = addV4<T>(s, readV4(recv[q] + j));
-        }
-        out[j] = s;
-    }
-}
-
-// The same reduction in CANONICAL rank order (FLLIPER_BARLINK_BAR1_CANON_ORDER):
-// ((x0 + x1) + x2) + ... on EVERY rank. reduceNPhase starts from the own
-// contribution, so rank 2 of three computes (x2 + x0) + x1 while ranks 0 and
-// 1 compute (x0 + x1) + x2 (IEEE addition commutes, so those two agree) --
-// the oneshot result then differs in the last bit across ranks. Same reads
-// (own from `in`, every peer once from its receive slot), no extra barrier;
-// for rank 0 it is the identical instruction sequence.
-template<typename T>
-__device__ __forceinline__ void reduceNPhaseCanon(const uint4 *__restrict__ in,
-                                                     uint4 *out,
-                                                     const uint4 *const *recv,
-                                                     int R, int rank,
-                                                     int n4, int tid, int nth)
-{
-    for (int j = tid; j < n4; j += nth) {
-        uint4 s = (rank == 0) ? in[j] : readV4(recv[0] + j);
-        for (int q = 1; q < R; ++q) {
-            const uint4 v = (q == rank) ? in[j] : readV4(recv[q] + j);
+            uint4 v;
+            if (q == rank) {
+                if (!canon) continue;          // own already in s
+                v = own;
+            } else if (!frRecvTile(recv[q], t, lane, valid,
+                                   frKey(round, frSalt(kind, step, q), t), round,
+                                   &v, cap, abortHost)) {
+                return false;
+            }
+            if (canon && first) { s = v; first = false; continue; }
             s = addV4<T>(s, v);
         }
-        out[j] = s;
+        if (valid) out[d] = s;
     }
+    return true;
 }
 
-// Adopt what was received (the probe's adopt phase, without the check).
-__device__ __forceinline__ void takeOverPhase(uint4 *out, const uint4 *recv,
-                                                int n4, int tid, int nth)
+// Adopt what was received, verified tile by tile (the probe's adopt phase).
+__device__ __forceinline__ bool takeOverPhase(uint4 *out, const uint4 *recv, int n4,
+                                              unsigned int salt, u64 round, u64 cap,
+                                              const unsigned int *abortHost,
+                                              int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) out[j] = readV4(recv + j);
+    const int lane = tid & 31;
+    const long long nT = ((long long)n4 + FR_DATA - 1) / FR_DATA;
+    for (long long t = (long long)(tid >> 5); t < nT; t += (long long)(nth >> 5)) {
+        const long long d = t * FR_DATA + lane;
+        const bool valid = (lane < FR_DATA) && (d < (long long)n4);
+        uint4 v;
+        if (!frRecvTile(recv, t, lane, valid, frKey(round, salt, t), round, &v,
+                        cap, abortHost))
+            return false;
+        if (valid) out[d] = v;
+    }
+    return true;
 }
 
 // Ring reduce-scatter, receive step: own contribution plus partial sum.
 template<typename T>
-__device__ __forceinline__ void ringAdd(const uint4 *__restrict__ in,
-                                            uint4 *out, const uint4 *recv,
-                                            int n4, int tid, int nth)
+__device__ __forceinline__ bool ringAdd(const uint4 *__restrict__ in,
+                                        uint4 *out, const uint4 *recv, int n4,
+                                        unsigned int salt, u64 round, u64 cap,
+                                        const unsigned int *abortHost,
+                                        int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) out[j] = addV4<T>(in[j], readV4(recv + j));
+    const int lane = tid & 31;
+    const long long nT = ((long long)n4 + FR_DATA - 1) / FR_DATA;
+    for (long long t = (long long)(tid >> 5); t < nT; t += (long long)(nth >> 5)) {
+        const long long d = t * FR_DATA + lane;
+        const bool valid = (lane < FR_DATA) && (d < (long long)n4);
+        const uint4 own = valid ? in[d] : make_uint4(0u, 0u, 0u, 0u);
+        uint4 v;
+        if (!frRecvTile(recv, t, lane, valid, frKey(round, salt, t), round, &v,
+                        cap, abortHost))
+            return false;
+        if (valid) out[d] = addV4<T>(own, v);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +623,29 @@ __device__ __forceinline__ void writeRound(const ARGS &A, u64 round)
     *(volatile u64 *)A.roundDev = round;
     __threadfence_system();
 }
+
+// Framed receive gave up (Fix A): mark it, then the barrier inside FR_CHECK
+// carries the mark to every thread, which all leave together with status
+// FR_STATUS (3). Used inside the kernels only -- they expand against the
+// kernel's own GRID, abortS, A, isFirst and round. A failed receive has NOT
+// consumed anything it did not verify; the round still advances (as on every
+// abort path) so the ranks never drift apart on the round number.
+#define FR_FAIL()                                                              \
+    do {                                                                       \
+        if (GRID == K_1BLK) abortS = (int)FR_STATUS;                           \
+        else { *(volatile unsigned int *)A.abortDev = FR_STATUS; __threadfence(); } \
+    } while (0)
+#define FR_CHECK()                                                             \
+    do {                                                                       \
+        barrier<GRID>();                                                       \
+        const int _frAb = (GRID == K_1BLK)                                     \
+                              ? abortS                                         \
+                              : (int)*(volatile unsigned int *)A.abortDev;     \
+        if (_frAb) {                                                           \
+            if (isFirst) { *A.ctlStatus = FR_STATUS; writeRound(A, round); }   \
+            return;                                                            \
+        }                                                                      \
+    } while (0)
 
 // ---------------------------------------------------------------------------
 // TOPOLOGY 'mesh' -- reduce-scatter + allgather over ALL pairs, two
@@ -741,7 +827,8 @@ __global__ void bar1_mesh_kernel(Bar1Args A)
         if (z == r) continue;
         int off, len;
         chunkBounds(n4, z, R, &off, &len);
-        sendPhase(A.in + off, sSendRS[z], len, tid, nth);
+        sendPhase(A.in + off, sSendRS[z], len, frSalt(FR_KIND_MESH, 0, r),
+                  round, tid, nth);
     }
     __threadfence_system();
     barrier<GRID>();
@@ -801,13 +888,16 @@ __global__ void bar1_mesh_kernel(Bar1Args A)
         // `sRecvRS` instead of a local copy: the copy was a per-THREAD array
         // in local memory, and it was also the reason the whole parameter
         // block had to go there.
-        reduceNPhase<T>(A.in + offR, A.out + offR, sRecvRS, R, r, lenR,
-                           tid, nth);
+        if (!reduceNPhase<T>(A.in + offR, A.out + offR, sRecvRS, R, r, lenR,
+                             FR_KIND_MESH, 0, round, 0, A.capCycles,
+                             A.abortHost, tid, nth))
+            FR_FAIL();
     }
-    barrier<GRID>();
+    FR_CHECK();
 
     // --- 3. Allgather: the finished own chunk to everyone else --------------
-    scatterPhase(A.out + offR, sSendAG, R, r, lenR, tid, nth);
+    scatterPhase(A.out + offR, sSendAG, R, r, lenR,
+                 frSalt(FR_KIND_MESH, 1, r), round, tid, nth);
     __threadfence_system();
     barrier<GRID>();
 
@@ -857,9 +947,14 @@ __global__ void bar1_mesh_kernel(Bar1Args A)
         if (s == r) continue;
         int off, len;
         chunkBounds(n4, s, R, &off, &len);
-        takeOverPhase(A.out + off, sRecvAG[s], len, tid, nth);
+        if (!takeOverPhase(A.out + off, sRecvAG[s], len,
+                           frSalt(FR_KIND_MESH, 1, s), round, A.capCycles,
+                           A.abortHost, tid, nth)) {
+            FR_FAIL();
+            break;
+        }
     }
-    barrier<GRID>();
+    FR_CHECK();
     if (isFirst) {
         // #622: the acknowledgment. AFTER the barrier that closes the receive
         // phase, i.e. after every byte this rank had to read out of its
@@ -978,7 +1073,8 @@ __global__ void bar1_oneshot_kernel(Bar1Args A)
     // --- 1. the WHOLE contribution to every peer's RS slot -----------------
     for (int z = 0; z < R; ++z) {
         if (z == r) continue;
-        sendPhase(A.in, sSendRS[z], n4, tid, nth);
+        sendPhase(A.in, sSendRS[z], n4, frSalt(FR_KIND_ONESHOT, 0, r), round,
+                  tid, nth);
     }
     __threadfence_system();
     barrier<GRID>();
@@ -1023,9 +1119,10 @@ __global__ void bar1_oneshot_kernel(Bar1Args A)
     }
     __threadfence_system();
     // --- 2. reduce locally over own + all received (full payloads) ---------
-    if (A.canon) reduceNPhaseCanon<T>(A.in, A.out, sRecvRS, R, r, n4, tid, nth);
-    else         reduceNPhase<T>(A.in, A.out, sRecvRS, R, r, n4, tid, nth);
-    barrier<GRID>();
+    if (!reduceNPhase<T>(A.in, A.out, sRecvRS, R, r, n4, FR_KIND_ONESHOT, 0,
+                         round, A.canon, A.capCycles, A.abortHost, tid, nth))
+        FR_FAIL();
+    FR_CHECK();
     if (isFirst) {
         // #622 ack, same order as the mesh: peers' lines, fence, watermark,
         // round.
@@ -1076,6 +1173,8 @@ __global__ void bar1_ring_kernel(Bar1Args A)
     const bool isFirst = (tid == 0);
     const int  n4 = A.n4, R = A.R, r = A.rank;
     const u64  round = *(const volatile u64 *)A.roundDev + 1ull;
+    // The rank whose slot stream I receive (the sender in the tile salt).
+    const int  fromRank = (r - 1 + R) % R;
 
     __shared__ int abortS;
     if (GRID == K_1BLK) {
@@ -1098,7 +1197,8 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         // sum formed in the previous step.
         const uint4 *source = (s == 0) ? (A.in + offS)
                                        : (const uint4 *)(A.out + offS);
-        sendPhase(source, A.rgSend[s], lenS, tid, nth);
+        sendPhase(source, A.rgSend[s], lenS, frSalt(FR_KIND_RING, s, r), round,
+                  tid, nth);
         __threadfence_system();
         barrier<GRID>();
 
@@ -1132,8 +1232,11 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         }
         __threadfence_system();
 
-        ringAdd<T>(A.in + offE, A.out + offE, A.rgRecv[s], lenE, tid, nth);
-        barrier<GRID>();
+        if (!ringAdd<T>(A.in + offE, A.out + offE, A.rgRecv[s], lenE,
+                        frSalt(FR_KIND_RING, s, fromRank), round, A.capCycles,
+                        A.abortHost, tid, nth))
+            FR_FAIL();
+        FR_CHECK();
     }
 
     // --------------------------- Allgather -----------------------------------
@@ -1145,7 +1248,8 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         chunkBounds(n4, cs, R, &offS, &lenS);
         chunkBounds(n4, cr, R, &offE, &lenE);
 
-        sendPhase((const uint4 *)(A.out + offS), A.rgSend[sl], lenS, tid, nth);
+        sendPhase((const uint4 *)(A.out + offS), A.rgSend[sl], lenS,
+                  frSalt(FR_KIND_RING, sl, r), round, tid, nth);
         __threadfence_system();
         barrier<GRID>();
 
@@ -1179,8 +1283,11 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         }
         __threadfence_system();
 
-        takeOverPhase(A.out + offE, A.rgRecv[sl], lenE, tid, nth);
-        barrier<GRID>();
+        if (!takeOverPhase(A.out + offE, A.rgRecv[sl], lenE,
+                           frSalt(FR_KIND_RING, sl, fromRank), round, A.capCycles,
+                           A.abortHost, tid, nth))
+            FR_FAIL();
+        FR_CHECK();
     }
 
     if (isFirst) writeRound(A, round);
@@ -1249,7 +1356,8 @@ struct A2aArgs {
     int           R;
     int           rank;
     u64           capCycles;
-    long long     slot;                 // slot size in bytes
+    long long     slot;                 // slot CAPACITY in payload bytes
+    long long     stride;               // slot distance in bytes (framed)
     long long     sendOff[BARLINK_BAR1_MAX_RANKS];   // offset in `in`
     long long     sendLen[BARLINK_BAR1_MAX_RANKS];
     long long     recvOff[BARLINK_BAR1_MAX_RANKS];   // offset in `out`
@@ -1283,7 +1391,7 @@ __device__ __forceinline__ uint4 packBytes(const unsigned char *q, int n)
 __device__ __forceinline__ unsigned char *a2aDst(const A2aArgs &A, int z, int par)
 {
     const int p = A.rank - (A.rank > z ? 1 : 0);
-    return A.dstBase[z] + (long long)(par * (A.R - 1) + p) * A.slot;
+    return A.dstBase[z] + (long long)(par * (A.R - 1) + p) * A.stride;
 }
 
 // Where rank s's block for me sits: its position in MY ascending peer
@@ -1292,7 +1400,7 @@ __device__ __forceinline__ const unsigned char *a2aSource(const A2aArgs &A,
                                                           int s, int par)
 {
     const int p = s - (s > A.rank ? 1 : 0);
-    return A.ownBase + (long long)(par * (A.R - 1) + p) * A.slot;
+    return A.ownBase + (long long)(par * (A.R - 1) + p) * A.stride;
 }
 
 template<int VEC, int LA, int GRID>
@@ -1341,8 +1449,13 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
             eDst[z]   = A.out + A.recvOff[z];
             sDst[z]   = (z == r) ? nullptr : a2aDst(A, z, par);
             eSource[z] = (z == r) ? nullptr : a2aSource(A, z, par);
-            sPre[z + 1] = sPre[z] + ((z == r) ? 0LL : (sLenS[z] + 15LL) / 16LL);
-            ePre[z + 1] = ePre[z] + ((z == r) ? 0LL : (eLenS[z] + 15LL) / 16LL);
+            // FRAMED (Fix A): the prefix counts TILES (31 data packets each),
+            // not packets -- a tile must never straddle two peers' blocks,
+            // because its hash is one warp reduction over ONE slot stream.
+            sPre[z + 1] = sPre[z] + ((z == r) ? 0LL
+                                     : (((sLenS[z] + 15LL) / 16LL) + FR_DATA - 1) / FR_DATA);
+            ePre[z + 1] = ePre[z] + ((z == r) ? 0LL
+                                     : (((eLenS[z] + 15LL) / 16LL) + FR_DATA - 1) / FR_DATA);
         }
     }
     __syncthreads();
@@ -1402,20 +1515,32 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
         }
     }
 
-    // --- 1. Send phase: all targets in the same flat index space -----------
+    // --- 1. Send phase: all targets in the same flat TILE space ------------
+    //
+    // FRAMED (Fix A): one warp per tile, tiles warp-strided over all targets,
+    // so different warps still write to different cards at the same time.
+    // Lane l < 31 carries packet t*31+l of the block, lane 31 the trailer;
+    // the tail packet of a block is assembled in a register (packBytes) and
+    // its zero padding is part of what the hash covers on both sides.
     {
+        const int lane = (int)(tid & 31LL);
         const long long total = sPre[R];
-        for (long long j = tid; j < total; j += nth) {
+        for (long long j = tid >> 5; j < total; j += nth >> 5) {
             int z = 0;
             while (sPre[z + 1] <= j) ++z;          // R <= 8, so a short scan
-            const long long b = (j - sPre[z]) * 16LL;
-            const int rest = (int)((sLenS[z] - b) < 16LL
-                                       ? (sLenS[z] - b) : 16LL);
-            const unsigned char *q = sSource[z] + b;
-            uint4 v;
-            if (VEC && rest == 16) v = *(const uint4 *)q;
-            else                   v = packBytes(q, rest);
-            writeV4(sDst[z] + b, v);
+            const long long t = j - sPre[z];
+            const long long d = t * FR_DATA + lane;
+            const long long b = d * 16LL;
+            const bool valid = (lane < FR_DATA) && (b < sLenS[z]);
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (valid) {
+                const int rest = (int)((sLenS[z] - b) < 16LL ? (sLenS[z] - b) : 16LL);
+                const unsigned char *q = sSource[z] + b;
+                if (VEC && rest == 16) v = *(const uint4 *)q;
+                else                   v = packBytes(q, rest);
+            }
+            frSendTile((uint4 *)sDst[z], t, lane, valid, v,
+                       frKey(round, frSalt(FR_KIND_A2A, par, r), t), round);
         }
     }
 
@@ -1480,24 +1605,49 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
     __threadfence_system();
 
     // --- 3. Receive phase: own slots into the output buffer -----------------
+    //
+    // FRAMED (Fix A): every tile is verified against its trailer before a
+    // single byte of it reaches `out`. The full 16-byte packet is read from
+    // the slot (the slot is 16-aligned and the sender wrote the whole packet,
+    // zero padding included -- the padding is covered by the hash); only the
+    // `rest` bytes that belong to the block are written out.
     {
+        const int lane = (int)(tid & 31LL);
         const long long total = ePre[R];
-        for (long long j = tid; j < total; j += nth) {
+        bool failed = false;
+        for (long long j = tid >> 5; j < total; j += nth >> 5) {
             int s = 0;
             while (ePre[s + 1] <= j) ++s;
-            const long long b = (j - ePre[s]) * 16LL;
-            const int rest = (int)((eLenS[s] - b) < 16LL
-                                       ? (eLenS[s] - b) : 16LL);
-            const unsigned char *q = eSource[s] + b;
-            unsigned char *z = eDst[s] + b;
-            if (VEC && rest == 16) {
-                *(uint4 *)z = readV4(q);
-            } else {
-                for (int i = 0; i < rest; ++i) z[i] = readB(q + i);
+            const long long t = j - ePre[s];
+            const long long d = t * FR_DATA + lane;
+            const long long b = d * 16LL;
+            const bool valid = (lane < FR_DATA) && (b < eLenS[s]);
+            uint4 v;
+            if (!frRecvTile((const uint4 *)eSource[s], t, lane, valid,
+                            frKey(round, frSalt(FR_KIND_A2A, par, s), t), round,
+                            &v, A.capCycles, A.abortHost)) {
+                failed = true;
+                break;
+            }
+            if (valid) {
+                const int rest = (int)((eLenS[s] - b) < 16LL ? (eLenS[s] - b) : 16LL);
+                unsigned char *z = eDst[s] + b;
+                if (VEC && rest == 16) {
+                    *(uint4 *)z = v;
+                } else {
+                    // Bytes out of the register by shifts, not through a
+                    // pointer to `v` (that would put `v` on the stack).
+                    for (int i = 0; i < rest; ++i) {
+                        const unsigned w = (i < 4) ? v.x : (i < 8) ? v.y
+                                         : (i < 12) ? v.z : v.w;
+                        z[i] = (unsigned char)(w >> (8 * (i & 3)));
+                    }
+                }
             }
         }
+        if (failed) FR_FAIL();
     }
-    barrier<GRID>();
+    FR_CHECK();
     if (isFirst) {
         // #622: acknowledge AFTER the barrier that closes the receive phase --
         // every byte out of the own slots has been read by then, which is the
@@ -1604,7 +1754,7 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
                      int64_t load_shape, int64_t read_flush, int64_t abort_host,
-                     int64_t ackbase_mesh)
+                     int64_t ackbase_mesh, int64_t slot_stride)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
@@ -1651,7 +1801,17 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                     "barlink-bar1: largest chunk ", (int64_t)maxLen * 16,
                     " bytes does not fit in the slot of ", chunk_max,
                     " bytes. The caller should have asked handles().");
+        // FRAMED (Fix A): the slot DISTANCE must hold the framed image of a
+        // full-capacity chunk (31 data packets + 1 trailer per 512 bytes).
+        TORCH_CHECK(frPackets(chunk_max / 16) * 16 <= slot_stride,
+                    "barlink-bar1: slot stride ", slot_stride, " bytes cannot "
+                    "carry the framed image (", frPackets(chunk_max / 16) * 16,
+                    " bytes) of a ", chunk_max, "-byte chunk -- geometry() and "
+                    "the kernel disagree on the framing");
     }
+    TORCH_CHECK(threads >= 32 && threads % 32 == 0,
+                "barlink-bar1: threads ", threads, " is not a positive multiple "
+                "of 32 -- the framed tiles are one warp each");
 
     // #622: three words, and the kernels index word 1 and 2 of them.
     TORCH_CHECK(round_dev.scalar_type() == at::kLong && round_dev.numel() >= 3,
@@ -1699,9 +1859,9 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
             const size_t p = (size_t)(r - (r > z ? 1 : 0));
             char *zb = (char *)(uintptr_t)peer_payload[z];
             A.nzSendRS[z] = (uint4 *)(zb + off_mesh +
-                                      (size_t)(0 * (R - 1) + (int)p) * chunk_max);
+                                      (size_t)(0 * (R - 1) + (int)p) * slot_stride);
             A.nzSendAG[z] = (uint4 *)(zb + off_mesh +
-                                      (size_t)(1 * (R - 1) + (int)p) * chunk_max);
+                                      (size_t)(1 * (R - 1) + (int)p) * slot_stride);
         }
         {
             char *mb = (char *)(uintptr_t)own_payload;
@@ -1709,9 +1869,9 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                 if (s == r) continue;
                 const size_t p = (size_t)(s - (s > r ? 1 : 0));
                 A.nzRecvRS[s] = (const uint4 *)(mb + off_mesh +
-                                  (size_t)(0 * (R - 1) + (int)p) * chunk_max);
+                                  (size_t)(0 * (R - 1) + (int)p) * slot_stride);
                 A.nzRecvAG[s] = (const uint4 *)(mb + off_mesh +
-                                  (size_t)(1 * (R - 1) + (int)p) * chunk_max);
+                                  (size_t)(1 * (R - 1) + (int)p) * slot_stride);
             }
         }
         for (int ph = 0; ph < 2; ++ph) {
@@ -1747,8 +1907,8 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
         char *zb = (char *)(uintptr_t)peer_payload[next_rank];
         char *mb = (char *)(uintptr_t)own_payload;
         for (int s = 0; s < steps_ring; ++s) {
-            A.rgSend[s]    = (uint4 *)(zb + off_ring + (size_t)s * chunk_max);
-            A.rgRecv[s]    = (const uint4 *)(mb + off_ring + (size_t)s * chunk_max);
+            A.rgSend[s]    = (uint4 *)(zb + off_ring + (size_t)s * slot_stride);
+            A.rgRecv[s]    = (const uint4 *)(mb + off_ring + (size_t)s * slot_stride);
             A.rgFlagTo[s]  = (u64 *)((char *)(uintptr_t)peer_flag[next_rank] +
                                      FSLOT(fbase_ring, s, r));
             A.rgFlagFrom[s] = (const u64 *)((char *)(uintptr_t)own_flag +
@@ -1836,7 +1996,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
                      int64_t load_shape, int64_t abort_host,
-                     int64_t ackbase_a2a)
+                     int64_t ackbase_a2a, int64_t slot_stride)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
@@ -1860,6 +2020,15 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
     TORCH_CHECK(slot > 0 && (slot % 16) == 0,
                 "barlink-bar1 a2a: slot size ", slot,
                 " is not a positive multiple of 16");
+    // FRAMED (Fix A): `slot` is the payload capacity, `slot_stride` the slot
+    // distance; the latter must hold the framed image of the former.
+    TORCH_CHECK(frPackets(slot / 16) * 16 <= slot_stride,
+                "barlink-bar1 a2a: slot stride ", slot_stride, " bytes cannot "
+                "carry the framed image (", frPackets(slot / 16) * 16,
+                " bytes) of a ", slot, "-byte slot");
+    TORCH_CHECK(threads >= 32 && threads % 32 == 0,
+                "barlink-bar1 a2a: threads ", threads, " is not a positive "
+                "multiple of 32 -- the framed tiles are one warp each");
 
     const int64_t in_bytes  = (int64_t)inp.numel()  * (int64_t)inp.element_size();
     const int64_t out_bytes = (int64_t)out.numel() * (int64_t)out.element_size();
@@ -1918,6 +2087,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
     A.rank         = r;
     A.capCycles = (u64)cap_cycles;
     A.slot      = (long long)slot;
+    A.stride    = (long long)slot_stride;
     A.ownBase   = (const unsigned char *)((char *)(uintptr_t)own_payload
                                              + off_a2a);
 
@@ -1960,6 +2130,17 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
 }
 """
 
+# Fix A (22.10.): splice the ONE definition of the framed-slot protocol into the
+# kernel source. Done by text, not #include, because load_inline compiles a
+# single translation unit and the frame source must sit after the primitives
+# (u64, readV4, writeV4) it builds on.
+from flliper.srt.distributed.device_communicators.barlink_bar1_frame import (  # noqa: E402
+    FRAME_CUDA_SRC as _FRAME_CUDA_SRC,
+)
+
+assert _CUDA_SRC.count("// @@BARLINK_FRAME_SRC@@") == 1
+_CUDA_SRC = _CUDA_SRC.replace("// @@BARLINK_FRAME_SRC@@", _FRAME_CUDA_SRC)
+
 _CPP_SRC = """
 void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world, int64_t algo,
@@ -1970,7 +2151,7 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
                      int64_t load_shape, int64_t read_flush, int64_t abort_host,
-                     int64_t ackbase_mesh);
+                     int64_t ackbase_mesh, int64_t slot_stride);
 
 void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world,
@@ -1985,7 +2166,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
                      int64_t load_shape, int64_t abort_host,
-                     int64_t ackbase_a2a);
+                     int64_t ackbase_a2a, int64_t slot_stride);
 """
 
 
