@@ -13554,6 +13554,44 @@ def rank_state_dir_for(spec: GroupSpec) -> str:
     return rank_state_mod.rank_state_dir_for_log(spec.log)
 
 
+#: Ops #164 (22.10.): the working directory the groups (P, D) and the front are
+#: spawned in. The kernel writes a crash core to "core.<pid>" RELATIVE TO THE
+#: CRASHING PROCESS'S CWD (proxmox: kernel.core_pattern=core, core_uses_pid=1;
+#: docker's LimitCORE=infinity reaches every container), and the cwd used to be
+#: the code tree. A core in the tree makes `git status --porcelain` dirty, and the
+#: container's next `docker start` was REFUSED TREE by the entrypoint's
+#: preflight_tree (27B night 22.10. 00:47Z, workaround recreate). The cwd is now
+#: <evidence>/core/<boot stem>/ on the evidence volume: the core survives as
+#: evidence there, the tree stays clean. One directory per boot, because the
+#: kernel UNLINKS an existing core of the same name and container pids restart
+#: low on every start (core.967 of one boot would replace core.967 of the last).
+#: Nothing reads relative to the cwd: argv and env carry absolute paths, the
+#: package comes from PYTHONPATH. "0" keeps the tree (the old cwd).
+CORE_CWD_ENV = "FLLIPER_PDFLIP_CORE_CWD"
+
+
+def core_cwd_for(group_log: str, tree: str, log: Log) -> str:
+    """cwd for a spawned group or the front: ``<EVIDENCE_DIR>/core/<boot stem>``,
+    the boot stem being the log name without ``.log`` and without the group
+    suffix (``boot_weg2_<tag>_<rev>_<date>.P.log`` -> ``boot_weg2_<tag>_<rev>_<date>``),
+    so P, D and the front of one boot share one directory. Falls back to the
+    tree, loudly, when the directory cannot be made."""
+    if (os.environ.get(CORE_CWD_ENV) or "1").strip() == "0":
+        return tree
+    stem = os.path.basename(group_log)
+    if stem.endswith(".log"):
+        stem = stem[: -len(".log")]
+    boot = stem.rsplit(".", 1)[0] if "." in stem else stem
+    d = os.path.join(EVIDENCE_DIR, "core", boot or "unknown")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        log(f"CORE-CWD FALLBACK {d}: {type(e).__name__}: {e} -- cwd stays {tree}; a crash "
+            f"core lands in the tree and the drei init moves it at the next start (ops #164)")
+        return tree
+    return d
+
+
 def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
                          kv_owner_ranks: Sequence[int] = ()) -> None:
     """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
@@ -13673,11 +13711,12 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     _logged_argv = ' '.join(shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv))
     fh.write(f"=== PDFLIP group {spec.name} launched {_now()} ===\nargv: {_logged_argv}\n".encode())
     fh.flush()
-    p = subprocess.Popen(spec.argv, env=spec.env, stdout=fh, stderr=subprocess.STDOUT, cwd=tree,
+    _cwd = core_cwd_for(spec.log, tree, log)
+    p = subprocess.Popen(spec.argv, env=spec.env, stdout=fh, stderr=subprocess.STDOUT, cwd=_cwd,
                          start_new_session=True)
     spec.pid = p.pid
     spec.proc = p
-    log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
+    log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log} cwd {_cwd}")
     if spec.name in ("P", "D"):
         # Nutzer 29.09.: rigdash liest daraus „aktiv“ je Schalter (argv redigiert wie im Log).
         boot_state_write(log, "loading", fields={f"groups.{spec.name}": {
@@ -28858,7 +28897,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     log("front argv: " + " ".join(shlex.quote(a) for a in front_argv))
     ffh = open(front_log, "ab")
-    fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
+    _front_cwd = core_cwd_for(front_log, tree, log)
+    log(f"front cwd {_front_cwd} (ops #164: crash cores land here, not in the tree)")
+    fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=_front_cwd, start_new_session=True)
     state.pids["front"] = fp.pid
     boot_state_write(log, fields=front_launch_fields(front_argv, fenv))
     # H135b: the front into the state json AND the registry at once -- until the

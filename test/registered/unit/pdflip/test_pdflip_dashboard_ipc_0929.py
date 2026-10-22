@@ -313,7 +313,8 @@ class TestLauncherForm(CustomTestCase):
         class _P:
             pid = 4242
 
-        with envs.PDFLIP_STATE_DIR.override(sd), mock.patch.object(L.subprocess, "Popen", return_value=_P()):
+        with envs.PDFLIP_STATE_DIR.override(sd), mock.patch.object(L.subprocess, "Popen", return_value=_P()), \
+             mock.patch.object(L, "EVIDENCE_DIR", root):  # ops #164: the core cwd lands in tmp
             L.launch_group(spec, root, lambda s: None, False)
         g = state_file.read(sd)["groups"]["P"]
         self.assertEqual(g["pids"], [4242])

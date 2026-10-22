@@ -162,8 +162,14 @@ class TestLauncherGate(unittest.TestCase):
         self.launcher = launcher
         self.tmp = tempfile.TemporaryDirectory()
         self.log_path = os.path.join(self.tmp.name, "boot.D.log")
+        # ops #164: launch_group makes <EVIDENCE_DIR>/core/<boot> as the group's cwd --
+        # inside this test's tmp, never in the rig's evidence directory
+        from unittest import mock
+        self._ev = mock.patch.object(launcher, "EVIDENCE_DIR", self.tmp.name)
+        self._ev.start()
 
     def tearDown(self):
+        self._ev.stop()
         self.tmp.cleanup()
 
     def _spec(self, name="D"):
