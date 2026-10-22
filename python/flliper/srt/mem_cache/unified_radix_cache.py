@@ -9260,6 +9260,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _w > 0 and len(node.key) > _w:
                 _tail = self._pdflip_split_for_publish(node, _w)
                 if _tail is not None:
+                    # KVLEITER-1022 review S-A: the split's re-queue of the anchored tail (the ORIGINAL node object,
+                    # marked visited above) is intentional -- clear its mark so the tail gets its own backup now
+                    _seen.discard(id(_tail))
                     queue.append(_tail)
                     node = _tail.parent
             # write_back at the flip (user order 2026-09-15: "die eviction ist

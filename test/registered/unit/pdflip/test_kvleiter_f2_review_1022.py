@@ -117,8 +117,6 @@ def test_rf3_two_mixed_segments_in_one_slot_on_one_rank_refuse_alike(monkeypatch
     assert _plans([two(), _chain(pages0=17)[:2], _chain(pages0=17)[:2]]) == [None, None, None]
 
 
-@pytest.mark.xfail(strict=True, reason="Auflage I1-A of review KVLEITER-1022: a mixed segment behind an un-backed "
-                                       "child is counted _mixed, its blocker unnamed")
 def test_rf4_a_mixed_segment_behind_an_unbacked_child_is_child_blocked():
     alloc, tree, a, b = _chain()
     _node(tree, alloc, [25], P, parent=b, backed=False)    # the fresh un-backed tail (rc32 under load)

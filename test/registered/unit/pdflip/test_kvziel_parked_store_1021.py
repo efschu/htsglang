@@ -219,7 +219,7 @@ def test_a_store_backed_leaf_is_room_through_the_s39_hand_off():
     assert not plan.evicts and not plan.pairs            # nothing demoted, nothing moved yet
 
 
-def test_split_a_mixed_chain_is_no_room_pure_chains_split_now_and_handoff():
+def test_split_a_mixed_chain_is_room_by_runs_pure_chains_split_now_and_handoff():
     """KVPLAN-1021: a single-child chain of L2 and store nodes is ONE segment of mixed kind; a pure L2 branch
     goes now, a pure store branch is handed to S39. KVLEITER-1022 (F2): the mixed segment is room once its
     profile is agreed (single-rank form: its own) -- run by run: the store tail handed off, the L2 head waits

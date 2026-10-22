@@ -54,8 +54,6 @@ def _world():
 
 
 @pytest.mark.parametrize("chain_only", [True, False])
-@pytest.mark.xfail(strict=True, reason="Auflage S-A of review KVLEITER-1022: the visit-once set drops the split "
-                                       "tail's intentional re-queue")
 def test_the_split_tail_is_backed_in_the_same_sweep(chain_only):
     t, root, a, leaf, backed = _world()
     first = [a, leaf] if chain_only else None

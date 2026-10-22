@@ -1279,8 +1279,14 @@ def _page_class(s: Survey, p: int, ag: Agreement, seg_of, can_go) -> str:
         return base + "_partial"
     if g.kind == 3:
         # KVLEITER-1022 (F2): a mixed segment the group agreed on (same profile everywhere) can go like any
-        # other; one it did not agree on stays ``_mixed``
-        return base + ("_ok" if (g.sub_ok and ag.agreed(g) and can_go(g)) else "_mixed")
+        # other. Review I1-A: ``_mixed`` only for a profile NOT agreed; a mixed segment behind a device child that
+        # cannot go (an un-backed tail: not ``sub_ok``, never voted) or whose child is not agreed is
+        # ``_child_blocked`` and ``blocked_by`` names that child
+        if not g.sub_ok:
+            return base + "_child_blocked"
+        if not ag.agreed(g):
+            return base + "_mixed"
+        return base + ("_ok" if can_go(g) else "_child_blocked")
     if not g.sub_ok:
         return base + "_child_blocked"
     if not ag.agreed(g):
