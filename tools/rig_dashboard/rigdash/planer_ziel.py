@@ -43,10 +43,10 @@ DE_FILE = os.path.join(DATA_DIR, "planer_ziel_de.json")
 TM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "i18n_de.json")
 MIB = float(1 << 20)
 
-#: The card counts the planning core is CHECKED for: NCARDS 1021 ships 12 release profiles ``{27b, 27b-nvfp4, 27b-nvfp4-dual, nf}-{2,3,4}x3090`` with a launcher dry-run
-#: golden each (the NCARDS goldens ``fixtures/ncards_1021/golden`` of the launcher tests; pinned by ``test_planer_release_1022``).  Fewer (one card: nothing to flip between) or
+#: The card counts the planning core is CHECKED for (user 22.10.: "2 karten und 4 karten, und 5 karten und 6 karten und 7 karten gehen"): NCARDS 1021 ships 12 release
+#: profiles ``{27b, 27b-nvfp4, 27b-nvfp4-dual, nf}-{2,3,4}x3090`` with a launcher dry-run golden each, release 1022 the same for 5, 6 and 7 (the NCARDS goldens ``fixtures/ncards_1021/golden`` of the launcher tests; pinned by ``test_planer_release_1022``).  Fewer (one card: nothing to flip between) or
 #: more (5..8: no profile, no golden) are not calculated here and say why.  Also the FALLBACK when the topology cannot be asked (no editor / no planner gate).
-SUPPORTED_N = (2, 3, 4)
+SUPPORTED_N = (2, 3, 4, 5, 6, 7)
 #: The counts a release boot has PROVEN on metal (``PROVEN_CARD_COUNTS`` of the topology module).  The other counts of ``SUPPORTED_N`` are calculated by the launcher dry run
 #: but carry the named blocker METAL-UNPROVEN (the launcher accepts them only with force; the first boot is the proof) -- the page shows that, it never hides it.
 PROVEN_N = (3,)
@@ -564,6 +564,10 @@ class ZielPlaner:
             if blocked_by_profile:
                 status = "blocked"
                 why.append(blocked_by_profile)
+                if calc["margin_mib"] >= 0:                         # the numbers of the calculation below: it is not the memory
+                    why.append("Memory is not the limit: the rough calculation below leaves a margin of %s, and the launcher's per-rank memory checks of the profile (W122/W130) "
+                               "pass on every rank. What fails is the ownership search of the decode group: no form with an edge on every rank and without more "
+                               "misses of a worker than form A." % _fmt_gib(calc["margin_mib"]))
             if calc["too_small"]:
                 status = "blocked"
                 why.append("too little memory on %s: %d MiB outside the pool alone are more than the card offers" % (", ".join(sorted(set(calc["too_small"]))), OVERHEAD_PER_CARD_MIB))

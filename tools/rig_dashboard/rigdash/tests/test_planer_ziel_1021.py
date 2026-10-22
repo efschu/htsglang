@@ -4,7 +4,7 @@ max seats + max tokens per seat -> the rest computed.
 Gepinnt:
   * the model table (``MODELS``) names release profiles that exist, every model has a fact sheet row, the layouts map to forms ``ProfilEditor.propose`` serves;
   * ``layouts()``: the table of statuses for the rig, 3 x RTX 3090 and a foreign card, for every model; NVFP4 is NOT excluded on sm86 (our own kernels; user rebuke
-    21.10.); a card count outside 2..4 is "not supported yet" for every layout, 2 and 4 carry the named blocker METAL-UNPROVEN; an sm89 card is blocked by the image's arch gate; a calculation line for every impossible
+    21.10.); a card count outside SUPPORTED_N (1 and 8) is "not supported yet" for every layout, 2 and 4 carry the named blocker METAL-UNPROVEN; an sm89 card is blocked by the image's arch gate; a calculation line for every impossible
     layout; the KV ceiling is never multiplied by the seats;
   * ``plan()``: GOLDEN of the rig -- the oracle request is exactly what the old page sent for this machine (``goals`` empty, the cards are the NVML cards of the machine,
     so the proposal runs on the measured hardware); seats/tokens go into the goals only when the user set them; a not-possible layout never asks the oracle;
@@ -94,7 +94,7 @@ class Pins(unittest.TestCase):
     def test_the_layouts_map_to_forms_the_editor_serves(self):
         self.assertEqual({l["form"] for l in Z.LAYOUTS}, {"tp", "flip", "dual"})
         self.assertLessEqual({l["form"] for l in Z.LAYOUTS}, set(P.ProfilEditor.FORMS))
-        self.assertEqual(Z.SUPPORTED_N, (2, 3, 4))        # NCARDS 1021: 12 release profiles + a dry-run golden each
+        self.assertEqual(Z.SUPPORTED_N[:3], (2, 3, 4))    # NCARDS 1021: 12 release profiles + a dry-run golden each (later counts are added behind them)
         self.assertEqual(Z.PROVEN_N, (3,))                # the only count a release boot has proven (topology.PROVEN_CARD_COUNTS)
 
     def test_page_routes_and_markup(self):
@@ -114,7 +114,7 @@ class Katalog(unittest.TestCase):
         k = zp()[0].katalog()
         self.assertEqual([m["name"] for m in k["models"]], ["Qwen3.8-27B INT8", "Qwen3.8-27B NVFP4", "Qwen3.8-Flash-Next INT4"])
         self.assertEqual([m["layouts"] for m in k["models"]], [["solo", "flip"], ["solo", "flip", "dual"], ["solo", "flip"]])
-        self.assertEqual(k["supported_n"], [2, 3, 4])
+        self.assertEqual(k["supported_n"], list(Z.SUPPORTED_N))
         self.assertEqual([c["id"] for c in k["cards"] if c["preset"]], ["rtx5090-32", "rtx3090-24", "rtx3080-20"])
         self.assertIsNone(k["machine"])                                         # no hardware profile: no "this machine" shortcut
 
@@ -149,7 +149,7 @@ class Layouts(unittest.TestCase):
             self.assertNotIn("fp4", " ".join(l["why"]).lower())
 
     def test_card_counts_outside_two_to_four_are_not_supported_and_say_why(self):
-        for n in (1, 5, 6, 8):
+        for n in (1, 8):
             lay = by_id(zp()[0].layouts({"model": "qwen38-27b-nvfp4", "cards": [{"card": "rtx3090-24", "count": n}]}))
             for l in lay.values():
                 self.assertEqual(l["status"], "n_unsupported", (n, l["id"]))
@@ -275,7 +275,7 @@ class Plan(unittest.TestCase):
 
     def test_a_layout_that_is_not_possible_never_asks_the_oracle(self):
         z, ed = zp(None, canned("res_27b_int8_flip_3090.json"))
-        for body in ({"model": "qwen38-27b-int8", "layout": "dual", "cards": X3090}, {"model": "qwen38-27b-nvfp4", "layout": "flip", "cards": [{"card": "rtx3090-24", "count": 5}]},
+        for body in ({"model": "qwen38-27b-int8", "layout": "dual", "cards": X3090}, {"model": "qwen38-27b-nvfp4", "layout": "flip", "cards": [{"card": "rtx3090-24", "count": 8}]},
                      {"model": "qwen38-nf-int4", "layout": "solo", "cards": [{"card": "rtx4070-12", "count": 3}]}):
             out = z.plan(body)
             self.assertIn(out["status"], ("blocked", "n_unsupported"))

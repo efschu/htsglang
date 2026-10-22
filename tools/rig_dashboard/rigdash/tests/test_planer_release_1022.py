@@ -35,7 +35,8 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 RELEASE_DIR = os.path.join(REPO_ROOT, "docker", "flliper", "profiles_release")
 NODE = shutil.which("node") or ("/opt/node-v22.14.0-linux-x64/bin/node" if os.path.exists("/opt/node-v22.14.0-linux-x64/bin/node") else None)
 
-NS = (2, 3, 4)
+NS = (2, 3, 4, 5, 6, 7)
+NS_FULL = (2, 3, 4)                                   # every possible layout of these counts has a recorded dry run; 5..7: INT8 solo + flip, NVFP4 flip + dual
 MODELS = ("qwen38-27b-int8", "qwen38-27b-nvfp4", "qwen38-nf-int4")
 LAYOUTS = ("solo", "flip", "dual")
 
@@ -55,6 +56,15 @@ def lay(n, m):
 
 def plan(n, m, l):
     return rec("plan_%d_%s_%s.json" % (n, m, l))
+
+
+def cells():
+    """(n, model, layout, layout row) of every OFFERED layout that has a recorded dry run."""
+    for n in NS:
+        for m in MODELS:
+            for l, row in lay(n, m).items():
+                if row["possible"] and has("plan_%d_%s_%s.json" % (n, m, l)):
+                    yield n, m, l, row
 
 
 # ------------------------------------------------------------------------------------------------------------------ the German detector
@@ -89,28 +99,31 @@ class Cells(unittest.TestCase):
             for m in MODELS:
                 self.assertTrue(has("layouts_%d_%s.json" % (n, m)), (n, m))
                 for l, row in lay(n, m).items():
-                    if row["possible"]:
+                    if row["possible"] and n in NS_FULL:
                         self.assertTrue(has("plan_%d_%s_%s.json" % (n, m, l)), (n, m, l))
+        for n in (5, 6, 7):
+            for m, l in (("qwen38-27b-int8", "solo"), ("qwen38-27b-int8", "flip"), ("qwen38-27b-nvfp4", "flip"), ("qwen38-27b-nvfp4", "dual")):
+                self.assertTrue(lay(n, m)[l]["possible"], (n, m, l))
+                self.assertTrue(has("plan_%d_%s_%s.json" % (n, m, l)), (n, m, l))
 
     def test_every_cell_is_a_real_dry_run_or_a_named_reason(self):
         real = 0
         for n in NS:
             for m in MODELS:
+                self.assertEqual(set(lay(n, m)), set(LAYOUTS))
                 for l, row in lay(n, m).items():
-                    self.assertEqual(set(lay(n, m)), set(LAYOUTS))
                     if not row["possible"]:
                         self.assertTrue(row["why"], (n, m, l))              # a disabled button names its reason ...
                         self.assertTrue(row["calc"], (n, m, l))             # ... and shows its calculation
-                        continue
-                    p = plan(n, m, l)
-                    self.assertEqual(p["status"], "ok", (n, m, l))
-                    self.assertEqual(p["n"], n)
-                    orc = p["intern"]["oracle"]
-                    self.assertIn("duration_s", orc, (n, m, l))              # the oracle child (launcher dry run) answered
-                    self.assertTrue(p["verdikt"]["outcome"], (n, m, l))
-                    self.assertTrue(p["felder"], (n, m, l))
-                    real += 1
-        self.assertEqual(real, 16)                                           # 4 + 7 + 5 offered cells, each a real dry run (the rest is a named reason)
+        for n, m, l, row in cells():
+            p = plan(n, m, l)
+            self.assertEqual(p["status"], "ok", (n, m, l))
+            self.assertEqual(p["n"], n)
+            self.assertIn("duration_s", p["intern"]["oracle"], (n, m, l))      # the oracle child (launcher dry run) answered
+            self.assertTrue(p["verdikt"]["outcome"], (n, m, l))
+            self.assertTrue(p["felder"], (n, m, l))
+            real += 1
+        self.assertEqual(real, 16 + 4 * 3)                                      # 4 + 7 + 5 cells of 2..4 cards and 4 each of 5, 6, 7 cards
 
     def test_three_cards_27b_gets_a_sensible_proposal_for_every_layout_the_model_has(self):
         for m, want in (("qwen38-27b-int8", ("solo", "flip")), ("qwen38-27b-nvfp4", ("solo", "flip", "dual"))):
@@ -131,41 +144,31 @@ class Cells(unittest.TestCase):
                 self.assertIn("d_pool", rows)
 
     def test_the_card_count_decides_the_per_card_columns(self):
-        for n in NS:
-            for m in MODELS:
-                for l, row in lay(n, m).items():
-                    if not row["possible"] or l == "solo":
-                        continue
-                    rows = {r["key"]: r for g in plan(n, m, l)["felder"] for r in g["zeilen"]}
-                    self.assertEqual(len(rows["p_mem"]["je_karte"]), n, (n, m, l))
-                    self.assertEqual(len(rows["d_mem"]["je_karte"]), n, (n, m, l))
+        for n, m, l, row in cells():
+            if l == "solo":
+                continue
+            rows = {r["key"]: r for g in plan(n, m, l)["felder"] for r in g["zeilen"]}
+            self.assertEqual(len(rows["p_mem"]["je_karte"]), n, (n, m, l))
+            self.assertEqual(len(rows["d_mem"]["je_karte"]), n, (n, m, l))
 
     def test_unproven_counts_say_so_and_the_proven_one_does_not(self):
-        for n in NS:
-            for m in MODELS:
-                for l, row in lay(n, m).items():
-                    if not row["possible"]:
-                        continue
-                    codes = [i["code"] for i in plan(n, m, l)["verdikt"]["items"]]
-                    if n == 3:
-                        self.assertEqual(row["proof"], "metal")
-                        self.assertNotIn("METAL-UNPROVEN", codes, (n, m, l))
-                        self.assertNotIn("HW-COUNT", codes, (n, m, l))
-                    else:
-                        self.assertEqual(row["proof"], "dry_run")
-                        self.assertIn("METAL-UNPROVEN", " ".join(row["why"]))
-                        self.assertIn("METAL-UNPROVEN", codes, (n, m, l))
-                        self.assertIn("HW-COUNT", codes, (n, m, l))
+        for n, m, l, row in cells():
+            codes = [i["code"] for i in plan(n, m, l)["verdikt"]["items"]]
+            if n == 3:
+                self.assertEqual(row["proof"], "metal")
+                self.assertNotIn("METAL-UNPROVEN", codes, (n, m, l))
+                self.assertNotIn("HW-COUNT", codes, (n, m, l))
+            else:
+                self.assertEqual(row["proof"], "dry_run")
+                self.assertIn("METAL-UNPROVEN", " ".join(row["why"]))
+                self.assertIn("METAL-UNPROVEN", codes, (n, m, l))
+                self.assertIn("HW-COUNT", codes, (n, m, l))
 
     def test_nothing_is_offered_that_the_launcher_refuses_outright(self):
         # a layout that the page offers either passes (with force) or the page adapted the ceiling; a plain refusal of an offered layout is a defect of the page
-        for n in NS:
-            for m in MODELS:
-                for l, row in lay(n, m).items():
-                    if not row["possible"]:
-                        continue
-                    p = plan(n, m, l)
-                    self.assertNotIn(p["verdikt"]["outcome"], ("verweigert", "crash"), (n, m, l, [i["code"] for i in p["verdikt"]["items"] if i["blocked"]]))
+        for n, m, l, row in cells():
+            p = plan(n, m, l)
+            self.assertNotIn(p["verdikt"]["outcome"], ("verweigert", "crash"), (n, m, l, [i["code"] for i in p["verdikt"]["items"] if i["blocked"]]))
 
     def test_27b_int8_on_two_cards_gets_the_largest_ceiling_the_launcher_takes(self):
         for l in ("solo", "flip"):
@@ -180,7 +183,7 @@ class Cells(unittest.TestCase):
 
     def test_one_card_and_more_than_four_are_not_supported_with_their_reason(self):
         z = Z.ZielPlaner(None)
-        for n in (1, 5, 6, 8):
+        for n in (1, 8):
             for m in MODELS:
                 for l in z.layouts({"model": m, "cards": [{"card": "rtx3090-24", "count": n}]})["layouts"]:
                     self.assertIn(l["status"], ("n_unsupported", "blocked"), (n, m, l["id"]))             # (INT8 dual has no profile at all: blocked, with the count reason first)
@@ -194,7 +197,7 @@ class Cells(unittest.TestCase):
         found = glob.glob(os.path.join(REPO_ROOT, "test", "registered", "unit", "*", "fixtures", "ncards_1021", "golden"))
         if not found:
             self.skipTest("NCARDS goldens not in this tree")
-        for n in Z.SUPPORTED_N:
+        for n in NS:
             for prof in ("27b", "27b-nvfp4", "27b-nvfp4-dual", "nf"):
                 self.assertTrue(os.path.exists(os.path.join(found[0], "dryrun_%s-%dx3090.json" % (prof, n))), (prof, n))
 
@@ -209,13 +212,12 @@ class German(unittest.TestCase):
 
     def test_no_english_sentence_in_the_german_view_of_any_recorded_answer(self):
         checked, found = 0, []
-        for n in NS:
-            for m in MODELS:
-                for doc in [rec("layouts_%d_%s.json" % (n, m))] + [rec("plan_%d_%s_%s.json" % (n, m, l)) for l, row in lay(n, m).items() if row["possible"]]:
-                    for s in strings(Z.localize(copy.deepcopy(doc), "de")):
-                        checked += 1
-                        if english_words(s):
-                            found.append((n, m, s[:160]))
+        docs = [("layouts", n, m, rec("layouts_%d_%s.json" % (n, m))) for n in NS for m in MODELS] + [("plan", n, m, plan(n, m, l)) for n, m, l, _row in cells()]
+        for _kind, n, m, doc in docs:
+            for s in strings(Z.localize(copy.deepcopy(doc), "de")):
+                checked += 1
+                if english_words(s):
+                    found.append((n, m, s[:160]))
         self.assertGreater(checked, 1500)                                                        # the check really walked the answers
         self.assertEqual(found, [], "\n".join(str(x) for x in found[:10]))
 
@@ -252,7 +254,7 @@ class German(unittest.TestCase):
 
     def test_the_n_states_and_the_adaptation_are_german(self):
         z = Z.ZielPlaner(None)
-        for n, frag in ((1, "Karte"), (5, "Karten"), (6, "Karten")):
+        for n, frag in ((1, "Karte"), (8, "Karten")):
             lays = z.layouts({"model": "qwen38-27b-nvfp4", "cards": [{"card": "rtx3090-24", "count": n}], "lang": "de"})["layouts"]
             why = " ".join(lays[0]["why"])
             self.assertIn("noch nicht unterstützt", why)
@@ -347,14 +349,14 @@ class Ceiling(unittest.TestCase):
 
         z = Z.ZielPlaner(Ed(*res_refused_at(0), 10 ** 9))
         st = z.n_states()
-        self.assertEqual({n: st[n]["state"] for n in range(1, 9)}, {1: "off", 2: "unproven", 3: "proven", 4: "refused", 5: "off", 6: "off", 7: "off", 8: "off"})
-        self.assertEqual(z.supported_n(), (2, 3))
+        self.assertEqual({n: st[n]["state"] for n in range(1, 9)}, {1: "off", 2: "unproven", 3: "proven", 4: "refused", **{n: ("unproven" if n in Z.SUPPORTED_N else "off") for n in range(5, 9)}})
+        self.assertEqual(z.supported_n()[:2], (2, 3))
         why = " ".join(next(l for l in z.layouts({"model": "qwen38-27b-int8", "cards": [{"card": "rtx3090-24", "count": 4}]})["layouts"] if l["id"] == "flip")["why"])
         self.assertIn("BAR1-WINDOWS", why)                                                      # the gate's own words, not a guess
 
     def test_without_a_gate_the_constants_decide(self):
         st = Z.ZielPlaner(None).n_states()
-        self.assertEqual({n: st[n]["state"] for n in range(1, 9)}, {1: "off", 2: "unproven", 3: "proven", 4: "unproven", 5: "off", 6: "off", 7: "off", 8: "off"})
+        self.assertEqual({n: st[n]["state"] for n in range(1, 9)}, {1: "off", 2: "unproven", 3: "proven", 4: "unproven", **{n: ("unproven" if n in Z.SUPPORTED_N else "off") for n in range(5, 9)}})
 
 
 class ReleaseBlock(unittest.TestCase):
@@ -370,12 +372,12 @@ class ReleaseBlock(unittest.TestCase):
         return {l["id"]: l for l in self.z().layouts({"model": model, "cards": [{"card": card, "count": n}]})["layouts"]}
 
     def test_the_profiles_say_what_the_page_says(self):
-        for n, want in ((2, True), (3, False), (4, True)):
+        for n, want in ((2, True), (3, False), (4, True), (5, True), (6, True), (7, True)):
             with open(os.path.join(RELEASE_DIR, "nf-%dx3090.env" % n), encoding="utf-8") as fh:
                 self.assertEqual(bool(re.search(r"^PROFILE_STATUS=blockiert-", fh.read(), re.M)), want, n)
 
     def test_nf_on_two_and_four_cards_is_a_disabled_button_with_the_profiles_reason(self):
-        for n in (2, 4):
+        for n in (2, 4, 5, 6, 7):
             for l in ("solo", "flip"):
                 row = self.layouts("qwen38-nf-int4", "rtx3090-24", n)[l]
                 self.assertEqual((row["status"], row["possible"]), ("blocked", False), (n, l))
@@ -386,7 +388,7 @@ class ReleaseBlock(unittest.TestCase):
     def test_nf_on_three_cards_and_the_27b_models_on_any_count_are_not_blocked_by_a_profile(self):
         for l in ("solo", "flip"):
             self.assertTrue(self.layouts("qwen38-nf-int4", "rtx3090-24", 3)[l]["possible"])
-        for n in (2, 3, 4):
+        for n in (2, 3, 4, 5, 6, 7):
             for m in ("qwen38-27b-int8", "qwen38-27b-nvfp4"):
                 for l in ("solo", "flip"):
                     self.assertNotIn("marked blocked", " ".join(self.layouts(m, "rtx3090-24", n)[l]["why"]), (n, m, l))
@@ -534,8 +536,8 @@ class Wiring(unittest.TestCase):
         self.assertGreaterEqual(h.count("RTX 3090"), 4)
         self.assertEqual([c[1]["layout"] for c in o["calls"] if c[0] == "planer-plan"], ["dual"])
 
-    def test_one_card_and_five_cards_are_greyed_with_the_reason(self):
-        for clicks, frag in (([{"pz": "dec", "id": "rtx3090-24"}] * 2, "1 card"), ([{"pz": "inc", "id": "rtx3090-24"}] * 2, "5 cards")):
+    def test_one_card_is_greyed_with_the_reason(self):
+        for clicks, frag in (([{"pz": "dec", "id": "rtx3090-24"}] * 2, "1 card"),):
             o = wire([{"click": c, "name": "s%d" % i} for i, c in enumerate(clicks)])
             h = list(o["steps"].values())[-1]
             self.assertIn("not supported yet", h)

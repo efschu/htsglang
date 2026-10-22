@@ -17,12 +17,12 @@
    "id": "solo",
    "margin_mib": 67423,
    "name": "Solo (TP only)",
-   "possible": false,
+   "possible": true,
    "proof": "dry_run",
    "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
-   "status": "n_unsupported",
+   "status": "ok",
    "why": [
-    "5 cards: the planner is checked for 2 to 4 cards (a launcher dry run per card count); more cards are not calculated here yet (not supported yet)."
+    "5 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
    ]
   },
   {
@@ -37,12 +37,12 @@
    "id": "flip",
    "margin_mib": 67423,
    "name": "Flip",
-   "possible": false,
+   "possible": true,
    "proof": "dry_run",
    "satz": "The same cards work alternately as prefill group P (pipeline) and decode group D (tensor-parallel); the weights are exchanged through the host.",
-   "status": "n_unsupported",
+   "status": "ok",
    "why": [
-    "5 cards: the planner is checked for 2 to 4 cards (a launcher dry run per card count); more cards are not calculated here yet (not supported yet)."
+    "5 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
    ]
   },
   {
@@ -57,12 +57,12 @@
    "id": "dual",
    "margin_mib": 49516,
    "name": "Dual",
-   "possible": false,
+   "possible": true,
    "proof": "dry_run",
    "satz": "P and D are awake at the same time on the same cards; no switching, but both layouts hold weights at once.",
-   "status": "n_unsupported",
+   "status": "ok",
    "why": [
-    "5 cards: the planner is checked for 2 to 4 cards (a launcher dry run per card count); more cards are not calculated here yet (not supported yet)."
+    "5 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
    ]
   }
  ],
