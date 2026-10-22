@@ -67,25 +67,28 @@ def _vote(cuda):
             ET.reset_for_tests()
 
 
-class WidthVoteCountsTheTorchCache(unittest.TestCase):
-    def test_metal_tp1_with_1_6_gib_idle_cache_votes_a_wide_chunk_inside_the_law(self):
-        # driver 19.8 + cache 1607 MiB fund floor((1626.8 - 700) / 0.3091) = 2998 rows: far above the Q-710 floor chunk
-        # (256), so no refusal -- and the chunk's growth leaves the 700 MiB corridor law free (before: width 63, refused)
+class WidthVoteFundsTheDriverOnly(unittest.TestCase):
+    """22.10. (test_27b_extend_transient_1022): the rc29 cache count was a double count -- the rate is the measured
+    reserved growth per row, i.e. already net of whatever the cache serves; the night's metal (23:43:54Z: driver 882 +
+    cache 860 funded 2263 rows, driver fell to 372) showed the cache funded nothing. The rc29 state therefore votes what
+    its DRIVER funds again; its hang stays closed by the R7 crawl (the floor never refuses under the central decider)."""
+
+    def test_metal_tp1_rc29_state_votes_what_the_driver_funds(self):
+        # driver 19.8 MiB: the line-respecting cap is one page; the Q-710 floor raises it to min(256, floor(19.8 /
+        # 0.3091)) = 64 -- and under the decider (SOLL R7) that width is crawled, not refused (no hang)
         w = _vote(_Cuda())
-        self.assertEqual(w, 2998)
-        self.assertGreater(w, ET.floor_rows(CONFIGURED, 1))
-        self.assertGreaterEqual(19.8 + 1607 - w * RATE, 700 - 1)
+        self.assertEqual(w, 64)
+        self.assertTrue(ET.cap_floor_crawls_under_soll_r7())
 
     def test_without_idle_cache_the_card_still_narrows(self):
-        # the danger direction stays: a card with nothing idle in the cache still votes narrow (Q-710 floor)
         w = _vote(_Cuda(free=19.8, reserved=18650, allocated=18650))
         self.assertIsNotNone(w)
         self.assertLess(w, ET.floor_rows(CONFIGURED, 1) + 1)
 
-    def test_partial_cache_funds_only_what_it_holds(self):
-        # 1000 MiB idle: floor((1019.8 - 700) / 0.3091) = 1034 rows -- the vote never funds more than the bytes that exist
-        w = _vote(_Cuda(free=19.8, reserved=18650, allocated=17650))
-        self.assertEqual(w, 1034)
+    def test_idle_cache_funds_nothing(self):
+        # 0 / 1000 / 1607 MiB idle: the same vote -- the cache is not driver free
+        votes = {_vote(_Cuda(free=19.8, reserved=18650, allocated=a)) for a in (18650, 17650, 17043)}
+        self.assertEqual(votes, {64})
 
 
 class WidthVoteKeepsTheCorridorLaw(unittest.TestCase):
@@ -94,8 +97,12 @@ class WidthVoteKeepsTheCorridorLaw(unittest.TestCase):
     keeps the LAW in force (FLLIPER_CORRIDOR_LAW_FLOOR_MIB / corridor_guard.corridor_law_mib)."""
 
     def test_the_metal_after_chunk_state_narrows_to_what_keeps_the_law(self):
-        # TP1 after a chunk (rc29b VRAM-PEAK minimum): driver + cache = 1406 MiB -> floor((1406 - 700) / 0.3091) = 2284
+        # TP1 after a chunk (rc29b VRAM-PEAK minimum): driver 600 MiB is under the 700 law -> one page, the Q-710 floor
+        # chunk (256) is what runs (22.10.: the 806 MiB cache is no longer counted)
         w = _vote(_Cuda(free=600, reserved=18286, allocated=17480))
+        self.assertEqual(w, ET.floor_rows(CONFIGURED, 1))
+        # a driver that funds: floor((1406 - 700) / 0.3091) = 2284 rows keep the law
+        w = _vote(_Cuda(free=1406, reserved=18286, allocated=18286))
         self.assertEqual(w, 2284)
         self.assertGreaterEqual(1406 - w * RATE, 700 - 1)
 

@@ -357,16 +357,23 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 post_mib = cuda.mem_get_info()[0] / MIB
                 cap_post = torch_cap - int(cuda.memory_reserved()) / MIB
             post_mib = min(post_mib, cap_post)
-        # 27B INT8 rc29 metal 21.10. 00:26Z (D TP1 3080: driver free 19.8 MiB, torch allocated 17043 / reserved 18650 MiB):
-        # the chunk's growth is served from torch's OWN free cache first -- reserved-but-unallocated bytes are as fundable
-        # as driver-free ones (the rate is the measured RESERVED growth per row, i.e. what a chunk adds beyond the cache).
-        # Read only, no sync: counting driver free alone voted width 63 with 1.6 GiB idle in the cache, refused every
-        # fresh D extend (Q-710) and -- with no flip under X (SOLL R7) -- hung the server.
+        # 27B INT8 night 22.10. (rounds 1+2, D TP1 3080, driver-free minimum 359.8 / 371.8 MiB under a 1024 MiB line): the
+        # chunk is funded by the DRIVER's free bytes alone. The rate is the measured RESERVED growth per row
+        # (EXTEND-RATE: reserved_after - reserved_at_start, read AFTER the trim), and for this process a reserved growth
+        # IS a driver-free loss -- whatever torch's own cache could serve is already netted out of that rate. Adding the
+        # cache on top (rc29 121e4bf3f2) counted it twice: at 23:43:54Z the vote read driver 882 + cache 860 = 1724 MiB,
+        # funded 2263 rows, and the 2162-row extend grew reserved by 534 MiB (driver 882 -> 372) while its live
+        # transient was 282 MiB -- not one MiB came out of the 860 MiB cache. That cache is the trim's remainder: free
+        # blocks inside segments that still hold live blocks (alloc_cache bound 853.7 MiB across every trim), which
+        # empty_cache cannot return and the extend's activations do not fit. All 80 TP1 extends >= 1024 rows of both
+        # rounds: driver drop <= 0.3091 x rows (max 0.253 MiB/row) with 807-1175 MiB of cache present, so the rate holds
+        # and the cache funded nothing. The cache is read for the line only (no sync).
+        # The rc29 hang (driver 19.8 MiB, vote 63, Q-710 refused) stays closed by its own fix: under the central decider
+        # (SOLL R7) the floor never refuses, D prefills at the narrowed width (cap_floor_crawls_under_soll_r7).
         try:
             cache_free_mib = max(0.0, (float(cuda.memory_reserved()) - float(cuda.memory_allocated())) / MIB)
-        except Exception:  # noqa: BLE001 -- no reading: driver free alone, as before
+        except Exception:  # noqa: BLE001 -- the line only
             cache_free_mib = 0.0
-        post_mib = post_mib + cache_free_mib
         line_mib = corridor_line_mib()
         cap = rows_cap(post_mib, rate, page_size, line_mib)
         if cap >= int(configured):
@@ -377,7 +384,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
             _CACHE["logged_cap"] = cap
             logger.info(
                 f"{CHUNKING_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
-                f"post={post_mib:.0f} cache_free={cache_free_mib:.0f} rate={rate:.4f} floor={line_mib:.0f}"
+                f"post={post_mib:.0f} cache_free={cache_free_mib:.0f} funds=driver rate={rate:.4f} floor={line_mib:.0f}"
                 + ("" if cap_post is None else f" torch_cap={torch_cap:.0f} cap_post={cap_post:.0f}")
                 + ("" if not measure_armed(rank) else
                    f" rate_src={'measured' if rate > start_rate else 'start'} start_rate={start_rate:.4f}")

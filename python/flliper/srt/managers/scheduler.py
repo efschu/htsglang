@@ -15722,7 +15722,7 @@ class Scheduler(
                 # the central decider P takes no flip for it, so the refusal had no exit: 27B INT8 rc29 00:26:49Z
                 # deadlock (width 63, u = 234..797 refused W31 -> W50-REROUTE to a sleeping P, 6 D seats parked, no
                 # flip by R7). D takes it and prefills at the group's narrowed width (named once per rid); the
-                # width vote itself (#794, corridor law, torch cache counted) still bounds every chunk.
+                # width vote itself (#794, corridor law, driver free -- 22.10.) still bounds every chunk.
                 if rid not in marks:
                     self.__dict__["_pdflip_ecf_crawl_n"] = int(self.__dict__.get("_pdflip_ecf_crawl_n", 0)) + 1
                     logger.warning(
