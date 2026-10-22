@@ -307,12 +307,12 @@
   "basis": "nf-int4",
   "form": "flip",
   "oracle": {
-   "cache_key": "fd45b14c5d32872b",
+   "cache_key": "fdea52180cc92180",
    "cached": false,
-   "duration_s": 62.84,
+   "duration_s": 27.94,
    "version": {
     "hw_fit": "4896e1cfe0b97ae5",
-    "launcher": "8728bbefd7d3403f",
+    "launcher": "f6ddb4401bd57acf",
     "propose_oracle": "8af4b0b24e9bb2c9",
     "refusals": "4d580c430d114481",
     "topology": "41e859db94f603d8"

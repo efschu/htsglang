@@ -63,14 +63,18 @@ def _check(self, profile, n):
     self.assertEqual(_mask(doc), _mask(json.loads(gp.read_text(encoding="utf-8"))))
     # the properties that matter, beside the golden: it runs, forced past named codes only, N stages
     self.assertIsNone(doc["exc_type"], doc)
-    self.assertEqual(set(doc["forced"]) - {"HW-UNCALIBRATED", "HW-BORROWED", "HW-COUNT", "D-BUDGET"}, set(), doc["forced"])
+    self.assertEqual(set(doc["forced"]) - {"HW-UNCALIBRATED", "HW-BORROWED", "HW-COUNT"}, set(), doc["forced"])
     self.assertEqual("HW-COUNT" in doc["forced"], n != 3, doc["forced"])      # N = 3 is the proven count: no HW-COUNT
-    # review 1021 A1: the launcher's D residency check (W122/W130) passes the planner's NF distribution on 2, 3 and 4 identical 3090s and it RUNS on every N
+    # review 1021 A1: the launcher's D residency check (W122/W130) passes the planner's NF distribution on every N and it RUNS on every N
     # (N != 3: the 3-rank reference taken to N ranks by rank role, named "BORROWED BY RANK ROLE")
-    # the launcher's own ownership / KV token-cut solve (D-EIGENTUM, #239 S3f) finds a bearable form on N = 3 and none on N = 2 / 4 (forced past as D-BUDGET): those two
-    # profiles carry PROFILE_STATUS=blockiert-d-budget (named, not hidden); the fix of that turns this assertion red
-    self.assertEqual("D-BUDGET" in doc["forced"], profile.startswith("nf-") and n != 3, doc["forced"])
+    # nfblock 1022: the launcher's own ownership / KV token-cut solve (D-EIGENTUM, #239 S3f) decides on EVERY N -- a cut form (N = 2, 3) or Form A kept (N = 4..7:
+    # every worker expert resident in Form A, no cut keeps x1) -- and nothing is forced past as D-BUDGET any more (was: N = 2, 4, 5, 6, 7)
+    self.assertNotIn("D-BUDGET", doc["forced"])
+    # a refusal the real boot would raise is printed by the dry run as "(dry run: would refuse)" without a forced code (NF 2 / 4 x 3090 carried the S3h flip riegel
+    # that way before nfblock 1022): none on any profile
+    self.assertNotIn("would_refuse", doc, doc.get("would_refuse"))
     if profile.startswith("nf-"):
+        self.assertEqual(doc.get("d_owner"), "cut" if n <= 3 else "form_a", doc.get("d_owner"))
         chk = doc.get("d_check")
         self.assertIsNotNone(chk, "the D FRACTION-SOLVE did not run: " + profile)
         self.assertFalse(chk["entfaellt"], chk)

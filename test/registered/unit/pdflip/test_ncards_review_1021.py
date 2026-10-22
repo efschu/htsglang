@@ -117,8 +117,8 @@ class NfDResidencyOnNIdenticalCards(unittest.TestCase):
     def _fits(self, n):
         (rests, trimmed), text = _d_rests(n, edge=True)
         # the W122 balance (what the review recomputed) fits on every N; whether the PROFILE is bootable is decided by the launcher's D-EIGENTUM solve as well
-        # (dry-run golden, test_ncards_dryruns_1021): bootable on N = 3, blockiert-d-budget on N = 2 / 4 (the status is named, never hidden)
-        self.assertIn("PROFILE_STATUS=" + ("hochrechnung" if n == 3 else "blockiert-d-budget"), text)
+        # (dry-run golden, test_ncards_dryruns_1021): since nfblock 1022 bootable on every N (a cut form on 2 / 3, Form A kept on 4)
+        self.assertIn("PROFILE_STATUS=hochrechnung", text)
         self.assertTrue(all(r >= 0 for r in rests), (rests, trimmed))
         self.assertLessEqual(max(trimmed), HOST_EDGE_ROWS, (rests, trimmed))   # the planner is within one row of the launcher on every rank
 

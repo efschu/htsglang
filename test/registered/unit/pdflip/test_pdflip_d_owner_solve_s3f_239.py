@@ -256,10 +256,11 @@ def test_seat_table_is_unchanged_without_an_owned_solve():
                   dict(kv_token_shares=(0.0, 48.0, 16.0), kv_dtype_bytes=1)):
         kw, fr = L.d_seat_table_form(_owned_plan(), kw_in, stated)
         assert kw == kw_in and fr == stated
-    # owned asked, but the solve found nothing: no rewrite (the refusal stands)
+    # owned asked, but no cut form carries: the plan decided Form A (nfblock 1022) -- the table prices Form A at every seat count (no cut,
+    # no second ownership search per seat count; the KV stage form is Form A's own, on the host)
     failed = types.SimpleNamespace(solved_owner_ratio=(), kv_token_cut=(), solved_fractions=())
-    kw, fr = L.d_seat_table_form(failed, dict(kv_token_shares="owned"), stated)
-    assert kw == dict(kv_token_shares="owned") and fr == stated
+    kw, fr = L.d_seat_table_form(failed, dict(kv_token_shares="owned", kv_dtype_bytes=1), stated)
+    assert kw == {} and fr == stated
 
 
 def test_the_launcher_feeds_the_seat_table_the_solved_form():

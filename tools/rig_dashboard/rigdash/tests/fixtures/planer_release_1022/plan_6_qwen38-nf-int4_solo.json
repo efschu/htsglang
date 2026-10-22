@@ -1,0 +1,378 @@
+{
+ "defaults": {
+  "seats": 6,
+  "tokens": 262144
+ },
+ "felder": [
+  {
+   "id": "seats",
+   "titel": "Your inputs",
+   "zeilen": [
+    {
+     "einheit": "",
+     "gruppe": "seats",
+     "je_karte": null,
+     "key": "seats",
+     "label": "Max concurrent seats (decode group)",
+     "quelle": "your input / planner default",
+     "roh": "goals.seats",
+     "schaetzung": false,
+     "warum": "--max-running-requests of D and --d-bs of the front",
+     "wert": "6"
+    },
+    {
+     "einheit": "",
+     "gruppe": "seats",
+     "je_karte": null,
+     "key": "tokens",
+     "label": "Max tokens per seat (ceiling for ONE request)",
+     "quelle": "your input / planner default",
+     "roh": "--max-kv-per-request",
+     "schaetzung": false,
+     "warum": "--max-kv-per-request: a ceiling per request; the KV pool is shared by all seats, so this is not multiplied by the seats",
+     "wert": "262144"
+    }
+   ]
+  },
+  {
+   "id": "weights",
+   "titel": "Weight split and memory per card",
+   "zeilen": [
+    {
+     "einheit": "",
+     "gruppe": "weights",
+     "je_karte": [
+      "1",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0"
+     ],
+     "key": "d_split",
+     "label": "Decode split: share of the dense weights per card (group D)",
+     "quelle": "launcher dry run",
+     "roh": "--rank-tp-ratio",
+     "schaetzung": false,
+     "warum": "--rank-tp-ratio: the ratio of the dense (non-expert) weights each card holds; 1,0,0 = rank 0 (host role) holds them all, the experts are spread by the MoE ratio",
+     "wert": null
+    },
+    {
+     "einheit": "MiB",
+     "gruppe": "weights",
+     "je_karte": [
+      "19208",
+      "21384",
+      "21384",
+      "21384",
+      "21384",
+      "21576"
+     ],
+     "key": "d_mem",
+     "label": "Memory budget per card, decode group",
+     "quelle": "launcher dry run",
+     "roh": "--rank-gpu-memory-mib (D)",
+     "schaetzung": false,
+     "warum": "--rank-gpu-memory-mib of group D (weights shard + KV pool + state of the tensor-parallel group)",
+     "wert": null
+    }
+   ]
+  },
+  {
+   "id": "kv",
+   "titel": "KV pool",
+   "zeilen": [
+    {
+     "einheit": "tokens",
+     "gruppe": "kv",
+     "je_karte": null,
+     "key": "d_pool",
+     "label": "KV pool, decode group (shared by all seats)",
+     "quelle": "launcher dry run (--max-total-tokens)",
+     "roh": "--max-total-tokens",
+     "schaetzung": false,
+     "warum": "--max-total-tokens of the launcher run: the pool is shared by all seats",
+     "wert": "262144"
+    }
+   ]
+  },
+  {
+   "id": "experts",
+   "titel": "Experts",
+   "zeilen": [
+    {
+     "einheit": "",
+     "gruppe": "experts",
+     "je_karte": null,
+     "key": "expert_total",
+     "label": "Experts of the model (in the host)",
+     "quelle": "model fact sheet",
+     "roh": "",
+     "schaetzung": false,
+     "warum": "the expert weights (58.0 GiB) stay in host memory; VRAM holds the non-expert layers and a row cache",
+     "wert": "512 per layer x 48 layers, top-10"
+    },
+    {
+     "einheit": "",
+     "gruppe": "experts",
+     "je_karte": [
+      "23",
+      "97",
+      "98",
+      "98",
+      "98",
+      "98"
+     ],
+     "key": "--rank-moe-ratio",
+     "label": "Expert share per card (MoE ratio, group D)",
+     "quelle": "planner / launcher",
+     "roh": "--rank-moe-ratio",
+     "schaetzung": false,
+     "warum": "",
+     "wert": null
+    },
+    {
+     "einheit": "",
+     "gruppe": "experts",
+     "je_karte": [
+      "32",
+      "32",
+      "32",
+      "32",
+      "32",
+      "32"
+     ],
+     "key": "--pp-cut-expert-lru-rows",
+     "label": "Expert rows resident per card (device cache)",
+     "quelle": "planner / launcher",
+     "roh": "--pp-cut-expert-lru-rows",
+     "schaetzung": false,
+     "warum": "LRU rows per stage are a pool size, not a card measurement; unverified for these cards",
+     "wert": null
+    },
+    {
+     "einheit": "",
+     "gruppe": "experts",
+     "je_karte": [
+      "0.916",
+      "0.979",
+      "0.979",
+      "0.979",
+      "0.979",
+      "0.979"
+     ],
+     "key": "--rank-moe-resident-fraction",
+     "label": "Resident expert fraction per card",
+     "quelle": "planner / launcher",
+     "roh": "--rank-moe-resident-fraction",
+     "schaetzung": false,
+     "warum": "",
+     "wert": null
+    },
+    {
+     "einheit": "",
+     "gruppe": "experts",
+     "je_karte": [
+      "0.996",
+      "0.996",
+      "0.996",
+      "0.996",
+      "0.996",
+      "0.996"
+     ],
+     "key": "--pp-cut-expert-device-fraction",
+     "label": "Expert share on the device per card",
+     "quelle": "planner / launcher",
+     "roh": "--pp-cut-expert-device-fraction",
+     "schaetzung": false,
+     "warum": "The rest of the stage after weights, LRU rows, KV (262144 tokens) and Mamba slots buys resident experts (hw_fit terms); unverified on the hardware (planner calculation)",
+     "wert": null
+    }
+   ]
+  },
+  {
+   "id": "host",
+   "titel": "Host memory",
+   "zeilen": [
+    {
+     "einheit": "MiB",
+     "gruppe": "host",
+     "je_karte": null,
+     "key": "mamba_host",
+     "label": "Mamba (recurrent state) host memory",
+     "quelle": "launcher dry run",
+     "roh": "--hicache-mamba-host-mib",
+     "schaetzung": false,
+     "warum": "--hicache-mamba-host-mib: where the recurrent state of parked/evicted seats lives in the host",
+     "wert": "900"
+    },
+    {
+     "einheit": "",
+     "gruppe": "host",
+     "je_karte": null,
+     "key": "host_cache",
+     "label": "Host KV cache (L2) per group",
+     "quelle": "launcher dry run",
+     "roh": "--hicache-size",
+     "schaetzung": false,
+     "warum": "--hicache-size of the groups: the host tier that catches the KV of parked seats",
+     "wert": "D 4 GiB"
+    }
+   ]
+  },
+  {
+   "id": "chunk",
+   "titel": "Chunk and X",
+   "zeilen": [
+    {
+     "einheit": "tokens",
+     "gruppe": "chunk",
+     "je_karte": null,
+     "key": "chunk_d",
+     "label": "Prefill chunk (group D)",
+     "quelle": "launcher dry run",
+     "roh": "--chunked-prefill-size (D)",
+     "schaetzung": false,
+     "warum": "--chunked-prefill-size of D",
+     "wert": "4096"
+    }
+   ]
+  }
+ ],
+ "goals": {
+  "kv_dtype": "fp8_e4m3",
+  "kv_tokens": 262144,
+  "p_cut": "auto",
+  "seats": 6
+ },
+ "hinweise": [
+  "Synthetic cards from the catalog (datasheet, synthetic UUID): what the launcher binds to card UUIDs (census) does not know them."
+ ],
+ "hw": {
+  "label": "estimated",
+  "quelle": "geschaetzt",
+  "text": "No measured hardware profile for these cards yet: memory sizes and bandwidth are catalog (datasheet) values, rates are borrowed from the nearest measured card. Every figure below is an estimate; the first boot on this hardware is the measurement."
+ },
+ "intern": {
+  "basis": "nf-int4",
+  "form": "tp",
+  "oracle": {
+   "cache_key": "eeb221c77c1d4832",
+   "cached": false,
+   "duration_s": 36.88,
+   "version": {
+    "hw_fit": "4896e1cfe0b97ae5",
+    "launcher": "f6ddb4401bd57acf",
+    "propose_oracle": "8af4b0b24e9bb2c9",
+    "refusals": "4d580c430d114481",
+    "topology": "41e859db94f603d8"
+   }
+  },
+  "startprofil": {
+   "doc": null,
+   "name": "nf-int4-proposal"
+  }
+ },
+ "karten": [
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  },
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  },
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  },
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  },
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  },
+  {
+   "mib": 24576,
+   "name": "RTX 3090",
+   "rate": "datasheet/unverified (FP16 peak)"
+  }
+ ],
+ "layout": {
+  "id": "solo",
+  "name": "Solo (TP only)"
+ },
+ "layout_info": {
+  "calc": [
+   "cards: 6 cards = 144.0 GiB of VRAM in total (RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB + RTX 3090 24 GB 24.0 GiB)",
+   "weights: non-expert layers 2955 + lm_head 616 + draft 4973 MiB (the 512 experts of every MoE layer stay in the host) = 8.3 GiB",
+   "KV: ONE request at the ceiling must fit the shared pool: 262144 tokens x 13056 B (fp8, 12 attention layers) = 3.2 GiB (never seats x tokens)",
+   "state: 6 seats x 56.1 MiB recurrent state (36 linear layers) = 0.3 GiB",
+   "per card outside the pool: 6 x 4784 MiB (graphs, activations, reserves; derived from the dry run) = 28.0 GiB",
+   "needed 39.9 GiB against 144.0 GiB available: margin 104.1 GiB"
+  ],
+  "id": "solo",
+  "margin_mib": 106607,
+  "name": "Solo (TP only)",
+  "possible": true,
+  "proof": "dry_run",
+  "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
+  "status": "ok",
+  "why": [
+   "6 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
+  ]
+ },
+ "model": {
+  "id": "qwen38-nf-int4",
+  "name": "Qwen3.8-Flash-Next INT4"
+ },
+ "n": 6,
+ "ok": true,
+ "schema": "flliper.planer-ziel/1",
+ "status": "ok",
+ "verdikt": {
+  "fit": {
+   "level": "ja",
+   "margin_mib": 5320.646399999998
+  },
+  "items": [
+   {
+    "blocked": false,
+    "code": "HW-COUNT",
+    "count": 1,
+    "force": true,
+    "text": "HW-COUNT: 6 cards would be P = TP1 x PP6, D = TP6 x PP1 (host ordinal 0); not yet runnable, 2 blocker(s): [RECORDS-NVEC] 11 measured records are 3-vectors of one inventory that cannot be derived for this one (D_ACTIVATION_MIB, D_AWAKE_REST_MIB, D_EXTEND_GROWTH_MIB, D_EXTEND_GROWTH_PER_ROW_MIB, ...)…"
+   },
+   {
+    "blocked": false,
+    "code": "RECORDS-NVEC",
+    "count": 1,
+    "force": true,
+    "text": "11 measured records are 3-vectors of one inventory that cannot be derived for this one (D_ACTIVATION_MIB, D_AWAKE_REST_MIB, D_EXTEND_GROWTH_MIB, D_EXTEND_GROWTH_PER_ROW_MIB, ...); 6 cards of this inventory need a calibration boot that writes their records (plan K1/P3a)"
+   },
+   {
+    "blocked": false,
+    "code": "METAL-UNPROVEN",
+    "count": 1,
+    "force": true,
+    "text": "no release boot on 6 cards yet (proven: [3])"
+   },
+   {
+    "blocked": false,
+    "code": "HW-UNCALIBRATED",
+    "count": 11,
+    "force": true,
+    "text": "HW-UNCALIBRATED: profile 'nextflash' (profile_records_data/nextflash.json inventory) was measured on the inventory [RTX5090, RTX3080, RTX3080] (card order), this rig is [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576M…"
+   }
+  ],
+  "outcome": "ok_with_force",
+  "text": "The launcher's dry run passes only with force: it does not trust numbers that were not measured on these cards (see the notes). The first boot is the measurement."
+ }
+}
