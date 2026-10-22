@@ -357,7 +357,7 @@
   "margin_mib": 47231,
   "name": "Flip",
   "possible": true,
-  "proof": "metal",
+  "proof": "dry_run",
   "satz": "The same cards work alternately as prefill group P (pipeline) and decode group D (tensor-parallel); the weights are exchanged through the host.",
   "status": "ok",
   "why": []

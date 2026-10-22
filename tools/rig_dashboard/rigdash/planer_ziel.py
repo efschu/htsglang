@@ -50,6 +50,9 @@ SUPPORTED_N = (2, 3, 4, 5, 6, 7)
 #: The counts a release boot has PROVEN on metal (``PROVEN_CARD_COUNTS`` of the topology module).  The other counts of ``SUPPORTED_N`` are calculated by the launcher dry run
 #: but carry the named blocker METAL-UNPROVEN (the launcher accepts them only with force; the first boot is the proof) -- the page shows that, it never hides it.
 PROVEN_N = (3,)
+#: The card SETS a release boot has run on (sorted catalog ids).  Only these carry ``proof = "metal"``; every other set -- also one with a proven card count -- is
+#: calculated by the dry run only (review 1022: 3 x RTX 3090 is never booted, the launcher itself names HW-UNCALIBRATED).
+METAL_CARD_SETS = {("rtx3080-20", "rtx3080-20", "rtx5090-32")}
 
 #: the three layouts of the page.  ``form`` = the form name of ``ProfilEditor.propose``.  The sentences are the user's words made plain (see profil_planer.FORMS)
 LAYOUTS = [
@@ -189,17 +192,39 @@ def _de_text(s: str) -> str:
     return "".join(got) if any(got[i] != bits[i] for i in range(0, len(bits), 2)) else s
 
 
+def _de_gib(s: str) -> str:
+    """German decimal comma in the server's GiB figures ("65.5 GiB" -> "65,5 GiB"): the page writes its own figures with ``toLocaleString("de-DE")``, so a
+    server figure with a point next to them is mixed notation (review 1022).  Only a point between two digits whose number is followed by " GiB" changes;
+    flags, versions and MiB integers stay as they are.  No regex: this page reads no log."""
+    if " GiB" not in s or "." not in s:
+        return s
+    out = list(s)
+    i = 0
+    while True:
+        j = s.find(" GiB", i)
+        if j < 0:
+            break
+        k = j - 1
+        while k >= 0 and (s[k].isdigit() or s[k] == "."):
+            k -= 1
+        num = s[k + 1:j]
+        if num.count(".") == 1 and num[0].isdigit() and num[-1].isdigit():
+            out[k + 1 + num.index(".")] = ","
+        i = j + 4
+    return "".join(out)
+
+
 def localize(obj, lang: Optional[str]):
     """The answer of the page API in the page language: every string with a German text in ``planer_ziel_de.json`` is replaced (exact text or template), anything
     else stays English (never blank).  ``lang`` other than ``de`` returns ``obj`` unchanged.  The structural keys (``id``, ``key``, ``roh`` = the raw flag, ``intern`` = the start profile that goes back to the server) are not touched."""
     if lang != "de":
         return obj
     if isinstance(obj, str):
-        return _de_text(obj)
+        return _de_gib(_de_text(obj))
     if isinstance(obj, list):
         return [localize(x, lang) for x in obj]
     if isinstance(obj, dict):
-        return {k: (v if k in ("id", "key", "roh", "code", "schema", "intern", "form", "outcome", "status", "was", "proof") else localize(v, lang)) for k, v in obj.items()}
+        return {k: (v if k in ("id", "key", "roh", "code", "schema", "intern", "form", "outcome", "status", "was", "proof", "n_states") else localize(v, lang)) for k, v in obj.items()}
     return obj
 
 
@@ -398,6 +423,12 @@ class ZielPlaner:
         return out
 
     @staticmethod
+    def _metal_cards(cards: List[dict]) -> bool:
+        """True only for the card SET a release boot ran on (``METAL_CARD_SETS``: the reference rig).  A proven card COUNT is not proof for other cards: 3 x RTX 3090
+        is three cards like the rig, but no 3090 was ever booted (the launcher names HW-UNCALIBRATED), so its chip says "not booted on metal yet" (review 1022)."""
+        return tuple(sorted(c["id"] for c in cards)) in METAL_CARD_SETS
+
+    @staticmethod
     def _blocker_codes(text: str) -> set:
         """The blocker codes ``[CODE]`` that a topology refusal names (``[3]`` in "(proven: [3])" is not a code)."""
         out = set()
@@ -581,7 +612,7 @@ class ZielPlaner:
                 why.append("tight: margin %s (%.0f%% of the cards' memory)" % (_fmt_gib(calc["margin_mib"]), 100.0 * calc["margin_mib"] / calc["have_mib"]))
             possible = status in ("ok", "tight")
             out.append({"id": l["id"], "name": l["name"], "satz": l["satz"], "status": status, "possible": possible, "why": why, "calc": calc["lines"],
-                        "margin_mib": calc["margin_mib"], "proof": "metal" if nst["state"] == "proven" else "dry_run"})
+                        "margin_mib": calc["margin_mib"], "proof": "metal" if (nst["state"] == "proven" and self._metal_cards(cards)) else "dry_run"})
         return {"ok": True, "schema": SCHEMA, "model": {"id": model["id"], "name": model["name"]}, "n": n, "layouts": out,
                 "hw": self._hw_info(cards), "seats": seats, "tokens": tokens,
                 "note": "A rough necessary condition from the model fact sheet and the card data. The planner's computation (next step) decides; "

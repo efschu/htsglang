@@ -204,7 +204,7 @@
   "margin_mib": 19972,
   "name": "Solo (TP only)",
   "possible": true,
-  "proof": "metal",
+  "proof": "dry_run",
   "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
   "status": "ok",
   "why": []

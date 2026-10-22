@@ -18,7 +18,7 @@
    "margin_mib": 27839,
    "name": "Solo (TP only)",
    "possible": true,
-   "proof": "metal",
+   "proof": "dry_run",
    "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
    "status": "ok",
    "why": []
@@ -36,7 +36,7 @@
    "margin_mib": 27839,
    "name": "Flip",
    "possible": true,
-   "proof": "metal",
+   "proof": "dry_run",
    "satz": "The same cards work alternately as prefill group P (pipeline) and decode group D (tensor-parallel); the weights are exchanged through the host.",
    "status": "ok",
    "why": []
@@ -54,7 +54,7 @@
    "margin_mib": 12917,
    "name": "Dual",
    "possible": true,
-   "proof": "metal",
+   "proof": "dry_run",
    "satz": "P and D are awake at the same time on the same cards; no switching, but both layouts hold weights at once.",
    "status": "ok",
    "why": []

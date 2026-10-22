@@ -261,7 +261,7 @@
   "margin_mib": 12917,
   "name": "Dual",
   "possible": true,
-  "proof": "metal",
+  "proof": "dry_run",
   "satz": "P and D are awake at the same time on the same cards; no switching, but both layouts hold weights at once.",
   "status": "ok",
   "why": []
