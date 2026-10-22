@@ -87,6 +87,26 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .lf button.copy { font: inherit; font-size: 11px; padding: 1px 8px; border-radius: 6px; border: 1px solid var(--line);
   background: var(--surface-2); color: var(--text); cursor: pointer; }
 .lf .miss { color: var(--warn); font-size: 12px; }
+/* SEATS 1022: tab Seats & devices (seats.js) */
+.st-help { font-size: 12px; margin: -2px 0 10px; }
+.st-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 10px; align-items: start; }
+.st-col { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px 10px; background: var(--surface); min-width: 0; }
+.st-col.st-free { background: var(--surface-2); }
+.st-head h3 { margin: 2px 0 2px; font-size: 15px; } .st-meta { font-size: 12px; margin-bottom: 6px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.st-chip { display: inline-block; font-size: 11px; line-height: 1.5; padding: 0 7px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text-2); }
+.st-chip.st-on { border-color: var(--good); color: var(--good); }
+.st-claim { margin: 4px 0 8px; font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.st-claim.st-wait { color: var(--warn); font-weight: 600; } .st-got { font-size: 12px; margin: -4px 0 8px; color: var(--good); }
+.st-dev { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; margin: 6px 0; background: var(--surface); transition: background .25s, box-shadow .25s; min-width: 0; }
+.st-dev.st-blink { background: color-mix(in srgb, var(--s4) 22%, var(--surface)); box-shadow: 0 0 0 2px var(--s4); }
+.st-dev.st-locked { opacity: .75; }
+.st-dn { overflow-wrap: anywhere; font-size: 13px; } .st-how { font-size: 12px; color: var(--text-2); margin: 2px 0 4px; overflow-wrap: anywhere; }
+.st-path { font-size: 11px; color: var(--muted); } .st-note { font-size: 12px; color: var(--muted); }
+.st-ctl { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12.5px; }
+.st-ctl select, #seats-root button { font: inherit; font-size: 12.5px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--text); cursor: pointer; max-width: 100%; }
+#seats-root button:disabled { opacity: .5; cursor: default; }
+.st-nodes { margin-top: 4px; font-size: 11.5px; } .st-nodes > summary { cursor: pointer; color: var(--text-2); } .st-nodes .mono { overflow-wrap: anywhere; font-size: 11px; }
+.st-empty { font-size: 12px; margin: 6px 2px; } .st-msg { font-size: 12.5px; min-height: 0; } .st-msg.st-bad { color: var(--bad); margin: 0 0 8px; }
 /* <!--DEV:END--> */
 /* Profil-Editor (Auftrag 930, S1): auch in der Release-Ausgabe (Nutzer-Entscheid 05.10.) */
 /* PLANER-ZIELBILD 1021: the planner (model + cards -> layout -> seats/tokens -> computed rest) */
@@ -628,6 +648,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
   <button type="button" role="tab" data-tab="karten">Cards</button>
   <button type="button" role="tab" data-tab="profil">Planner</button>
   <!--DEV:BEGIN-->
+  <button type="button" role="tab" data-tab="seats">Seats &amp; devices</button>
   <button type="button" role="tab" data-tab="entwicklung">Development <span class="cnt" id="tab-dev-cnt"></span></button>
   <!--DEV:END-->
 </nav>
@@ -702,6 +723,14 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
     <!--DEV:END-->
   </div>
   <!--DEV:BEGIN-->
+  <!-- SEATS 1022: rdma-display multiseat, the UI of rdx-seatmgr on the Proxmox host (seats.js) -->
+  <div class="tab" id="tab-seats" role="tabpanel" hidden>
+    <section class="card" id="seats-card" aria-label="Seats and devices">
+      <h2>Seats &amp; devices <span class="muted">which seat container gets which keyboard, mouse, gamepad, USB device and sound output &middot; every device belongs to at most one seat &middot; LAN only</span></h2>
+      <div class="st-help muted">Belongs to: moves the device now, until it is unplugged. Remember by port: whatever is plugged into that port goes to the seat. Remember by device: this device goes to the seat in any port. A device that is used right now lights up.</div>
+      <div id="seats-root"><div class="muted">loading &hellip;</div></div>
+    </section>
+  </div>
   <div class="tab" id="tab-entwicklung" role="tabpanel" hidden>
   <div class="devhead" id="dev-head"><h2>Development status</h2><span class="muted">rig dashboard only; the published fLLiper edition (<span class="mono">--edition release</span>) does not serve this part &middot; sections can be expanded/collapsed, the state is remembered</span></div>
   <details class="card fold" id="launch-card">
@@ -772,6 +801,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
 <script src="tooltip.js"></script>
 <!--DEV:BEGIN-->
 <script src="kartenplan.js"></script>
+<script src="seats.js"></script>
 <!--DEV:END-->
 <script src="modellprofil.js"></script>
 <script src="hwprofil.js"></script>
@@ -2247,6 +2277,7 @@ function setTab(t, fromHash) {
   if ((t === "verlauf" || t === "karten") && window.RigGrafik) window.RigGrafik.show();
   if (t === "profil" && window.RigPlaner) window.RigPlaner.show();
   if (t === "profil" && window.RigProfil) window.RigProfil.show();
+  if (window.RigSeats) { if (t === "seats") window.RigSeats.show(); else window.RigSeats.hide(); }
   refresh(true);
 }
 document.querySelectorAll("#tabbar button[data-tab]").forEach((b) => { b.onclick = () => setTab(b.dataset.tab); });
