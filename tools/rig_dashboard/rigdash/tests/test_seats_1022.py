@@ -48,7 +48,11 @@ STATE = {
          "devid": "usb:0b05:18f3", "roles": [], "keys": False, "assignable": True, "host_drivers": ["usbhid"],
          "nodes": [{"dev": "/dev/hidraw0"}], "seat": None, "how": "port rule", "active": False, "last_input_s": None,
          "rules": [{"kind": "port", "match": "x", "seat": 2}]},
+        {"id": "virtual:input27", "kind": "virtual", "name": "rdx: Keyboard", "path": "", "devid": "", "roles": ["keyboard"],
+         "keys": True, "assignable": False, "host_drivers": [], "virtual": "uinput", "nodes": [{"dev": "/dev/input/event24"}],
+         "seat": 2, "how": "created in this seat", "active": False, "last_input_s": None, "rules": []},
     ],
+    "virtual_pending": [{"id": "virtual:input30", "name": "Steam Virtual Gamepad", "why": "open /dev/uinput in several containers (3102, 3103)"}],
 }
 
 
@@ -178,6 +182,14 @@ class TestSeatsJs(unittest.TestCase):
         aura = html.split('data-id="usb:3-4"')[1]
         self.assertIn('data-act="forget"', aura)                                          # it has a rule
         self.assertIn('data-act="port" disabled', aura)                                   # unassigned: nothing to remember
+        virt = html.split('data-id="virtual:input27"')[1].split('class="st-dev')[0]
+        self.assertIn("made by this seat itself", virt)                                   # not "used by the host"
+        self.assertNotIn("<select", virt)
+        seat2 = html.split('<section class="st-col" data-seat="2"')[1].split("</section>")[0]
+        self.assertIn('data-id="virtual:input27"', seat2)
+        free = html.split('st-col st-free')[1]
+        self.assertIn("its seat is not known yet", free)                                  # pending: a note, no device entry
+        self.assertNotIn('data-id="virtual:input30"', html)
 
     def test_every_text_has_german(self):
         mem = memory()
@@ -187,7 +199,8 @@ class TestSeatsJs(unittest.TestCase):
         st["seats"][0]["claimed"] = {"id": "usb:1-3", "name": "PixArt USB Optical Mouse", "t": 1792664295}
         p.feed(self.render(STATE) + self.render(st) + self.render({"seats": [], "devices": []}) + self.render(None))
         data = {d["name"] for d in STATE["devices"]} | {s["name"] for s in STATE["seats"]} \
-            | {d["path"] for d in STATE["devices"]} | {d["devid"] for d in STATE["devices"]}
+            | {d["path"] for d in STATE["devices"]} | {d["devid"] for d in STATE["devices"]} \
+            | {v["name"] for v in STATE["virtual_pending"]} | {v["why"] for v in STATE["virtual_pending"]}
         missing = [t for t in p.found if t not in data and t not in SAME_IN_BOTH and not t.startswith(("/dev/", "CT "))
                    and any(c.isalpha() for c in t) and german(t, mem) == t and not t.endswith(" s")]
         self.assertFalse(missing, missing)

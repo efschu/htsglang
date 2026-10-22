@@ -5173,6 +5173,10 @@
 "reaches no seat": "erreicht keinen Seat",
 "rdx-seatmgr answered nothing": "rdx-seatmgr hat nichts geantwortet",
 "rdx-seatmgr not reachable:": "rdx-seatmgr nicht erreichbar:",
-"device node": "Geräteknoten"
+"device node": "Geräteknoten",
+"created inside this seat": "in diesem Seat erzeugt",
+"virtual": "virtuell",
+"Streamed or virtual input made by this seat itself; it stays with it": "Gestreamte oder virtuelle Eingabe, die dieser Seat selbst erzeugt hat; sie bleibt bei ihm",
+"Virtual device, its seat is not known yet:": "Virtuelles Gerät, sein Seat ist noch nicht bekannt:"
 }
 }
