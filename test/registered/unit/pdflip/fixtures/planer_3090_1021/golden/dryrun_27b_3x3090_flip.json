@@ -3,7 +3,7 @@
   {
    "card": "NVIDIA GeForce RTX 3090",
    "group": "P",
-   "mib": 18584,
+   "mib": 19984,
    "nvml_idx": 0,
    "ordinal": 0,
    "pass": "P"
@@ -11,7 +11,7 @@
   {
    "card": "NVIDIA GeForce RTX 3090",
    "group": "P",
-   "mib": 18584,
+   "mib": 19984,
    "nvml_idx": 1,
    "ordinal": 1,
    "pass": "P"
@@ -19,7 +19,7 @@
   {
    "card": "NVIDIA GeForce RTX 3090",
    "group": "P",
-   "mib": 18584,
+   "mib": 19984,
    "nvml_idx": 2,
    "ordinal": 2,
    "pass": "P"
@@ -27,7 +27,7 @@
   {
    "card": "NVIDIA GeForce RTX 3090",
    "group": "P",
-   "mib": 18584,
+   "mib": 19984,
    "nvml_idx": 0,
    "ordinal": 0,
    "pass": "P"
@@ -35,7 +35,7 @@
   {
    "card": "NVIDIA GeForce RTX 3090",
    "group": "P",
-   "mib": 16792,
+   "mib": 18192,
    "nvml_idx": 1,
    "ordinal": 1,
    "pass": "P"
@@ -43,7 +43,7 @@
   {
    "card": "NVIDIA GeForce RTX 3090",
    "group": "P",
-   "mib": 16792,
+   "mib": 18192,
    "nvml_idx": 2,
    "ordinal": 2,
    "pass": "P"
@@ -83,10 +83,10 @@
   "--rank-tp-ratio": "auto"
  },
  "pp_cut": {
-  "attn": "6,6,4",
-  "chosen_pool": "307660",
-  "layers": "24,24,16",
-  "makespan_ms": "1220.0",
+  "attn": "5,6,5",
+  "chosen_pool": "268404",
+  "layers": "22,22,20",
+  "makespan_ms": "1105.1",
   "pool_floor": "264192",
   "pool_floor_source": "flag"
  }

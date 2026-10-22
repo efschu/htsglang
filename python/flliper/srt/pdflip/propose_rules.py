@@ -31,6 +31,7 @@ the functions that need them (all four are stdlib/msgspec-only, none imports tor
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -464,16 +465,41 @@ def draft_placement(p: Any, host_budget_mib: float, host_fixed_mib: float, kv_mi
                                                   "fits" if margin >= 0 else "does not fit", margin))}
 
 
+#: NCARDS 1021 (review A1): the launcher's D residency balance (W122) books the Form A HOST by the NF role records (D_FIXED_MIB / D_ACTIVATION_MIB /
+#: D_AWAKE_REST_MIB, KV cell of the reference boot); the planner's posts are the borrowed boot fn8ah.  On the launcher dry runs of nf-2x3090 and nf-4x3090 the
+#: host was 286 MiB (44 rows) / 54 MiB (42 rows) over at 262144 tokens and 6 seats -- 394 MiB the planner did not see, both times: 269 MiB of it the KV
+#: cell (the reference boot's 14143 B/token against the model profile's 13056 B/token, per token), the remaining 125 MiB activation / awake-rest items that do
+#: not scale with the context.  The workers are the other way round (the planner is 205 MiB MORE conservative there).  Booked as one named host post
+#: (``unverified`` says so) until the planner reads the role records itself; applies only to the new scratch-accounting path (foreign cards).
+HOST_REF_KV_CELL_BYTES = 14143
+HOST_OTHER_GAP_MIB = 125
+
+
+def launcher_host_gap_mib(planner_kv_cell_bytes: int, kv_tokens: int) -> float:
+    """The MiB the launcher books on the Form A host beyond the planner's posts (see ``HOST_OTHER_GAP_MIB``)."""
+    return HOST_OTHER_GAP_MIB + max(0, HOST_REF_KV_CELL_BYTES - int(planner_kv_cell_bytes)) * int(kv_tokens) / MIB
+
+
 def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[int], reserves_mib: Sequence[int], *,
-             kv_tokens: int, kv_cell_bytes: float, draft_mib: float, d_mamba_slots: int, mamba_slot_mib: float
-             ) -> Dict[str, Any]:
+             kv_tokens: int, kv_cell_bytes: float, draft_mib: float, d_mamba_slots: int, mamba_slot_mib: float,
+             scratch_rows: Optional[Sequence[int]] = None) -> Dict[str, Any]:
     """The Form A D layout (``form_a_plan.solve_form_a``): rank 0 = attention host with the dense weights, the undivided KV,
     the draft and the GDN states; every other rank is a pure expert worker.  ``budgets_mib`` = what each rank may use
     (``--rank-gpu-memory-mib`` semantics: total minus the D context), ``reserves_mib`` the user reserve.
 
     The runtime posts of the plan (host runtime 3.20 GiB, worker runtime 1.45, corridor 1.90, dispatch buffer 0.20, router
     0.12, speculative state 0.15) are the measured posts of boot fn8ah (``MeasuredPosts.from_fn8ah``): BORROWED for every
-    model and card, named in ``unverified``.  Returns ``{ok, error, role, tp_ratio, moe_ratio, fr, capacity, owned, unverified}``."""
+    model and card, named in ``unverified``.  Returns ``{ok, error, role, tp_ratio, moe_ratio, fr, capacity, owned, unverified}``.
+
+    ``scratch_rows`` (NCARDS 1021 review A1): the Platztausch scratch rows per rank (``FLLIPER_MOE_SCRATCH_SLOTS``).  The runtime holds
+    ``min(R + S, E)`` expert rows per layer on a rank (``E = owned + pad``, ``R`` = resident rows, ``S`` = scratch rows;
+    ``expert_residency.buffer_rows``), so the scratch rows are paid from the same VRAM as the resident rows.  The Form A solver prices
+    ONE row per resident expert and, without ``scratch_rows``, nothing for the scratch and the pad row: a plan that is exact for the
+    solver is then ``S`` rows (116 MiB each on NF) over the launcher's D budget on every rank (nf-3x3090: -5622 / -5426 / -4996 MiB).
+    With ``scratch_rows`` the pad row and the scratch rows are booked first: when ALL experts still fit resident (sum of the rank
+    capacities >= the expert count) nothing is offloaded and no scratch is needed; otherwise the solver runs on the budgets minus
+    ``(S + pad)`` rows, and the published fraction is the largest one whose ``min(R + S, E)`` rows fit the rank's rows (the launcher's
+    own formula, ``largest_fraction_for_rows``).  ``None`` = the pre-review behaviour (byte-identical; the rig's carried profile)."""
     from flliper.srt import form_a_plan as FA
 
     n = len(cards)
@@ -491,14 +517,52 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
     geom = FA.ExpertGeometry(num_experts=p.n_experts, num_layers=exp_layers,
                              expert_bytes=int(round(exp_mib * MIB)), pad_experts_per_rank=1,
                              source="model profile (bytes per expert from the safetensors headers)")
-    cb = [FA.CardBudget(rank=i, name=str(c.get("name", "")), nameplate_mib=int(c["total_mib"]), budget_mib=int(budgets_mib[i]),
+    host_gap_mib = 0.0
+    if scratch_rows is not None:
+        host_gap_mib = launcher_host_gap_mib(posts.kv_bytes_per_token, int(kv_tokens))
+    cb = [FA.CardBudget(rank=i, name=str(c.get("name", "")), nameplate_mib=int(c["total_mib"]),
+                        budget_mib=int(budgets_mib[i]) - (int(math.ceil(host_gap_mib)) if i == 0 else 0),
                         reserve_mib=int(reserves_mib[i]), link_gib_s=link_rate(c)[0], role="host" if i == 0 else "worker")
           for i, c in enumerate(cards)]
-    unb = ["Runtime items of form A (host %.2f / worker %.2f GiB, corridor %.2f, dispatch %.2f, router %.2f, speculative state %.2f) are the measured items of boot fn8ah: borrowed, unverified for this model and these cards" % (
+    unb = ([] if not host_gap_mib else [
+        "host posts: the launcher's NF role records book %.0f MiB more on the Form A host than the fn8ah-borrowed posts (KV cell %d B/token of the reference boot against %d B/token of the model profile, plus %d MiB of activation / awake-rest items; measured by the launcher dry runs of nf-2x3090 / nf-4x3090: host %d / %d MiB over at 262144 tokens, 6 seats) -- booked as a named host post until the planner reads the role records itself" % (
+            host_gap_mib, HOST_REF_KV_CELL_BYTES, posts.kv_bytes_per_token, HOST_OTHER_GAP_MIB, 286, 54)]) + ["Runtime items of form A (host %.2f / worker %.2f GiB, corridor %.2f, dispatch %.2f, router %.2f, speculative state %.2f) are the measured items of boot fn8ah: borrowed, unverified for this model and these cards" % (
                ref.host_runtime_gib, ref.worker_runtime_gib, ref.corridor_gib, ref.dispatch_buffer_gib, ref.worker_router_gib,
                ref.spec_state_gib)]
+    scratch_eff: Optional[List[int]] = None
+    rows_fit: Optional[List[int]] = None
     try:
-        plan = FA.solve_form_a(cb, posts, geom)
+        if scratch_rows is None:
+            plan = FA.solve_form_a(cb, posts, geom)
+        else:
+            if len(scratch_rows) != n:
+                return {"ok": False, "error": "scratch rows: %d values for %d D ranks" % (len(scratch_rows), n), "unverified": unb}
+            slot_mib = geom.slot_gib * 1024.0
+            pad = int(geom.pad_experts_per_rank)
+
+            def _reduced(extra_rows: Sequence[int]) -> List["FA.CardBudget"]:
+                return [dataclasses.replace(c, budget_mib=int(math.floor(c.budget_mib - (int(x) + pad) * slot_mib)))
+                        for c, x in zip(cb, extra_rows)]
+
+            plan = FA.solve_form_a(_reduced([0] * n), posts, geom)          # all resident: pad row only, no scratch
+            # rows each rank can hold in total: the launcher's balance is rows x row cost against the budget minus the fixed posts
+            rows_fit = [int(math.floor((c.budget_mib / 1024.0 - f) / geom.slot_gib)) for c, f in zip(cb, plan.fixed_gib)]
+            if sum(plan.capacity) >= geom.num_experts:
+                scratch_eff = [0] * n
+            else:
+                # the scratch is the swap working set; the budget of a rank caps it (rig: SCRATCH_D 118 -> 100 because TP0 refused it, W130):
+                # at most the rows that stay after the pad row and ONE resident row; the runtime needs at least 2 (MIN_SCRATCH_ROWS)
+                scratch_eff = [min(int(x), rf - pad - 1) for x, rf in zip(scratch_rows, rows_fit)]
+                low = [i for i, x in enumerate(scratch_eff) if x < 2]
+                if low:
+                    return {"ok": False, "error": "rank %s: %s expert rows fit after the fixed posts, the Platztausch buffer needs the pad row, one resident row and at least 2 scratch rows" % (
+                                ",".join(str(i) for i in low), ",".join(str(rows_fit[i]) for i in low)), "unverified": unb}
+                capped_s = [i for i, (x, r_) in enumerate(zip(scratch_eff, scratch_rows)) if x < int(r_)]
+                if capped_s:
+                    unb.append("scratch rows of rank %s limited by the rank's budget (wanted %s, rows that fit after the pad row and one resident row: %s)" % (
+                        ",".join(str(i) for i in capped_s), ",".join(str(int(scratch_rows[i])) for i in capped_s),
+                        ",".join(str(scratch_eff[i]) for i in capped_s)))
+                plan = FA.solve_form_a(_reduced(scratch_eff), posts, geom)
     except FA.FormAInfeasible as exc:
         return {"ok": False, "error": "the form A solver finds no split (%s: %s)" % (type(exc).__name__, exc), "unverified": unb}
     # The launcher refuses a D rank without a Platztausch buffer (W120 PdFlipPlatztauschBufferUnbuilt, ``launcher.py``
@@ -511,10 +575,24 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
 
     fr_plan = [round(math.floor(f * 1000.0) / 1000.0, 3) for f in plan.resident_fraction]
     fr_cap: List[Optional[float]] = []
-    for o in plan.owned:
+    for i, o in enumerate(plan.owned):
         e = int(o) + int(geom.pad_experts_per_rank)
-        fr_cap.append(largest_fraction_for_rows(local_experts=e, scratch_rows=0, max_rows=e) if e > 0 else None)
+        if rows_fit is not None and scratch_eff and scratch_eff[i] > 0:
+            # offload with S scratch rows: the largest fraction whose min(R + S, E) rows fit this rank (the launcher's own count)
+            fr_cap.append(largest_fraction_for_rows(local_experts=e, scratch_rows=scratch_eff[i], max_rows=min(rows_fit[i], e))
+                          if e > 0 else None)
+        else:
+            fr_cap.append(largest_fraction_for_rows(local_experts=e, scratch_rows=0, max_rows=e) if e > 0 else None)
     fr = [min(f, c) if c is not None else f for f, c in zip(fr_plan, fr_cap)]
+    if rows_fit is not None and scratch_eff and any(scratch_eff):
+        # the exact cap replaces the solver fraction (the solver one is the same row count rounded, never above the cap by construction,
+        # but the launcher's ceil(f x E) counts the pad row too: the cap is the authority)
+        fr = [c if (c is not None and scratch_eff[i] > 0) else f for i, (f, c) in enumerate(zip(fr, fr_cap))]
+        bad = [i for i, c in enumerate(fr_cap) if scratch_eff[i] > 0 and c is None]
+        if bad:
+            return {"ok": False, "error": "rank %s: no resident expert row fits next to %s scratch rows (rows that fit: %s)" % (
+                        ",".join(str(i) for i in bad), ",".join(str(scratch_eff[i]) for i in bad), ",".join(str(rows_fit[i]) for i in bad)),
+                    "unverified": unb}
     capped = [i for i, (f, g) in enumerate(zip(fr_plan, fr)) if g < f]
     if capped:
         unb.append("resident share of rank %s limited to the swap buffer (solver: %s, limit: %s): a rank with fewer than 2 scratch rows builds no buffer, the launcher refuses that as W120" % (
@@ -523,6 +601,7 @@ def form_a_d(p: Any, cards: Sequence[Mapping[str, Any]], budgets_mib: Sequence[i
     return {"ok": True, "error": "", "role": ["host"] + ["worker"] * (n - 1), "tp_ratio": [1] + [0] * (n - 1),
             "moe_ratio": [int(o) for o in plan.owned],
             "fr": fr, "fr_solver": fr_plan, "fr_cap": fr_cap,
+            "scratch": list(scratch_eff) if scratch_eff is not None else None, "rows_fit": rows_fit,
             "capacity": [int(c) for c in plan.capacity], "owned": [int(o) for o in plan.owned],
             "host_breakdown": dict(plan.host_breakdown), "unverified": unb}
 

@@ -239,8 +239,11 @@ class PChunkModelOnlyUnderDynamic(unittest.TestCase):
     refused P-CHUNK-MODEL (1520 A: a simulator artefact)."""
 
     KEYS = ["3080-20G", "5090", "3080-20G", "3080-20G"]
+    #: NCARDS 1021: a card of a CALIBRATED class beyond the calibrated count (a third 3080) and an arch twin (sm86 3090 -> 3080) are mapped
+    #: by class now (``launcher._p_chunk_by_class``), so the table check needs a card with NO class and NO arch twin to refuse: sm89.
+    KEYS_NO_TWIN = ["4090", "4090", "4090", "4090"]
 
-    def _blockers(self, policy):
+    def _blockers(self, policy, keys=None):
         m = HS.MODELS["NF"]
         if policy:
             m = dataclasses.replace(m, argv=tuple(m.argv) + ("--p-chunk-policy", policy))
@@ -249,7 +252,7 @@ class PChunkModelOnlyUnderDynamic(unittest.TestCase):
         with mock.patch.dict(os.environ):
             refusals.arm(True)      # a --force boot: UNCALIBRATED is passed, the P-chunk stage is reached
             try:
-                return HS.simulate("4x", self.KEYS, m).blockers
+                return HS.simulate("4x", keys or self.KEYS, m).blockers
             finally:
                 refusals.arm(False)
 
@@ -258,7 +261,11 @@ class PChunkModelOnlyUnderDynamic(unittest.TestCase):
         self.assertNotIn("P-CHUNK-MODEL", self._blockers("fixed"))
 
     def test_dynamic_policy_still_checks_the_table(self):
-        self.assertIn("P-CHUNK-MODEL", self._blockers("dynamic"))
+        self.assertIn("P-CHUNK-MODEL", self._blockers("dynamic", self.KEYS_NO_TWIN))
+
+    def test_dynamic_policy_maps_a_known_class_or_an_arch_twin(self):
+        self.assertNotIn("P-CHUNK-MODEL", self._blockers("dynamic"))
+        self.assertNotIn("P-CHUNK-MODEL", self._blockers("dynamic", ["3090"] * 4))
 
 
 class ProgressMeter(unittest.TestCase):

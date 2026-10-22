@@ -584,9 +584,11 @@ class TestOtherInventories(unittest.TestCase):
         self.assertIs(d["required"]["pool_geeicht"], False)                        # the pool calibration is the 3-card reference boot's
         self.assertIsNone(d["required"]["erfuellt"])                                 # flags are met, the pool is not computable: "nicht gerechnet"
         self.assertTrue(any("not calculated" in x["text"] for x in d["verdikte"] if x["code"] == "DUAL-PFLICHT"))
-        # the launcher cannot price the profile's 3-entry alloc-cache record on two cards: a NAMED refusal (record of another inventory)
+        # NCARDS 1021 review A2: the 3-entry alloc-cache record is read through the inventory view on EVERY card count (class-derived for this subset of the
+        # reference inventory), so the launcher no longer stops at "has 3 entries for 2 cards"; it stops at the next NAMED refusal, the model verdict W64
         self.assertEqual(run.result.exc_type, "PdFlipLaunchRefused")
-        self.assertIn("D_DUAL_ALLOC_CACHE_BOOK_MIB has 3 entries for 2 cards", run.result.exc_msg)
+        self.assertNotIn("D_DUAL_ALLOC_CACHE_BOOK_MIB has 3 entries for 2 cards", run.result.exc_msg)
+        self.assertIn("W64", run.result.exc_msg[:200])
 
     def test_n2_goes_through_the_whole_pipeline_with_a_verdict_document(self):
         """The dashboard worker's job (``propose_verdict.run_propose``): proposal + oracle + verdicts, as one JSON document."""

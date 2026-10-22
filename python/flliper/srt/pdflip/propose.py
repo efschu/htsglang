@@ -278,6 +278,8 @@ RULE_ORIGIN = {
     "role": "Rule form A: rank 0 attention host, all others expert workers",
     "tp_ratio": "Rule form A: only the host carries the dense weights",
 }
+#: the user reserve flags: the operator's headroom per card (NCARDS 1021 review A3), never borrowed by arch twin
+USER_RESERVE_FLAGS = ("--user-reserve-mib", "--rank-user-reserve-mib")
 #: launcher flags whose value is a measurement (boot logs) of the profile's own inventory
 INVENTORY_BOUND_FLAGS = ("--wake-credit-reference-logs", "--p-card-reference-logs", "--d-card-reference-logs",
                          "--d-residency-reference-logs")
@@ -336,6 +338,9 @@ RATE_PRICED_OBJECTIVES = ("decode-bs1", "decode-bs6")
 #: 3080 ``--rank-tp-ratio`` -- and the launcher refuses any other D weight vector ("the presets are built on --rank-tp-ratio 58,25,25",
 #: ``launcher.d_reshard_argv``).  Pinned against ``d_reshard.RC9_BASE`` by test_planer_3090_1021.
 D_RESHARD_RIG_BASE = (58, 25, 25)
+#: NCARDS 1021: the per-rank D flag whose host-ordinal value is a ROLE value of Form A (see ``per_class``): --d-nontorch-mib (host 1981 MiB on the
+#: rig, workers 528 / 524).
+HOST_ROLE_FLAG = "--d-nontorch-mib"
 
 
 def homogeneous(classes: Sequence[str]) -> bool:
@@ -624,6 +629,23 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
             return
         if binv is not None and len(vec) == len(binv):
             new, srcs = R.class_rekey(vec, binv, cards)
+            if is_moe and name == HOST_ROLE_FLAG and new and binv[0] != live_cls[0]:
+                # NCARDS 1021: what a Form A D rank keeps OUTSIDE the torch allocator is a ROLE value, not only a class value: the host
+                # (rank 0, the dense weights, the PLE/dispatch handles) measured 1981 MiB on the rig's 5090, the workers 528 / 524 on the
+                # 3080s.  A class rekey would hand the host of N identical 3090s the worker value (528): 1.4 GB too little on exactly the
+                # card that dies first (the host's TP0 OOM at load).  The host ordinal keeps at least the profile's own host-ordinal value
+                # (conservative direction, books more), named as a role borrow.
+                host = max(float(new[0]), float(vec[0]))
+                new[0] = str(int(host)) if host.is_integer() else str(host)
+                srcs[0] = "%s; host role (Form A rank 0): not below the profile's host-ordinal value %s (unverified)" % (srcs[0], vec[0])
+            if name in USER_RESERVE_FLAGS:
+                # NCARDS 1021 (review A3): the user reserve is the OPERATOR's headroom for other processes on THEIR cards (rig 1800,1400,1400:
+                # display / other jobs), not a property of the card class and not a model measurement; the launcher default is 0 (user decision
+                # 2026-09-09).  A card whose class the profile never ran on is not handed a reserve borrowed from its arch twin.
+                for i_, c_ in enumerate(live_cls):
+                    if c_ not in binv:
+                        new[i_] = "0"
+                        srcs[i_] = "launcher default 0 (user decision 2026-09-09): the profile's reserve is its operator's headroom on its own cards, not borrowed by arch twin"
             newt = R.csv(new)
             _set(la, kind, group, name, newt)
             borrowed = [s for s in srcs if s.startswith(("borrowed", "unverified", "borrowed", "unverified"))]
@@ -693,9 +715,35 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
     results["draft"] = dp
     fa = None
     res_mib = [int(float(x)) for x in reserve] if reserve and len(reserve) == n else [0] * n
+    scratch_d_basis = _get(la, "env", "d", "FLLIPER_MOE_SCRATCH_SLOTS")      # the profile's value, before decide() moves it
+
+    def cap_host_scratch(vals: Sequence[str]) -> List[str]:
+        """NCARDS 1021 (review A1): the Platztausch scratch of the Form A HOST is a role value sized to the rig's host CARD (100 rows = 11.6 GB
+        of NF rows on the 5090's 32 GB); on a host card of ANOTHER class it is not carried over -- the host takes at most the worker value of
+        the profile (48 rows, measured on the arch-twin 3080 class).  Not capped on the profile's own inventory (measured there)."""
+        if same_inv or not is_moe or len(vals) < 2 or binv is None or binv[0] == live_cls[0]:
+            return list(vals)
+        cap_ = max(float(v) for v in vals[1:])
+        return [str(int(min(float(vals[0]), cap_)))] + list(vals[1:])
+
+    def d_scratch_rows(tgt_s: int) -> Optional[List[int]]:
+        """The D scratch rows per rank at ``tgt_s`` seats exactly as ``decide`` will publish them (re-keyed by role, scaled by the seats,
+        host capped on a foreign host card); None on the profile's own inventory (carried value, the rig stays byte-identical) or when the
+        profile names no D scratch."""
+        if same_inv or scratch_d_basis is None:
+            return None
+        v_ = R.parse_csv(scratch_d_basis)
+        if v_ is None:
+            if not str(scratch_d_basis).replace(".", "").isdigit():
+                return None
+            vals_ = R.scale_by_seats([scratch_d_basis], tgt_s, d_seats_base) * n
+        else:
+            vals_ = R.scale_by_seats(v_ if len(v_) == n else R.role_rekey(v_, n), tgt_s, d_seats_base)
+        return [int(float(x)) for x in cap_host_scratch(vals_)]
+
     if is_moe:
         fa = R.form_a_d(fp, cards, d_budget, res_mib, kv_tokens=kv_tokens, kv_cell_bytes=kv_cell, draft_mib=fp.draft_mib,
-                        d_mamba_slots=asm.d_mamba_slots, mamba_slot_mib=mamba_slot)
+                        d_mamba_slots=asm.d_mamba_slots, mamba_slot_mib=mamba_slot, scratch_rows=d_scratch_rows(seats))
         results["form_a"] = fa
         rec.unverified += fa["unverified"]
         if not fa["ok"]:
@@ -730,7 +778,7 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
             if is_moe:
                 fa_s = R.form_a_d(fp, cards, budget_s, res_mib, kv_tokens=kv_tokens, kv_cell_bytes=kv_cell,
                                   draft_mib=fp.draft_mib, d_mamba_slots=asm_s.d_mamba_slots,
-                                  mamba_slot_mib=hw_fit.mamba_slot_mib(fp, sb_s["posts"]))
+                                  mamba_slot_mib=hw_fit.mamba_slot_mib(fp, sb_s["posts"]), scratch_rows=d_scratch_rows(s_))
             seat_cache[s_] = {"sb": sb_s, "fa": fa_s}
         return seat_cache[s_]
 
@@ -779,13 +827,26 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
                 return
             ref_s = seats_base if (group != "p" or p_coupled) else (seats_ref or seats_base)
             tgt_s = seats if (group != "p" or p_coupled) else ref_s
+            host_capped = False
             if vec is None:
                 nt = R.scale_by_seats([old], tgt_s, ref_s)[0]
             elif same_inv and tgt_s == ref_s:
                 nt = old
             else:
                 base = vec if len(vec) == n else R.role_rekey(vec, n)
-                nt = R.csv(R.scale_by_seats(base, tgt_s, ref_s))
+                scaled = R.scale_by_seats(base, tgt_s, ref_s)
+                if group == "d":
+                    capped_ = cap_host_scratch(scaled)           # NCARDS 1021 review A1: the host row count is sized to the rig host card
+                    host_capped, scaled = capped_ != list(scaled), capped_
+                    if fa is not None and fa.get("ok") and fa.get("scratch"):
+                        # the Form A solve books the scratch against each rank's rows (``form_a_d``): a rank whose budget cannot carry the
+                        # wanted rows publishes the rows that fit (0 = everything resident, nothing offloaded: the wanted value stays)
+                        eff_ = [str(e) if 0 < e < int(float(v)) else v for v, e in zip(scaled, fa["scratch"])]
+                        budget_capped, scaled = eff_ != list(scaled), eff_
+                    else:
+                        budget_capped = False
+                    host_capped = host_capped or budget_capped
+                nt = R.csv(scaled)
             if nt != old:
                 _set(la, kind, group, name, nt)
             rekeyed = vec is not None and len(vec) != n
@@ -798,6 +859,9 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
                 parts = []
                 if rekeyed:
                     parts.append("re-keyed to %d cards by rank role (first/middle/last entry of the profile with %d entries)" % (n, len(vec)))
+                if host_capped:
+                    parts.append("scratch rows capped: the host's value is sized to the profile's host card (%s), not to %s, and a rank takes at most the rows its budget carries next to one resident row (form A solve)" % (
+                        binv[0] if binv else "?", live_cls[0]))
                 if by_seats:
                     parts.append("scaled linearly in the seats (%d -> %d), extrapolation from one measuring point" % (ref_s, tgt_s))
                 st, hk = R.UNVERIFIED, "Profile %s: %s" % (bname, "; ".join(parts))

@@ -14,7 +14,7 @@
   "--pdflip-vision",
   "transient",
   "--user-reserve-mib",
-  "1400,1400,1400",
+  "0,0,0",
   "--store-max-gb",
   "150",
   "--max-kv-per-request",
@@ -68,7 +68,7 @@
   "--p-chunk-max",
   "2048",
   "--p-chunk-model",
-  "/spinning/wt-planer-3090-1021/test/registered/unit/pdflip/fixtures/planer_3090_1021/profiles/27b-nvfp4.pchunk.json",
+  "/spinning/wt-planer-ncards-1021/test/registered/unit/pdflip/fixtures/planer_3090_1021/profiles/27b-nvfp4.pchunk.json",
   "--p-chunk-mscale",
   "nvfp4",
   "--d-only"
@@ -103,7 +103,6 @@
  "unverified": [
   "--pp-stage-ratio (Seed): Rule: P cut by GEMM rate; rate: datasheet/unverified: FP16 peak rate per card (no measured rate)",
   "--pp-stage-ratio: Rule: layer cut of the P stages by GEMM rate and memory capacity for the cards [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86]",
-  "--user-reserve-mib: Class maximum of the profile measurement 27b-nvfp4.env [RTX5090,RTX3080,RTX3080] -> [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86]: borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified)",
   "D context per card: no --d-foreign-context-mib/--d-nontorch-mib in the profile for this inventory",
   "GEMM rates: datasheet/unverified: FP16 peak rate per card (no measured rate)"
  ],
@@ -146,8 +145,8 @@
   ],
   [
    "--user-reserve-mib",
-   "1400,1400,1400",
-   "unverified",
+   "0,0,0",
+   "vorgeschlagen",
    true
   ],
   [

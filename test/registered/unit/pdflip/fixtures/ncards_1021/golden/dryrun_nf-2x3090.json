@@ -1,0 +1,82 @@
+{
+ "budgets": [
+  [
+   "P",
+   0,
+   21608
+  ],
+  [
+   "P",
+   1,
+   21608
+  ],
+  [
+   "D(Karte, Erwartung)",
+   0,
+   19208
+  ],
+  [
+   "D(Karte, Erwartung)",
+   1,
+   21576
+  ],
+  [
+   "D(dry, expectation)",
+   0,
+   19208
+  ],
+  [
+   "D(dry, expectation)",
+   1,
+   21576
+  ]
+ ],
+ "d_check": {
+  "borrowed_by_role": true,
+  "entfaellt": false,
+  "ranks": [
+   {
+    "R": 2,
+    "scratch": 39,
+    "verdict": "PASST"
+   },
+   {
+    "R": 119,
+    "scratch": 48,
+    "verdict": "PASST"
+   }
+  ]
+ },
+ "exc_head": "",
+ "exc_type": null,
+ "forced": [
+  "D-BUDGET",
+  "HW-BORROWED",
+  "HW-COUNT",
+  "HW-UNCALIBRATED"
+ ],
+ "group_flags": {
+  "D": {
+   "--max-total-tokens": "262144",
+   "--pp-size": "1",
+   "--rank-gpu-memory-mib": "19208,21576",
+   "--rank-tp-ratio": "1,0",
+   "--tp-size": "2"
+  },
+  "P": {
+   "--max-total-tokens": "262144",
+   "--pp-size": "2",
+   "--rank-gpu-memory-mib": "21608,21608",
+   "--rank-tp-ratio": null,
+   "--tp-size": "1"
+  }
+ },
+ "pp_cut": {
+  "attn": "6,6",
+  "chosen_pool": "1088157",
+  "layers": "24,24",
+  "pool_floor": "none",
+  "pool_floor_source": "none"
+ },
+ "stages": 2
+}
