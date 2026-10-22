@@ -84,6 +84,16 @@ Review NF-RC30-R6STALE (21.10., Auflagen A1/A2; the v4 layout below was never bo
   t_grant``) -- a lagging rank's record of an EARLIER leg (park-handback / resume re-grant) no longer pulls free to 0.
   Merge of ``free``: the ranks with the highest ``n_launch`` decide (the others have not noted the newest chunk yet); any of
   them COMMITTED -> COMMITTED, else the MIN of their known values.
+
+NF-RC31-R6REST (21.10., SOLL R6 + R7 + R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): ``free`` is exact at the moment it
+is read -- but an R6 redirect moves what is free when D APPLIES the abort, and D keeps launching chunks until then. Live NF boot
+``..._82784e1138_1021_202608`` pdflip-6-401 (halb, u=6550): chunk 1 (2240) ended 21:15:36,826, the front read free=4310 (no
+COMMITTED, nothing in flight) and decided REROUTE_P at 36,982 (S = 3786 + 4310 = 8096 > X = 7370); D's next recv step came before
+the abort (sent 37,114, the leg's ROS poll), D launched chunk 2 (2300, forward 36,9.. -> 40,066), the abort applied after it, P got
+the tail 2069/2070: real S = 5855 < X (SOLL R7 violated). The rank now writes a HALT record (``note_halt``) when the abort of a rid
+it extended is APPLIED (no forward of it launches any more): under the derived key ``halt_key(rid)`` -- the v4 layout and
+``_VERSION`` are unchanged, a v4 reader ignores the key -- with ``free`` = the tokens no forward was launched for AT THE HALT (a
+chunk in flight ends on D). That is the number the front's R6 decides on (``halted_free``): what the redirect really moves to P.
 """
 from __future__ import annotations
 
@@ -170,6 +180,11 @@ class DExtendBeacon:
         #: keys whose done the poll already wrote (the result path then writes nothing)
         self._polled: "collections.OrderedDict[int, None]" = collections.OrderedDict()
         self._head = 0
+        #: NF-RC31-R6REST: this rank applies halts (``announce_halt``) -- the cap record is re-written before the ring wraps it
+        self._halt_cap = False
+        #: Review B2: rid -> t_first of the leg whose halt record is written (a later abort of the same leg never overwrites it)
+        self._halted: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+        self._cap_at = 0
         self.mm = None
         size = _HDR_SIZE + self._slots * _REC_SIZE
         try:
@@ -335,18 +350,84 @@ class DExtendBeacon:
 
     def _put(self, rid: str, t_first: int, rest: int, free: int, n: int) -> bool:
         """One record of ``rid``; False = the mmap failed (the beacon then writes nothing more this call)."""
-        try:
-            off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
-            self._head += 1
-            struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(rest), int(self._head), int(free),
-                             int(n))
-            struct.pack_into("<q", self.mm, 12, self._head)
-        except Exception:  # noqa: BLE001
+        if not self._put_key(rid_key(rid), t_first, rest, free, n):
             return False
         self._last_rest.pop(rid, None)
         self._last_rest[rid] = int(rest)
         while len(self._last_rest) > ARMED_CAP:
             self._last_rest.popitem(last=False)
+        return True
+
+    def _put_key(self, key: int, t_first: int, rest: int, free: int, n: int) -> bool:
+        try:
+            off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
+            self._head += 1
+            struct.pack_into(_REC_FMT, self.mm, off, int(key), int(t_first), int(rest), int(self._head), int(free), int(n))
+            struct.pack_into("<q", self.mm, 12, self._head)
+        except Exception:  # noqa: BLE001
+            return False
+        if self._halt_cap and key != HALT_CAP_KEY and self._head - self._cap_at >= self._slots // 2:
+            self._put_cap()
+        return True
+
+    def _put_cap(self) -> None:
+        if self._put_key(HALT_CAP_KEY, int(self._clock_ns()), 0, 0, 0):
+            self._cap_at = self._head
+
+    def announce_halt(self) -> None:
+        """NF-RC31-R6REST: this rank's scheduler writes a halt record when it APPLIES an abort (``note_halt``, wired in
+        ``Scheduler.process_pending_chunked_abort`` / ``_abort_request_now``). The front stops an R6-counted prefill first and
+        decides on its halted rest only for a D that announces it -- a D without halt records would leave every R6 verdict
+        waiting for the liveness guard. The cap record rides the ring (re-written before the ring can wrap it)."""
+        if self.mm is None:
+            return
+        self._halt_cap = True
+        self._put_cap()
+
+    def note_halt(self, *, rid: str, held_free: Optional[int] = None) -> bool:
+        """NF-RC31-R6REST (SOLL R6 + R7, R11): the abort of ``rid`` is APPLIED on this rank -- no forward of it is launched any
+        more (a chunked prefill: ``process_pending_chunked_abort`` cleared ``chunked_req`` at the top of the scheduling step; any
+        other: the abort took it out of the waiting queue / running batch). ONE halt record under ``halt_key(rid)``: ``free`` =
+        the tokens no forward was launched for at the halt -- final, what an R6 redirect really moves to P (a chunk already in
+        flight ends on D, its KV stays in D's tree and the store); ``rest`` = what D still computes (the in-flight chunk
+        included). A COMMITTED marker of the rid is resolved (its next chunk never launches). A rid this leg never extended
+        writes nothing (D never began it; the front's R6 never counted it). Returns True when a halt record was written.
+
+        Review A1 (NF-RC31-R6REST, SOLL R6/R7 + user 19.10. "EXAKTE ZAHLEN"): ``held_free`` = the scheduler's exact number at the
+        halt -- the request's length minus what D's TREE holds of it after the abort (the retaining halt landed the in-flight chunk
+        and inserted it; a discarding abort holds only the prefix). Given, it is the record's ``free`` AND ``rest`` (nothing of
+        the request computes on D any more); the launch-based ``free`` above is then only the fallback of a caller without it."""
+        if self.mm is None:
+            return False
+        t_first = self._live.get(rid)
+        if t_first is None:
+            return False
+        n = self._nl.get(rid, 0)
+        free = int(self._free.get(rid, -1))
+        rest = int(self._last_rest.get(rid, -1))
+        q0 = self._after.get(rid)
+        if q0:
+            rest = int(q0[0][0])  # the oldest launched batch whose forward has not ended (review A1): D still computes it
+        if free < 0:
+            free = rest  # no launch length known (a v2-style caller): the rest is all D has not computed
+        exact = held_free is not None and int(held_free) >= 0
+        if exact:
+            free = rest = int(held_free)
+        elif self._halted.get(rid) == t_first:
+            # Review B2 (SOLL R6/R7, user 19.10. "EXAKTE ZAHLEN"): this leg's halt is written already. A LATER abort of the same
+            # leg -- the leg's own abort (``_requeue_park_handback``), the client-gone abort 2 s after the stream end (on a Weg-2
+            # group dispatched to every rank even for an unknown rid) -- applies at receipt and would overwrite the exact
+            # (tree-held) number with the launch-based free (live 6-401: 2069 -> 2010; on the discarding path a whole chunk)
+            return False
+        if rid in self._committed:
+            self._committed.discard(rid)
+            self._put(rid, t_first, self._last_rest.get(rid, -1), free, n)
+        if not self._put_key(halt_key(rid), t_first, rest, free, n):
+            return False
+        self._halted.pop(rid, None)
+        self._halted[rid] = t_first
+        while len(self._halted) > ARMED_CAP:
+            self._halted.popitem(last=False)
         return True
 
     def commit_next(self, *, rids: Iterable[str]) -> None:
@@ -386,6 +467,16 @@ class DExtendBeacon:
         self._armed.pop(rid, None)
 
 
+#: NF-RC31-R6REST: the key of the "this rank applies halts" record (``announce_halt``)
+HALT_CAP_KEY = int.from_bytes(hashlib.blake2b(b"\x00d-extend-halt-capable", digest_size=8).digest(), "little") or 1
+
+
+def halt_key(rid: str) -> int:
+    """NF-RC31-R6REST: the key of ``rid``'s HALT record (``note_halt``) -- a derived key, so the v4 layout carries it and a v4
+    reader that does not ask for it never sees it."""
+    return rid_key(str(rid) + "\x00halt")
+
+
 def req_rest(req) -> int:
     """S56: the tokens of ``req`` D has not computed at a batch start -- its whole sequence (prompt + output, a park
     resume included) minus the prefix the batch extends from (cached + earlier chunks). Never raises; -1 = unknown."""
@@ -412,7 +503,9 @@ def build(*, group: str, tag: str = "", env=None) -> Optional[DExtendBeacon]:
     d = beacon_dir(tag, env)
     if not d:
         return None
-    return DExtendBeacon(os.path.join(d, f"D-pid{os.getpid()}.bin"))
+    w = DExtendBeacon(os.path.join(d, f"D-pid{os.getpid()}.bin"))
+    w.announce_halt()  # NF-RC31-R6REST: the scheduler wires note_halt -- the front may stop R6 prefills first
+    return w
 
 
 def read_group_full(directory: str, group: str, sid: int,
@@ -492,10 +585,11 @@ def _merge_free(ranks) -> int:
     return min(known) if known else -1
 
 
-def _of_grant(reading, rid: str, t_grant_s: float):
+def _of_grant(reading, rid: str, t_grant_s: float, key: Optional[int] = None):
     """Review A2: ``(rest, free)`` of ``rid`` over the ranks whose record is of the grant at ``t_grant_s`` (first extend at or
-    after it); None = no such rank. A reading without per-rank values (a stub, a caller's tuple) uses the merged entry."""
-    v = reading.get(rid_key(rid)) if reading else None
+    after it); None = no such rank. A reading without per-rank values (a stub, a caller's tuple) uses the merged entry.
+    ``key``: read that key instead of ``rid_key(rid)`` (NF-RC31-R6REST: the halt record)."""
+    v = reading.get(rid_key(rid) if key is None else int(key)) if reading else None
     if v is None:
         return None
     t0 = int(float(t_grant_s) * 1e9)
@@ -557,3 +651,44 @@ def rest_of(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) ->
     if g is None or g[0] < 0:
         return None
     return int(g[0])
+
+
+def halted_free(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) -> Optional[int]:
+    """NF-RC31-R6REST (SOLL R6 + R7, R11; user 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): the tokens of ``rid`` no forward of D was
+    launched for when D APPLIED its abort -- the exact number an R6 redirect moves to P -- from the halt record (``note_halt``) of
+    the grant at ``t_grant_s``; None = no rank has applied the abort of this grant yet (D may still launch a chunk). The abort
+    reaches every TP rank in the same recv step and chunk boundaries are group-agreed (#794), so the ranks that halted agree;
+    their merge is ``_merge_free`` (MIN of the ranks with the most launches)."""
+    g = _of_grant(reading, rid, t_grant_s, key=halt_key(rid))
+    if g is None:
+        return None
+    # Review NF-RC31-R6REST A3 (SOLL R11, rank unanimity): the halt counts only once EVERY live rank that holds this grant's
+    # extend record has applied the abort. A rank that has not may still launch a chunk (its free would be smaller); reading the
+    # first rank alone would rest the verdict on one rank's state. Until then: None -> the verdict holds (liveness guard
+    # ``Front.R6_HALT_STALE_S`` names a rank that never halts). A reading without per-rank values (a stub) keeps the merged entry.
+    n_ext = _n_ranks_of_grant(reading, rid_key(rid), t_grant_s)
+    n_halt = _n_ranks_of_grant(reading, halt_key(rid), t_grant_s)
+    if n_ext is not None and n_halt is not None and n_halt < n_ext:
+        return None
+    free = int(g[1])
+    if free < 0:
+        return None if int(g[0]) < 0 else int(g[0])
+    return free
+
+
+def _n_ranks_of_grant(reading, key: int, t_grant_s: float) -> Optional[int]:
+    """Review A3: how many ranks carry a record under ``key`` of the grant at ``t_grant_s``; None = the reading has no per-rank
+    values (a stub, a caller's tuple) -- the count is not known."""
+    v = reading.get(int(key)) if reading else None
+    if v is None:
+        return 0
+    ranks = getattr(v, "ranks", None)
+    if not ranks:
+        return None
+    t0 = int(float(t_grant_s) * 1e9)
+    return sum(1 for r in ranks if int(r[0]) >= t0)
+
+
+def halt_capable(reading: Optional[Dict[int, object]]) -> bool:
+    """NF-RC31-R6REST: a live rank of the group announced halt records (``DExtendBeacon.announce_halt``)."""
+    return bool(reading) and HALT_CAP_KEY in reading
