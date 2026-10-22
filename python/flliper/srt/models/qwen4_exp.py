@@ -605,6 +605,17 @@ def _ple_turn_rows(forward_batch: ForwardBatch, kind: str):
     turn = getattr(forward_batch, "pdflip_turn_tracks", None)
     if turn is None or not len(turn):
         return None
+    # Review nf-rc31-forkanchor 1022: the same mode gate as ``turn_anchor.forward_rows`` (the GDN side). After a MIXED-D
+    # forward the mixed batch object becomes the running batch (scheduler ``running_batch = last_batch``; filter_batch
+    # returns early when nothing finished, prepare_for_decode keeps the field), so a DECODE forward can carry the
+    # consumed descriptor with ``gdn`` already done and ``dst_phys`` set -- its slot by then a tree anchor or freed.
+    # Only an extend that is not a verify writes a second track.
+    mode = getattr(forward_batch, "forward_mode", None)
+    try:
+        if mode is None or not mode.is_extend() or mode.is_target_verify():
+            return None
+    except Exception:  # noqa: BLE001 - an unknown mode writes nothing (as forward_rows)
+        return None
     turn.need.add(kind)
     if "gdn" not in turn.done or turn.dst_phys is None:
         return None
