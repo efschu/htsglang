@@ -64,6 +64,35 @@ class R4ProofIsTheCardSet(unittest.TestCase):
                 self.assertEqual(l["proof"], "dry_run", (m, l["id"]))
 
 
+class GateTextIsReadByCode(unittest.TestCase):
+    """Danger direction of the release core (mutant A1): the gate text "[METAL-UNPROVEN] no release boot on 2 cards yet (proven: [3])" names ONE blocker; "[3]"
+    read as a code would refuse every unproven count (2, 4 to 7 cards would vanish from the page)."""
+    TEXT = "[METAL-UNPROVEN] no release boot on %d cards yet (proven: [3]) (pdflip/topology.py PROVEN_CARD_COUNTS)"
+
+    def test_the_proven_list_is_not_a_blocker(self):
+        self.assertEqual(Z.ZielPlaner._blocker_codes(self.TEXT % 2), {"METAL-UNPROVEN"})
+        self.assertEqual(Z.ZielPlaner._blocker_codes("[HW-COUNT] x [METAL-UNPROVEN] y [3] [a-b]"), {"HW-COUNT", "METAL-UNPROVEN"})
+
+    def test_unproven_counts_stay_offered_with_the_real_gate_text(self):
+        text = self.TEXT
+
+        class Kp:
+            @staticmethod
+            def _mods():
+                return None, object()
+
+        class Ed(T.StubEd):
+            kp = Kp()
+
+            def _topology_verdict(self, n, tp, notes):
+                return None if n == 3 else text % n
+
+        z = Z.ZielPlaner(Ed(*T.res_refused_at(0), 10 ** 9))
+        st = z.n_states()
+        self.assertEqual({n: st[n]["state"] for n in Z.SUPPORTED_N}, {2: "unproven", 3: "proven", 4: "unproven", 5: "unproven", 6: "unproven", 7: "unproven"})
+        self.assertEqual(z.supported_n(), Z.SUPPORTED_N)
+
+
 class R2StatesAreKeys(unittest.TestCase):
     def test_n_states_keep_their_values_in_german(self):
         st = {"1": "off", "2": "unproven", "3": "proven", "4": "refused"}
@@ -86,10 +115,20 @@ class R3GermanFigures(unittest.TestCase):
     def test_everything_else_stays(self):
         for s in ("--max-total-tokens 268404", "v1.2.3 GiB", "5. GiB", "Qwen3.8-27B 12 GiB", "1.5 MiB", "x.5 GiB", "Text ohne Zahl"):
             self.assertEqual(Z._de_gib(s), s)
+        # mutant R3b: only the number right before " GiB" changes, never another figure in the same sentence
+        self.assertEqual(Z._de_gib("Reserve 65.5 GiB, util 0.82 und 1.5 MiB"), "Reserve 65,5 GiB, util 0.82 und 1.5 MiB")
 
     def test_the_english_view_keeps_the_point(self):
         lay = zp().layouts({"model": "qwen38-nf-int4", "cards": [{"card": "rtx3090-24", "count": 4}]})
         self.assertIn("65.5 GiB", json.dumps(lay))
+
+    def test_only_the_german_view_gets_the_comma(self):                                          # mutant R3c: the comma leaks into the English answer
+        for lang in (None, "en"):
+            self.assertEqual(Z.localize("Reserve 65.5 GiB", lang), "Reserve 65.5 GiB")
+            for n in T.NS:
+                for m in T.MODELS:
+                    raw = T.rec("layouts_%d_%s.json" % (n, m))
+                    self.assertEqual(Z.localize(raw, lang), raw, (lang, n, m))
 
     def test_no_point_figure_in_any_german_answer(self):
         for n in T.NS:
