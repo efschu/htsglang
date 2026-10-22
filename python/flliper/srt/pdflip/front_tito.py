@@ -56,12 +56,31 @@ import numpy as np
 
 logger = logging.getLogger("pdflip.front")
 
-#: carried requests the front remembers (ids + bytes, ~4.4 B/token each)
-BOOK_CAP = 32
-#: finished requests group D remembers (generated ids, 4 B/token)
-OUTPUT_BOOK_CAP = 512
-#: the front waits this long for D's answer to /pdflip/output_ids
-FETCH_TIMEOUT_S = 0.5
+#: carried sequences the front remembers (ids + bytes, ~8.4 B/token each). A
+#: follow-up turn SUPERSEDES the entry it extends (one entry per session, the
+#: last turn), so the cap counts sessions (review A4 22.10.).
+BOOK_CAP = 16
+#: ... and at most this many tokens over all entries (the newest always stays):
+#: 3M tokens ~ 25 MiB of front RAM, whatever the context length
+BOOK_MAX_TOKENS = 3_000_000
+#: finished requests group D remembers (generated ids, 4 B/token). The front
+#: TAKES a record at its request end (``take``: answered = dropped), so the
+#: book holds only rids whose end the front has not reached yet (review A4).
+OUTPUT_BOOK_CAP = 64
+#: the arrival waits at most this long for D's answer to /pdflip/output_ids;
+#: no answer = D's ids of that turn are not used (``tito_fetch_timeout``)
+FETCH_TIMEOUT_S = 0.05
+#: the WHOLE TITO step of one arrival (fetch + decide) is bounded by this; over
+#: it the render's ids stand (``tito_budget_timeout``, review A3 22.10.)
+TITO_BUDGET_S = 0.2
+#: the request end's fetch of D's ids (off the arrival's path)
+END_FETCH_TIMEOUT_S = 2.0
+#: the decode check runs on a changed region of at most this many tokens;
+#: above, the byte check plus the control-token check decide alone (for a
+#: byte-level tokenizer -- verified at load by PROBE_TEXTS -- the decode is a
+#: function of the bytes between control tokens, so it adds nothing there; at
+#: 1M tokens it cost ~480 ms, review A3)
+DECODE_CHECK_MAX_TOKENS = 65536
 #: an entry D had no finished record for (still decoding) is asked again after
 REFETCH_AFTER_S = 2.0
 OUTPUT_PATH = "/pdflip/output_ids"
@@ -155,6 +174,12 @@ class TokenBytes:
                 return
         self.table = table
         self.lens = np.fromiter((len(b) for b in table), dtype=np.int64, count=len(table))
+        # review A3: one flat buffer + start offsets -- bytes_of gathers with numpy
+        # (1M tokens: ~85 ms as a join of bytes objects)
+        self.flat = np.frombuffer(b"".join(table), dtype=np.uint8)
+        self.starts = np.zeros(len(table), dtype=np.int64)
+        if len(table) > 1:
+            np.cumsum(self.lens[:-1], out=self.starts[1:])
         mask = np.zeros(len(table), dtype=bool)
         for i in added:
             if 0 <= i < len(table):
@@ -175,8 +200,19 @@ class TokenBytes:
         return ids.size == 0 or (int(ids.min()) >= 0 and int(ids.max()) < len(self.table))
 
     def bytes_of(self, ids: Iterable[int]) -> bytes:
-        t = self.table
-        return b"".join([t[i] for i in (ids.tolist() if isinstance(ids, np.ndarray) else ids)])
+        flat = getattr(self, "flat", None)
+        if flat is None or not isinstance(ids, np.ndarray) or ids.size < 4096:
+            t = self.table
+            return b"".join([t[i] for i in (ids.tolist() if isinstance(ids, np.ndarray) else ids)])
+        ids64 = ids.astype(np.int64, copy=False)
+        ln = self.lens[ids64]
+        total = int(ln.sum())
+        if total == 0:
+            return b""
+        ends = np.cumsum(ln)
+        # every output byte k of token t reads flat[starts[t] + (k - first byte of t)]
+        shift = np.repeat(self.starts[ids64] - (ends - ln), ln)
+        return flat[shift + np.arange(total, dtype=np.int64)].tobytes()
 
     def offsets(self, ids: np.ndarray) -> np.ndarray:
         """``off[k]`` = byte length of ``ids[:k]`` (k = 0..len)."""
@@ -222,6 +258,39 @@ def same_control_tokens(tb: Any, a: np.ndarray, b: np.ndarray) -> bool:
     return bool(np.array_equal(tb.offsets(a)[:-1][ma], tb.offsets(b)[:-1][mb]))
 
 
+def byte_lcp2(a: bytes, b1: bytes, b2: bytes) -> int:
+    """``byte_lcp(a, b1 + b2)`` without building ``b1 + b2`` (a 1M-token prompt
+    is ~4 MB of bytes per candidate and call)."""
+    n = byte_lcp(a, b1)
+    if n < len(b1) or not b2:
+        return n
+    return n + byte_lcp(a[n:], b2)
+
+
+def common_boundary(new_off: np.ndarray, d_off: np.ndarray, shared: int) -> int:
+    """The largest byte offset ``p <= shared`` that is a token boundary of both
+    (offset arrays: non-decreasing, start 0). 0 = none. Review A3: a window at
+    the tail first (the common boundary is almost always a few tokens before
+    ``shared``), then the whole range -- never ``np.intersect1d`` (it sorts both
+    arrays: ~100 ms at 1M tokens, and wrong with repeated offsets)."""
+    hi = int(np.searchsorted(new_off, shared, side="right"))
+    lo = 0
+    for w in (256, None):
+        lo = 0 if w is None else max(0, hi - w)
+        a = new_off[lo:hi]
+        if a.size == 0:
+            continue
+        idx = np.searchsorted(d_off, a, side="left")
+        ok = idx < d_off.size
+        idx = np.minimum(idx, d_off.size - 1)
+        ok &= d_off[idx] == a
+        if ok.any():
+            return int(a[np.flatnonzero(ok)[-1]])
+        if lo == 0:
+            break
+    return 0
+
+
 def token_lcp(a: np.ndarray, b: np.ndarray) -> int:
     n = min(int(a.size), int(b.size))
     if n == 0:
@@ -260,10 +329,7 @@ def reuse(tb: TokenBytes, new_ids: np.ndarray, new_bytes: bytes, new_off: np.nda
     if shared <= 0:
         base.why = "no_shared_bytes"
         return base
-    a = new_off[new_off <= shared]
-    b = d_off[d_off <= shared]
-    common = np.intersect1d(a, b, assume_unique=True)
-    p = int(common[-1]) if common.size else 0
+    p = common_boundary(new_off, d_off, shared)
     if p <= 0:
         base.why = "no_common_boundary"
         return base
@@ -281,8 +347,9 @@ def reuse(tb: TokenBytes, new_ids: np.ndarray, new_bytes: bytes, new_off: np.nda
     if not same_control_tokens(tb, out[k:], new_ids[k:]):
         base.why = "control_token_check_failed"
         return base
-    if check_decode:
-        if tb.decode(out[k:]) != tb.decode(new_ids[k:]):
+    if check_decode and max(i, j) - k <= DECODE_CHECK_MAX_TOKENS:
+        # the changed region only: out[i:] == new_ids[j:] and both start at byte p
+        if tb.decode(out[k:i]) != tb.decode(new_ids[k:j]):
             base.why = "decode_check_failed"
             return base
     return Reuse(ids=out, reused=i, from_new=j, shared_bytes=shared, reach=reach, canon=canon)
@@ -302,6 +369,12 @@ class Entry:
     out_state: str = ""
     out_asked_t: float = 0.0
     bad: str = ""
+    #: the request of this entry ended at the front (review A4: only an ended
+    #: entry is superseded by the turn that extends it)
+    ended: bool = False
+
+    def tokens(self) -> int:
+        return int(self.prompt.size) + (int(self.out.size) if self.out is not None else 0)
 
 
 @dataclasses.dataclass
@@ -329,6 +402,7 @@ class TitoBook:
         self.tb = tb
         self.cap = max(1, int(cap))
         self.items: "collections.OrderedDict[str, Entry]" = collections.OrderedDict()
+        self.superseded = 0
 
     # -- writes ----------------------------------------------------------------
     def note(self, rid: str, ids: np.ndarray, ns: Optional[str], now: Optional[float] = None,
@@ -339,9 +413,50 @@ class TitoBook:
                   prompt_bytes=prompt_bytes if prompt_bytes is not None else self.tb.bytes_of(ids),
                   ns=ns, t=time.time() if now is None else float(now))
         self.items.pop(e.rid, None)
+        # review A4: the last turn per session -- an ENDED entry of the same
+        # namespace whose whole prompt this one extends is superseded (the next
+        # turn extends THIS prompt; the old one is never the better donor). An
+        # entry still in flight stays (a parallel sibling may extend it).
+        for old in [o for o in self.items.values()
+                    if o.ended and o.ns == e.ns and len(o.prompt_bytes) <= len(e.prompt_bytes)
+                    and byte_lcp(e.prompt_bytes, o.prompt_bytes) == len(o.prompt_bytes)]:
+            self.items.pop(old.rid, None)
+            self.superseded += 1
         self.items[e.rid] = e
+        self._bound()
+
+    def _bound(self) -> None:
+        """Entry cap and token cap (the newest entry always stays)."""
         while len(self.items) > self.cap:
             self.items.popitem(last=False)
+        total = sum(x.tokens() for x in self.items.values())
+        while total > BOOK_MAX_TOKENS and len(self.items) > 1:
+            _, x = self.items.popitem(last=False)
+            total -= x.tokens()
+
+    def end(self, rid: str, served: bool, rec: Optional[Dict[str, Any]]) -> str:
+        """The request end of ``rid`` (review A4): D's record attached when the
+        request was served, the entry marked ended (supersedable). Returns what
+        happened (``set_output``'s words, or ``not_served`` / ``unknown_rid``)."""
+        e = self.items.get(str(rid))
+        if e is None:
+            return "unknown_rid"
+        e.ended = True
+        if not served:
+            return "not_served"
+        if e.out is not None:
+            return "fetched"
+        what = self.set_output(rid, rec)
+        self._bound()
+        return what
+
+    def memory(self) -> Dict[str, int]:
+        """entries, tokens and bytes the book holds (the A4 instrument)."""
+        n_tok = sum(x.tokens() for x in self.items.values())
+        n_b = sum(int(x.prompt.nbytes) + len(x.prompt_bytes)
+                  + (int(x.out.nbytes) + len(x.out_bytes) if x.out is not None else 0)
+                  for x in self.items.values())
+        return {"entries": len(self.items), "tokens": n_tok, "bytes": n_b}
 
     def set_output(self, rid: str, rec: Optional[Dict[str, Any]]) -> str:
         """Attach D's record for ``rid``; returns what happened (``fetched`` |
@@ -350,6 +465,8 @@ class TitoBook:
         if e is None:
             return "unknown_rid"
         if not rec:
+            if e.out is not None:
+                return "fetched"  # taken earlier (the request end or the arrival): kept
             e.out_state = "absent"
             e.out_asked_t = time.monotonic()
             return "absent"
@@ -377,8 +494,7 @@ class TitoBook:
         for e in reversed(self.items.values()):
             if e.bad or e.ns != ns:
                 continue
-            seq_bytes = e.prompt_bytes + e.out_bytes if e.out is not None else e.prompt_bytes
-            n = byte_lcp(new_bytes, seq_bytes)
+            n = byte_lcp2(new_bytes, e.prompt_bytes, e.out_bytes if e.out is not None else b"")
             if n > 0:
                 out.append((n, e))
         out.sort(key=lambda t: -t[0])  # stable: newest first among equals
@@ -512,11 +628,14 @@ class OutputBook:
                 self.items.popitem(last=False)
         return True
 
-    def answer(self, rids: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
+    def answer(self, rids: Iterable[Any], take: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Records of ``rids``; ``take`` drops what was answered (review A4: the
+        front takes a rid's record at its request end -- D holds generated ids
+        only until then)."""
         out = {}
         with self.lock:
             for rid in rids:
-                rec = self.items.get(str(rid))
+                rec = self.items.pop(str(rid), None) if take else self.items.get(str(rid))
                 if rec is None:
                     continue
                 sha, n, ids = rec

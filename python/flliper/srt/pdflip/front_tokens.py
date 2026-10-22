@@ -421,6 +421,10 @@ class FrontTokens:
         self.why = ""
         self.tokenizer_path = ""
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdflip-xexact")
+        #: TITO's own thread (review A3 22.10.): the TitoBook is touched here only,
+        #: so a slow decide (or one past its budget, still finishing) never queues
+        #: in front of the next arrival's count on ``executor``
+        self.tito_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdflip-tito")
         self.ids_by_text: "collections.OrderedDict[str, np.ndarray]" = collections.OrderedDict()
         self._chat = None
         self._anth = None
@@ -581,7 +585,7 @@ class FrontTokens:
                      reused=seg.last_reused, encoded=seg.last_encoded,
                      round_trip_ok=seg.last_round_trip_ok), image_data
 
-    # -- TITO (front_tito.py) -- every method runs in the worker thread ------------
+    # -- TITO (front_tito.py) -- every method runs in ``tito_executor`` ----------------
     def tito_prepare(self, ids: np.ndarray, ns: Optional[str]) -> Tuple[Optional[bytes], List[str]]:
         """The render's bytes and the rids whose generated ids D is asked for."""
         book = self.tito
@@ -608,6 +612,13 @@ class FrontTokens:
     def tito_note(self, rid: str, ids: np.ndarray, ns: Optional[str]) -> None:
         if self.tito is not None:
             self.tito.note(rid, ids, ns)
+
+    def tito_end(self, rid: str, served: bool, rec: Optional[Dict[str, Any]]) -> str:
+        """The request end of ``rid`` (review A4): D's taken record attached
+        when served; the entry becomes supersedable."""
+        if self.tito is None:
+            return "no_book"
+        return self.tito.end(rid, served, rec)
 
     def remember(self, text: str, ids: np.ndarray) -> None:
         key = _sha(text)

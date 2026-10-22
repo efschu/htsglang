@@ -1627,10 +1627,12 @@ async def pdflip_output_ids(raw_request: Request):
     try:
         body = await raw_request.json()
         rids = [str(r) for r in (body.get("rids") or ())][:64]
+        take = bool(body.get("take"))
     except Exception as e:
         return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:200]}"},
                               status_code=200)
-    return ORJSONResponse({"success": True, "items": book.answer(rids)}, status_code=200)
+    # TITO review A4: "take" (the front's request end) drops what was answered
+    return ORJSONResponse({"success": True, "items": book.answer(rids, take=take)}, status_code=200)
 
 
 @app.api_route("/pdflip/tokenize_ahead", methods=["POST"])

@@ -7919,14 +7919,33 @@ class Front:
             self.counters["tito_not_carried"] += 1
             return c
         loop = asyncio.get_running_loop()
+        # review A3 22.10.: TITO's own thread -- a decide past its budget (still
+        # finishing there) never queues in front of the next count on ft.executor
+        ex = getattr(ft, "tito_executor", None) or ft.executor
         t0 = time.perf_counter()
         fetched: Dict[str, str] = {}
-        try:
-            nb, need = await loop.run_in_executor(ft.executor, ft.tito_prepare, c.ids, ns)
+
+        async def _run():
+            nb, need = await loop.run_in_executor(ex, ft.tito_prepare, c.ids, ns)
             if need:
-                items = await Front._tito_fetch(self, need)
-                fetched = await loop.run_in_executor(ft.executor, ft.tito_attach, items, need)
-            d = await loop.run_in_executor(ft.executor, ft.tito_decide, c.ids, ns, nb)
+                items = await Front._tito_fetch(self, need, timeout_s=_tito.FETCH_TIMEOUT_S)
+                if items is None:
+                    # D did not answer inside FETCH_TIMEOUT_S: the turn goes on WITHOUT D's ids of
+                    # the predecessor (its carried prompt -- ids every group already ran -- still
+                    # donates; dropping that too would lose the older turns' splices the cache holds)
+                    self.counters["tito_fetch_timeout"] += 1
+                    fetched.update({str(r): "timeout" for r in need})
+                    items = None
+                if items is not None:
+                    fetched.update(await loop.run_in_executor(ex, ft.tito_attach, items, need))
+            return await loop.run_in_executor(ex, ft.tito_decide, c.ids, ns, nb)
+
+        try:
+            # the HARD bound of the whole step (fetch + decide): over it the render's ids stand
+            d = await asyncio.wait_for(_run(), timeout=_tito.TITO_BUDGET_S)
+        except asyncio.TimeoutError:
+            self.counters["tito_budget_timeout"] += 1
+            d = _tito.Decision(_tito.V_REFUSED, c.ids, why="budget_timeout")
         except Exception as e:  # noqa: BLE001 -- the render's ids stand, named
             d = _tito.Decision(_tito.V_REFUSED, c.ids, why=f"error:{type(e).__name__}")
         d.ms = (time.perf_counter() - t0) * 1e3
@@ -7950,8 +7969,8 @@ class Front:
         hour_line = tally.add(d)
         if hour_line:
             logger.info(hour_line)
-        # the request's own ids are the next arrival's donor (worker thread: ordered after the decide above)
-        loop.run_in_executor(ft.executor, ft.tito_note, rid, d.ids, ns)
+        # the request's own ids are the next arrival's donor (TITO thread: ordered after the decide above)
+        loop.run_in_executor(ex, ft.tito_note, rid, d.ids, ns)
         if d.ids is c.ids:
             return c
         return _FtCount(n=int(d.ids.size), ids=d.ids, ms=c.ms, reused=c.reused, encoded=c.encoded,
@@ -7964,25 +7983,83 @@ class Front:
             return None
         return c.ids
 
-    async def _tito_fetch(self, rids: List[str]) -> Dict[str, Any]:
+    async def _tito_fetch(self, rids: List[str], timeout_s: Optional[float] = None,
+                          take: bool = False) -> Optional[Dict[str, Any]]:
         """TITO: group D's generated ids for ``rids`` (``/pdflip/output_ids``);
-        {} when D has no record, no book, or does not answer in time."""
+        {} when D has no record, no book, or failed; None when D did not answer
+        inside ``timeout_s`` (review A3: a hard bound -- the arrival never waits
+        longer). ``take``: D drops what it answered (the request end, A4)."""
         from flliper.srt.pdflip import front_tito as _tito
 
         D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
         if D is None or getattr(self, "session", None) is None:
             return {}
-        try:
-            async with self.session.post(f"{D.url}{_tito.OUTPUT_PATH}", json={"rids": list(rids)},
+        tmo = _tito.FETCH_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        body_out: Dict[str, Any] = {"rids": list(rids)}
+        if take:
+            body_out["take"] = True
+
+        async def _post():
+            async with self.session.post(f"{D.url}{_tito.OUTPUT_PATH}", json=body_out,
                                          headers=admin_key_mod.auth_headers(self.admin_key),
-                                         timeout=ClientTimeout(total=_tito.FETCH_TIMEOUT_S)) as r:
-                body = json.loads((await r.read()).decode(errors="replace")) if r.status == 200 else {}
+                                         timeout=ClientTimeout(total=tmo)) as r:
+                return json.loads((await r.read()).decode(errors="replace")) if r.status == 200 else {}
+
+        try:
+            body = await asyncio.wait_for(_post(), timeout=tmo)
+        except asyncio.TimeoutError:
+            return None
         except Exception as e:  # noqa: BLE001 -- no answer: the render's ids
             self.counters["tito_fetch_failed"] += 1
             logger.info("PDFLIP TITO-FETCH rids=%s failed: %s: %s", ",".join(rids), type(e).__name__, str(e)[:120])
             return {}
         items = body.get("items") if isinstance(body, dict) and body.get("success") else None
         return items if isinstance(items, dict) else {}
+
+    def _tito_rid_end(self, rid: str, status: Any) -> None:
+        """Review A4 22.10.: the request end of ``rid`` -- served, aborted,
+        client gone, failed (every exit of the generate handler, ipc_out_wrap).
+        The carried ids are released here (``_send_ids`` held them for every
+        leg; nothing posts for the rid after its end), and D's record of the
+        generated ids is TAKEN (dropped on D) -- attached to the front's TITO
+        entry when the request was served (the next turn's donor), else
+        discarded. Off the answer's path: a task, bounded by END_FETCH_TIMEOUT_S."""
+        book = self.__dict__.get("_send_ids")
+        if book is not None:
+            book.pop(rid, None)
+        posted = self.__dict__.get("_send_ids_posted")
+        if posted is not None:
+            posted.discard(rid)
+        lost = self.__dict__.get("_send_ids_lost")
+        if lost is not None:
+            lost.pop(rid, None)
+        self.counters["front_send_ids_released"] += 1
+        ft = getattr(self, "ftok", None)
+        if ft is None or getattr(ft, "tito", None) is None:
+            return
+        try:
+            t = asyncio.ensure_future(Front._tito_end_fetch(self, rid, status == 200))
+        except RuntimeError:  # no running loop (a desk double)
+            return
+        tasks = self.__dict__.setdefault("_tito_end_tasks", set())
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+
+    async def _tito_end_fetch(self, rid: str, served: bool) -> str:
+        from flliper.srt.pdflip import front_tito as _tito
+
+        items = await Front._tito_fetch(self, [rid], timeout_s=_tito.END_FETCH_TIMEOUT_S, take=True)
+        if items is None:
+            self.counters["tito_end_fetch_timeout"] += 1
+            items = {}
+        ft = self.ftok
+        ex = getattr(ft, "tito_executor", None) or ft.executor
+        try:
+            what = await asyncio.get_running_loop().run_in_executor(ex, ft.tito_end, rid, served, items.get(rid))
+        except Exception as e:  # noqa: BLE001 -- an instrument of the next turn, never this answer's fault
+            what = f"error_{type(e).__name__}"
+        self.counters["tito_end_" + what] += 1
+        return what
 
     def _d_page_size(self) -> int:
         """IMAGE-CACHED-1002: the groups' KV page size (their server info: NF 64,
@@ -10616,6 +10693,10 @@ class Front:
                 if rid:
                     self._ipc_out_book().end(rid)
                     Front._lane_end(self, rid)  # PRIORITY LANES 1008 (L1): the lane note goes with the rid
+                    try:  # TITO review A4: the rid's carried ids and D's generated ids end here
+                        Front._tito_rid_end(self, rid, status)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("PDFLIP TITO rid-end rid=%s: %s: %s", rid, type(e).__name__, e)
                     try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
                         Front._rb_done(self, rid, status)
                     except Exception as e:  # noqa: BLE001
