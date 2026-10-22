@@ -44,6 +44,7 @@ from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     ROUND_CAP_AUTO,
     BarlinkBar1Transport,
     ar_plan,
+    geometry,
     max_payload,
     parse_round_cap,
     round_budget,
@@ -151,8 +152,20 @@ class TestGeometryIsTheTreesOwn(CustomTestCase):
     """Every constant above is recomputed, never typed twice."""
 
     def test_w24_geometry_matches_the_boot(self):
-        self.assertEqual(max_payload(WORLD, W24_BYTES), W24_ROUND_MAX)
+        """Fix A (22.10.): the slots are FRAMED (31 data + 1 trailer packet
+        per 512 B). At this window the boot's slot DISTANCE and region stay
+        byte-for-byte (2 093 056 / 25 120 768); the payload capacity of a slot
+        is the framed 31/32 of it, and the DCP operating point still plans to
+        17 rounds. The stub below keeps the boot's historical chunk_max: the
+        decision tests grade the policy, not the frame."""
         self.assertEqual(W24_ROUND_MAX // WORLD, W24_CHUNK_MAX)
+        n = max_payload(WORLD, W24_BYTES)
+        g = geometry(WORLD, n)
+        self.assertEqual(g["slot_stride"], W24_CHUNK_MAX)
+        self.assertEqual(g["region_bytes"], W24_REGION)
+        self.assertEqual(g["chunk_max"], 2027520)
+        self.assertEqual(n, (2027520 // 16) * WORLD * 16)
+        self.assertEqual(len(ar_plan(DCP_AR_BYTES, g["chunk_max"], WORLD)), 17)
 
     def test_the_operating_point_is_seventeen_rounds_at_w24(self):
         self.assertEqual(

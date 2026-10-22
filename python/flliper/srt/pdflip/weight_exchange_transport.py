@@ -850,6 +850,8 @@ class CudartDeviceOps(DeviceOps):
         lib.cudaIpcOpenMemHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p),
                                              _IpcHandle, ctypes.c_uint]
         lib.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
+        # Fix A (22.10., bar1_lanes "VISIBILITY"): CUDA 11.3+. Resolved lazily
+        # in rdma_flush so an older runtime fails THERE, by name.
         self.lib = lib
         # FLIP-LEGS 02.10.: the same library through PyDLL -- calls that keep
         # the GIL. Bound ONLY for the two async copy entry points, used ONLY
@@ -883,6 +885,21 @@ class CudartDeviceOps(DeviceOps):
 
     def set_device(self, device: int) -> None:
         self._check(self.lib.cudaSetDevice(int(device)), "cudaSetDevice")
+
+    def rdma_flush(self, device: int) -> None:
+        """cudaDeviceFlushGPUDirectRDMAWrites(current device, TO_OWNER).
+
+        Makes every remote (peer BAR1) write that has ARRIVED at ``device``
+        visible to that card's own engines and SMs -- the documented step for a
+        card whose GPU_DIRECT_RDMA_WRITES_ORDERING is below "owner" (RTX 3080:
+        NONE). Host-synchronous. See bar1_lanes "Fix A".
+        """
+        fn = self.lib.cudaDeviceFlushGPUDirectRDMAWrites
+        fn.argtypes = [ctypes.c_int, ctypes.c_int]
+        self.set_device(device)
+        # cudaFlushGPUDirectRDMAWritesTargetCurrentDevice = 0,
+        # cudaFlushGPUDirectRDMAWritesToOwner = 100 (driver_types.h)
+        self._check(fn(0, 100), "cudaDeviceFlushGPUDirectRDMAWrites")
 
     # -- streams ----------------------------------------------------------
     def create_stream(self, device: int) -> int:

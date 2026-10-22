@@ -202,25 +202,160 @@ def reduced_result(comm, probe):
     return probe if out is None else out
 
 
-def verify_all_reduce(comm, buf, world: int, where: str):
+def verify_all_reduce(comm, buf, world: int, where: str, want=None):
     """One all_reduce of ``buf``, checked. Returns the reduced tensor.
 
     Runs on a CLONE, so the caller's buffer is reusable whichever contract
     the communicator has -- the timing loop below depends on that. Raises
     ``SystemExit`` on a wrong sum: a decomposition that returns the wrong
     answer is not a slow case, and no timing taken after it means anything.
+
+    ``want`` is the expected tensor (a :func:`round_payload` pair); ``None``
+    keeps the old scalar ``sum(1..world)`` for a constant ``rank + 1`` fill.
     """
     probe = reduced_result(comm, buf.clone())
-    want = float(sum(range(1, world + 1)))
     import torch
 
-    if not bool(torch.all(probe == want).item()):
+    if want is None:
+        want = float(sum(range(1, world + 1)))
+        ok = bool(torch.all(probe == want).item())
+    else:
+        ok = bool(torch.equal(probe, want))
+    if not ok:
+        bad = (probe != want)
+        nbad = int(bad.sum().item())
+        first = int(bad.nonzero()[0].item()) if nbad else -1
+        st = transport_status(comm) if hasattr(comm, "transport") else ""
         raise SystemExit(
-            f"WRONG RESULT: {where} -- expected {want}, got "
-            f"{probe.min().item()}..{probe.max().item()}. A decomposition "
-            f"that returns the wrong sum is not a slow case."
+            f"WRONG RESULT: {where} -- {nbad} of {probe.numel()} values wrong "
+            f"(first at element {first}), got {probe.min().item()}.."
+            f"{probe.max().item()} {st}. A decomposition that returns the wrong "
+            f"sum is not a slow case."
         )
     return probe
+
+
+# ---------------------------------------------------------------------------
+# The ROUND TERM (Fix A, 22.10.). A constant ``rank + 1`` fill is blind to a
+# receiver that reads a STALE slot: the previous round left the very same
+# value there, and the sum comes out right. bar1_allreduce.cu carried a round
+# term for exactly that reason ("(d) Beleg"); it was lost in the port
+# (barlink_bar1_ext.py docstring, "No round term rt") and with it the only
+# instrument that could see switch-p2p-wurzel-1022 §2.4. Every call below
+# gets a payload that differs per ROUND (k), per ELEMENT (i) and per RANK, and
+# never contains the 0 that an untouched slot holds:
+#
+#     x[r, k, i] = (r + 1) + 8 * ((7 i + 3 k) mod 61)      (exact in fp32)
+#     sum_r      = R(R+1)/2 + 8 R ((7 i + 3 k) mod 61)
+# ---------------------------------------------------------------------------
+
+def transport_status(comm) -> str:
+    """The BAR1 status word, for a WRONG line: 1 = payload barrier, 2 = entry
+    ack wait, 3 = a framed receive never verified a tile (Fix A). Reading it
+    synchronizes -- only ever called after a wrong result."""
+    try:
+        return f"status={int(comm.transport.status())}"
+    except Exception as e:      # noqa: BLE001 -- a diagnostic, never the error
+        return f"status=? ({type(e).__name__})"
+
+
+def round_payload(n: int, rank: int, world: int, k: int, device):
+    """``(payload, expected all_reduce sum)`` for call ``k``, float32, exact."""
+    import torch
+
+    i = torch.arange(n, device=device, dtype=torch.int64)
+    pat = ((7 * i + 3 * int(k)) % 61).to(torch.float32) * 8.0
+    payload = pat + float(rank + 1)
+    want = pat * float(world) + float(world * (world + 1) // 2)
+    return payload, want
+
+
+def gather_payload(n: int, rank: int, k: int, device):
+    """Shard of rank ``rank`` for all_gather/broadcast/a2a call ``k``."""
+    import torch
+
+    i = torch.arange(n, device=device, dtype=torch.int64)
+    return (((7 * i + 3 * int(k) + 11 * rank) % 251) + 1 + 256 * rank).to(
+        torch.float32)
+
+
+def _timed_verified(comm, pairs: list, seconds: float, where: str,
+                    at_least: int = 3) -> list:
+    """Like :func:`_timed`, rotating over round-termed ``(payload, want)``
+    pairs, and every single result checked after its clock stopped."""
+    import torch
+
+    samples = []
+    wrong = []
+    deadline = time.perf_counter() + seconds
+    j = 0
+    while time.perf_counter() < deadline or len(samples) < at_least:
+        buf, want = pairs[j % len(pairs)]
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = comm.all_reduce(buf)
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - t0) * 1e3)
+        res = buf if out is None else out
+        if not bool(torch.equal(res, want)):
+            wrong.append((j, int((res != want).sum().item())))
+        j += 1
+    if wrong:
+        raise SystemExit(
+            f"WRONG RESULT: {where} -- {len(wrong)} of {j} timed calls wrong "
+            f"(call, n_bad) {wrong[:8]} {transport_status(comm)}. A "
+            f"decomposition that returns the wrong sum is not a slow case.")
+    return samples
+
+
+def check_other_ops(comm, n: int, rank: int, world: int, dev, kctr: list,
+                    where: str, log) -> None:
+    """all_gather, broadcast and all_to_all_single with the round term.
+
+    Same transport, same window -- the a2a kernel carries all three, and a
+    stale slot shows the same way: a value from an earlier call, or 0.
+    Raises SystemExit on any wrong element.
+    """
+    import torch
+
+    tr = comm.transport
+    shard = max(4, n // world // 4 * 4)
+    # all_gather
+    k = kctr[0]
+    kctr[0] += 1
+    mine = gather_payload(shard, rank, k, dev)
+    got = comm.all_gather(mine, dim=0)
+    want = torch.cat([gather_payload(shard, r, k, dev) for r in range(world)])
+    path = "bar1" if tr.handles("all_gather", shard * 4) else "host"
+    if not torch.equal(got, want):
+        raise SystemExit(f"WRONG RESULT: {where} all_gather ({path}) -- "
+                         f"{int((got != want).sum())} of {want.numel()} wrong")
+    # broadcast from every source
+    for src in range(world):
+        k = kctr[0]
+        kctr[0] += 1
+        t = gather_payload(shard, src, k, dev) if rank == src else torch.zeros(
+            shard, dtype=torch.float32, device=dev)
+        got = comm.broadcast(t, src)
+        want = gather_payload(shard, src, k, dev)
+        if not torch.equal(got, want):
+            raise SystemExit(f"WRONG RESULT: {where} broadcast src={src} -- "
+                             f"{int((got != want).sum())} of {shard} wrong")
+    # all_to_all_single, even split
+    k = kctr[0]
+    kctr[0] += 1
+    blk = max(4, shard // world // 4 * 4)
+    inp = torch.cat([gather_payload(blk, rank * world + z, k, dev)
+                     for z in range(world)])
+    out = torch.empty_like(inp)
+    comm.all_to_all_single(out, inp)
+    want = torch.cat([gather_payload(blk, s * world + rank, k, dev)
+                      for s in range(world)])
+    if not torch.equal(out, want):
+        raise SystemExit(f"WRONG RESULT: {where} all_to_all_single -- "
+                         f"{int((out != want).sum())} of {want.numel()} wrong")
+    log(f"#   {where}: all_gather({path}, {shard * 4} B shard), broadcast x{world}, "
+        f"all_to_all_single ({blk * 4} B blocks) CORRECT")
 
 
 def run_rank(a) -> int:
@@ -267,6 +402,7 @@ def run_rank(a) -> int:
 
     sizes = [m << 20 for m in a.messages]
     ref = None
+    kctr = [0]          # the round term's call counter, global over the run
 
     for wmib in a.windows:
         os.environ["FLLIPER_BARLINK_BAR1_WINDOW_MIB"] = str(wmib)
@@ -286,21 +422,31 @@ def run_rank(a) -> int:
 
         for nbytes in sizes:
             n = nbytes // 4
-            buf = torch.full((n,), float(rank + 1), dtype=torch.float32,
-                             device=dev)
             rounds = len(ar_plan(nbytes, chunk_max, world))
+            where = f"window {wmib} MiB, {nbytes} B, {rounds} rounds"
 
-            # -- correctness, BEFORE any timing. A fast wrong answer is the
-            # -- one failure mode a throughput bench cannot see.
-            verify_all_reduce(
-                comm, buf, world,
-                f"window {wmib} MiB, {nbytes} B, {rounds} rounds",
-            )
+            # -- correctness, BEFORE any timing, WITH THE ROUND TERM. A fast
+            # -- wrong answer is the one failure mode a throughput bench
+            # -- cannot see; a constant payload cannot see a stale slot.
+            for c in range(a.verify_calls):
+                buf, want = round_payload(n, rank, world, kctr[0], dev)
+                kctr[0] += 1
+                verify_all_reduce(comm, buf, world, f"{where}, call {c}",
+                                  want=want)
             ok = True
 
-            work = buf.clone()
-            _timed(lambda: comm.all_reduce(work), a.warmup)
-            bar1 = _timed(lambda: comm.all_reduce(work), a.secs)
+            # -- timing on ROTATING round-termed payloads; every timed result
+            # -- is verified OUTSIDE the timed span, so a wrong timed call
+            # -- still ends the run.
+            pairs = []
+            for _ in range(3):
+                pairs.append(round_payload(n, rank, world, kctr[0], dev))
+                kctr[0] += 1
+            _timed_verified(comm, pairs, a.warmup, f"{where} (warmup)")
+            bar1 = _timed_verified(comm, pairs, a.secs, f"{where} (timed)")
+            buf = pairs[0][0]
+            if a.other_ops:
+                check_other_ops(comm, n, rank, world, dev, kctr, where, log)
 
             nccl = []
             if a.nccl:
@@ -472,6 +618,11 @@ def main() -> int:
                             os.path.dirname(os.path.abspath(__file__)))),
                         "python"))
     ap.add_argument("--out", default="")
+    ap.add_argument("--verify-calls", type=int, default=4,
+                    help="round-termed, verified all_reduce calls per cell "
+                         "before timing")
+    ap.add_argument("--other-ops", type=int, default=1,
+                    help="also verify all_gather/broadcast/a2a per cell")
     a = ap.parse_args()
     a.cards = [int(x) for x in str(a.cards).split(",") if x != ""]
     a.windows = [int(x) for x in str(a.windows).split(",") if x != ""]

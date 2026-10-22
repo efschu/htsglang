@@ -97,12 +97,15 @@ class SelectionTest(unittest.TestCase):
 
 class WindowTest(unittest.TestCase):
     def test_oneshot_requirement_is_r_minus_1_full_payloads(self):
-        self.assertEqual(window_requirement("oneshot", 24576, 3), 2 * 24576)
+        # Fix A (22.10.): counted in FRAMED bytes -- 24576 B = 1536 packets =
+        # 50 tiles of 31 data packets, 512 B each.
+        self.assertEqual(window_requirement("oneshot", 24576, 3), 2 * 50 * 512)
         # never above the mesh's requirement in its own range? Not claimed:
         # (R-1)*N vs 2(R-1)*ceil(N/R) -- for R=3 it is 1.5x. What IS claimed:
         # it is only chosen for N <= chunk_max, where R-1 slots of chunk_max
         # exist by construction.
-        self.assertEqual(window_requirement("mesh", 24576, 3), 2 * 2 * 8192)
+        # share 8192 B = 512 packets = 17 tiles (framed, Fix A)
+        self.assertEqual(window_requirement("mesh", 24576, 3), 2 * 2 * 17 * 512)
 
 
 if __name__ == "__main__":

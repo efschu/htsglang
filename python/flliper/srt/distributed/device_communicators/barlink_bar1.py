@@ -168,6 +168,9 @@ from flliper.srt.distributed.device_communicators import (
     barlink_env_guard,  # noqa: F401  (rejects retired FLLIPER_HTCCL* vars)
     barlink_liveness,
 )
+from flliper.srt.distributed.device_communicators import (
+    barlink_bar1_frame as _frame,
+)
 from flliper.srt.distributed.device_communicators.barlink_liveness import (
     PeerLivenessError,
     bounded_barrier,
@@ -1114,13 +1117,20 @@ def window_requirement(algorithm: str, nbytes: int, world: int) -> int:
     # size each, computed in ``barlink_bar1_pipe_ext.pipe_window_requirement``
     # and additionally checked in ``handles``. That number depends on
     # ``pipe_chunk_bytes``, not on the payload.
-    if algorithm in ("mesh", "mesh_pipe", "ring", "hierarchical"):
+    # Fix A: every slot carries its payload FRAMED (one 16-byte trailer per
+    # 31 data packets), so the requirement is counted in framed bytes.
+    if algorithm in ("mesh", "ring", "hierarchical"):
+        return 2 * (world - 1) * _frame.framed_bytes(share)
+    if algorithm == "mesh_pipe":
+        # The pipe kernel is not framed (it is declined while framing is the
+        # protocol, see BarlinkBar1Transport.__init__); kept unframed here so
+        # the number it would have needed stays the measured one.
         return 2 * (world - 1) * share
     if algorithm == "oneshot":
         # Task #53: R-1 RS slots, each holding the WHOLE payload (the AG
         # slots exist but stay unused). Never above the mesh's requirement
         # for nbytes <= chunk_max, which is the only range it is chosen in.
-        return (world - 1) * nbytes
+        return (world - 1) * _frame.framed_bytes(nbytes)
     if algorithm == "star":
         return 2 * (world - 1) * nbytes
     raise ValueError(f"unknown algorithm {algorithm!r}")
@@ -1200,22 +1210,30 @@ def geometry(world: int, max_bytes: int, with_a2a: bool = True,
     n4_max = max_bytes // 16
     chunk4 = -(-n4_max // world)
     chunk_max = ((chunk4 * 16 + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    # FRAMED SLOTS (Fix A, 22.10., barlink_bar1_frame.py): ``chunk_max`` stays
+    # the payload CAPACITY of a slot -- every plan, round count and refusal
+    # keeps reading it -- and the slots are laid out at ``slot_stride``, the
+    # page-rounded size of the framed image of a full slot (31 data packets
+    # + 1 trailer per 512 bytes, i.e. x32/31). The kernels get both and check
+    # that the stride carries the capacity.
+    slot_stride = ((_frame.framed_bytes(chunk_max) + PAGE_SIZE - 1)
+                   // PAGE_SIZE) * PAGE_SIZE
     slots = 2 * (world - 1)
     off_mesh = 0
-    off_ring = slots * chunk_max
-    off_a2a = 2 * slots * chunk_max
+    off_ring = slots * slot_stride
+    off_a2a = 2 * slots * slot_stride
     from flliper.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
         result_stride_bytes,
     )
 
     sets = 2 + (1 if with_a2a else 0)
-    off_pipe = sets * slots * chunk_max
+    off_pipe = sets * slots * slot_stride
     # The pipe region: the absolute number passed in, otherwise the old full
     # slot set. Rounded up to a page, so the result ring behind it again
     # begins on a page boundary.
     pipe_range = int(pipe_range) if with_pipe else 0
     if with_pipe and pipe_range <= 0:
-        pipe_range = slots * chunk_max
+        pipe_range = slots * slot_stride
     pipe_range = ((pipe_range + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE if pipe_range else 0
     off_result = off_pipe + pipe_range
     ring = int(result_ring) if with_pipe else 0
@@ -1223,6 +1241,7 @@ def geometry(world: int, max_bytes: int, with_a2a: bool = True,
     region = off_result + ring * result_stride + PAGE_SIZE
     return {
         "chunk_max": chunk_max,
+        "slot_stride": slot_stride,
         "off_mesh": off_mesh,
         "off_ring": off_ring,
         # -1 explicitly means "does not exist", not "is at 0" -- an offset
@@ -1826,7 +1845,11 @@ def max_payload(world: int, region_bytes: int, with_a2a: bool = True,
     rest = region_bytes - PAGE_SIZE - absolute
     if rest <= 0:
         return 0
-    chunk_max = (rest // denominator // PAGE_SIZE) * PAGE_SIZE
+    # The slots are laid out at the FRAMED stride (x32/31, page-rounded,
+    # Fix A); the capacity estimate therefore starts at 31/32 of a stride.
+    # The forward check below has the final word, as always.
+    stride = (rest // denominator // PAGE_SIZE) * PAGE_SIZE
+    chunk_max = (_frame.capacity_of(stride) // PAGE_SIZE) * PAGE_SIZE
     if chunk_max <= 0:
         return 0
     n = (chunk_max // 16) * world * 16
@@ -2289,6 +2312,25 @@ class BarlinkBar1Transport:
         self.pipe_on = os.environ.get("FLLIPER_BARLINK_BAR1_PIPE", "0") not in (
             "0", "no", "off", "false"
         )
+        # Fix A (22.10., barlink_bar1_frame.py): every slot of mesh, ring,
+        # oneshot and a2a is FRAMED -- a receiver consumes a tile only once its
+        # trailer carries this round and the hash of the bytes it read, so no
+        # PCIe write order is assumed. ``mesh_pipe`` is NOT framed: its direct
+        # mode writes results straight into the caller's tensor with no
+        # receive pass to verify in, and its slot mode was never ported. On
+        # this rig (posted writes not ordered: 3080 WRITES_ORDERING=NONE, RO
+        # on, PEX switch in every path) an unframed kernel can return stale
+        # bytes silently (switch-p2p-wurzel-1022.md), so the pipe is declined
+        # by name instead of being run. Rank-uniform: the env var is.
+        if self.pipe_on:
+            logger.warning(
+                "barlink-BAR1: FLLIPER_BARLINK_BAR1_PIPE=1 is DECLINED -- the "
+                "mesh_pipe kernel is not framed (Fix A, 22.10.) and would rely "
+                "on PCIe posted-write order, which this hardware does not "
+                "promise. all_reduce runs on the framed mesh/ring/oneshot "
+                "kernels instead."
+            )
+            self.pipe_on = False
         # RING DEPTH T -- slots per phase and connection. 4, from NCCL:
         # NCCL_STEPS 8 (src/include/device.h:26) divided by
         # ALLREDUCE_SLICESTEPS 2 (src/include/collectives.h:19).
@@ -2920,6 +2962,20 @@ class BarlinkBar1Transport:
                 continue
             self._peers[peer] = self._bind_peer(peer, self._foreign_fds[peer])
 
+        # 6b. PREFAULT (Fix A, 22.10.): write every byte of every peer's
+        # payload region once, here, while no kernel waits on it. Measured
+        # 22.10. with the framed kernels (dissect reproducer, status-3 aborts
+        # after 2.3 / 4.7 s): bytes a peer posts into a payload area this boot
+        # has NEVER written before do not become visible to the receiving
+        # card while its collective kernel runs -- not with ld.cv + system
+        # fence, not with ld.mmio, not with back-off -- and are there right
+        # after the kernel ends. That is the first-use signature of
+        # switch-p2p-wurzel-1022 §2.2. Touching the whole window once at
+        # bring-up removes the first use from every collective; the framing
+        # keeps any recurrence (e.g. a BAR1 remap) a loud status-3 abort
+        # instead of a stale number.
+        self._prefault_peer_windows(region)
+
         # 7. What is ACTUALLY mapped -- the group-wide minimum. Not the
         # gross size from sysfs and not the requested one: what governs is
         # the contiguous length the holder actually reported per peer. A
@@ -3020,7 +3076,9 @@ class BarlinkBar1Transport:
             duration * 1000, len(self._peers), region / 2**20,
             f"{(6 if self.a2a_on else 4) * (self.world - 1)} slots"
             + (" (of which 2(R-1) for all_to_all)" if self.a2a_on
-               else ", all_to_all disabled"),
+               else ", all_to_all disabled")
+            + f", FRAMED 31+1 per 512 B, stride "
+              f"{self._geo['slot_stride'] // 1024} KiB (Fix A)",
             self._geo["chunk_max"] // 1024,
             max_bytes // 1024, flag_bytes, route,
         )
@@ -3047,6 +3105,45 @@ class BarlinkBar1Transport:
             logger.warning(
                 "barlink-BAR1: coverage lines could not be built: %r", e
             )
+
+    def _prefault_peer_windows(self, region: int) -> None:
+        """Zero every peer's payload region once through the BAR1 mapping.
+
+        Copy engine, 16-MiB pieces, one stream, synchronized; then a bounded
+        group barrier so no rank starts a byte proof against a window its peer
+        is still writing. Zeros are the bring-up state of the region anyway
+        (a zero trailer never verifies), so nothing a peer relies on changes.
+        Env FLLIPER_BARLINK_BAR1_PREFAULT=0 skips it (A/B only).
+        """
+        import torch
+
+        if os.environ.get("FLLIPER_BARLINK_BAR1_PREFAULT", "1") in ("0", "off", "no", "false"):
+            logger.warning("barlink-BAR1: window prefault SKIPPED "
+                           "(FLLIPER_BARLINK_BAR1_PREFAULT=0) -- first use of a slot "
+                           "area can stall a framed receive (status 3).")
+            return
+        t0 = time.perf_counter()
+        piece = 16 << 20
+        zero = torch.zeros(min(piece, int(region)), dtype=torch.uint8,
+                           device=self.device)
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        total = 0
+        for z in self._peers.values():
+            n = min(int(region), int(z.payload.length))
+            off = 0
+            while off < n:
+                k = min(piece, n - off)
+                self._cuda.memcpy_async(int(z.payload.dev_ptr) + off,
+                                        int(zero.data_ptr()), k,
+                                        int(stream.cuda_stream))
+                off += k
+            total += n
+        stream.synchronize()
+        bounded_barrier(self.cpu_group, "bar1 bring-up: window prefault")
+        logger.info("barlink-BAR1: prefaulted %.1f MiB of peer payload windows "
+                    "in %.0f ms (Fix A: no first use inside a collective).",
+                    total / 2**20, (time.perf_counter() - t0) * 1e3)
 
     def _bind_peer(self, peer: int, foreign_fds: list) -> PeerTarget:
         """Attach, map, and register both regions of a peer."""
@@ -4187,6 +4284,8 @@ class BarlinkBar1Transport:
             # into this call stays where it was -- the same discipline the
             # flag region follows for its new banks.
             int(self._ackbase_mesh),
+            # Fix A: the framed slot distance, appended the same way.
+            int(self._geo["slot_stride"]),
         )
         return out
 
@@ -5269,6 +5368,8 @@ class BarlinkBar1Transport:
             int(self._abort_host),
             # #622: appended, not inserted -- see _all_reduce_one_round.
             int(self._ackbase_a2a),
+            # Fix A: the framed slot distance, appended the same way.
+            int(self._geo["slot_stride"]),
         )
         return output
 
@@ -6385,7 +6486,10 @@ class BarlinkBar1Transport:
         # Both mean "a spin kernel took its abort path", so both must raise --
         # a `!= 1` test here would have made the new code an invisible abort,
         # which is worse than the deadlock it reports on.
-        if status not in (1, 2):
+        # Fix A (22.10.): 3 = a framed receive never verified a tile (its
+        # trailer never carried this round and the matching hash before the
+        # deadline). Also an abort path -- nothing unverified was consumed.
+        if status not in (1, 2, _frame.STATUS_FRAME):
             if status is not None:
                 # A RESOLVED clean read closes the window it covered; an
                 # unresolved one (None) must not, or the raise would
@@ -6487,6 +6591,16 @@ class BarlinkBar1Transport:
         # the slots. A rank stuck there is downstream of a peer that is
         # behind, not the origin of the stall -- look at the peer whose ack
         # line is short, not at this rank's own last collective.
+        if status == _frame.STATUS_FRAME:
+            cause += (
+                " PHASE: the abort fired in a FRAMED RECEIVE (Fix A, status "
+                "3): the payload flags had all arrived, but a slot tile never "
+                "verified -- its trailer never carried this round with the "
+                "hash of the bytes this rank read, within the deadline. "
+                "Nothing unverified was consumed. Either the peer's posted "
+                "writes never became visible here, or a tile was written for "
+                "a different slot stream (geometry/salt disagreement)."
+            )
         if status == 2:
             cause += (
                 " PHASE: the abort fired in the ENTRY ack wait (#622): this "
@@ -6603,8 +6717,9 @@ class BarlinkBar1Transport:
         """
         code = self.status()
         # #622: 1 = a payload barrier gave up, 2 = the entry acknowledgment
-        # wait did. Both are abort paths; only the phase differs.
-        if code not in (1, 2):
+        # wait did. Both are abort paths; only the phase differs. Fix A: 3 =
+        # a framed receive never verified a tile.
+        if code not in (1, 2, _frame.STATUS_FRAME):
             return
         window = self._abort_window
         reason = window.reason if window is not None and window.tripped else None
@@ -6612,7 +6727,14 @@ class BarlinkBar1Transport:
             " The abort fired in the ENTRY ack wait (#622): this rank waited "
             "for the peers to consume its PREVIOUS collective's payload."
             if code == 2
-            else ""
+            else (
+                " The abort fired in a FRAMED RECEIVE (Fix A, status 3): a "
+                "slot tile never carried this round's trailer with the "
+                "matching hash -- the peer's bytes never became visible, or "
+                "they were written for another slot stream."
+                if code == _frame.STATUS_FRAME
+                else ""
+            )
         )
         raise Bar1KernelAborted(
             f"barlink-BAR1 {label}: a spin kernel took its abort path. Either "

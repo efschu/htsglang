@@ -746,7 +746,9 @@ def _a2a_usage(geo: dict, world: int) -> list:
     reaches exactly these, never more -- it is that kernel with a different
     table.
     """
-    slot = int(geo["a2a_slot"])
+    # Fix A (22.10.): the slots are FRAMED -- laid out at ``slot_stride`` and
+    # written over the whole framed image, not over the payload capacity.
+    slot = int(geo.get("slot_stride", geo["a2a_slot"]))
     base = int(geo["off_a2a"])
     return [
         (base + (par * (world - 1) + p) * slot, slot)
@@ -893,8 +895,8 @@ class TestBroadcastAlongsideTheResultRing(CustomTestCase):
         geo = self._geo(world, max_bytes, ring)
         slots = 2 * (world - 1)
         for forgotten, off_result in (
-            ("a2a and pipe", 2 * slots * geo["chunk_max"]),
-            ("a2a only", 3 * slots * geo["chunk_max"]),
+            ("a2a and pipe", 2 * slots * geo["slot_stride"]),
+            ("a2a only", 3 * slots * geo["slot_stride"]),
         ):
             wrong = dict(geo)
             wrong["off_result"] = off_result

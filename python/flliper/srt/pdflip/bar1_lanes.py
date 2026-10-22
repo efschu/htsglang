@@ -549,6 +549,70 @@ def deposit_copy_mode(ops, device: int):
     return COPY_SM, copier, ""
 
 
+# -- Fix A (22.10.): visibility of the deposited bytes, without an order assumption --
+#
+# switch-p2p-wurzel-1022.md: on this rig a receiving card's SMs/engines can see a
+# peer's posted writes LATE and out of order (3080 GPU_DIRECT_RDMA_WRITES_ORDERING =
+# NONE, 5090 OWNER; Relaxed Ordering on the P2P writes; a PEX switch in every path).
+# The lanes' "full" credit travels via the host, so the old chain was
+#     deposit copies -> stream sync -> socket -> collector's copy out of the window
+# and nothing in it says the deposited bytes had ARRIVED at the collector's card, let
+# alone become visible to its copy engine. Two documented steps close it:
+#
+# 1. ARRIVAL -- the depositor reads 16 bytes back from the peer window on the SAME
+#    stream after the batch's copies. A PCIe read request may not pass a posted write
+#    on its path (PCIe ordering table, rule "read must not pass posted"; Relaxed
+#    Ordering relaxes posted-vs-posted only, ID-based ordering does not apply to one
+#    requester), so when the read completes -- before the stream sync that precedes
+#    the credit -- every write of the batch has reached the peer card.
+# 2. VISIBILITY -- the collector calls cudaDeviceFlushGPUDirectRDMAWrites(current
+#    device, TO_OWNER) after the credit and before its copies: NVIDIA's documented
+#    way to make remote writes that have ARRIVED visible to the owning card on a
+#    device whose WRITES_ORDERING is below "owner" (measured: both cards report
+#    FLUSH_WRITES_OPTIONS = HOST).
+#
+# Cost per batch (8-64 MiB): one 16-byte read round trip on the depositor (~us) and
+# one host flush call on the collector. A missing method on the ops (desk fakes) is
+# a NAMED refusal in the lane-time line, never a silent pass.
+ENV_WRITE_ORDER = "FLLIPER_PDFLIP_BAR1_WRITE_ORDER"
+READBACK_BYTES = 16
+
+
+def write_order_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_WRITE_ORDER, env)
+
+
+def write_order_ops(ops, role: str):
+    """(callable or None, why). Depositor: readback(scratch_dev, src, stream);
+    collector: flush(device). None + why when the switch is off or the ops
+    cannot do it."""
+    if not write_order_on():
+        return None, f"{ENV_WRITE_ORDER}=0"
+    if role == "src":
+        if not callable(getattr(ops, "memcpy_async", None)) or not callable(
+                getattr(ops, "raw_malloc", None)):
+            return None, f"ops {getattr(ops, 'name', type(ops).__name__)} has no raw_malloc"
+        return ops.memcpy_async, ""
+    fn = getattr(ops, "rdma_flush", None)
+    if not callable(fn):
+        return None, f"ops {getattr(ops, 'name', type(ops).__name__)} has no rdma_flush"
+    return fn, ""
+
+
+_RB_LOCK = threading.Lock()
+_RB_SCRATCH: dict = {}       # device -> raw device address of the readback target
+
+
+def readback_scratch(ops, device: int) -> int:
+    """A raw 4-KiB device buffer per card, allocated once per process."""
+    with _RB_LOCK:
+        p = _RB_SCRATCH.get(int(device))
+        if p is None:
+            p = int(ops.raw_malloc(int(device), 4096))
+            _RB_SCRATCH[int(device)] = p
+        return p
+
+
 def _compact(why: str, n: int = 120) -> str:
     return "_".join(str(why).split())[:n]
 
@@ -1618,6 +1682,15 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     sync_q = sync_query_mode(ops)
     cblocks = sm_blocks() if copier is not None else 0
     slow = 0          # this tag's bytes that could not take the 16-B SM path
+    # Fix A (22.10.): arrival (depositor readback) and visibility (collector flush)
+    wo_fn, wo_why = write_order_ops(ops, "src" if role == "src" else "dst")
+    rb_dst = 0
+    if wo_fn is not None and role == "src":
+        try:
+            rb_dst = readback_scratch(ops, device)
+        except Exception as exc:  # noqa: BLE001 -- named in the lane-time line
+            wo_fn, wo_why = None, f"readback scratch: {type(exc).__name__}: {exc}"
+    wo_n = 0
     # FLIPCYCLE H4: fast-receiver-first on this card's one D2H engine
     _gate = None
     _gate_ms = 0.0
@@ -1834,6 +1907,11 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     else:
                         out_cp2d(dst, int(piece.run_bytes), src, int(piece.spitch),
                                  int(piece.run_bytes), int(piece.rows), stream)
+                if wo_fn is not None:
+                    # ARRIVAL: a read on the same stream, behind the batch's
+                    # writes -- it cannot complete before they have arrived.
+                    wo_fn(rb_dst, sbase, READBACK_BYTES, stream)
+                    wo_n += 1
                 clk.issue += time.perf_counter() - ti
                 if _gate is not None:
                     _gate.issued(lane_key, stream)
@@ -1848,6 +1926,11 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             if got is None:
                 return (f"bar1 collect lane={lane_key} seq={seq}: no 'full' for batch {g} "
                         f"within {budget_s:.0f} s (depositor gone or stuck)")
+            if wo_fn is not None:
+                # VISIBILITY: the batch has arrived (depositor readback before
+                # its credit); make it visible to this card before copying out.
+                wo_fn(int(device))
+                wo_n += 1
             if pre is not None:
                 for kind, dst, soff, a, b, c in pre[g]:
                     if kind == tp.FLAT:
@@ -1936,6 +2019,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         mode_f = f"mode={cmode} sm_blocks={cblocks} sm_slow_bytes={slow}"
     else:
         mode_f = f"mode={cmode}" + (f" mode_why={_compact(cwhy)}" if cwhy else "")
+    mode_f += (f" write_order={'readback' if role == 'src' else 'flush'}x{wo_n}"
+               if wo_fn is not None else f" write_order=OFF why={_compact(wo_why)}")
     log(f"PDFLIP-BAR1 lane-time lane={lane_key} phase={phase} seq={seq} units={npieces} "
         f"batches={nb} bytes={total} total_ms={total_s * 1000:.0f} "
         f"wait_ms={clk.credit * 1000:.0f} copy_sync_ms={clk.sync * 1000:.0f} "

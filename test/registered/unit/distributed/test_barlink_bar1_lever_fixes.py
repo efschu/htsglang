@@ -219,15 +219,19 @@ class TestWhoStealsTheSlot(CustomTestCase):
     def test_the_measured_slot_without_the_pipe_is_reproduced(self):
         n = max_payload(WORLD, WINDOW, True, False, 0)
         geo = geometry(WORLD, n, True, False, 0)
-        self.assertEqual(geo["chunk_max"] // 1024, 8188)
-        self.assertEqual(_tipping_tokens(n), 2456)
+        # Fix A (22.10.): the measured 8188-KiB slot is now the slot DISTANCE;
+        # its payload capacity is the framed 31/32 of it.
+        self.assertEqual(geo["slot_stride"] // 1024, 8188)
+        self.assertEqual(geo["chunk_max"] // 1024, 7932)
+        self.assertEqual(_tipping_tokens(n), 2379)
 
     def test_the_measured_loss_comes_from_the_pipe_set_not_from_the_ring(self):
         """6140 KiB falls out at ``result_ring = 0`` -- the ring was not involved."""
         n = max_payload(WORLD, WINDOW, True, True, 0)
         geo = geometry(WORLD, n, True, True, 0)
-        self.assertEqual(geo["chunk_max"] // 1024, 6140)
-        self.assertEqual(_tipping_tokens(n), 1842)
+        self.assertEqual(geo["slot_stride"] // 1024, 6140)   # framed (Fix A)
+        self.assertEqual(geo["chunk_max"] // 1024, 5948)
+        self.assertEqual(_tipping_tokens(n), 1784)
         self.assertLess(
             _tipping_tokens(n), WORKING_POINT_TOKENS,
             "the tipping point must lie BELOW the working point -- "
@@ -265,14 +269,15 @@ class TestWhoStealsTheSlot(CustomTestCase):
                 ((WINDOW - page) // denominator // page) * page // 1024,
                 expected,
             )
+        # Fix A: the division gives the slot DISTANCE (framed stride).
         self.assertEqual(
             geometry(WORLD, max_payload(WORLD, WINDOW, True, False, 0),
-                      True, False, 0)["chunk_max"],
+                      True, False, 0)["slot_stride"],
             ((WINDOW - page) // 12 // page) * page,
         )
         self.assertEqual(
             geometry(WORLD, max_payload(WORLD, WINDOW, True, True, 0),
-                      True, True, 0)["chunk_max"],
+                      True, True, 0)["slot_stride"],
             ((WINDOW - page) // 16 // page) * page,
         )
 
@@ -301,8 +306,9 @@ class TestPipeRangeByNeed(CustomTestCase):
     def test_the_right_sized_area_lifts_the_tipping_point_over_the_working_point(self):
         n = max_payload(WORLD, WINDOW, True, True, 0, self._range_bytes())
         geo = geometry(WORLD, n, True, True, 0, self._range_bytes())
-        self.assertEqual(geo["chunk_max"] // 1024, 7736)
-        self.assertEqual(_tipping_tokens(n), 2320)
+        self.assertEqual(geo["slot_stride"] // 1024, 7736)   # framed (Fix A)
+        self.assertEqual(geo["chunk_max"] // 1024, 7492)
+        self.assertEqual(_tipping_tokens(n), 2247)
         self.assertGreater(_tipping_tokens(n), WORKING_POINT_TOKENS)
 
     def test_pure_pipe_without_direct_keeps_almost_the_whole_slot(self):
@@ -416,9 +422,10 @@ class TestPipeRangeByNeed(CustomTestCase):
         """``pipe_range = 0`` means "as before" -- exactly that."""
         for max_bytes in (64 << 10, 8 << 20):
             old = geometry(WORLD, max_bytes, True, True, 2, 0)
+            # a full slot SET -- slots sit at the framed stride (Fix A)
             self.assertEqual(
                 old["pipe_range"],
-                2 * (WORLD - 1) * old["chunk_max"],
+                2 * (WORLD - 1) * old["slot_stride"],
             )
             self.assertEqual(
                 old["off_result"], old["off_pipe"] + old["pipe_range"]
