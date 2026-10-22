@@ -2596,7 +2596,16 @@ def _weight_terms_key(model_path: str) -> Optional[Tuple[object, ...]]:
     try:
         if os.path.isfile(model_path):
             st = os.stat(model_path)
-            return (str(model_path), ((os.path.basename(model_path), st.st_size, st.st_mtime_ns),))
+            files = [(os.path.basename(model_path), st.st_size, st.st_mtime_ns)]
+            # review nfblock 1022: a GGUF FILE is priced through its sibling config.json too (gguf_census._sibling_text_config: the
+            # family name map and the depth check) -- that file is part of what was read, so it is part of the key
+            from flliper.srt.server_args import declared_config_path_for
+
+            cfg = declared_config_path_for(model_path)
+            if cfg is not None:
+                cst = os.stat(cfg)
+                files.append((str(cfg), cst.st_size, cst.st_mtime_ns))
+            return (str(model_path), tuple(files))
         shards = sorted(_glob.glob(os.path.join(model_path, "*.safetensors")))
         if not shards:
             return None
