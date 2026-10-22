@@ -1458,8 +1458,9 @@ HEAD_POS_ATTR = "_pdflip_head_pos"
 HEAD_CLOSE_IDS: Tuple[int, ...] = (510, 8678, 12, 75240)
 #: at most this many head tracks per prompt, the lowest. A Claude-Code first user message carries 4 closes (rc32
 #: pdflip-8-255, rebuilt from its transcript: instructions 17503, session context 18040, attribution 18175, the
-#: SubagentHandback note 19468 -- the last one shares the turn track's page); 4 keeps a prompt whose SYS-GRID part
-#: uses its slack (2 slots at a 64k / 131k / 250k system part against the arena share cap of 21) at most 2 over it
+#: SubagentHandback note 19468 -- the last one shares the turn track's page). The cap bounds the device slots and
+#: the arena/L3 bytes (4 x 58834944 B per head family); it is NOT an H19 share bound: second-track nodes are untagged
+#: and never count against the per-request arena share (review 22.10., ``_pdflip_tag_retain_chain``)
 HEAD_MAX = 4
 
 
@@ -1548,7 +1549,12 @@ def _note_head_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     step's own track can be rank-local (TP0's branching point replaces it, review A2 of nf-rc31-forkanchor, fixed on
     desk/nf-rc32-forkanchor2-1022 as the 'branch' second track) and a head plan bounded by it would split the group's
     tree; the rc32 boot had 0 head branches recomputed on D (5 of 5 requests that prefilled through the head ran on
-    P)."""
+    P). Review on rc33 (22.10.): with forkanchor2 merged the D step track IS rank-agreed (:func:`d_branch_rides`),
+    so that reason is gone; D stays out because no D case was measured and a D head plan would have to be a
+    POSITION plan on every rank (:func:`_draw_slot` / :func:`_put_plan`, the in-flight registry) for a list of
+    plans -- a feature of its own, not part of this one. The head anchor nodes carry no ``pdflip_anchor_rid``
+    (only the retain's final / END node and the chunk node are tagged), so they never count against the H19
+    per-request arena share (cap 21) and SHARE / the FULL foreign pick never take them."""
     pts = req_head_pos(req, tok, page)
     if not pts:
         return desc
