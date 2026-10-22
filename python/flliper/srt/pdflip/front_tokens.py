@@ -88,10 +88,15 @@ class SegmentEncoder:
     ``enabled`` is False and every call encodes the whole text."""
 
     def __init__(self, tok, marker: str = SEGMENT_MARKER,
-                 cap_tokens: int = SEGMENT_CACHE_TOKENS, track_round_trip: bool = False):
+                 cap_tokens: int = SEGMENT_CACHE_TOKENS, track_round_trip: bool = False,
+                 cap_entries: Optional[int] = None):
         self.tok = tok
         self.marker = marker
         self.cap_tokens = int(cap_tokens)
+        #: GROUP-SEG-1022 review: optional bound on the NUMBER of cached pieces (None = tokens only, as before).
+        #: A cached piece costs ~450 B of Python overhead beside its 4 B/token, so a token bound alone lets
+        #: many short distinct pieces grow the cache to ~1 GB (measured: 50k pieces of ~7 tokens = 22.7 MB).
+        self.cap_entries = int(cap_entries) if cap_entries else None
         self.cache: "collections.OrderedDict[Tuple[str, str], array.array]" = collections.OrderedDict()
         self.cached_tokens = 0
         self.enabled, self.why = self._probe()
@@ -167,7 +172,9 @@ class SegmentEncoder:
                         self.rt_lossy.add(key)
                     self.cache[key] = hit
                     self.cached_tokens += len(hit)
-                    while self.cached_tokens > self.cap_tokens and len(self.cache) > 1:
+                    while (self.cached_tokens > self.cap_tokens
+                           or (self.cap_entries is not None and len(self.cache) > self.cap_entries)) \
+                            and len(self.cache) > 1:
                         old_key, old = self.cache.popitem(last=False)
                         self.cached_tokens -= len(old)
                         self.rt_lossy.discard(old_key)

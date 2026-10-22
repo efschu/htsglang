@@ -67,6 +67,11 @@ TAG = "PDFLIP GROUP-SEG"
 ENCODE_CAP_TOKENS = 4_000_000
 #: decode cache, in tokens of the decoded pieces (the text is ~3.5 chars/token)
 DECODE_CAP_TOKENS = 4_000_000
+#: GROUP-SEG-1022 review: pieces per cache (encode and decode each). A piece costs ~450 B (encode) /
+#: ~375 B (decode) of Python overhead beside its tokens (measured, NF tokenizer); without an entry bound a run of
+#: short distinct pieces fills the 4M-token caps with ~2M entries = ~1.6 GB per tokenizer process. 65536 pieces
+#: (hundreds of agent sessions' messages) bound the overhead to ~55 MB.
+CAP_ENTRIES = 65536
 #: tokenizers with a registry entry (strong refs: an id() is never reused while held)
 REGISTRY_CAP = 8
 
@@ -83,17 +88,48 @@ CHECK_TEXTS = (
 
 
 def _sha_ids(ids: np.ndarray) -> str:
-    return hashlib.sha1(np.ascontiguousarray(ids, dtype=np.int32).tobytes()).hexdigest()
+    # int64, never int32 (review): an int32 cast wraps id x + 2**32 onto x, so a run the whole decode refuses
+    # (OverflowError) was answered from another run's cached text
+    return hashlib.sha1(np.ascontiguousarray(ids, dtype=np.int64).tobytes()).hexdigest()
+
+
+def _marker_overlap(tok: Any, marker: str) -> Optional[str]:
+    """The structural half of the encode check (review): the cut before every ``marker`` equals the HF split only
+    if no OTHER added token can be matched across the cut -- one that holds the marker after its first character,
+    or ends in a proper head of it (``"x<|im"``: leftmost-longest matching takes it in the whole text, the cut
+    never sees it). The marker itself must not be ``single_word`` (the whole text matches it only between word
+    boundaries, a piece always at its start) nor ``normalized`` (matched after a normalizer, not on the raw cut).
+    Returns why not, or None. No added-token table: unknown is not sound."""
+    added = getattr(tok, "added_tokens_decoder", None)
+    if not added:
+        return "no added_tokens_decoder to check the marker against"
+    for _id, info in added.items():
+        c = str(getattr(info, "content", info))
+        if c == marker:
+            if getattr(info, "single_word", False):
+                return f"{marker!r} is single_word"
+            if getattr(info, "normalized", False):
+                return f"{marker!r} is normalized"
+            continue
+        for i in range(1, len(c)):
+            tail = c[i:]
+            if marker.startswith(tail) or tail.startswith(marker):
+                return f"added token {c!r} overlaps {marker!r}"
+    return None
 
 
 class GroupSegTokens:
     """encode / decode of one tokenizer, segmented at ``<|im_start|>`` and cached
     per piece; each operation only where its load check passed."""
 
-    def __init__(self, tok: Any, enc_cap: int = ENCODE_CAP_TOKENS, dec_cap: int = DECODE_CAP_TOKENS):
+    def __init__(self, tok: Any, enc_cap: int = ENCODE_CAP_TOKENS, dec_cap: int = DECODE_CAP_TOKENS,
+                 cap_entries: int = CAP_ENTRIES):
         self.tok = tok
-        self.seg = SegmentEncoder(tok, cap_tokens=enc_cap)
+        self.seg = SegmentEncoder(tok, cap_tokens=enc_cap, cap_entries=cap_entries)
         self.dec_cap = int(dec_cap)
+        self.cap_entries = int(cap_entries)
+        #: review: seg-path failures answered by the whole call (counted, first one logged)
+        self.fallbacks = 0
         self.dec_cache: "collections.OrderedDict[Tuple[str, str], Tuple[str, int]]" = collections.OrderedDict()
         self.dec_tokens = 0
         self.lock = threading.Lock()
@@ -119,6 +155,9 @@ class GroupSegTokens:
     # -- load checks ---------------------------------------------------------
     def _check_encode(self) -> Tuple[bool, str]:
         try:
+            why = _marker_overlap(self.tok, SEGMENT_MARKER)
+            if why is not None:
+                return False, why
             for t in CHECK_TEXTS:
                 whole = list(self.tok.encode(t))
                 parts = [list(self.tok.encode(p)) for p in self.seg.split(t)]
@@ -156,16 +195,32 @@ class GroupSegTokens:
             return False, f"call check failed: {type(e).__name__}: {e}"
 
     # -- operations ----------------------------------------------------------
+    def _fell_back(self, op: str, e: BaseException) -> None:
+        """A segmented call raised: the caller gets the whole call's result (or its exception), never a
+        partial one. Review: before, the exception escaped -- in serving_chat into the flat-tools re-render."""
+        self.fallbacks += 1
+        if self.fallbacks == 1:
+            logger.warning("%s FALLBACK op=%s %s: %s (this call and any later failing one run the whole call; "
+                           "counted in GroupSegTokens.fallbacks)", TAG, op, type(e).__name__, e)
+
     def encode(self, text: str, **kw) -> List[int]:
         if not self.enc_ok or not isinstance(text, str):
             return self.tok.encode(text, **kw)
-        return self.seg.encode(text, **kw)
+        try:
+            return self.seg.encode(text, **kw)
+        except Exception as e:  # noqa: BLE001 -- the whole call decides, named once
+            self._fell_back("encode", e)
+            return self.tok.encode(text, **kw)
 
     def encode_call(self, text: str) -> List[int]:
         """``tok([text])["input_ids"][0]`` (the tokenizer manager's single-string encode)."""
         if not (self.enc_ok and self.call_ok) or not isinstance(text, str):
             return list(self.tok([text])["input_ids"][0])
-        return self.seg.encode(text)
+        try:
+            return self.seg.encode(text)
+        except Exception as e:  # noqa: BLE001
+            self._fell_back("encode_call", e)
+            return list(self.tok([text])["input_ids"][0])
 
     def _cuts(self, ids: np.ndarray) -> List[int]:
         pos = np.flatnonzero(ids == int(self.marker_id)).tolist()
@@ -193,7 +248,8 @@ class GroupSegTokens:
             decoded += int(piece.size)
             self.dec_cache[key] = (s, int(piece.size))
             self.dec_tokens += int(piece.size)
-            while self.dec_tokens > self.dec_cap and len(self.dec_cache) > 1:
+            while (self.dec_tokens > self.dec_cap or len(self.dec_cache) > self.cap_entries) \
+                    and len(self.dec_cache) > 1:
                 _, (_, n_old) = self.dec_cache.popitem(last=False)
                 self.dec_tokens -= n_old
             out.append(s)
@@ -210,8 +266,12 @@ class GroupSegTokens:
             return self.tok.decode(ids, **kw)
         if arr.ndim != 1 or arr.size == 0 or arr.dtype.kind not in "iu":
             return self.tok.decode(ids, **kw)
-        with self.lock:
-            return self._decode_pieces(arr, **kw)
+        try:
+            with self.lock:
+                return self._decode_pieces(arr, **kw)
+        except Exception as e:  # noqa: BLE001
+            self._fell_back("decode", e)
+            return self.tok.decode(ids, **kw)
 
 
 _REG: "collections.OrderedDict[int, Tuple[Any, Optional[GroupSegTokens]]]" = collections.OrderedDict()
@@ -234,9 +294,11 @@ def for_tokenizer(tok: Any) -> Optional[GroupSegTokens]:
     try:
         g: Optional[GroupSegTokens] = GroupSegTokens(tok)
         logger.info("%s armed encode=%d (%s) decode=%d (%s) call=%d (%s) enc_cap_tokens=%d dec_cap_tokens=%d "
+                    "cap_entries=%d "
                     "(#157: a long prompt is encoded/decoded per <|im_start|> piece, each piece cached by its "
                     "content; results equal the whole call bit for bit)", TAG, int(g.enc_ok), g.enc_why,
-                    int(g.dec_ok), g.dec_why, int(g.call_ok), g.call_why, ENCODE_CAP_TOKENS, DECODE_CAP_TOKENS)
+                    int(g.dec_ok), g.dec_why, int(g.call_ok), g.call_why, ENCODE_CAP_TOKENS, DECODE_CAP_TOKENS,
+                    CAP_ENTRIES)
     except Exception as e:  # noqa: BLE001 -- no segmenting: every call is the whole call, named
         g = None
         logger.warning("%s not armed: %s: %s (every encode/decode runs on the whole prompt)", TAG,
