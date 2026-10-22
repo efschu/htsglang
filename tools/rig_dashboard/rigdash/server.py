@@ -74,7 +74,13 @@ STATIC_FILES = {
 #: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
 DEV_STATIC_FILES = {
     "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
+    # SEATS 1022: tab "Seats & devices", the UI of rdx-seatmgr on the Proxmox host (rdma-display multiseat)
+    "/seats.js": ("seats.js", "application/javascript; charset=utf-8"),
 }
+#: rdx-seatmgr routes the dashboard passes on (GET state, POST actions), see _seats
+SEATS_GET = {"/api/seats/state": "/api/state"}
+SEATS_POST = {"/api/seats/assign": "/api/assign", "/api/seats/forget": "/api/forget",
+              "/api/seats/claim": "/api/claim", "/api/seats/claim/cancel": "/api/claim/cancel"}
 #: Körper einer POST-Anfrage: Pfad und ein paar Optionen, nie mehr
 MAX_POST_BODY = 64 * 1024
 #: so viel eines zu großen Körpers wird noch gelesen und verworfen, damit die 400-Antwort beim Client ankommt
@@ -310,6 +316,8 @@ class App:
         self.t0 = time.time()
         self.version = _version()
         self.edition = getattr(args, "edition", "rig") or "rig"
+        # SEATS 1022: rdx-seatmgr (input/sound/USB devices of the seat containers) on the Proxmox host
+        self.seatmgr_url = (getattr(args, "seatmgr", "") or "").rstrip("/")
         # Auftrag 1995 (Release-Image): reiner Profil-Editor ohne Messquellen; Proxy-Schalter fuer Betreiber hinter eigenem Reverse-Proxy
         self.editor_only = bool(getattr(args, "editor_only", False))
         self.trust_proxy = bool(getattr(args, "trust_proxy", False))
@@ -789,6 +797,35 @@ def make_handler(app: App):
             return self._send(404, "not found", "text/plain")
 
 
+        def _seats(self, method, path, raw=b""):
+            """SEATS 1022: tab "Seats & devices".  The page talks to rdx-seatmgr through here (one origin, no CORS):
+            GET /api/seats/state, POST /api/seats/{assign,forget,claim,claim/cancel}.  It moves keyboards, mice and sound
+            cards between the seat containers: rig edition and LAN only, never through the public proxy."""
+            if app.edition == "release":
+                return self._send(404, "not found", "text/plain")
+            if self._via_proxy():
+                return self._json({"ok": False, "error": "Seats & devices only in the LAN (http://192.168.0.88:8890/#t=seats)"}, 403)
+            base = getattr(app, "seatmgr_url", "")
+            target = (SEATS_GET if method == "GET" else SEATS_POST).get(path)
+            if not base or target is None:
+                return self._send(404, "not found", "text/plain")
+            import urllib.error
+            import urllib.request
+            req = urllib.request.Request(base + target, data=raw if method == "POST" else None, method=method,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    body, code = r.read(), r.status
+            except urllib.error.HTTPError as e:
+                body, code = e.read(), e.code
+            except (OSError, ValueError) as e:
+                return self._json({"ok": False, "error": "rdx-seatmgr at %s not reachable: %s" % (base, e)}, 502)
+            try:
+                obj = json.loads(body.decode("utf-8") or "{}")
+            except ValueError:
+                return self._json({"ok": False, "error": "rdx-seatmgr answered no JSON (HTTP %d)" % code}, 502)
+            return self._json(obj, code)
+
         def _editor_only_allows(self, method, path) -> bool:
             """--editor-only (Auftrag 1995): nur die Seite, ihre Module, Gesundheit und die drei Editor-Routengruppen; alles andere 404."""
             if path in ("/", "/index.html", "/healthz", "/logo.svg", "/logo-dark.svg", "/mark.svg", "/favicon.svg"):
@@ -864,6 +901,8 @@ def make_handler(app: App):
                             raise ValueError("q= must be JSON: {profile, cards:[{card, pcie:{gen,lanes,rebar,chipset}}], host_patched}")
                         return self._json(app.kartenplaner.plan(req))
                     return self._send(404, "not found", "text/plain")
+                if path.startswith("/api/seats/"):
+                    return self._seats("GET", path)
                 if path == "/api/modellprofil/modelle":
                     # welche Modellverzeichnisse unter den Wurzeln liegen (nur stat); wie das Schätzen nur im LAN (auch im Release: der Reiter Profil braucht es)
                     if self._via_proxy():
@@ -935,6 +974,10 @@ def make_handler(app: App):
                     return self._json(app.modellprofil.estimate(req))
                 if path.startswith("/api/hwprofil/"):
                     return self._hwprofil("POST", n, raw)
+                if path.startswith("/api/seats/"):
+                    if n > MAX_POST_BODY:
+                        raise ValueError("Request too large (%d bytes, at most %d)" % (n, MAX_POST_BODY))
+                    return self._seats("POST", path, raw)
                 if path.startswith("/api/profil/"):
                     return self._profil_post(path, n, raw)
                 return self._send(404, "not found", "text/plain")
@@ -962,6 +1005,8 @@ def main(argv=None):
     ap.add_argument("--front", action="append", default=[],
                     help="pdflip front base URL to read /pdflip/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
+    ap.add_argument("--seatmgr", default=os.environ.get("RIGDASH_SEATMGR", "http://192.168.0.1:8771"),
+                    help="rdx-seatmgr on the Proxmox host (tab Seats & devices, rig edition); '' = off")
     ap.add_argument("--vm-url", default=os.environ.get("RIGDASH_VM_URL", vmpush.DEFAULT_URL),
                     help="VictoriaMetrics (read PromQL; the sampler writes the IPC there); '' = off")
     ap.add_argument("--sampler", choices=("prozess", "thread"), default=None,
