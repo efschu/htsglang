@@ -326,15 +326,21 @@ def publish(arena: Any, slots, gens) -> None:
 def unsecured_keys_lo(arena: Any, backend: Any = None, keys: bool = True):
     """S109d: the key low words of every COMPLETE slot WITHOUT an L3 copy (record or index) -- the arena clock's keep
     list, so no room-making frees a page that has no copy -- and those slots queued for the write-behind. One census
-    call (``complete_census``, C) plus memory reads; never I/O. Returns a sorted uint64 array."""
+    call (``complete_census``, C) plus memory reads; never I/O. Returns a sorted uint64 array; ``keys=False``
+    (the S109-A7 quiesce wake-up) the COUNT of slots queued, an int on EVERY path.
+
+    S109-A7-TYPE (W65 22.10., boot 1022_003738: D TP0 00:40:15 x3 and P PP0 00:39:02 x2 "S109-A7 QUIESCE-WAKE quiesce
+    failed: TypeError('only length-1 arrays can be converted to Python scalars')"): the first quiesce of a boot finds an
+    empty arena, and the two early exits below returned the empty KEY ARRAY to ``int(...)`` in ``queue_unsecured_all``
+    -- the count contract held only on the last line."""
     try:
         slots, gens, klo, _khi = arena.complete_census()
     except Exception as exc:  # noqa: BLE001 -- no census: nothing is known secured -- keep nothing extra, but say so
         logger.warning("S109d unsecured census failed: %r", exc)
-        return np.zeros(0, dtype=np.uint64)
+        return np.zeros(0, dtype=np.uint64) if keys else 0
     slots = np.asarray(slots, dtype=np.int64)
     if not slots.shape[0]:
-        return np.zeros(0, dtype=np.uint64)
+        return np.zeros(0, dtype=np.uint64) if keys else 0
     if backend is None:
         backend = getattr(arena, "_l3sec_backend", None)
     sec = arrays(arena, create=False)

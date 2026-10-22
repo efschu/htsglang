@@ -1797,6 +1797,25 @@ def adopt_host_prefetch_span(tree_cache: Any, req: Any, match_end: int) -> Optio
 # is never regrouped again -- so every path that raised W65 before still does,
 # except the one split the retry resolves.
 
+# W65-REGROUP-FIXPOINT (27B INT8 round 3, boot 1022_003738 on a4f4b8fec1, D
+# 00:47:28, rid pdflip-4-73): "the deeper rank passed the shallower anchor on
+# its way down" holds for the KV path, NOT for the mamba anchors: the ranks'
+# host anchors differ per node (the mamba arena slot is ONE blob shared by the
+# ranks; a spill's release frees it only at the last releaser, so the earlier
+# releasers tombstone their node's anchor and the last one backs it --
+# "FLUSH-SPILL ... dropped=0" + "PDFLIP-ANCHOR-LOST at=evict" on TP1, "dropped=1"
+# on TP0 for node 307 depth 51712 at 00:45:58). Intake matches 51712 / 52416 /
+# 53120 -> group start 51712 -> TP1/TP2 capped there fell back to 50880
+# ("ANCHOR-ONLY-READ depth=51712 anchor_was=50880 how=branch_point_never_anchored")
+# -> spans 13632 / 14464 / 14464 -> the single retry raised W65 and D died.
+# A split that survives the cap has its group start STRICTLY below the cap
+# (every capped match is <= the cap and they are not all equal), so the walk
+# down the common anchors is regrouped again until the votes agree, bounded
+# here; a start that does not go down is a named stop (scheduler).
+#: Rounds of regroup one intake may run before a split is the W65 stop (06.10.
+#: needed 1, 22.10. needed 2; every round is one participation vote).
+W65_REGROUP_MAX_ROUNDS = 8
+
 #: Tree attribute: rid -> (group_start, span_min, span_max, group_len) of a
 #: regroup the vote asked for on THIS rank (identical on every rank).
 SPAN_REGROUP_ATTR = "_pdflip_span_regroup"

@@ -7305,6 +7305,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         and released only when that worked -- no anchor is traded for
         another, the victim's next reader takes it from the store. Returns
         True when a slot was freed."""
+        if UnifiedRadixCache._shared_slot_spill_skipped(self, node, "park_first"):
+            return False
         tries = int(node.__dict__.get("_pdflip_park_spill_tries", 0))
         if tries >= self.PDFLIP_PARK_SPILL_TRIES:
             return False
@@ -7385,6 +7387,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         read after the wake takes it from disk. A victim whose copy could not
         be secured is NOT released (no anchor is traded for another). Returns
         True when a slot was freed."""
+        if UnifiedRadixCache._shared_slot_spill_skipped(self, node, "flush_spill"):
+            return False
         arena = getattr(mp, "arena", None)
         if arena is None:
             return False
@@ -7453,6 +7457,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return os.environ.get("FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE", "1").strip().lower() not in (
             "0", "false", "no", "off", "")
 
+    @staticmethod
+    def _k15_tp_slot_shared(tree) -> bool:
+        """K15-TP: does every rank of this pure TP group hold its own reference on
+        the shared mamba blob slot? True on a TP>1 group off Form A (R12 role None);
+        Form A (host/worker) keeps the slots on TP0 alone. Group-uniform: the group
+        size and the Form A switch are the same on every rank."""
+        if int(getattr(tree, "tp_world_size", 1) or 1) <= 1:
+            return False
+        return _r12.role() is None
+
+    def _shared_slot_spill_skipped(self, node, site: str) -> bool:
+        """SPILL-TP (W65 22.10.): True (and named) when this rank must not spill on a
+        TP group whose ranks share the mamba blob slot -- see :meth:`_k15_tp_slot_shared`.
+        Measured on both D paths of the 27B INT8 night: the sleep flush (round 3b,
+        1022_010424, 01:30:09 victims 1214/1222/1223/1224 ``dropped=1`` on TP0 alone,
+        TP1/TP2 ``dropped=0`` -> node 1342 ``parent_backuped=True`` on TP0, False on
+        TP1/TP2 -> W65 REGROUP pdflip-10-212 / pdflip-10-220 at 01:30:47) and the K15
+        eviction (round 3a, 1022_003738, node 307, the W65 death). A spill releases
+        this rank's reference only; the slot frees at the LAST releaser, which alone
+        backs its node, while every rank lost the victim's anchor. Skipping on every
+        rank keeps the victims' anchors on every rank and leaves the node un-backed on
+        every rank alike -- what the group already had (every consumer floors the
+        match to the group min)."""
+        if not UnifiedRadixCache._k15_tp_slot_shared(self):
+            return False
+        UnifiedRadixCache._spill_tp_skip_n = getattr(UnifiedRadixCache, "_spill_tp_skip_n", 0) + 1
+        k = UnifiedRadixCache._spill_tp_skip_n
+        if k <= 16 or k % 256 == 0:
+            logger.info("PDFLIP MAMBA-ARENA SPILL SKIPPED site=%s tp_size=%d node=%s (n=%d): the mamba arena slot "
+                        "is shared by this TP group's ranks -- a rank-local spill frees it only at the last "
+                        "releaser and splits the ranks' anchors (W65 22.10.); the node stays un-backed on every "
+                        "rank alike, the victim keeps its anchor on every rank",
+                        site, int(self.tp_world_size), getattr(node, "id", "?"), k)
+        return True
+
     def _pdflip_evict_spill_room(self, node, mp) -> bool:
         """K15: the flush's spill room (an L3-secured foreign INTERMEDIATE
         anchor leaves the arena, :meth:`_pdflip_flush_spill_room`) for an
@@ -7474,6 +7513,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 logger.info("K15 EVICT-SPILL SKIPPED pp_size=%d pp_rank=%s node=%s (n=%d): a stage-local "
                             "spill frees no shared mamba slot on P -- the anchor save is tried without it",
                             int(self.pp_size), getattr(self, "pp_rank", "?"), getattr(node, "id", "?"), k)
+            return False
+        if UnifiedRadixCache._k15_tp_slot_shared(self):
+            # K15-TP (W65 22.10., 27B INT8 round 3, boot 1022_003738 on a4f4b8fec1, D TP3): the SAME class
+            # as the PP rule above on a pure TP group whose ranks each hold a reference on the one shared
+            # mamba blob slot (not Form A, where the workers hold none). A rank-local spill frees the slot
+            # only at the LAST releaser: that rank backs its node, every earlier releaser saw dropped=0 and
+            # tombstoned it ("FLUSH-SPILL node=307 ... dropped=1" on TP0, "dropped=0" + "PDFLIP-ANCHOR-LOST
+            # at=evict node=307 depth=51712" on TP1, 00:45:58), and each early releaser also lost its
+            # victim's host anchor alone. The ranks' anchor depths split (51712/52416/53120 for pdflip-4-73)
+            # and the intake prefetch died on W65 at 00:47:28. A save on one rank is no save for the
+            # group (every consumer floors the match to the group min); skipped, named; the save itself
+            # stays and is tried without the spill on every rank alike.
+            UnifiedRadixCache._k15_tp_skip_n = getattr(UnifiedRadixCache, "_k15_tp_skip_n", 0) + 1
+            k = UnifiedRadixCache._k15_tp_skip_n
+            if k <= 16 or k % 256 == 0:
+                logger.info("K15 EVICT-SPILL SKIPPED tp_size=%d node=%s (n=%d): the mamba arena slot is shared by "
+                            "this TP group's ranks -- a rank-local spill frees it only at the last releaser and "
+                            "splits the ranks' anchors (W65 22.10.); the anchor save is tried without it",
+                            int(self.tp_world_size), getattr(node, "id", "?"), k)
             return False
         try:
             return bool(self._pdflip_flush_spill_room(node, mp))
@@ -11676,7 +11734,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "group_start=%d: the ranks matched different prefix "
                         "depths at intake; nothing is registered on this pass, "
                         "every rank re-matches capped at group_start and asks "
-                        "once more (a second split is the W65 stop).",
+                        "again (W65-REGROUP-FIXPOINT: a split that survives the "
+                        "cap regroups at its strictly shallower start, bounded; "
+                        "past the bound it is the W65 stop).",
                         str(req_id)[:16], int(span_base), int(local_span),
                         span_lo, span_hi, group_len, _group_start,
                     )

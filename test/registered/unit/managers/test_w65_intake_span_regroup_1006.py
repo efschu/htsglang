@@ -231,14 +231,17 @@ class TestAgreementIsUntouched(unittest.TestCase):
 
 
 class TestTheStopSurvivesWhereTheRegroupCannot(unittest.TestCase):
-    def test_a_rank_that_cannot_realize_the_group_start_stops_by_name(self):
+    def test_a_rank_that_cannot_realize_the_group_start_regroups_again(self):
         # TP1 holds only the deeper anchor: capped at 99776 it falls back to the
-        # device prefix, its span differs again -> the second vote is W65.
-        _t, reqs, results, errors, _g = _intake({0: TP02, 1: [100266], 2: TP02})
-        self.assertEqual(set(errors), {0, 1, 2}, (results, errors))
-        self.assertTrue(all(isinstance(e, HiCacheCollectiveDesyncError) and "W65" in str(e)
-                            for e in errors.values()), errors)
-        # the cap never outlives the retry, even on the stop
+        # device prefix, its span differs again. Until 22.10. the second vote was
+        # W65; W65-REGROUP-FIXPOINT (test_w65_regroup_fixpoint_1022) regroups at
+        # the strictly shallower start (the device prefix), where all agree.
+        _t, reqs, results, errors, group = _intake({0: TP02, 1: [100266], 2: TP02})
+        self.assertEqual(errors, {}, (results, errors))
+        want = MATCH_END - DEVICE
+        self.assertEqual({r: v[1] for r, v in results.items()}, {r: (want, want) for r in range(3)})
+        self.assertEqual([x[0] for x in group.log[0]].count("prefetch_participation_vote"), 3)
+        # the cap never outlives the retry
         for r in reqs.values():
             self.assertFalse(hasattr(r, "_pdflip_prefix_cap"))
 
