@@ -329,6 +329,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     pdflip_prompt_ids_digest = False
     # S63 F2 TOK-AHEAD: set in init_pdflip_tok_ahead; None = every leg tokenizes itself, as before.
     pdflip_tok_ahead = None
+    # TITO (pdflip/front_tito.py): group D's generated ids by rid, answered on
+    # /pdflip/output_ids; set in init_pdflip_prompt_ids_digest, None off group D.
+    pdflip_output_book = None
 
     @property
     def serving_chat_class(self):
@@ -563,11 +566,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def init_pdflip_prompt_ids_digest(self):
-        from flliper.srt.pdflip.prompt_ids_digest import d_digest_armed
+        from flliper.srt.pdflip.prompt_ids_digest import d_digest_armed, ids_marker, p_digest_armed
 
-        self.pdflip_prompt_ids_digest = d_digest_armed(
-            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
-        )
+        _group = os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        self.pdflip_prompt_ids_digest = d_digest_armed(group=_group) or p_digest_armed(group=_group)
+        self.pdflip_ids_marker = ids_marker(_group)
+        from flliper.srt.pdflip import front_tito as _tito
+
+        self.pdflip_output_book = _tito.OutputBook() if _tito.output_book_armed() else None
 
     def init_pdflip_tok_ahead(self):
         """S63 F2 (pdflip/tok_ahead.py): one tokenization per group and request -- the D probe's / P's ahead
@@ -936,8 +942,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state = self.rid_to_state[obj.rid]
                         if obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
-                        elif int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0:
+                        elif (int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0
+                              or self.pdflip_output_book is not None):
                             # SEQ-HASH: a Weg-2 D group hashes prompt + output at the finish
+                            # (TITO: and keeps the generated ids beside the prompt's digest)
                             state.pdflip_prompt_ids = tokenized_obj.input_ids
                         await turn.dispatch(self._send_one_request, tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
@@ -1310,6 +1318,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if text_ids is not None
                     else "ids" if obj.input_ids is not None else "handoff"
                 ),
+                marker=getattr(self, "pdflip_ids_marker", "D-IDS"),
             )
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
@@ -2581,6 +2590,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self.convert_to_span_attrs(state, recv_obj, i)
                     )
                 state.time_stats.set_finished_time()
+                if self.pdflip_output_book is not None:
+                    # TITO: the ids D generated, for the front's next turn of this sequence
+                    self.pdflip_output_book.note(
+                        rid,
+                        state.prompt_token_ids or getattr(state, "pdflip_prompt_ids", None),
+                        state.output_ids,
+                    )
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
                 # H84: a Weg-2 D group's own prefill time (scheduler forward
                 # entry -> prefill finished), independent of --enable-metrics;

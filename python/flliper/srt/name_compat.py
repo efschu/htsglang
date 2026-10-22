@@ -119,6 +119,12 @@ def marker_tail(text: str, marker: str) -> Optional[str]:
 _LEG = "SG" "LANG_"  # the legacy env prefix, split for the rename (module doc)
 _LEG_SUB = _LEG + "WE" "G2_"
 _LEG_OPT_SUB = _LEG + "OPT_" + "WE" "G2_"
+# TITO 22.10.: the subsystem token also sits behind a LOG_ / ENABLE_ infix
+# (``<LEGACY>_LOG_<OLD>_PROMPT_IDS_DIGEST``, ``<LEGACY>_LOG_<OLD>_D_LEAD_MS`` --
+# the NF profile's Hebel 2b/3a lines); the generic pair folded them onto
+# ``FLLIPER_LOG_<OLD>_*``, a name nobody reads.
+_LEG_LOG_SUB = _LEG + "LOG_" + "WE" "G2_"
+_LEG_ENABLE_SUB = _LEG + "ENABLE_" + "WE" "G2_"
 
 #: (legacy, renamed) env prefix pairs, the more specific first: the subsystem
 #: families ``<LEGACY>_<OLD>_X <-> FLLIPER_PDFLIP_X`` (RENAME_PLAN 8.1) and
@@ -137,6 +143,8 @@ _LEG_OPT_SUB = _LEG + "OPT_" + "WE" "G2_"
 ENV_PREFIX_PAIRS: Tuple[Tuple[str, str], ...] = (
     (_LEG_SUB, "FLLIPER_PDFLIP_"),
     (_LEG_OPT_SUB, "FLLIPER_OPT_PDFLIP_"),
+    (_LEG_LOG_SUB, "FLLIPER_LOG_PDFLIP_"),
+    (_LEG_ENABLE_SUB, "FLLIPER_ENABLE_PDFLIP_"),
     (_LEG, "FLLIPER_"),
 )
 

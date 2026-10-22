@@ -8517,6 +8517,13 @@ class Scheduler(
         _pi_min = p_intake_min_tokens()
         if _pi_min is not None:
             _tail_min = _pi_min if _tail_min is None else min(int(_tail_min), int(_pi_min))
+        # F3 (rc32 SCHWELLE, 4x '#915 vote_negative need=192 threshold=256' on D TP0): a group-D
+        # store read is read whatever its length; the anchor-clamped group hit decides (handback_claim).
+        from flliper.srt.pdflip.handback_claim import d_store_read_min_tokens
+
+        _dr_min = d_store_read_min_tokens()
+        if _dr_min is not None:
+            _tail_min = _dr_min if _tail_min is None else min(int(_tail_min), int(_dr_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         # S90: a told-bounded read is prescribed -- the speculative-span budget

@@ -10,6 +10,8 @@ when D renders the same text AND ``encode(decode(ids)) == ids`` on every
 ``<|im_start|>`` segment -- the bit the segment encoder now keeps per new
 segment. The first condition is the metal's to prove: FRONT-IDS / D-IDS shadow
 lines (log only) before ``FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS`` is turned on.
+(TITO 22.10.: the lines matched 494/494 on NF rc32; the carrier is always on,
+for /v1/messages too, on every leg -- test_nf_rc32_tito_1022.py.)
 
 Pinned here, on the real NF tokenizer and template: the front's ids ARE the
 old path's D ids, D takes the posted ids unchanged; a lossy segment, media, a
@@ -139,8 +141,9 @@ class Eligible(unittest.TestCase):
         self.assertTrue(FT.send_ids_eligible(path="/v1/chat/completions", payload=ok, count=_count()))
         image = dict(PAYLOAD, messages=PAYLOAD["messages"] + [{"role": "user", "content": [
             {"type": "text", "text": "?"}, {"type": "image_url", "image_url": {"url": "data:x"}}]}])
+        # TITO 22.10.: the Anthropic wire carries the ids too (its body declares input_ids)
+        self.assertTrue(FT.send_ids_eligible(path="/v1/messages", payload=ok, count=_count()))
         cases = {
-            "anthropic path": ("/v1/messages", ok, _count()),
             "/generate": ("/generate", ok, _count()),
             "round trip unknown (switch off)": ("/v1/chat/completions", ok, _count(rt_ok=None)),
             "lossy segment": ("/v1/chat/completions", ok, _count(rt_ok=False)),
@@ -172,34 +175,35 @@ class FrontBody(unittest.TestCase):
         with envs.FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS.override(on):
             self.Front._send_ids_note(stub, rid, "/v1/chat/completions", dict(PAYLOAD), _count())
 
-    def test_switch_off_posts_the_payload_object_itself(self):
+    def test_no_switch_the_env_off_still_carries(self):
+        # TITO 22.10. (user order): the carrier is always on, the old name is not read
         stub = _front_stub()
         self._note(stub, on=False)
-        payload = dict(PAYLOAD)
-        self.assertIs(self.Front._send_ids_body(stub, "pdflip-2-7", payload, None, False), payload)
-        self.assertNotIn("_send_ids", stub.__dict__)
+        body = self.Front._send_ids_body(stub, "pdflip-2-7", dict(PAYLOAD), None, False)
+        self.assertEqual(body["input_ids"], [0, 1, 2])
 
-    def test_ids_go_once_and_only_on_a_leg_without_p(self):
+    def test_ids_go_on_every_leg_and_every_repost(self):
+        # TITO 22.10. (R11): after P's leg 1 too -- P carried the same ids (Front.leg1), so D's
+        # input_ids equal P's hand-off ids; a re-posted leg carries them again
         stub = _front_stub()
         self._note(stub)
         body = self.Front._send_ids_body(stub, "pdflip-2-7", dict(PAYLOAD), None, False)
         self.assertEqual(body["input_ids"], [0, 1, 2])
         self.assertEqual(body["messages"], PAYLOAD["messages"])
-        payload = dict(PAYLOAD)
-        self.assertIs(self.Front._send_ids_body(stub, "pdflip-2-7", payload, None, False), payload)
         after_p = SimpleNamespace(d_direct=False, skip_leg1=False)
-        self._note(stub)
-        self.assertIs(self.Front._send_ids_body(stub, "pdflip-2-7", payload, after_p, False), payload)
-        for pending, single in ((SimpleNamespace(d_direct=True, skip_leg1=False), False),
+        for pending, single in ((None, False), (after_p, False),
+                                (SimpleNamespace(d_direct=True, skip_leg1=False), False),
                                 (SimpleNamespace(d_direct=False, skip_leg1=True), False),
                                 (after_p, True)):
-            self._note(stub)
-            self.assertIn("input_ids", self.Front._send_ids_body(stub, "pdflip-2-7", dict(PAYLOAD),
-                                                                pending, single))
+            self.assertEqual(self.Front._send_ids_body(stub, "pdflip-2-7", dict(PAYLOAD),
+                                                       pending, single)["input_ids"], [0, 1, 2])
+        payload = dict(PAYLOAD)
+        self.assertIs(self.Front._send_ids_body(stub, "pdflip-2-8", payload, None, False), payload)
 
     def test_wiring(self):
         leg2 = inspect.getsource(self.Front.leg2)
-        self.assertIn("_d_body = Front._send_ids_body(self, rid, payload, pending, single_prefill)", leg2)
+        self.assertIn("_d_body = Front._send_ids_body(self, rid, payload, pending, single_prefill, request.path)",
+                      leg2)
         self.assertIn("json=with_cached_tier_ask(_d_body, request.path)", leg2)
         # S56: the FRONT's own count rides the send-ids note (D's probe ids price the class, never the leg)
         self.assertIn("Front._send_ids_note(self, rid, path, payload, _c_front)",
