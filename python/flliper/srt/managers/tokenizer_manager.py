@@ -1106,6 +1106,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
                 input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
                 token_type_ids = None
+            elif (
+                not is_cross_encoder
+                and input_format == InputFormat.SINGLE_STRING
+                and isinstance(tokenizer_input[0], str)
+            ):
+                # GROUP-SEG-1022 (#157): a media prompt reaches this group as text
+                # (rendered, encoded, decoded by serving_chat) and is encoded here
+                # again -- per <|im_start|> piece, each piece cached by its
+                # content; equal to tok([text])["input_ids"][0] bit for bit
+                from flliper.srt.pdflip import group_seg_tokens as _gseg
+
+                input_ids = [_gseg.seg_encode_call(self.tokenizer, tokenizer_input[0])]
+                token_type_ids = None
             else:
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
                 input_ids = encoded["input_ids"]

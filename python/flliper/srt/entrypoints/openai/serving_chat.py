@@ -77,6 +77,7 @@ from flliper.srt.parser.jinja_template_utils import process_content_for_template
 from flliper.srt.parser.reasoning_parser import ReasoningParser
 from flliper.srt.pdflip import front_x as weg2_front_x
 from flliper.srt.pdflip import handoff as pdflip_handoff
+from flliper.srt.pdflip import group_seg_tokens as pdflip_group_seg
 
 if TYPE_CHECKING:
     from flliper.srt.managers.tokenizer_manager import TokenizerManager
@@ -1115,8 +1116,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
+                # GROUP-SEG-1022 (#157): encoded per <|im_start|> piece, each piece
+                # cached by its content -- equal to the whole encode bit for bit
+                prompt_ids = pdflip_group_seg.seg_encode(
+                    self.tokenizer_manager.tokenizer, rendered_prompt, **encode_kwargs
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -1137,8 +1140,8 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
+                    prompt_ids = pdflip_group_seg.seg_encode(
+                        self.tokenizer_manager.tokenizer, rendered_prompt, **encode_kwargs
                     )
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1153,7 +1156,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                # GROUP-SEG-1022 (#157): decoded per <|im_start|> piece, cached
+                prompt = pdflip_group_seg.seg_decode(
+                    self.tokenizer_manager.tokenizer, prompt_ids
+                )
 
         stop = request.stop
         image_data = image_data if image_data else None
