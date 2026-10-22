@@ -70,9 +70,9 @@ class TestProfileFiles(unittest.TestCase):
                     self.assertEqual(li.vars.get("PROFILE_CARD_COUNT"), str(n))
                     self.assertEqual(li.vars.get("PROFILE_INVENTORY"), ",".join(["RTX3090"] * n))
                     self.assertEqual(li.vars.get("PROFILE_GPUS"), "NVIDIA GeForce RTX 3090=%d" % n)
-                    # NF on 2, 4, 5, 6 and 7 identical 3090s: the launcher's D-EIGENTUM (#239 S3f) solve finds no bearable form, forced past only as the named D-BUDGET
-                    # (review 1021 A1; the W122/W130 residency balance passes there); N = 3 is bootable
-                    self.assertEqual(li.vars.get("PROFILE_STATUS"), "blockiert-d-budget" if (fam == "nf" and n != 3) else "hochrechnung")
+                    # nfblock 1022: NF on every N is bootable (HOCHRECHNUNG) -- the launcher's D-EIGENTUM (#239 S3f) solve decides a cut form (N = 2, 3) or keeps
+                    # Form A (N = 4..7) instead of the former D-BUDGET refusal on 2, 4, 5, 6, 7 (dry-run goldens, test_ncards_dryruns_1021)
+                    self.assertEqual(li.vars.get("PROFILE_STATUS"), "hochrechnung")
                     la = P.LaunchArgv(li.argv, li.env)
                     for kind, grp, flag in VECTOR_FLAGS:
                         val = la.get_flag(flag) if kind == "flag" else la.extra_get(grp, flag)

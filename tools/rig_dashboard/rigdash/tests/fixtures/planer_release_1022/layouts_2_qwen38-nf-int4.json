@@ -17,13 +17,12 @@
    "id": "solo",
    "margin_mib": 27439,
    "name": "Solo (TP only)",
-   "possible": false,
+   "possible": true,
    "proof": "dry_run",
    "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
-   "status": "blocked",
+   "status": "ok",
    "why": [
-    "2 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof.",
-    "The release profile for this model on 2 cards of this kind is marked blocked (D-BUDGET): the launcher's decode-ownership solver (D-EIGENTUM, #239 S3f) finds no sustainable distribution, and even with force it only passes the D-BUDGET refusal by name. Not startable yet; the cause is open."
+    "2 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
    ]
   },
   {
@@ -38,13 +37,12 @@
    "id": "flip",
    "margin_mib": 27439,
    "name": "Flip",
-   "possible": false,
+   "possible": true,
    "proof": "dry_run",
    "satz": "The same cards work alternately as prefill group P (pipeline) and decode group D (tensor-parallel); the weights are exchanged through the host.",
-   "status": "blocked",
+   "status": "ok",
    "why": [
-    "2 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof.",
-    "The release profile for this model on 2 cards of this kind is marked blocked (D-BUDGET): the launcher's decode-ownership solver (D-EIGENTUM, #239 S3f) finds no sustainable distribution, and even with force it only passes the D-BUDGET refusal by name. Not startable yet; the cause is open."
+    "2 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
    ]
   },
   {

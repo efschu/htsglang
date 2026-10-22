@@ -17,14 +17,12 @@
    "id": "solo",
    "margin_mib": 106607,
    "name": "Solo (TP only)",
-   "possible": false,
+   "possible": true,
    "proof": "dry_run",
    "satz": "All cards work as one tensor-parallel group that prefills and decodes; no switching, no front.",
-   "status": "blocked",
+   "status": "ok",
    "why": [
-    "6 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof.",
-    "The release profile for this model on 6 cards of this kind is marked blocked (D-BUDGET): the launcher's decode-ownership solver (D-EIGENTUM, #239 S3f) finds no sustainable distribution, and even with force it only passes the D-BUDGET refusal by name. Not startable yet; the cause is open.",
-    "Memory is not the limit: the rough calculation below leaves a margin of 104.1 GiB, and the launcher's per-rank memory checks of the profile (W122/W130) pass on every rank. What fails is the ownership search of the decode group: no form with an edge on every rank and without more misses of a worker than form A."
+    "6 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
    ]
   },
   {
@@ -39,14 +37,12 @@
    "id": "flip",
    "margin_mib": 106607,
    "name": "Flip",
-   "possible": false,
+   "possible": true,
    "proof": "dry_run",
    "satz": "The same cards work alternately as prefill group P (pipeline) and decode group D (tensor-parallel); the weights are exchanged through the host.",
-   "status": "blocked",
+   "status": "ok",
    "why": [
-    "6 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof.",
-    "The release profile for this model on 6 cards of this kind is marked blocked (D-BUDGET): the launcher's decode-ownership solver (D-EIGENTUM, #239 S3f) finds no sustainable distribution, and even with force it only passes the D-BUDGET refusal by name. Not startable yet; the cause is open.",
-    "Memory is not the limit: the rough calculation below leaves a margin of 104.1 GiB, and the launcher's per-rank memory checks of the profile (W122/W130) pass on every rank. What fails is the ownership search of the decode group: no form with an edge on every rank and without more misses of a worker than form A."
+    "6 cards: no release boot has proven this card count on metal yet (the named blocker METAL-UNPROVEN). The numbers come from the launcher dry run; the launcher takes this layout only with force, and the first boot is the proof."
    ]
   },
   {

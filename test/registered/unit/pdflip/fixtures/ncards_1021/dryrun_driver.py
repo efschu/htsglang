@@ -60,6 +60,14 @@ def main(argv):
                     last[int(m.group(1))] = {"scratch": int(m.group(2)), "R": int(m.group(4)), "verdict": m.group(5)}
             doc["d_check"] = {"entfaellt": any("ENTFAELLT" in l for l in d_lines), "borrowed_by_role": any("BORROWED BY RANK ROLE" in l for l in d_lines),
                               "ranks": [last[k] for k in sorted(last)]}
+        # nfblock 1022: what D-EIGENTUM (#239 S3f) decided -- a published cut form or Form A kept (only where the owned solve ran: NF)
+        if any("D-EIGENTUM (#239 S3f)" in l for l in d_lines):
+            doc["d_owner"] = ("cut" if any("D-EIGENTUM (#239 S3f) veroeffentlicht" in l for l in res.text.splitlines())
+                              else "form_a" if any("FORM A BLEIBT" in l for l in d_lines) else "none")
+        # a dry run prints a refusal it would raise in a real boot as "(dry run: would refuse)" -- no forced code, so it is listed here
+        wr = [l.split("PDFLIP-LAUNCH ", 1)[-1][:120] for l in res.text.splitlines() if "would refuse" in l]
+        if wr:
+            doc["would_refuse"] = wr
         gf = plan.get("group_flags", {})
         doc["group_flags"] = {g: {k: gf.get(g, {}).get(k) for k in ("--rank-tp-ratio", "--rank-gpu-memory-mib", "--max-total-tokens", "--tp-size", "--pp-size")}
                               for g in ("P", "D")}

@@ -5556,6 +5556,14 @@ def refuse_flip_stage_form_without_trim_cells(ns, boot_form, log) -> Optional[st
             log(msg + " (dry run: would refuse)")
             return msg
         raise PdFlipTokenCutFlipNotWired(msg)
+    if not cut:
+        # nfblock 1022: the owned solve kept Form A (no cut form carries) -- no worker holds full-attention KV, D ships no token vector
+        # (the rank resolves dcp 1, the host holds the whole KV, rank_role.resolve_dcp_under_host_kv) and the stage form is the host's own
+        msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} STUFEN ERLAUBT (Form A, nfblock 1022): --d-kv-token-cut {ns.d_kv_token_cut} -- der Planer "
+               "behielt Form A, kein Worker haelt Voll-Attention-KV, kein Token-Vektor an D; die Stufenform ist die des Hosts (TP0 %d "
+               "Stufenzeilen)" % int(w["rows"]))
+        log(msg)
+        return msg
     per_rank = " ".join("rang%d: %d" % (r, rows[r]) for r in sorted(rows))
     msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} STUFEN ERLAUBT: jeder KV-Worker %s traegt seine "
            "Stufenzeilen aus der eigenen Trim-Zelle (%s; TP0 %d) -- S3g greift im Flip-Boot. "
@@ -5581,9 +5589,16 @@ def d_seat_table_form(plan, kv_cut_kw: dict, fractions):
     ... Eigentum ab 215,113,160'). Any other cut: unchanged."""
     from flliper.srt.planner import expert_residency as _er
 
-    if (not kv_cut_kw or not _er.owned_cut_request(kv_cut_kw.get("kv_token_shares"))[0]
-            or not getattr(plan, "solved_owner_ratio", None)):
+    if not kv_cut_kw or not _er.owned_cut_request(kv_cut_kw.get("kv_token_shares"))[0]:
         return dict(kv_cut_kw), [float(x) for x in fractions]
+    if not getattr(plan, "solved_owner_ratio", None):
+        # nfblock 1022: the owned solve decided Form A (no cut form carries; or it refused and --force runs Form A) -- the table prices
+        # that form at every seat count.  Before, it handed 'owned' on and every seat count ran its OWN ownership search: the search space
+        # does not depend on the seat count, only the budget does, and the row it would find is the one D does not run (NF 4 x 3090:
+        # 6 x 4.48 M candidates, 655 s of a dry run; NF 6 / 7 x 3090: 62 / 70 s).
+        # The KV stage form then sees no cut either: Form A's own #251c stages on the host (no KV worker, nothing to trim on a worker), the
+        # form every uncut D runs -- and the S3h flip riegel finds a written stage form with no KV worker instead of an unsolved cut.
+        return {}, [float(x) for x in fractions]
     out = dict(kv_cut_kw)
     out["kv_token_shares"] = tuple(float(x) for x in plan.kv_token_cut)
     fr = plan.solved_fractions or fractions

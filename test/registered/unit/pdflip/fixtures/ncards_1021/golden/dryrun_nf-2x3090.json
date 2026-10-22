@@ -36,21 +36,21 @@
   "entfaellt": false,
   "ranks": [
    {
-    "R": 2,
-    "scratch": 39,
+    "R": 39,
+    "scratch": 20,
     "verdict": "PASST"
    },
    {
-    "R": 119,
+    "R": 94,
     "scratch": 48,
     "verdict": "PASST"
    }
   ]
  },
+ "d_owner": "cut",
  "exc_head": "",
  "exc_type": null,
  "forced": [
-  "D-BUDGET",
   "HW-BORROWED",
   "HW-COUNT",
   "HW-UNCALIBRATED"

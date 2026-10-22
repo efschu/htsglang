@@ -36,7 +36,7 @@ RELEASE_DIR = os.path.join(REPO_ROOT, "docker", "flliper", "profiles_release")
 NODE = shutil.which("node") or ("/opt/node-v22.14.0-linux-x64/bin/node" if os.path.exists("/opt/node-v22.14.0-linux-x64/bin/node") else None)
 
 NS = (2, 3, 4, 5, 6, 7)
-NS_FULL = (2, 3, 4)                                   # every possible layout of these counts has a recorded dry run; 5..7: INT8 solo + flip, NVFP4 flip + dual
+NS_FULL = (2, 3, 4)                                   # every possible layout of these counts has a recorded dry run; 5..7: INT8 solo + flip, NVFP4 flip + dual, NF solo + flip
 MODELS = ("qwen38-27b-int8", "qwen38-27b-nvfp4", "qwen38-nf-int4")
 LAYOUTS = ("solo", "flip", "dual")
 
@@ -102,7 +102,8 @@ class Cells(unittest.TestCase):
                     if row["possible"] and n in NS_FULL:
                         self.assertTrue(has("plan_%d_%s_%s.json" % (n, m, l)), (n, m, l))
         for n in (5, 6, 7):
-            for m, l in (("qwen38-27b-int8", "solo"), ("qwen38-27b-int8", "flip"), ("qwen38-27b-nvfp4", "flip"), ("qwen38-27b-nvfp4", "dual")):
+            for m, l in (("qwen38-27b-int8", "solo"), ("qwen38-27b-int8", "flip"), ("qwen38-27b-nvfp4", "flip"), ("qwen38-27b-nvfp4", "dual"),
+                         ("qwen38-nf-int4", "solo"), ("qwen38-nf-int4", "flip")):
                 self.assertTrue(lay(n, m)[l]["possible"], (n, m, l))
                 self.assertTrue(has("plan_%d_%s_%s.json" % (n, m, l)), (n, m, l))
 
@@ -123,7 +124,7 @@ class Cells(unittest.TestCase):
             self.assertTrue(p["verdikt"]["outcome"], (n, m, l))
             self.assertTrue(p["felder"], (n, m, l))
             real += 1
-        self.assertEqual(real, 16 + 4 * 3)                                      # 4 + 7 + 5 cells of 2..4 cards and 4 each of 5, 6, 7 cards
+        self.assertEqual(real, 20 + 6 * 3)                                      # 6 + 7 + 7 cells of 2..4 cards and 6 each of 5, 6, 7 cards (nfblock 1022: NF solo + flip on every count)
 
     def test_three_cards_27b_gets_a_sensible_proposal_for_every_layout_the_model_has(self):
         for m, want in (("qwen38-27b-int8", ("solo", "flip")), ("qwen38-27b-nvfp4", ("solo", "flip", "dual"))):
@@ -360,45 +361,69 @@ class Ceiling(unittest.TestCase):
 
 
 class ReleaseBlock(unittest.TestCase):
-    """NF on 2 and 4 cards: the release profile says ``PROFILE_STATUS=blockiert-d-budget`` (NCARDS 1021: D-EIGENTUM finds no sustainable form).  The page does not offer
-    what its own profile says cannot start: the buttons are disabled with that reason (and the 300 s oracle never runs for the 4-card search)."""
+    """A release profile for N identical RTX 3090 that says ``PROFILE_STATUS=blockiert-<code>`` is a disabled button with that reason: the page does not offer what its
+    own profile says cannot start.  Since nfblock 1022 no NF profile is blocked (the launcher's D-EIGENTUM decides a cut form on 2 / 3 cards and keeps Form A on 4..7,
+    where it refused D-BUDGET before); the mechanism is pinned on a copy of the profiles with one status set back to blocked."""
 
-    def z(self):
+    def z(self, release_dir=RELEASE_DIR):
         ed = StubEd(*res_refused_at(0), 10 ** 9)
-        ed.release_dir = RELEASE_DIR
+        ed.release_dir = release_dir
         return Z.ZielPlaner(ed)
 
-    def layouts(self, model, card, n):
-        return {l["id"]: l for l in self.z().layouts({"model": model, "cards": [{"card": card, "count": n}]})["layouts"]}
+    def layouts(self, model, card, n, release_dir=RELEASE_DIR, lang=None):
+        body = {"model": model, "cards": [{"card": card, "count": n}]}
+        if lang:
+            body["lang"] = lang
+        return {l["id"]: l for l in self.z(release_dir).layouts(body)["layouts"]}
 
-    def test_the_profiles_say_what_the_page_says(self):
-        for n, want in ((2, True), (3, False), (4, True), (5, True), (6, True), (7, True)):
+    def blocked_copy(self, n):
+        import tempfile
+
+        d = tempfile.mkdtemp(prefix="nfblock-release-")
+        self.addCleanup(shutil.rmtree, d, True)
+        for name in os.listdir(RELEASE_DIR):
+            if name.endswith(".env"):
+                shutil.copy(os.path.join(RELEASE_DIR, name), d)
+        path = os.path.join(d, "nf-%dx3090.env" % n)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(re.sub(r"^PROFILE_STATUS=\S+", "PROFILE_STATUS=blockiert-d-budget", text, flags=re.M))
+        return d
+
+    def test_no_nf_profile_is_blocked_any_more(self):
+        for n in NS:
             with open(os.path.join(RELEASE_DIR, "nf-%dx3090.env" % n), encoding="utf-8") as fh:
-                self.assertEqual(bool(re.search(r"^PROFILE_STATUS=blockiert-", fh.read(), re.M)), want, n)
+                text = fh.read()
+            self.assertIsNone(re.search(r"^PROFILE_STATUS=blockiert-", text, re.M), n)
+            self.assertRegex(text, r"(?m)^PROFILE_STATUS=hochrechnung\b")
 
-    def test_nf_on_two_and_four_cards_is_a_disabled_button_with_the_profiles_reason(self):
-        for n in (2, 4, 5, 6, 7):
-            for l in ("solo", "flip"):
-                row = self.layouts("qwen38-nf-int4", "rtx3090-24", n)[l]
-                self.assertEqual((row["status"], row["possible"]), ("blocked", False), (n, l))
-                why = " ".join(row["why"])
-                self.assertIn("marked blocked (D-BUDGET)", why)
-                self.assertIn("D-EIGENTUM", why)
-
-    def test_nf_on_three_cards_and_the_27b_models_on_any_count_are_not_blocked_by_a_profile(self):
-        for l in ("solo", "flip"):
-            self.assertTrue(self.layouts("qwen38-nf-int4", "rtx3090-24", 3)[l]["possible"])
-        for n in (2, 3, 4, 5, 6, 7):
-            for m in ("qwen38-27b-int8", "qwen38-27b-nvfp4"):
+    def test_nf_and_the_27b_models_on_any_count_are_not_blocked_by_a_profile(self):
+        for n in NS:
+            for m in ("qwen38-nf-int4", "qwen38-27b-int8", "qwen38-27b-nvfp4"):
                 for l in ("solo", "flip"):
                     self.assertNotIn("marked blocked", " ".join(self.layouts(m, "rtx3090-24", n)[l]["why"]), (n, m, l))
+            for l in ("solo", "flip"):
+                self.assertTrue(self.layouts("qwen38-nf-int4", "rtx3090-24", n)[l]["possible"], (n, l))
+
+    def test_a_blocked_profile_is_a_disabled_button_with_the_profiles_reason(self):
+        d = self.blocked_copy(4)
+        for l in ("solo", "flip"):
+            row = self.layouts("qwen38-nf-int4", "rtx3090-24", 4, d)[l]
+            self.assertEqual((row["status"], row["possible"]), ("blocked", False), l)
+            why = " ".join(row["why"])
+            self.assertIn("marked blocked (D-BUDGET)", why)
+            self.assertIn("D-EIGENTUM", why)
+        self.assertTrue(self.layouts("qwen38-nf-int4", "rtx3090-24", 5, d)["flip"]["possible"])   # only the profile that says so
 
     def test_other_cards_are_not_judged_by_a_profile_for_3090s(self):
+        d = self.blocked_copy(2)
         for l in ("solo", "flip"):
-            self.assertNotIn("marked blocked", " ".join(self.layouts("qwen38-nf-int4", "rtx3080-20", 2)[l]["why"]))
+            self.assertNotIn("marked blocked", " ".join(self.layouts("qwen38-nf-int4", "rtx3080-20", 2, d)[l]["why"]))
 
     def test_the_reason_is_german_in_the_german_view(self):
-        why = " ".join(self.z().layouts({"model": "qwen38-nf-int4", "cards": [{"card": "rtx3090-24", "count": 4}], "lang": "de"})["layouts"][1]["why"])
+        d = self.blocked_copy(4)
+        why = " ".join(self.layouts("qwen38-nf-int4", "rtx3090-24", 4, d, lang="de")["flip"]["why"])
         self.assertIn("als gesperrt markiert (D-BUDGET)", why)
         self.assertEqual(english_words(why), [], why)
 

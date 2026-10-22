@@ -2583,7 +2583,42 @@ def _gguf_weight_sizes(model_path: str) -> Optional[Dict[str, float]]:
     return {name: float(nbytes) for name, nbytes in census.sizes().items()}
 
 
+#: nfblock 1022: the header read of a checkpoint, once per process per unchanged checkpoint.  One launcher dry run called
+#: :func:`checkpoint_weight_terms` 26 times on the same NF checkpoint (D solve passes, the seat table 1..6 per pass, the P cut,
+#: the TP decision), 1.46 s each under the profiler -- the largest single cost of an NF dry run on 7 cards.  The key is the
+#: path plus (name, size, mtime_ns) of every shard / the GGUF file, so a changed file is read again; a failed read is never kept.
+_WEIGHT_TERMS_MEMO: Dict[Tuple[object, ...], "CheckpointWeightTerms"] = {}
+
+
+def _weight_terms_key(model_path: str) -> Optional[Tuple[object, ...]]:
+    import glob as _glob
+
+    try:
+        if os.path.isfile(model_path):
+            st = os.stat(model_path)
+            return (str(model_path), ((os.path.basename(model_path), st.st_size, st.st_mtime_ns),))
+        shards = sorted(_glob.glob(os.path.join(model_path, "*.safetensors")))
+        if not shards:
+            return None
+        return (str(model_path), tuple((os.path.basename(f), os.stat(f).st_size, os.stat(f).st_mtime_ns) for f in shards))
+    except OSError:
+        return None
+
+
 def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
+    """:func:`_checkpoint_weight_terms_read`, memoized per process on the checkpoint's file signature (nfblock 1022).  The
+    returned value is a fresh copy (its one mutable field, ``replicated_breakdown``, is copied), so a caller can never change
+    the memo."""
+    key = _weight_terms_key(model_path)
+    got = _WEIGHT_TERMS_MEMO.get(key) if key is not None else None
+    if got is None:
+        got = _checkpoint_weight_terms_read(model_path)
+        if key is not None:
+            _WEIGHT_TERMS_MEMO[key] = got
+    return dataclasses.replace(got, replicated_breakdown=dict(got.replicated_breakdown))
+
+
+def _checkpoint_weight_terms_read(model_path: str) -> CheckpointWeightTerms:
     """Measure the weight terms `PPCutInputs` needs from a safetensors dir
     or (27B line G6) a GGUF file's tensor directory.
 

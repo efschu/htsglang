@@ -1588,7 +1588,10 @@ def owned_ratio_vectors_free(base: Sequence[int], *, step: int = OWNED_RATIO_STE
 #: with the rank count (about 55^(N-1) vectors at the 8-unit step; the launcher dry run of NF on 5 identical cards did not finish in 300 s).  Ranks whose own inputs
 #: are identical (card, budget, fixed posts, miss and extend cost) are one class and move together, so N identical cards are a search over the host and ONE worker
 #: class (the host differs by role), mixed cards over the number of card types.  N <= OWNED_CLASS_MIN_RANKS runs the exact search of before, bit for bit.
-OWNED_CLASS_MIN_RANKS = 4
+#: nfblock 1022: 3 (was 4).  NF on 4 identical 3090s ran the exact lattice, 4.48 M candidates per owned solve, one solve per pass (Karte / map / dry, LRU
+#: rounds): 655 s for one dry run.  With the classes 4 ranks are host + one class per worker kind (4 x 3090: workers 1-2 and the last worker), the
+#: 3-rank boards (the rig, 3 x 3090) keep the exact search bit for bit.
+OWNED_CLASS_MIN_RANKS = 3
 
 
 def owned_rank_classes(fits: Sequence["DRankResidency"], host: int,
@@ -1688,6 +1691,32 @@ def owned_share_vectors_classes(n: int, host: int, groups: Sequence[Sequence[int
             for r in g:
                 vec[r] = v
         full.append(tuple(vec))
+    if not full and wg:
+        # nfblock 1022: a worker class whose size does not divide the grid in ``step`` units (5 or 6 IDENTICAL workers on 64 units) had NO share
+        # vector at all -- the owned solve then saw 0 candidates and refused (D-BUDGET).  Latent: the N x 3090 boards split their workers into two
+        # classes (middle / last, the borrowed role reference), each of a divisible size.  Same rule as the ownership classes: every class
+        # takes a TOTAL in ``step`` units and splits it as evenly as integers allow (the members differ by at most one unit).  Only reached where the
+        # stepped enumeration above is empty, so every count it served stays bit for bit.
+        tot: List[Tuple[int, ...]] = []
+
+        def _tot(i, acc, used):
+            if i == len(wg) - 1:
+                rest = int(grid) - used
+                if rest >= 0:
+                    tot.append(tuple(acc + [rest]))
+                return
+            for t in range(0, int(grid) + 1, int(step)):
+                if used + t <= int(grid):
+                    _tot(i + 1, acc + [t], used + t)
+
+        _tot(0, [], 0)
+        for totals in tot:
+            vec = [0] * n
+            for g, t in zip(wg, totals):
+                q, rem = divmod(int(t), len(g))
+                for j, r in enumerate(g):
+                    vec[r] = q + (1 if j < rem else 0)
+            full.append(tuple(vec))
     return full
 
 
@@ -4793,14 +4822,14 @@ def plan_d_residency(
                                  kv_tokens=int(kv_tokens), rank_tp_ratio=rank_tp_ratio,
                                  n_ranks=len(base_rat))
 
-        def _owned_from(b):
+        def _owned_from(b, lim=None):
             return solve_owned_cut(
                 lambda rat, sh: _solve(sh, None, rat), b, host,
                 num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
                 ids_per_step=ids, miss_ms=_miss_ms, card_rows=_card_rows, fa_layers=fa_layers,
                 rows_per_round=int(verify), forced_shares=_forced_shares,
                 x1_scope=_x1_scope, bs_weights=_bs_w, miss_ms_rank=_miss_rank, heat=_heat,
-                switch_gain=OWNED_SWITCH_GAIN, **_ext_kw, **_lim)
+                switch_gain=OWNED_SWITCH_GAIN, **_ext_kw, **(_lim if lim is None else lim))
 
         sol = _owned_from(base_rat)
         if tuple(int(x) for x in base_rat) != tuple(int(x) for x in _stated_base):
@@ -4823,6 +4852,41 @@ def plan_d_residency(
                 )
                 sol = sol_st
                 base_rat = list(_stated_base)
+        _wave_lines: Tuple[str, ...] = ()
+        _form_a_waves = None
+        if (not sol.feasible and _forced_shares is None and derive_waves and seats is not None
+                and str(env_d.get(POOL_GRAPH_MODE_ENV, "")).strip().lower() == "pool"
+                and replayssm_spec is not None and text_cfg.get("num_experts_per_tok")):
+            # nfblock 1022: the wave cap of the guard is the line's cap -- but where the waves are the launcher's own default (derive_waves) the D
+            # group runs the waves its FORM needs (OVERFLOW-WAVES below, max(Env, ceil(rows per step / scratch))).  Form A at the stated vector
+            # already needs those waves; a cut that needs no more than Form A is not slower in waves than what would run without it.  So when no
+            # cut form holds the Env cap, the search runs once more at Form A's own waves (never above them).  NF on 2 x 3090: Env 2, Form A 6.
+            _fa = _solve(None)
+            _form_a_waves = max(
+                pool_overflow_waves(env_d),
+                max(pool_step_waves_needed(
+                    need_rows=pool_step_rows_needed(
+                        seats=int(seats), verify_tokens=int(verify),
+                        top_k=int(text_cfg.get("num_experts_per_tok")),
+                        local_experts=f.local_experts, resident_rows=f.resident_rows),
+                    scratch_rows=int(f.scratch_rows)) for f in _fa))
+            if _form_a_waves > int(_lim.get("waves_cap", 1)):
+                _lim_fa = dict(_lim, waves_cap=int(_form_a_waves))
+                sol_fa = _owned_from(base_rat, _lim_fa)
+                _wave_lines = (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM WELLEN (nfblock 1022): keine Schnittform haelt die Env-Wellen %d (%d Kandidaten, %d an den "
+                    "harten Grenzen); %s=%s ist der Launcher-Default, D faehrt die Wellen seiner Form -- Form A braucht %d (max ueber die Raenge "
+                    "ceil(min(Ids, E-R) / Scratch) bei %d Sitzen): neu gesucht mit hoechstens %d Wellen -> %s"
+                    % (marker, label, int(_lim.get("waves_cap", 1)), sol.candidates, sol.guard_refused,
+                       POOL_OVERFLOW_WAVES_ENV, env_d.get(POOL_OVERFLOW_WAVES_ENV, "-"), int(_form_a_waves), int(seats),
+                       int(_form_a_waves),
+                       ("%d tragbar" % sol_fa.feasible) if sol_fa.feasible else
+                       ("keine tragbare Form (%d Kandidaten, %d an den harten Grenzen)"
+                        % (sol_fa.candidates, sol_fa.guard_refused))),
+                )
+                if sol_fa.feasible:
+                    sol = sol_fa
+                    _lim = _lim_fa
         owner_record = (
             ("base_ratios", list(sol.base_ratios)),
             ("base_round_ms", [round(x, 3) for x in sol.base_round_ms]),
@@ -4910,7 +4974,7 @@ def plan_d_residency(
                    _miss_src, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
                    int(kv_tokens)),
             )
-            cut_lines = _base_lines + cut_lines
+            cut_lines = _base_lines + _wave_lines + cut_lines
             cut_lines = cut_lines + (
                 ("%s FRACTION-SOLVE %s D-EIGENTUM EXTEND-KOPIE (S54): Experten-Kopie je D-Extend "
                  "(%d neue Token, %d Ids, %.4f Extends je Decode-Runde, %s) je Rang %s ms "
@@ -4992,8 +5056,24 @@ def plan_d_residency(
                 + (" -- %d davon an den harten Grenzen rejected (%s)"
                    % (sol.guard_refused, dict(sol.guard)) if sol.guard_refused else ""))
             # the derived base is printed even when no cut form carries
-            cut_lines = _base_lines
+            cut_lines = _base_lines + _wave_lines
             kv_token_shares = None
+            if _forced_shares is None:
+                # nfblock 1022: the owned solve CHOOSES between Form A (the host holds the KV, no token cut) and the cut forms; a cut form is taken
+                # only when it carries and keeps x1 against Form A.  When none does, Form A is the answer -- not a refusal: the D group then runs
+                # Form A (exactly what --force ran) and Form A is judged by the same checks as every uncut D (W122 / W130 / pool step below, each
+                # with its own refusal).  NF on 4 x 3090: every expert of every worker is resident in Form A (miss time 0.00 ms), so every cut can
+                # only add worker misses and x1 refused all 4.48 M candidates -- the best form was refused as "D-BUDGET".  A forced cut
+                # ('owned:<vector>', the measurement arm M1b) keeps the refusal: there the cut itself is the order.
+                cut_lines = cut_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f) FORM A BLEIBT (nfblock 1022): keine Schnittform traegt und haelt x1 (%s) -- "
+                    "der Host haelt den KV, kein Token-Schnitt, --rank-moe-ratio bleibt %s; Form A wird unten wie jede D-Form ohne Schnitt "
+                    "geprueft (W122/W130/Pool-Schritt)"
+                    % (marker, label, owner_refusal.split(": D-EIGENTUM (#239 S3f) -- ", 1)[-1],
+                       ",".join("%g" % float(x) for x in ratios)),
+                )
+                owner_record = owner_record + (("form_a_kept", True),)
+                owner_refusal = None
     if isinstance(kv_token_shares, str):
         if kv_token_shares not in (KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT):
             raise ValueError(

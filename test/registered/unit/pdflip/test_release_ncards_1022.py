@@ -134,8 +134,8 @@ class OwnedClasses(unittest.TestCase):
             self.assertEqual(v[0], 0)
             self.assertEqual(len({v[1], v[2], v[3], v[4]}), 1)
 
-    def test_a_search_with_four_ranks_or_fewer_does_not_branch(self):
-        self.assertEqual(E.OWNED_CLASS_MIN_RANKS, 4)                                          # n > 4 only: 2, 3 and 4 ranks run the exact search as before
+    def test_a_search_with_three_ranks_or_fewer_does_not_branch(self):
+        self.assertEqual(E.OWNED_CLASS_MIN_RANKS, 3)                                          # n > 3 only (nfblock 1022: was 4): 2 and 3 ranks (the rig) run the exact search as before
 
 
 class Profiles(unittest.TestCase):

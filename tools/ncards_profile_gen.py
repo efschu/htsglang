@@ -229,26 +229,28 @@ profile_form_env() {{
 """
 
 
-#: PROFILE_STATUS of the generated NF profiles (review 1021 A1).  Two checks of the launcher's D side matter: (1) the D residency balance FRACTION-SOLVE D
-#: (W122 / W130): it did not run at all for N != 3 (the 3-rank reference did not fit) and the planner counted resident rows only (``scratch_rows=0``) and kept the
-#: 5090's host scratch 100 on a 24 GB card; both fixed, every rank of every N now PASSES; (2) D-EIGENTUM (#239 S3f), the launcher's own ownership / KV token-cut
-#: solve: it finds a bearable form on N = 3, and none on N = 2 and N = 4 (forced past as D-BUDGET).  So nf-3x3090 is bootable (HOCHRECHNUNG), nf-2x3090 and
-#: nf-4x3090 stay ``blockiert-d-budget`` -- named, pinned by the dry-run golden (``D-BUDGET`` forced exactly there).
-NF_STATUS = {0: ("blockiert-d-budget", "Launcher-D-EIGENTUM (#239 S3f) findet keine tragbare Form (D-BUDGET, auch mit --force nur benannt durchgelassen): nicht startbar, siehe Kopf"),
-             3: ("hochrechnung", "Planer-Rechnung, keine Messung auf 3090; Abnahme erst nach Metall")}
+#: PROFILE_STATUS of the generated NF profiles (review 1021 A1, nfblock 1022).  Two checks of the launcher's D side matter: (1) the D residency balance FRACTION-SOLVE D
+#: (W122 / W130): every rank of every N PASSES since review 1021 A1; (2) D-EIGENTUM (#239 S3f), the launcher's own ownership / KV token-cut solve: until nfblock 1022 it
+#: found a bearable form on N = 3 only and refused 2, 4, 5, 6, 7 as D-BUDGET.  Two launcher defects, fixed in nfblock 1022 (expert_residency.plan_d_residency,
+#: launcher.d_seat_table_form): the guard held the Env wave cap 2 although D runs the waves its form needs (N = 2), and a Form A that beats every cut was refused
+#: instead of kept (N = 4..7).  Every N is now bootable as HOCHRECHNUNG.
+NF_STATUS = {0: ("hochrechnung", "Planer-Rechnung, keine Messung auf 3090; Abnahme erst nach Metall")}
 
 _DBUDGET_COMMON = (
-    "# D-BUDGET (Review 1021 A1): der D-Rechenweg des Launchers (FRACTION-SOLVE D, W122/W130) LAEUFT jetzt auf jeder Rangzahl -- fuer N != 3 mit der 3-Rang-Referenz fnFL2\n"
-    "# nach Rolle (Host / mittlerer / letzter Worker) auf N Raenge genommen, im Log benannt (\"BORROWED BY RANK ROLE\", UNMEASURED bei dieser Rangzahl); vorher entfiel die\n"
-    "# Pruefung bei N = 2 / 4 stumm. Der Planer rechnet die residente Fraction mit min(R + S, E) Zeilen (residente + Scratch-Zeilen) gegen das Rangbudget (vorher nur R),\n"
-    "# leitet den Host-Scratch aus dem Budget der Karte ab (nicht der 5090-Rollenwert 100 = 11,6 GB Zeilen auf 24 GB) und bucht die Host-Differenz zu den Rollen-Rekorden\n"
-    "# des Launchers als benannten Posten (propose_rules.launcher_host_gap_mib). Ergebnis im Trockenlauf: W122/W130 PASST auf jedem Rang jeder Rangzahl.\n")
+    "# D-PRUEFUNG (Review 1021 A1): der D-Rechenweg des Launchers (FRACTION-SOLVE D, W122/W130) LAEUFT auf jeder Rangzahl -- fuer N != 3 mit der 3-Rang-Referenz fnFL2\n"
+    "# nach Rolle (Host / mittlerer / letzter Worker) auf N Raenge genommen, im Log benannt (\"BORROWED BY RANK ROLE\", UNMEASURED bei dieser Rangzahl). Der Planer rechnet\n"
+    "# die residente Fraction mit min(R + S, E) Zeilen gegen das Rangbudget, leitet den Host-Scratch aus dem Budget der Karte ab und bucht die Host-Differenz zu den\n"
+    "# Rollen-Rekorden des Launchers als benannten Posten (propose_rules.launcher_host_gap_mib). Ergebnis im Trockenlauf: W122/W130 PASST auf jedem Rang jeder Rangzahl.\n")
+#: per N: what D-EIGENTUM (#239 S3f) decides on N identical 3090s (launcher dry run, nfblock 1022).  The numbers are the dry run's (fixtures/ncards_1021/golden).
 _DBUDGET_N = {
-    3: "# N = 3: auch D-EIGENTUM (#239 S3f, Eigentums-/KV-Token-Schnitt-Loeser) findet eine tragbare Form -- kein D-BUDGET, das Profil ist startbar (Hochrechnung).\n",
-    "other": ("# D-EIGENTUM (#239 S3f, der Eigentums-/KV-Token-Schnitt-Loeser des Launchers) findet auf N = {n} KEINE tragbare Form (\"keine mit Kante auf jedem Rang und ohne\n"
-              "# Mehr-Fehlgriffe eines Workers gegen Form A\", der Grossteil der Kandidaten an den harten Grenzen rejected: Sitze 6, Wellen 2, Token-Stufen): D-BUDGET, auch mit\n"
-              "# --force nur benannt durchgelassen. Geprueft ohne Wirkung: KV-Decke 131072 / 65536 und 5 Sitze auf N = 2. Ursache offen: der Planer (Form A) haelt den KV ungeteilt auf\n"
-              "# dem Host, der Launcher schneidet ihn nach Tokens ueber die Raenge (#239). Siehe /spinning/gpu-arb/deskq/done/planer-ncards-1021.md, Abschnitt 12.\n"),
+    3: "# N = 3: D-EIGENTUM (#239 S3f, Eigentums-/KV-Token-Schnitt-Loeser) findet eine tragbare Schnittform -- kein D-BUDGET, das Profil ist startbar (Hochrechnung).\n",
+    2: ("# N = 2 (nfblock 1022, vorher D-BUDGET): bei den Env-Wellen 2 traegt keine Schnittform (240 Ids je Schritt bei 6 Sitzen; zwei Karten halten zusammen ~210\n"
+        "# Experten-Zeilen fuer 514). D faehrt aber die Wellen seiner Form (Launcher-Default, OVERFLOW-WAVES): Form A braucht schon 6. Bei diesen Wellen traegt eine\n"
+        "# Schnittform (KV ganz auf dem Worker, Eigentum vom Launcher geloest). Startbar; Preis: bis 10 Ueberlaufwellen je Decode-Schritt bei 6 Sitzen, der Grossteil\n"
+        "# der Experten kommt je Schritt vom Host (Planer-Saat, UNMEASURED) -- physikalisch passt es, schnell ist es nicht.\n"),
+    "formA": ("# N = {n} (nfblock 1022, vorher D-BUDGET): D-EIGENTUM behaelt Form A (der Host haelt den KV, kein Token-Schnitt). In Form A sind die Worker-Experten\n"
+              "# (fast) alle resident; jeder Token-Schnitt nimmt Worker-Zeilen fuer KV und erhoeht ihre Fehlgriffe, die x1-Regel verwirft ihn. Vorher wurde das als\n"
+              "# \"keine tragbare Form\" verweigert, obwohl Form A alle Pruefungen (W122/W130/Pool-Schritt) besteht. Startbar (Hochrechnung).\n"),
 }
 
 
@@ -257,8 +259,8 @@ def render_profile(basis: str, n: int, card: str = "rtx3090-24", checkpoints: st
     if basis != "nf":
         raise SystemExit("render_profile: only the NF profiles are generated (27B: _3090_common.sh _p3090_apply)")
     status, note = NF_STATUS.get(n, NF_STATUS[0])
-    dnote = _DBUDGET_COMMON + (_DBUDGET_N[3] if n == 3 else _DBUDGET_N["other"].format(n=n))
-    return NF_TEMPLATE.format(n=n, count=", HW-COUNT, D-BUDGET" if n != 3 else "", inv=",".join(["RTX3090"] * n), status=status, status_note=note,
+    dnote = _DBUDGET_COMMON + (_DBUDGET_N[n] if n in _DBUDGET_N else _DBUDGET_N["formA"].format(n=n))
+    return NF_TEMPLATE.format(n=n, count=", HW-COUNT" if n != 3 else "", inv=",".join(["RTX3090"] * n), status=status, status_note=note,
                               dbudget_note=dnote, block=block(basis, n, card, checkpoints, kv_tokens))
 
 
