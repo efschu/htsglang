@@ -228,15 +228,20 @@ def owner_share(ctx) -> str:
 
 def format_turn_line(*, rid: str, chain: int, stats: Mapping[str, Any], ops: int, tokens: int,
                      share: str, wall: float, cpu: float, blocked: float, n: int,
-                     deferred_open: int, anchor_deferred: int = 0) -> str:
+                     deferred_open: int, anchor_deferred: int = 0, match_ms: Optional[float] = None,
+                     sweep_ms: Optional[float] = None, claim_ms: Optional[float] = None) -> str:
+    # KVLEITER-1022: issue_ms split into match_ms (chain match + deferred filter), sweep_ms (the sweep's walk) and
+    # claim_ms (its claims / write_backup issues) -- appended after n=, the fields before are unchanged
+    split = ("" if match_ms is None else " match_ms=%.2f sweep_ms=%.2f claim_ms=%.2f" % (
+        float(match_ms), float(sweep_ms or 0.0), float(claim_ms or 0.0)))
     return (
         "%s rid=%s chain=%d unbacked=%d issued=%d deferred=%d ops=%d tokens=%d share=%s "
-        "issue_ms=%.2f issue_cpu_ms=%.2f blocked_ms=%.2f deferred_open=%d anchor_deferred=%d n=%d "
+        "issue_ms=%.2f issue_cpu_ms=%.2f blocked_ms=%.2f deferred_open=%d anchor_deferred=%d n=%d%s "
         "(scheduler thread only: host claims/commits, one event record; the copy runs on the "
         "copier thread, its bytes and ms are the %s lines)"
         % (TURN_LINE, rid, chain, int(stats.get("unbacked", 0) or 0), int(stats.get("issued", 0) or 0),
            max(0, int(stats.get("unbacked", 0) or 0) - int(stats.get("issued", 0) or 0)), ops, tokens, share,
-           wall, cpu, blocked, deferred_open, anchor_deferred, n, COPY_LINE)
+           wall, cpu, blocked, deferred_open, anchor_deferred, n, split, COPY_LINE)
     )
 
 
