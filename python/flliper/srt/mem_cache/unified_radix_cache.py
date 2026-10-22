@@ -6046,6 +6046,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if int(getattr(self, "pp_size", 1) or 1) > 1:
             return False   # K15 review A2/B2: a stage-local spill frees no shared slot on P
+        if _r12.role() != "host" and int(getattr(self, "tp_world_size", 1) or 1) > 1:
+            # TURNEND-1022 review B2 (SOLL R11/R12): the release is rank-agreed only where TP0 is the Form A host and
+            # R12 carries its verdict (and K15c's ref-free filter runs). A TP group without that plan would choose
+            # its victims rank-locally (own tree, own L3 record timing) -- no spill there, the anchor is deferred
+            return False
         left["mamba"] = int(left["mamba"]) - 1
         info: dict = {}
         t0 = time.perf_counter()
@@ -6068,14 +6073,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if (n <= 16 or (n & (n - 1)) == 0) if ok else (k <= 16 or (k & (k - 1)) == 0):
             logger.info(
                 "S108 TURN-END-SPILL n=%d freed=%d total_freed=%d node=%s victim_node=%s victim_depth=%s "
-                "secured_mark=%s tree_anchors=%s l3_secured=%s pending=%s shared=%s left=%d ms=%.2f (an L3-secured, "
-                "ref-free tree anchor leaves L2 for this turn end's anchor; R12 has the workers drop it too; no "
+                "secured_mark=%s pick=%s tree_anchors=%s l3_secured=%s pending=%s shared=%s left=%d ms=%.2f "
+                "(an L3-secured, ref-free tree anchor leaves L2 for this turn end's anchor; R12 has the workers drop it too; no "
                 "write, no stat, no wait)",
                 n, int(ok), st["freed"], getattr(node, "id", "?"),
                 getattr(getattr(victim, "node", None), "id", "-"), getattr(victim, "depth", "-"),
                 bool(getattr(getattr(victim, "node", None), "pdflip_anchor_secured", False)),
-                info.get("tree", "?"), info.get("secured", "?"), info.get("pending", "?"),
-                info.get("shared", "?"), int(left.get("mamba", 0)), (time.perf_counter() - t0) * 1000.0)
+                info.get("pick", "foreign"), info.get("tree", "?"), info.get("secured", "?"),
+                info.get("pending", "?"), info.get("shared", "?"), int(left.get("mamba", 0)), (time.perf_counter() - t0) * 1000.0)
         return ok
 
     def _s108_make_room(self, pool, need: int, kind: str) -> bool:
@@ -6936,7 +6941,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             tree = [a for a in tree if _rf(a)]
         victim = _mad.pick_foreign_victim(tree, rid="")
         if victim is None or not victim.slots:
-            victim = self._pdflip_last_resort_victim(node, mp, ref_free=_rf, shared_out=_shared)
+            # TURNEND-1022 review B1: group D's tree anchors are UNTAGGED (rc33 1022_060647 D: 1624 of 1624 K15
+            # DISPLACE lines victim_rid=''), so the tagged walk above is empty there and the census it took read 0.
+            # For the turn end (``info``) the last resort prefers its L3-secured candidates (one PENDING shallowest
+            # anchor no longer blocks the spill while a secured one exists) and the census is the last resort's own.
+            # K15 / flush (``info`` None): byte for byte the old call.
+            if info is None:
+                victim = self._pdflip_last_resort_victim(node, mp, ref_free=_rf, shared_out=_shared)
+            else:
+                victim = self._pdflip_last_resort_victim(
+                    node, mp, ref_free=_rf, shared_out=_shared, census=info,
+                    secured=lambda a: bool(_l3s.secured(arena, a.slots, _backend).all()))
         if info is not None:
             info["shared"] = len(_shared)
         if (victim is None or not victim.slots) and _shared:
@@ -7255,7 +7270,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            "ours would free no slot, so none is released", getattr(node, "id", "?"),
                            len(shared), k)
 
-    def _pdflip_last_resort_victim(self, node, mp, park: bool = False, ref_free=None, shared_out=None):
+    def _pdflip_last_resort_victim(self, node, mp, park: bool = False, ref_free=None, shared_out=None,
+                                   secured=None, census=None):
         """MAMBA-LAST-RESORT (``FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT``, default
         on since 09.10.): the anchor a full arena's claim may spill when the H19 /
         PARK-END-ANCHOR-FIRST rules found none (NF int22, D TP0 boot
@@ -7278,6 +7294,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if shared_out is not None:
                 shared_out.update(id(a.node) for a in cands if not ref_free(a))
             cands = [a for a in cands if ref_free(a)]
+        if secured is not None:
+            # TURNEND-1022 review B1 (turn end only): L3-secured candidates first; the caller still checks the
+            # victim's copy (``l3_secured.check``) before it releases anything
+            sec = [a for a in cands if a.slots is not None and secured(a)]
+            if census is not None:
+                census.update(tree=len(cands), secured=len(sec), pending=len(cands) - len(sec), pick="last_resort")
+            cands = sec or cands
         return _mad.pick_last_resort_victim(cands, chain_ids=self._pdflip_park_chain(),
                                             claimer_lane=self._pdflip_claim_lane(node, park=park))
 
