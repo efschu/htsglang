@@ -372,7 +372,10 @@ def test_a_ple_side_state_is_required_once_registered():
 
     turn = ta.TurnTracks(1)
     turn.add(0, torch.tensor([7]), 64, 0, 100)
-    fb = SimpleNamespace(pdflip_turn_tracks=turn)
+    from flliper.srt.model_executor.forward_batch_info import ForwardMode
+
+    # an extend forward (review nf-rc31-forkanchor 1022: the PLE side gates on the mode like forward_rows)
+    fb = SimpleNamespace(pdflip_turn_tracks=turn, forward_mode=ForwardMode.EXTEND)
     assert q._ple_turn_rows(fb, "ple_conv") is None, "no GDN rows yet: nothing to write"
     assert "ple_conv" in turn.need
     turn.done.add("gdn")
