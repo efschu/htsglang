@@ -25,8 +25,10 @@ Lightning, ProRL Agent, LMSYS Miles, SkyRL token-in-token-out rendering):
   inside it; the rest stays the new render's ids (``reuse``).
 
 THE HARD CHECK, per request: the result's bytes equal the new render's bytes
-(byte table) AND the tokenizer's own decode of the changed region equals the
-render's -- otherwise the render's ids are kept and the case is counted by
+(byte table), the changed region holds the same control tokens (added ids:
+'<|im_end|>' as one id, never as plain pieces, and the reverse; review 22.10.)
+AND the tokenizer's own decode of the changed region equals the render's --
+otherwise the render's ids are kept and the case is counted by
 name. So the model always sees exactly the text the client sent; only the
 split of the shared bytes is the one a group already computed. Every reused id
 is a prefix of a sequence a group processed, so its KV (keyed by ids on device
@@ -121,6 +123,10 @@ class TokenBytes:
         self.why = ""
         self.table: List[bytes] = []
         self.lens = np.zeros(0, dtype=np.int64)
+        #: True for the tokenizer's added (control) tokens: '<|im_end|>' as ONE id
+        #: and as six plain pieces are the same bytes and the same decode, but
+        #: not the same input (review 22.10., :func:`same_control_tokens`)
+        self.added = np.zeros(0, dtype=bool)
         self._tok = tok
         try:
             self._build(tok)
@@ -149,6 +155,11 @@ class TokenBytes:
                 return
         self.table = table
         self.lens = np.fromiter((len(b) for b in table), dtype=np.int64, count=len(table))
+        mask = np.zeros(len(table), dtype=bool)
+        for i in added:
+            if 0 <= i < len(table):
+                mask[i] = True
+        self.added = mask
         for text in PROBE_TEXTS:
             ids = list(tok.encode(text, add_special_tokens=False))
             joined = self.bytes_of(ids)
@@ -186,6 +197,29 @@ def byte_lcp(a: bytes, b: bytes) -> int:
     y = np.frombuffer(b, dtype=np.uint8, count=n)
     ne = np.flatnonzero(x != y)
     return int(ne[0]) if ne.size else n
+
+
+def same_control_tokens(tb: Any, a: np.ndarray, b: np.ndarray) -> bool:
+    """The added (control) tokens of ``a`` and ``b`` -- two splits of the SAME
+    bytes -- are the same ids at the same byte offsets.
+
+    Review 22.10.: the byte check and the decode check both pass when one side
+    holds '<|im_end|>' (or '<tool_call>', '<think>') as the control id and the
+    other as plain text pieces (NF tokenizer: [248046] vs [27, 91, 316, 6018,
+    91, 29], same bytes, same decode). The model then reads a turn end where
+    the client sent text, or text where the template put a turn end. Such a
+    splice is refused; the render keeps the template's token classes."""
+    mask = getattr(tb, "added", None)
+    if mask is None or int(getattr(mask, "size", 0)) == 0:
+        return True
+    ma, mb = mask[a], mask[b]
+    if int(ma.sum()) != int(mb.sum()):
+        return False
+    if not ma.any():
+        return True
+    if not np.array_equal(a[ma], b[mb]):
+        return False
+    return bool(np.array_equal(tb.offsets(a)[:-1][ma], tb.offsets(b)[:-1][mb]))
 
 
 def token_lcp(a: np.ndarray, b: np.ndarray) -> int:
@@ -243,8 +277,11 @@ def reuse(tb: TokenBytes, new_ids: np.ndarray, new_bytes: bytes, new_off: np.nda
     if tb.bytes_of(out) != new_bytes:
         base.why = "byte_check_failed"
         return base
+    k = min(canon, i, j)
+    if not same_control_tokens(tb, out[k:], new_ids[k:]):
+        base.why = "control_token_check_failed"
+        return base
     if check_decode:
-        k = min(canon, i, j)
         if tb.decode(out[k:]) != tb.decode(new_ids[k:]):
             base.why = "decode_check_failed"
             return base

@@ -7844,7 +7844,16 @@ class Front:
         book[rid] = c.ids
         while len(book) > Front.SEND_IDS_KEEP:
             old, _ = book.popitem(last=False)
-            posted.discard(old)
+            if old in posted:
+                # TITO review 22.10.: a leg of ``old`` carried these ids and they are gone -- a later leg
+                # (parked request, re-queue) posts the TEXT, i.e. the render's ids, not the TITO ids P
+                # ran under. Named here; D's #1442 id check (handoff_keys.record_ids_differ) keeps P's
+                # page keys away from it.
+                posted.discard(old)
+                lost = self.__dict__.setdefault("_send_ids_lost", collections.OrderedDict())
+                lost[old] = True
+                while len(lost) > 4096:
+                    lost.popitem(last=False)
 
     def _send_ids_peek(self, rid: str, path: str) -> "Optional[np.ndarray]":
         """FRONT-SEND-IDS / TITO: the ids every leg of ``rid`` carries (None =
@@ -7857,6 +7866,12 @@ class Front:
         ids = None if book is None else book.get(rid)
         if ids is not None:
             self.__dict__.setdefault("_send_ids_posted", set()).add(rid)
+        elif rid in (self.__dict__.get("_send_ids_lost") or ()):
+            self.counters["front_send_ids_lost"] += 1
+            logger.warning("PDFLIP FRONT-SEND-IDS-LOST rid=%s path=%s (an earlier leg of this rid carried the "
+                           "front's ids, the book (SEND_IDS_KEEP=%d) evicted them: this leg posts the text; "
+                           "the group renders it again -- D's #1442 id check refuses P's page keys if the "
+                           "ids differ)", rid, path, Front.SEND_IDS_KEEP)
         return ids
 
     def _send_ids_body(self, rid: str, payload: dict, pending: Optional["Pending"],
