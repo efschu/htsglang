@@ -67,7 +67,7 @@
   "ranks": [
    {
     "R": 37,
-    "scratch": 48,
+    "scratch": 57,
     "verdict": "PASST"
    },
    {
@@ -87,10 +87,10 @@
    }
   ]
  },
+ "d_owner": "form_a",
  "exc_head": "",
  "exc_type": null,
  "forced": [
-  "D-BUDGET",
   "HW-BORROWED",
   "HW-COUNT",
   "HW-UNCALIBRATED"
