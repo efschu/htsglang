@@ -207,6 +207,9 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
     # rc12g: the reserved growth of one D extend per row (extend chunk cap)
     assert n["D_EXTEND_GROWTH_PER_ROW_MIB"].measured_on == "nextflash"
     assert "D_EXTEND_GROWTH_PER_ROW_MIB" not in q
+    # EXTEND-KORRIDOR review 22.10.: the wide-extend card cost per row (the vote's lend_rate start)
+    assert n["D_EXTEND_LEND_RATE_MIB"].measured_on == "nextflash"
+    assert "D_EXTEND_LEND_RATE_MIB" not in q
     # #242 (28.09.): group P's posts measured on the NF form, no longer the 27B borrow
     # #240: and P's awake overshoot, measured at the NF card
     for own in ("P_ACTIVATION_MIB", "P_PP_STAGE_FIXED_MIB", "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
@@ -220,6 +223,7 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
     assert set(borrowed) == set(n) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "P_DORMANT_SERVED_GROWTH_MIB",
                                       "D_AWAKE_REST_MIB", "D_FIXED_MIB", "D_ACTIVATION_MIB",
                                       "D_EXTEND_GROWTH_MIB", "D_EXTEND_GROWTH_PER_ROW_MIB",
+                                      "D_EXTEND_LEND_RATE_MIB",
                                       "P_ACTIVATION_MIB", "P_PP_STAGE_FIXED_MIB",
                                       "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", "P_OVERSHOOT_MIB",
                                       "D_POOL_PEAK_NONRES_ROWS", "D_POOL_PEAK_NONRES_SPAN_ROWS"}

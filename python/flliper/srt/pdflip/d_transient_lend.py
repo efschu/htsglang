@@ -122,6 +122,12 @@ round_start prices the PENDING rows, ``on_batch`` the BUILT extend (often far wi
 the built price is the guard, a return can move from round_start to on_batch (review A3).
 Amount rank-local like every lend amount; no verdict reads it. ``FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE``
 (default ON); off = the old price byte for byte.
+
+EXTEND-KORRIDOR (22.10., nf-rc33-extendkorridor-1022, planner decision on the review): A4 STANDS. The short
+price above is unchanged against rc33 byte for byte (300 MiB HALT line, rc33 rate -- the wide-extend cost of the
+width vote, ``extend_trim.vote_rate``, never enters it): all 28 rc33 corridor breaches were WIDE extends, and the
+corridor-line price would have cost ~300-600 more partial returns per 71 min on TP0 (~105 ms each) without
+preventing a recorded breach. Only the #794 width vote funds down to the corridor line.
 """
 
 from __future__ import annotations
@@ -768,6 +774,11 @@ def quiesce_for_sleep(sched) -> None:
         ctl = dsv.controller(sched)
     except Exception:  # noqa: BLE001
         ctl = None
+    # review nf-rc33-extendkorridor-1022: an extend right before the sleep (R6 flips mid-D-prefill) left its
+    # LEND-COST tail open; settled after the wake it would book the wake's reserved delta as draft growth and
+    # ratchet ``extend_trim.lend_rate`` -- the width vote's rate since EXTEND-KORRIDOR -- for the rest of the
+    # boot. Close it here, while ``reserved`` is still the extend batch's own (before the sleep's empty_cache).
+    _settle_lend_cost(sched, ctl)
     try:
         if ctl is not None:
             ctl.settle()

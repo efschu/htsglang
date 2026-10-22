@@ -134,6 +134,21 @@
    "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
   },
   {
+   "name": "D_EXTEND_LEND_RATE_MIB",
+   "value": [
+    0.7547,
+    null,
+    null
+   ],
+   "provenance": "EXTEND-KORRIDOR review 22.10. (planner order: TP0 start rate to the worst measured wide-extend cost): the LEND-COST card cost of ONE wide D extend (target forward max(peak_allocated - allocated_at_start, reserved growth) + the draft extend's reserved growth at the next pass, pdflip/extend_trim.lend_cost_settle) per row, maximum over the extends of >= 2048 rows on D-TP0 (5090) of NF rc33 (fbb680d6d3, D.log boot_weg2_dkrnfint4h6ablxcw3spmlrhlvwflbar1dauer10220606_fbb680d6d3_1022_060647): 06:23:24 2629 rows 1984 MiB -> 0.7547 (ceil 4 decimals, 87680 cached), 06:24:12 2629 1974 -> 0.7509, 06:16:13 2375 1788 -> 0.7529, 06:17:08 2710 2024 -> 0.7469 (87488 cached; card 47 MiB, CORRIDOR LAW BREACHED 44), 06:14:16 2880 1930 -> 0.6702. The rc12g record D_EXTEND_GROWTH_PER_ROW_MIB (0.5871, rc12g 27.09.) sits under it: it counts the target's reserved growth only, at shallower prefixes. This record starts the #794 width vote's rate (FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_MIB, extend_trim.vote_rate = max(rc33 rate, this, the boot's own LEND-COST readings)) so the FIRST wide extend after a boot is priced too (rc33 06:14:15: 2880 rows at the 0.5871 start under the 767 corridor line would have ended at ~593 MiB). Vote only: the short-extend price (A4 21.10.) and the 3080 ranks' start (null: no record-floor, their Q-694b / LEND-COST readings) are untouched.",
+   "boots": [
+    "dkrnfint4h6ablxcw3spmlrhlvwflbar1dauer10220606"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
+  },
+  {
    "name": "D_POOL_PEAK_NONRES_ROWS",
    "value": [
     89,
