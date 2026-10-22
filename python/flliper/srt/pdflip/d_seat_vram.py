@@ -4512,6 +4512,15 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
                                 "_child_blocked = waits behind a device child that cannot, "
                                 "_not_agreed = not secured on every rank)", KV_COMPACT_MARK, n, jj_, b_,
                                 " ".join("%s=%d" % kv for kv in sorted(cen.items())))
+                # KVLEITER-1022 (I1): what lies AT OR BELOW the deepest candidate's boundary, and which device child
+                # blocks every child-blocked page (above and below) -- one line, gated with HOLDERS
+                below, blocked = KC.below_census(sv, bounds[0], ag)
+                logger.info("%s n=%d BELOW S%d boundary_page=%d %s | blocked_by %s (pages; rank-local -- the classes "
+                            "of HOLDERS for the pages at or below the boundary; blocked_by = the first device child "
+                            "that cannot go: unbacked / move_only / pinned / partial / mixed / not_agreed)",
+                            KV_COMPACT_MARK, n, cands[0], bounds[0],
+                            " ".join("%s=%d" % kv for kv in sorted(below.items())),
+                            " ".join("%s=%d" % kv for kv in sorted(blocked.items())) or "-")
             pages = sorted({int(x) for x in re.findall(r"page (\d+)", why or "")})
             for pg in pages[:2]:
                 logger.info("%s n=%d WITNESS page=%d (tokens from %d) here: %s", KV_COMPACT_MARK, n,

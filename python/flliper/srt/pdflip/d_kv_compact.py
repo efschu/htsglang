@@ -1309,6 +1309,58 @@ def holder_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None)
     return out
 
 
+def _blocker(g: Segment, ag: Agreement, can_go, memo: Dict[int, str]) -> str:
+    """KVLEITER-1022 (I1): the class of the first device segment below ``g`` that cannot go -- ``unbacked``,
+    ``move_only`` (a running request / a write in flight), ``pinned``, ``partial`` (secured, not whole pages of its
+    own), ``mixed`` (profile not agreed), ``not_agreed``; ``-`` when nothing below blocks."""
+    k = id(g)
+    if k in memo:
+        return memo[k]
+    memo[k] = "-"
+    for c in g.children:
+        if not c.evictable:
+            cls = _node_class(c.nodes[0] if c.nodes else None)
+            memo[k] = "partial" if cls in ("l2", "store") else cls
+            return memo[k]
+        if not ag.agreed(c):
+            memo[k] = "mixed" if c.kind == 3 else "not_agreed"
+            return memo[k]
+        if not can_go(c):
+            b = _blocker(c, ag, can_go, memo)
+            if b != "-":
+                memo[k] = b
+                return b
+    return memo[k]
+
+
+def below_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """KVLEITER-1022 (I1, rank-local, log only): (a) WHAT holds the live pages AT OR BELOW ``boundary_page`` --
+    the same classes as ``holder_census`` (rc32 1022_030836: ``free_below=0`` with the running rows needing fewer
+    pages, and no line said what else lay there), plus ``free`` and ``staged`` (a staged free);
+    (b) for every ``_child_blocked`` page, above or below, WHICH device child blocks it
+    (``above:<blocker>`` / ``below:<blocker>``, see ``_blocker``)."""
+    B = int(boundary_page)
+    ag, seg_of, can_go = _census_ctx(s, ag)
+    below: Dict[str, int] = {}
+    blocked: Dict[str, int] = {}
+    memo: Dict[int, str] = {}
+    pages = [int(p) for p in s.live_below if int(p) <= B] + [int(p) for p in s.live_above]
+    for p in pages:
+        c = _page_class(s, p, ag, seg_of, can_go)
+        if p <= B:
+            below[c] = below.get(c, 0) + 1
+        if c.endswith("_child_blocked"):
+            g = seg_of.get(p)
+            b = _blocker(g, ag, can_go, memo) if g is not None else "-"
+            key = ("below:" if p <= B else "above:") + b
+            blocked[key] = blocked.get(key, 0) + 1
+    below["free"] = sum(1 for p in s.free if p <= B)
+    st = sum(1 for p in s.staged if 1 <= int(p) <= B)
+    if st:
+        below["staged"] = st
+    return below, blocked
+
+
 def plan_digest(stage: int, plan: Plan) -> int:
     """N3: a 62-bit digest of what the GROUP must do alike -- the target stage, its
     boundary and the CONTENT of every eviction (S112b, review A1: after rank-local moves

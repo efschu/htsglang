@@ -153,3 +153,45 @@ def test_mutant_store_run_demoted_now_is_a_token_loss(monkeypatch):
     plan, _w = KC.plan_for(KC.survey(tree, alloc, P, 16, store_ok=True), 16)
     bad = [m for m in plan.evicts if m.node.component_data[FULL].host_value is None]
     assert bad, "the mutant must demote the store prefix"
+
+
+# ---- I1: below the boundary, and which child blocks --------------------------------------------------
+
+def test_below_census_names_the_classes_below_and_the_blocking_child():
+    """Below boundary 16: four pages a store-backed idle chain holds, its un-backed leaf above; above: an L2 chain
+    whose leaf is a running request's (move_only)."""
+    alloc, tree = _world()
+    _take(alloc, list(range(1, 11)))                       # 10 pages outside the tree (a session / request)
+    s = _store(_node(tree, alloc, [11, 12, 13, 14], P))    # store-backed, below the boundary
+    _node(tree, alloc, [20], P, parent=s, backed=False)    # its fresh un-backed tail, above
+    c = _node(tree, alloc, [21, 22], P)                    # L2 chain above ...
+    _node(tree, alloc, [23], P, parent=c, lock=1)          # ... behind a locked leaf
+    sv = KC.survey(tree, alloc, P, 16, store_ok=True)
+    below, blocked = KC.below_census(sv, 16)
+    assert below["outside_tree"] == 10 and below["store_child_blocked"] == 4 and below["free"] == 2, below
+    assert blocked.get("below:unbacked") == 4, blocked
+    assert blocked.get("above:pinned") == 2 or blocked.get("above:move_only") == 2, blocked
+
+
+def test_the_refusal_prints_one_below_line(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    alloc, tree = _world()
+    _take(alloc, list(range(1, 17)))
+    n = _node(tree, alloc, [20, 21], P)
+    n.component_data[FULL].host_value = None               # un-backed: no room
+    from test_s77_kv_compact_s9_hold_1019 import _Copier
+
+    cop = _Copier(NP, P)
+    sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=P, tree_cache=tree)
+    monkeypatch.setattr(dsv, "kv_page_buffers", lambda s_: ([], None))
+    monkeypatch.setattr(dsv.KvPageCopier, "from_buffers", classmethod(lambda cls, b, p: cop))
+    toks = (16 * P, 24 * P, 28 * P, 32 * P)
+    ms = types.SimpleNamespace(stage=3, stage_tokens=toks,
+                               _smallest_holding=lambda f: next(j for j, t in enumerate(toks) if t >= f))
+    fr = {}
+    for _ in range(3):
+        dsv._kv_compact_for_shrink(sched, ms, fr, 0, True, 22 * P)
+        if fr.get("compact_refused"):
+            break
+    below = [m for m in caplog.messages if " BELOW " in m]
+    assert len(below) == 1 and "outside_tree=16" in below[0] and "free=0" in below[0], below
