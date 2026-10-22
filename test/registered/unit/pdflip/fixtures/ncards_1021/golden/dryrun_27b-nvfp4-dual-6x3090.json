@@ -1,0 +1,125 @@
+{
+ "budgets": [
+  [
+   "P",
+   0,
+   19984
+  ],
+  [
+   "P",
+   1,
+   19984
+  ],
+  [
+   "P",
+   2,
+   19984
+  ],
+  [
+   "P",
+   3,
+   19984
+  ],
+  [
+   "P",
+   4,
+   19984
+  ],
+  [
+   "P",
+   5,
+   19984
+  ],
+  [
+   "D(dual-share, P-Plan)",
+   0,
+   17192
+  ],
+  [
+   "D(dual-share, P-Plan)",
+   1,
+   17024
+  ],
+  [
+   "D(dual-share, P-Plan)",
+   2,
+   17024
+  ],
+  [
+   "D(dual-share, P-Plan)",
+   3,
+   17024
+  ],
+  [
+   "D(dual-share, P-Plan)",
+   4,
+   17416
+  ],
+  [
+   "D(dual-share, P-Plan)",
+   5,
+   16680
+  ],
+  [
+   "D(dry, expectation)",
+   0,
+   19792
+  ],
+  [
+   "D(dry, expectation)",
+   1,
+   19792
+  ],
+  [
+   "D(dry, expectation)",
+   2,
+   19792
+  ],
+  [
+   "D(dry, expectation)",
+   3,
+   19792
+  ],
+  [
+   "D(dry, expectation)",
+   4,
+   19792
+  ],
+  [
+   "D(dry, expectation)",
+   5,
+   19792
+  ]
+ ],
+ "exc_head": "",
+ "exc_type": null,
+ "forced": [
+  "HW-BORROWED",
+  "HW-COUNT",
+  "HW-UNCALIBRATED"
+ ],
+ "group_flags": {
+  "D": {
+   "--max-total-tokens": null,
+   "--pp-size": "1",
+   "--rank-gpu-memory-mib": "19792,19792,19792,19792,19792,19792",
+   "--rank-tp-ratio": "auto",
+   "--tp-size": "6"
+  },
+  "P": {
+   "--max-total-tokens": null,
+   "--pp-size": "6",
+   "--rank-gpu-memory-mib": "2800,2970,2970,2970,2580,3310",
+   "--rank-tp-ratio": null,
+   "--tp-size": "1"
+  }
+ },
+ "pp_cut": {
+  "attn": "2,3,3,3,2,3",
+  "chosen_pool": "2137276",
+  "layers": "11,11,11,11,11,9",
+  "pool_floor": "263168",
+  "pool_floor_source": "flag"
+ },
+ "stages": 6
+}

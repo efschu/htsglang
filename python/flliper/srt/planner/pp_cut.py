@@ -3003,22 +3003,63 @@ class PrefillCutCandidate:
 
 
 def _enumerate_cuts(
-    total_layers: int, stages: int, min_per_stage: int
+    total_layers: int, stages: int, min_per_stage: int,
+    around: Optional[Sequence[int]] = None, halfwidth: Optional[int] = None,
 ) -> List[Tuple[int, ...]]:
+    """Every contiguous cut of ``total_layers`` over ``stages`` stages.  With ``around`` and ``halfwidth`` (release 1022) only the cuts whose every stage count lies
+    within ``halfwidth`` layers of ``around``: the neighbourhood of a balanced cut, used above ``PP_CUT_WINDOW_MIN_STAGES`` stages where the full field (compositions of
+    64 layers: 595 k at 5 stages, 7 M at 6, 67 M at 7) neither fits in memory nor in time."""
     out: List[Tuple[int, ...]] = []
+    centre = None if around is None or halfwidth is None else [int(a) for a in around]
+    hw = None if halfwidth is None else int(halfwidth)
 
     def rec(remaining: int, left: int, acc: Tuple[int, ...]) -> None:
+        idx = len(acc)
         if left == 1:
-            if remaining >= min_per_stage:
+            if remaining >= min_per_stage and (centre is None or abs(remaining - centre[idx]) <= hw):
                 out.append(acc + (remaining,))
             return
         # Leave at least min_per_stage for each of the remaining stages.
         hi = remaining - min_per_stage * (left - 1)
-        for n in range(min_per_stage, hi + 1):
+        lo = min_per_stage
+        if centre is not None:
+            lo, hi = max(lo, centre[idx] - hw), min(hi, centre[idx] + hw)
+        for n in range(lo, hi + 1):
             rec(remaining - n, left - 1, acc + (n,))
 
     rec(int(total_layers), int(stages), ())
     return out
+
+
+#: release 1022 (user 22.10.: 2..7 cards must go, an answer per cell in about a minute): from this stage count on the P cut field is the neighbourhood of the balanced cut,
+#: not every composition of the layers.  Up to 4 stages the field is the full one, bit for bit.
+PP_CUT_WINDOW_MIN_STAGES = 5
+#: the neighbourhood is the widest one (layers per stage around the balanced cut) that has at most this many cuts
+PP_CUT_WINDOW_MAX_CUTS = 70000
+
+
+def _cut_window(total_layers: int, stages: int, min_per_stage: int, around: Sequence[int]) -> Optional[int]:
+    """The half width of the cut neighbourhood for ``stages`` >= ``PP_CUT_WINDOW_MIN_STAGES`` (``None`` below: the full field): the largest width whose cut count (counted
+    by dynamic programming, no list built) is at most ``PP_CUT_WINDOW_MAX_CUTS``; never below 1."""
+    if int(stages) < PP_CUT_WINDOW_MIN_STAGES:
+        return None
+    best = 1
+    for hw in range(1, int(total_layers) + 1):
+        ways = {0: 1}
+        for i in range(int(stages)):
+            nxt: Dict[int, int] = {}
+            lo, hi = max(int(min_per_stage), int(around[i]) - hw), int(around[i]) + hw
+            for used, w in ways.items():
+                for n in range(lo, hi + 1):
+                    if used + n <= int(total_layers):
+                        nxt[used + n] = nxt.get(used + n, 0) + w
+            ways = nxt
+        if ways.get(int(total_layers), 0) > PP_CUT_WINDOW_MAX_CUTS:
+            break
+        best = hw
+        if hw >= int(total_layers):
+            break
+    return best
 
 
 def solve_pp_cut_for_prefill_speed(
@@ -3047,7 +3088,9 @@ def solve_pp_cut_for_prefill_speed(
     base_serial = serial_prefill_ms(incumbent, timing)
     base_pipelined = pipelined_prefill_ms(incumbent, timing)
     cands: List[PrefillCutCandidate] = []
-    for counts in _enumerate_cuts(total_layers, stages, min_layers_per_stage):
+    _hw = _cut_window(total_layers, stages, min_layers_per_stage, incumbent)
+    for counts in _enumerate_cuts(total_layers, stages, min_layers_per_stage,
+                                  around=None if _hw is None else incumbent, halfwidth=_hw):
         if counts[0] > int(max_rank0_layers):
             continue
         s = serial_prefill_ms(counts, timing)
@@ -3802,13 +3845,21 @@ def enumerate_gapped_splits(
     """
     lo = [0 if s == int(gdn_stage) else 1 for s in range(int(n_stages))]
     out: List[Tuple[int, ...]] = []
+    # release 1022: from PP_CUT_WINDOW_MIN_STAGES stages on the deal stays within one layer of the even deal (the full field is C(n_attn + n_stages - 1, n_stages - 1)
+    # splits per GDN stage, tens of thousands at 7 stages); up to 4 stages it is every deal, as before
+    cap = None
+    if int(n_stages) >= PP_CUT_WINDOW_MIN_STAGES:
+        cap = -(-int(n_attn) // int(n_stages)) + 1
+        lo = [max(l, int(n_attn) // int(n_stages) - 1) if s != int(gdn_stage) else l for s, l in enumerate(lo)]
 
     def rec(remaining: int, stage: int, acc: Tuple[int, ...]) -> None:
         if stage == int(n_stages) - 1:
-            if remaining >= lo[stage]:
+            if remaining >= lo[stage] and (cap is None or remaining <= cap):
                 out.append(acc + (remaining,))
             return
         hi = remaining - sum(lo[stage + 1 :])
+        if cap is not None:
+            hi = min(hi, cap)
         for take in range(lo[stage], hi + 1):
             rec(remaining - take, stage + 1, acc + (take,))
 

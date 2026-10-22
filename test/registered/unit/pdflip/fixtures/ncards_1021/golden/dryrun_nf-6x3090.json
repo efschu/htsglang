@@ -1,0 +1,162 @@
+{
+ "budgets": [
+  [
+   "P",
+   0,
+   21608
+  ],
+  [
+   "P",
+   1,
+   21608
+  ],
+  [
+   "P",
+   2,
+   21608
+  ],
+  [
+   "P",
+   3,
+   21608
+  ],
+  [
+   "P",
+   4,
+   21608
+  ],
+  [
+   "P",
+   5,
+   21608
+  ],
+  [
+   "D(Karte, Erwartung)",
+   0,
+   19208
+  ],
+  [
+   "D(Karte, Erwartung)",
+   1,
+   21384
+  ],
+  [
+   "D(Karte, Erwartung)",
+   2,
+   21384
+  ],
+  [
+   "D(Karte, Erwartung)",
+   3,
+   21384
+  ],
+  [
+   "D(Karte, Erwartung)",
+   4,
+   21384
+  ],
+  [
+   "D(Karte, Erwartung)",
+   5,
+   21576
+  ],
+  [
+   "D(dry, expectation)",
+   0,
+   19208
+  ],
+  [
+   "D(dry, expectation)",
+   1,
+   21384
+  ],
+  [
+   "D(dry, expectation)",
+   2,
+   21384
+  ],
+  [
+   "D(dry, expectation)",
+   3,
+   21384
+  ],
+  [
+   "D(dry, expectation)",
+   4,
+   21384
+  ],
+  [
+   "D(dry, expectation)",
+   5,
+   21576
+  ]
+ ],
+ "d_check": {
+  "borrowed_by_role": true,
+  "entfaellt": false,
+  "ranks": [
+   {
+    "R": 22,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 96,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 97,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 97,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 97,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 97,
+    "scratch": 48,
+    "verdict": "PASST"
+   }
+  ]
+ },
+ "exc_head": "",
+ "exc_type": null,
+ "forced": [
+  "D-BUDGET",
+  "HW-BORROWED",
+  "HW-COUNT",
+  "HW-UNCALIBRATED"
+ ],
+ "group_flags": {
+  "D": {
+   "--max-total-tokens": "262144",
+   "--pp-size": "1",
+   "--rank-gpu-memory-mib": "19208,21384,21384,21384,21384,21576",
+   "--rank-tp-ratio": "1,0,0,0,0,0",
+   "--tp-size": "6"
+  },
+  "P": {
+   "--max-total-tokens": "262144",
+   "--pp-size": "6",
+   "--rank-gpu-memory-mib": "21608,21608,21608,21608,21608,21608",
+   "--rank-tp-ratio": null,
+   "--tp-size": "1"
+  }
+ },
+ "pp_cut": {
+  "attn": "2,2,2,2,2,2",
+  "chosen_pool": "3957031",
+  "layers": "8,8,8,8,8,8",
+  "pool_floor": "none",
+  "pool_floor_source": "none"
+ },
+ "stages": 6
+}

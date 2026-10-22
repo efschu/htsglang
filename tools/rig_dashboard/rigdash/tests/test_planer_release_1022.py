@@ -110,7 +110,7 @@ class Cells(unittest.TestCase):
                     self.assertTrue(p["verdikt"]["outcome"], (n, m, l))
                     self.assertTrue(p["felder"], (n, m, l))
                     real += 1
-        self.assertGreaterEqual(real, 20)                                    # 9 + 9 + ... cells: not a stub of a few
+        self.assertEqual(real, 16)                                           # 4 + 7 + 5 offered cells, each a real dry run (the rest is a named reason)
 
     def test_three_cards_27b_gets_a_sensible_proposal_for_every_layout_the_model_has(self):
         for m, want in (("qwen38-27b-int8", ("solo", "flip")), ("qwen38-27b-nvfp4", ("solo", "flip", "dual"))):
@@ -183,7 +183,7 @@ class Cells(unittest.TestCase):
         for n in (1, 5, 6, 8):
             for m in MODELS:
                 for l in z.layouts({"model": m, "cards": [{"card": "rtx3090-24", "count": n}]})["layouts"]:
-                    self.assertEqual(l["status"], "n_unsupported", (n, m, l["id"]))
+                    self.assertIn(l["status"], ("n_unsupported", "blocked"), (n, m, l["id"]))             # (INT8 dual has no profile at all: blocked, with the count reason first)
                     self.assertFalse(l["possible"])
                     why = " ".join(l["why"])
                     self.assertIn("not supported yet", why)
@@ -447,7 +447,7 @@ class Page(unittest.TestCase):
     def test_the_adaptation_of_the_ceiling_is_the_first_thing_under_the_heading(self):
         p = plan(2, "qwen38-27b-int8", "flip")
         h = render(plan=p)["plan"]
-        self.assertLess(h.index("do not fit these cards"), h.index("pz-verdict " + ("bad" if p["verdikt"]["outcome"] in ("verweigert", "crash") else "ok") + '"><b>'))
+        self.assertLess(h.index("do not fit these cards"), h.index("dry run passes only with force"))
         self.assertIn("W40", h)
 
     def test_the_german_server_texts_reach_the_page_unchanged(self):

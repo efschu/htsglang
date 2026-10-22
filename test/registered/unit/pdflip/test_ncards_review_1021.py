@@ -134,7 +134,7 @@ class NfDResidencyOnNIdenticalCards(unittest.TestCase):
         self._fits(4)
 
     def test_host_scratch_is_not_the_rig_5090_role_value(self):
-        for n in (2, 3, 4):
+        for n in (2, 3, 4, 5, 6, 7):
             _, text = _d_rests(n)
             sv = _profile_value(text, "env", "FLLIPER_MOE_SCRATCH_SLOTS")
             self.assertIsNotNone(sv)

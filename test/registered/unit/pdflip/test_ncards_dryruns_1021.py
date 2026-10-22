@@ -30,10 +30,10 @@ NEEDS_BOX = unittest.skipUnless(os.path.exists(CENSUS_27B), "27B census not on t
 #: (profile, n): the matrix of the round.  27B INT8 2x carries the per-request ceiling 65536 (2 x 24 GB cannot hold 27B INT8 with a
 #: 262144-token request: the cut solver names 81623 tokens as the best servable P pool).
 MATRIX = (
-    [("27b-%dx3090" % n, n) for n in (2, 3, 4)]
-    + [("27b-nvfp4-%dx3090" % n, n) for n in (2, 3, 4)]
-    + [("27b-nvfp4-dual-%dx3090" % n, n) for n in (2, 3, 4)]
-    + [("nf-%dx3090" % n, n) for n in (2, 3, 4)]
+    [("27b-%dx3090" % n, n) for n in (2, 3, 4, 5, 6, 7)]
+    + [("27b-nvfp4-%dx3090" % n, n) for n in (2, 3, 4, 5, 6, 7)]
+    + [("27b-nvfp4-dual-%dx3090" % n, n) for n in (2, 3, 4, 5, 6, 7)]
+    + [("nf-%dx3090" % n, n) for n in (2, 3, 4, 5, 6, 7)]
 )
 
 
@@ -69,7 +69,7 @@ def _check(self, profile, n):
     # (N != 3: the 3-rank reference taken to N ranks by rank role, named "BORROWED BY RANK ROLE")
     # the launcher's own ownership / KV token-cut solve (D-EIGENTUM, #239 S3f) finds a bearable form on N = 3 and none on N = 2 / 4 (forced past as D-BUDGET): those two
     # profiles carry PROFILE_STATUS=blockiert-d-budget (named, not hidden); the fix of that turns this assertion red
-    self.assertEqual("D-BUDGET" in doc["forced"], profile in ("nf-2x3090", "nf-4x3090"), doc["forced"])
+    self.assertEqual("D-BUDGET" in doc["forced"], profile.startswith("nf-") and n != 3, doc["forced"])
     if profile.startswith("nf-"):
         chk = doc.get("d_check")
         self.assertIsNotNone(chk, "the D FRACTION-SOLVE did not run: " + profile)

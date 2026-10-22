@@ -1080,6 +1080,13 @@ def solve_launch_cut(
     def pool_fn(counts: Sequence[int]) -> Optional[float]:
         return resolve(counts)[1]
 
+    from flliper.srt.planner import pp_cut as _ppc
+
+    _hw = _ppc._cut_window(int(total_layers), n_stages, int(min_layers_per_stage), tuple(int(n) for n in incumbent_layers))
+    if _hw is not None:
+        # release 1022: said in the decision's own provenance, never silently
+        cost_provenance = "%s; P cut field: the cuts within %d layers per stage of the incumbent (%d stages: the full field is too large to enumerate; up to %d stages it is the full one)" % (
+            cost_provenance, _hw, n_stages, _ppc.PP_CUT_WINDOW_MIN_STAGES - 1)
     ranked = solve_pp_cut_for_prefill_speed(
         total_layers=int(total_layers),
         timing=timing,

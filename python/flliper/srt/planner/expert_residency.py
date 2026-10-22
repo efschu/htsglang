@@ -1584,6 +1584,113 @@ def owned_ratio_vectors_free(base: Sequence[int], *, step: int = OWNED_RATIO_STE
     return tuple(out)
 
 
+#: release 1022 (user 22.10.: 2..7 cards must go): above this rank count the ownership search runs over CLASSES of ranks, not over every rank.  The full lattice grows
+#: with the rank count (about 55^(N-1) vectors at the 8-unit step; the launcher dry run of NF on 5 identical cards did not finish in 300 s).  Ranks whose own inputs
+#: are identical (card, budget, fixed posts, miss and extend cost) are one class and move together, so N identical cards are a search over the host and ONE worker
+#: class (the host differs by role), mixed cards over the number of card types.  N <= OWNED_CLASS_MIN_RANKS runs the exact search of before, bit for bit.
+OWNED_CLASS_MIN_RANKS = 4
+
+
+def owned_rank_classes(fits: Sequence["DRankResidency"], host: int,
+                       miss_ms_rank: Optional[Sequence[float]] = None,
+                       extend_row_ms: Optional[Sequence[float]] = None) -> List[List[int]]:
+    """Rank classes of the owned search: the host alone, the workers grouped by everything that prices a rank on its own (budget, fixed posts, slot MiB,
+    draft vocab delta, miss cost, extend cost; NOT the expert MiB, they follow the ownership the search moves).  Ranks of one class are interchangeable, so the search moves them together."""
+    cls: Dict[Tuple[Any, ...], List[int]] = {}
+    for f in fits:
+        r = int(f.rank)
+        if r == host:
+            continue
+        key = (round(float(f.budget_mib), 3), round(float(f.fixed_mib), 3), round(float(f.slot_mib), 6),
+               round(float(f.draft_vocab_delta_mib), 3),
+               None if miss_ms_rank is None else round(float(miss_ms_rank[r]), 9),
+               None if extend_row_ms is None else round(float(extend_row_ms[r]), 9))
+        cls.setdefault(key, []).append(r)
+    return [[int(host)]] + [sorted(v) for v in sorted(cls.values(), key=lambda v: v[0])]
+
+
+def owned_ratio_vectors_classes(base: Sequence[int], groups: Sequence[Sequence[int]], *, step: int = OWNED_RATIO_STEP,
+                                max_shift: Optional[int] = None, limit: int = 400000) -> Tuple[Tuple[int, ...], ...]:
+    """The class-symmetric counterpart of :func:`owned_ratio_vectors_free`: one ownership value per CLASS (``groups``, host first), every member of a class holds it,
+    the sum stays, no rank below 1.  The rounding residue of the base (its members differ by an expert or two) stays on the first member of the largest class, so
+    the lattice is the same lattice, one dimension per class.  ``step`` doubles until the lattice has at most ``limit`` vectors (mixed cards with many types)."""
+    base = [int(x) for x in base]
+    total = sum(base)
+    gs = [[int(r) for r in g] for g in groups]
+    gbase = [sum(base[r] for r in g) // len(g) for g in gs]
+    big = max(range(len(gs)), key=lambda i: len(gs[i]))
+    resid = total - sum(len(g) * b for g, b in zip(gs, gbase))
+    st = int(step)
+    cap0 = (total - max(base)) // 2 if max_shift is None else int(max_shift)
+
+    def _ranges(st_):
+        out = []
+        for g, b in zip(gs, gbase):
+            vals = [b + d for d in range(-(cap0 // st_) * st_, cap0 + 1, st_) if b + d >= 1]
+            out.append(vals)
+        return out
+
+    rng = _ranges(st)
+    while True:
+        est = 1
+        for r_ in rng[:-1]:
+            est *= max(1, len(r_))
+        if est <= limit or st >= total:
+            break
+        st *= 2
+        rng = _ranges(st)
+    k = [len(g) for g in gs]
+    out = []
+
+    def _rec(i, acc, used):
+        if i == len(gs) - 1:
+            rest = total - resid - used
+            if rest % k[i] == 0 and (rest // k[i]) in set(rng[i]):
+                out.append(acc + [rest // k[i]])
+            return
+        for v in rng[i]:
+            _rec(i + 1, acc + [v], used + k[i] * v)
+
+    _rec(0, [], 0)
+    vecs = []
+    for vals in out:
+        vec = list(base)
+        for g, v in zip(gs, vals):
+            for r in g:
+                vec[r] = v
+        vec[gs[big][0]] += resid
+        if all(x >= 1 for x in vec):
+            vecs.append(tuple(vec))
+    vecs.sort(key=lambda v: (sum(abs(a - b) for a, b in zip(v, base)), v))
+    return tuple(dict.fromkeys(vecs))
+
+
+def owned_share_vectors_classes(n: int, host: int, groups: Sequence[Sequence[int]], grid: int, step: int) -> List[Tuple[int, ...]]:
+    """The workers' KV shares (host 0) with one share value per worker CLASS, in ``grid`` units stepped by ``step``: sum over the classes of size x share = ``grid``."""
+    wg = [list(g) for g in groups if host not in g]
+    out: List[Tuple[int, ...]] = []
+
+    def _rec(i, acc, used):
+        if i == len(wg) - 1:
+            rest = int(grid) - used
+            if rest >= 0 and rest % len(wg[i]) == 0 and (rest // len(wg[i])) % int(step) == 0:
+                out.append(tuple(acc + [rest // len(wg[i])]))
+            return
+        for v in range(0, int(grid) // len(wg[i]) + 1, int(step)):
+            if used + len(wg[i]) * v <= int(grid):
+                _rec(i + 1, acc + [v], used + len(wg[i]) * v)
+
+    _rec(0, [], 0)
+    full = []
+    for vals in out:
+        vec = [0] * n
+        for g, v in zip(wg, vals):
+            for r in g:
+                vec[r] = v
+        full.append(tuple(vec))
+    return full
+
+
 def solve_owned_cut(
     solve_at: Callable[[Sequence[int], Optional[Sequence[int]]], Sequence["DRankResidency"]],
     base_ratios: Sequence[int],
@@ -1713,7 +1820,8 @@ def solve_owned_cut(
         return (sum(w * max(by[b]) for b, w in _bsw)
                 + (float(extend_per_round) * max(ext) if _ext_on and ext else 0.0))
 
-    base_fits = _edge(tuple(solve_at(base, None)))
+    base_fits_raw = tuple(solve_at(base, None))
+    base_fits = _edge(base_fits_raw)
     # Form A: the host attends over the whole KV, no merge
     base_by = _by_bs(base_fits, tuple(1 if r == host else 0 for r in range(len(base))), False,
                      base)
@@ -1729,11 +1837,18 @@ def solve_owned_cut(
         tot = sum(vec)
         shares_list.append(tuple(int(round(x * int(grid) / tot)) for x in vec))
     else:
-        for take in _compositions(int(grid), len(workers), int(share_step)):
-            vec = [0] * n
-            for w, t in zip(workers, take):
-                vec[w] = t
-            shares_list.append(tuple(vec))
+        _groups = None
+        if n > OWNED_CLASS_MIN_RANKS:
+            _groups = owned_rank_classes(base_fits_raw, host, miss_ms_rank, extend_row_ms)
+        if _groups is not None and len(_groups) < n:
+            shares_list.extend(owned_share_vectors_classes(n, host, _groups, int(grid), int(share_step)))
+        else:
+            _groups = None
+            for take in _compositions(int(grid), len(workers), int(share_step)):
+                vec = [0] * n
+                for w, t in zip(workers, take):
+                    vec[w] = t
+                shares_list.append(tuple(vec))
     import time as _time
 
     t0 = _time.monotonic()
@@ -1796,7 +1911,9 @@ def solve_owned_cut(
 
     ranked = []
     cand = feas = 0
-    for rat in owned_ratio_vectors_free(base, step=ratio_step, max_shift=max_shift):
+    _vecs = (owned_ratio_vectors_classes(base, _groups, step=ratio_step, max_shift=max_shift)
+             if (not forced and _groups is not None) else owned_ratio_vectors_free(base, step=ratio_step, max_shift=max_shift))
+    for rat in _vecs:
         move = sum(abs(a - b) for a, b in zip(rat, base)) // 2
         for sh in shares_list:
             cand += 1
@@ -1995,7 +2112,17 @@ def derive_owned_base(
     # the whole lattice once, then single-expert steps around the best until
     # nothing moves (the lattice phase must not pick the optimum)
     it = 0
-    for rat in owned_ratio_vectors_free(center, step=ratio_step, max_shift=sum(seed)):
+    _big = n > OWNED_CLASS_MIN_RANKS
+    _lattice = None
+    if _big:
+        _g = owned_rank_classes(tuple(solve_at(seed, None)), host, miss_ms_rank=miss_ms_rank, extend_row_ms=extend_row_ms if ext_on else None)
+        if len(_g) < n:
+            _lattice = owned_ratio_vectors_classes(center, _g, step=ratio_step, max_shift=sum(seed))
+        else:
+            _big = False
+    if _lattice is None:
+        _lattice = owned_ratio_vectors_free(center, step=ratio_step, max_shift=sum(seed))
+    for rat in _lattice:
         cand += 1
         k = _rank(rat)
         if k is not None and (best is None or k < best):
@@ -2003,7 +2130,7 @@ def derive_owned_base(
     while best is not None and it < int(max_iter):
         it += 1
         moved = False
-        for rat in owned_ratio_vectors_free(best[3], step=1, max_shift=int(ratio_step)):
+        for rat in owned_ratio_vectors_free(best[3], step=1, max_shift=(min(int(ratio_step), 2) if _big else int(ratio_step))):
             cand += 1
             k = _rank(rat)
             if k is not None and k < best:

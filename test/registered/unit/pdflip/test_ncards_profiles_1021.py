@@ -33,7 +33,7 @@ REPLAY_REF = HERE / "fixtures" / "xchg_launch_replay_0911" / "nvml_devices_1378.
 GEN = TREE / "tools" / "ncards_profile_gen.py"
 
 FAMILIES = ("27b", "27b-nvfp4", "27b-nvfp4-dual", "nf")
-NS = (2, 3, 4)
+NS = (2, 3, 4, 5, 6, 7)      # release 1022: 5, 6 and 7 cards too (user 22.10.)
 #: positional per-card vectors a profile may carry (flag / extra-group word): their entry count is N on an N-card profile
 VECTOR_FLAGS = (("flag", "-", "--user-reserve-mib"), ("flag", "-", "--d-foreign-context-mib"), ("flag", "-", "--d-nontorch-mib"),
                 ("flag", "-", "--pp-cut-expert-lru-rows"), ("flag", "-", "--pp-cut-expert-device-fraction"),
@@ -70,9 +70,9 @@ class TestProfileFiles(unittest.TestCase):
                     self.assertEqual(li.vars.get("PROFILE_CARD_COUNT"), str(n))
                     self.assertEqual(li.vars.get("PROFILE_INVENTORY"), ",".join(["RTX3090"] * n))
                     self.assertEqual(li.vars.get("PROFILE_GPUS"), "NVIDIA GeForce RTX 3090=%d" % n)
-                    # NF on 2 and 4 identical 3090s: the launcher's D-EIGENTUM (#239 S3f) solve finds no bearable form, forced past only as the named D-BUDGET
+                    # NF on 2, 4, 5, 6 and 7 identical 3090s: the launcher's D-EIGENTUM (#239 S3f) solve finds no bearable form, forced past only as the named D-BUDGET
                     # (review 1021 A1; the W122/W130 residency balance passes there); N = 3 is bootable
-                    self.assertEqual(li.vars.get("PROFILE_STATUS"), "blockiert-d-budget" if name in ("nf-2x3090", "nf-4x3090") else "hochrechnung")
+                    self.assertEqual(li.vars.get("PROFILE_STATUS"), "blockiert-d-budget" if (fam == "nf" and n != 3) else "hochrechnung")
                     la = P.LaunchArgv(li.argv, li.env)
                     for kind, grp, flag in VECTOR_FLAGS:
                         val = la.get_flag(flag) if kind == "flag" else la.extra_get(grp, flag)

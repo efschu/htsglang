@@ -50,7 +50,7 @@ class PGroupStagesFollowTheCards(unittest.TestCase):
     """The P-chunk stage table and the prefill-graph pool vector ask NVML for the stage count (main reads them before the cards)."""
 
     def test_foreign_n_identical_cards_give_n_stages(self):
-        for n in (2, 3, 4):
+        for n in (2, 3, 4, 5, 6, 7):
             with HS.replayed(["3090"] * n, None):
                 self.assertEqual(L.p_group_stages(), n)
 
@@ -74,7 +74,7 @@ class PChunkTablesOnForeignCards(unittest.TestCase):
     def test_every_3090_stage_takes_the_slowest_3080_stage(self):
         three = self._three()
         slow = max(three[1:], key=lambda m: m.points[-1][1])
-        for n in (2, 3, 4):
+        for n in (2, 3, 4, 5, 6, 7):
             with HS.replayed(["3090"] * n, None):
                 tab, src = L.p_chunk_stage_model("builtin-int8", "int8", n, "qwen27b")
             self.assertEqual(len(tab), n, n)
@@ -114,7 +114,7 @@ class TopologyOfN(unittest.TestCase):
                 self.assertIn("METAL-UNPROVEN", {b.code for b in T.blockers(n, ctx)})
 
     def test_release_topology_is_pp_n_over_tp_n(self):
-        for n in (2, 3, 4):
+        for n in (2, 3, 4, 5, 6, 7):
             t = T.release_topology(n)
             self.assertEqual((t.p_pp, t.d_tp, t.n_cards), (n, n, n))
             self.assertEqual(t.proven, n in T.PROVEN_CARD_COUNTS)
