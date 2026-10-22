@@ -53,7 +53,9 @@ def test_scheduler_holds_the_w88_bound_while_dormant_and_sweep_takes_first():
     assert 'return "stalled"' in src[i:src.index("_pdflip_prefetch_stall_s()", i)]
     from flliper.srt.mem_cache import unified_radix_cache as u
     s2 = inspect.getsource(u.UnifiedRadixCache.publish_unbacked_sweep)
-    assert "queue = list(first or []) + ([] if chain_only else [self.root_node])" in s2
+    # KVLEITER-1022: the same queue -- the retain's own chain first, then the root -- as a deque (the sweep visits
+    # every node once; first-visit order unchanged, test_kvleiter_sweep_once_1022)
+    assert "queue = deque(list(first or []) + ([] if chain_only else [self.root_node]))" in s2
 
 
 def test_chunk_publish_gate_and_budget():

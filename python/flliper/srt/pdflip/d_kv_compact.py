@@ -131,6 +131,12 @@ class Segment:
     kind: int = 0
     #: KVPLAN-1021: the segment and every device segment below it are secured HERE
     sub_ok: bool = False
+    #: KVLEITER-1022 (F2): a mixed segment's backing runs, top-down: (kind 1/2, tokens, nodes top..bottom)
+    runs: List[Tuple[int, int, List["NodePages"]]] = field(default_factory=list)
+    #: KVLEITER-1022 (F2): the mixed segment's PROFILE key -- its content key, the kind of every run and the
+    #: token length of every run but the bottom one (Form A: TP0's leaf may be deeper -- same kind, longer
+    #: bottom run). Equal on every rank = every token depth leaves by the same path on every rank. 0 = none
+    profile: int = 0
 
     @property
     def size(self) -> int:
@@ -193,10 +199,12 @@ class Plan:
     #: KVZIEL-1021: per chosen segment (content key, state: 1 now, 2 handoff, 3 waits) -- the
     #: digest compares it, so every rank stages alike or the plan check refuses uniformly
     split: List[Tuple[int, int]] = field(default_factory=list)
+    #: KVLEITER-1022 (F2): a mixed segment has a run that waits for a later pass
+    waits: bool = False
 
     @property
     def staged(self) -> bool:
-        return bool(self.handoff) or any(st == 3 for _k, st in self.split)
+        return bool(self.handoff) or self.waits or any(st == 3 for _k, st in self.split)
 
     @property
     def moved_pages(self) -> int:
@@ -713,6 +721,9 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
         kinds = {int(ev(m)) for m in chain}
         kind = (next(iter(kinds)) if len(kinds) == 1 else 3) if evict else 0
         seg = Segment(nodes=chain, key=key, tokens=toks, pages=pages, evictable=evict, kind=kind)
+        if kind == 3 and key >= 0:
+            seg.runs = _runs_of(chain, ev, full)
+            seg.profile = profile_key(key, seg.runs)
         out.append(seg)
         seg_of[id(chain[0].node)] = seg
     for seg in out:
@@ -733,6 +744,30 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
     for seg in out:
         seg.sub_ok = sub_ok(seg)
     return out
+
+
+def _runs_of(chain: List[NodePages], ev, full: int) -> List[Tuple[int, int, List[NodePages]]]:
+    """KVLEITER-1022 (F2): the backing runs of a chain, top-down -- consecutive nodes of one kind merged, their
+    tokens summed (cut-independent: the same content cut into other nodes gives the same runs)."""
+    runs: List[Tuple[int, int, List[NodePages]]] = []
+    for m in chain:
+        k = int(ev(m))
+        t = int(m.node.component_data[full].value.numel())
+        if runs and runs[-1][0] == k:
+            runs[-1] = (k, runs[-1][1] + t, runs[-1][2] + [m])
+        else:
+            runs.append((k, t, [m]))
+    return runs
+
+
+def profile_key(key: int, runs) -> int:
+    """KVLEITER-1022 (F2): 62-bit, never 0 -- the content key, every run's kind, every run's tokens but the bottom
+    run's (a deeper leaf on one rank only lengthens the bottom run)."""
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=8)
+    h.update(repr((int(key), tuple(int(r[0]) for r in runs), tuple(int(r[1]) for r in runs[:-1]))).encode())
+    return (int.from_bytes(h.digest(), "big") >> 2) or 1
 
 
 def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0, *,
@@ -941,13 +976,30 @@ def local_secured_bitmap(s: Survey) -> List[int]:
     return out
 
 
+def local_mixed_map(s: Survey) -> List[int]:
+    """KVLEITER-1022 (F2): per content slot the PROFILE of the mixed segment secured here with a secured subtree
+    (0 none; a slot two local mixed segments share is 0 -- no claim). Voted as MIN and as negated MIN (= MAX): a
+    mixed segment is room only when MIN == MAX == its own profile on every rank."""
+    out = [0] * BITMAP
+    clash = set()
+    for seg in s.segments:
+        if seg.evictable and seg.kind == 3 and seg.sub_ok and seg.key >= 0 and seg.profile > 0:
+            i = seg.key % BITMAP
+            if out[i] != 0 or i in clash:
+                clash.add(i)
+                out[i] = 0
+            else:
+                out[i] = int(seg.profile)
+    return out
+
+
 def local_sizes(s: Survey) -> List[int]:
     """S112c (B4): per content slot this rank's segment size (pages; the smallest when two share a
     slot). The group MIN is the size the choice counts on every rank -- each rank frees at least that
     much (its own segment is never smaller), so the agreed choice closes every rank's gap."""
     out = [0] * BITMAP
     for seg in s.segments:
-        if seg.evictable and seg.kind in (1, 2) and seg.sub_ok and seg.key >= 0:
+        if seg.evictable and seg.kind in (1, 2, 3) and seg.sub_ok and seg.key >= 0:
             i = seg.key % BITMAP
             out[i] = seg.size if out[i] == 0 else min(out[i], seg.size)
     return out
@@ -965,16 +1017,24 @@ class Agreement:
     #: KVZIEL-1021: per slot the group MIN of "secured here" (L2 or store); None = only the
     #: L2 map counts (a vote without it)
     secured: Optional[Sequence[int]] = None
+    #: KVLEITER-1022 (F2): per slot the group MIN and MAX of the mixed profile (None: no mixed agreement)
+    mixed_lo: Optional[Sequence[int]] = None
+    mixed_hi: Optional[Sequence[int]] = None
 
     def agreed(self, seg: Segment) -> bool:
         """May the content leave every device (chosen for room)? KVPLAN-1021: all-L2 on every rank
         (the L2 map's MIN) or all-store on every rank (the store map's MIN), its subtree secured on every
-        rank; a mixed segment here never."""
-        if not seg.evictable or seg.key < 0 or seg.kind not in (1, 2):
+        rank. KVLEITER-1022 (F2): a MIXED segment when its profile is the same on every rank (MIN == MAX ==
+        its own): every run leaves by its own path on every rank -- L2 now, store through the S39 drop."""
+        if not seg.evictable or seg.key < 0 or seg.kind not in (1, 2, 3):
             return False
         if self.bitmap is None:
-            return bool(seg.sub_ok)
+            return bool(seg.sub_ok) and (seg.kind != 3 or seg.profile > 0)
         slot = seg.key % BITMAP
+        if seg.kind == 3:
+            if self.mixed_lo is None or self.mixed_hi is None or seg.profile <= 0:
+                return False
+            return int(self.mixed_lo[slot]) == int(self.mixed_hi[slot]) == int(seg.profile)
         if int(self.bitmap[slot]) >= 1:
             return True
         return self.secured is not None and int(self.secured[slot]) >= 1
@@ -1042,6 +1102,11 @@ def split_evictions(segs: List[Segment], ag: Agreement) -> List[Tuple[Segment, i
     out: List[Tuple[Segment, int]] = []
     for g in segs:
         kids = [state.get(id(c), 3) for c in g.children]
+        if g.kind == 3:
+            rs = mixed_run_states(g, kids)
+            state[id(g)] = rs[0]                 # what a parent sees: the top run's state
+            out.append((g, mixed_code(rs)))
+            continue
         if ag.now(g):
             st = 1 if all(k == 1 for k in kids) else 3
         else:
@@ -1049,6 +1114,31 @@ def split_evictions(segs: List[Segment], ag: Agreement) -> List[Tuple[Segment, i
         state[id(g)] = st
         out.append((g, st))
     return out
+
+
+def mixed_run_states(g: Segment, kids: List[int]) -> List[int]:
+    """KVLEITER-1022 (F2): per run (top-down) how it leaves, bottom-up like ``split_evictions``: an L2 run goes
+    now when everything below goes now (1), else waits (3); a store run is handed to the S39 drop when everything
+    below goes now or is handed off (2), else waits (3). A run above a waiting run waits."""
+    below = 1 if all(k == 1 for k in kids) else (2 if all(k in (1, 2) for k in kids) else 3)
+    out: List[int] = []
+    for kind, _t, _nodes in reversed(g.runs):
+        if kind == 1:
+            st = 1 if below == 1 else 3
+        else:
+            st = 2 if below in (1, 2) else 3
+        out.append(st)
+        below = st
+    out.reverse()
+    return out
+
+
+def mixed_code(rs: List[int]) -> int:
+    """The digest's state of a mixed segment: 1000 + base-4 digits of the run states, top run first."""
+    c = 0
+    for st in rs:
+        c = c * 4 + int(st)
+    return 1000 + c
 
 
 def plan_for(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> Tuple[Optional[Plan], str]:
@@ -1094,8 +1184,25 @@ def plan_for(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> T
                     B, getattr(m.node, "id", "req"), sum(1 for p in above if s.owner[p] is m), why))
             return None, "no free page below %d for %d pages above it: %s" % (B, len(above), why)
         now_pages: set = set()
+        seg_state: Dict[int, int] = {}
         for g, st in split_evictions(segs, ag):
             plan.split.append((int(g.key), st))
+            if g.kind == 3:
+                # KVLEITER-1022 (F2): run by run, bottom-up -- L2 runs demoted now (``_evict_to_host``, a host copy
+                # on every rank: the agreed profile says so), store runs handed to the S39 drop, the rest waits
+                rs = mixed_run_states(g, [seg_state.get(id(c), 3) for c in g.children])
+                for (_kind, _t, nodes), rst in reversed(list(zip(g.runs, rs))):
+                    if rst == 1:
+                        plan.evicts.extend(reversed(nodes))
+                        now_pages.update(int(p) for m in nodes for p in m.pages)
+                    elif rst == 2:
+                        plan.handoff.extend(reversed(nodes))
+                    else:
+                        plan.waits = True
+                seg_state[id(g)] = rs[0]
+                ev_set.update(g.pages)
+                continue
+            seg_state[id(g)] = st
             if st == 1:
                 plan.evicts.extend(reversed(g.nodes))       # bottom-up: leaf first
                 now_pages.update(g.pages)
@@ -1130,16 +1237,8 @@ def plan_for(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> T
     return plan, ""
 
 
-def holder_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> Dict[str, int]:
-    """KVZIEL-1021 instrument (rank-local, log only): WHAT holds the live pages above
-    ``boundary_page`` -- the refusal ``no free page below N for N pages above it after N
-    evictions here`` (rc29 1021_022209 02:27:54, all of S0..S8) named no page and so no
-    witness. Per page one class: the backing of its node (``l2`` / ``store`` / ``unbacked``,
-    or ``move_only`` / ``pinned`` / ``running_rows`` / ``outside_tree``) and for a secured
-    node whether its segment can go (``_ok``), waits behind a device child that cannot
-    (``_child_blocked``), or is not secured on every rank (``_not_agreed``). Plus the free
-    pages at or below the boundary."""
-    B = int(boundary_page)
+def _census_ctx(s: Survey, ag: Optional[Agreement]):
+    """The per-page segment map and a memoised "can this segment go (with every device segment below it)"."""
     ag = ag if ag is not None else Agreement(None)
     seg_of: Dict[int, Segment] = {}
     for g in s.segments:
@@ -1154,46 +1253,118 @@ def holder_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None)
             avail[k] = bool(ag.agreed(g) and all(can_go(c) for c in g.children))
         return avail[k]
 
+    return ag, seg_of, can_go
+
+
+def _node_class(m: Optional[NodePages]) -> str:
+    """What holds a page, by its owner alone (no segment)."""
+    if m is None:
+        return "outside_tree"
+    if m.node is None:
+        return "running_rows"
+    if m.pinned:
+        return "pinned"
+    if m.move_only:
+        return "move_only"
+    return "l2" if m.backed else ("store" if m.store else "unbacked")
+
+
+def _page_class(s: Survey, p: int, ag: Agreement, seg_of, can_go) -> str:
+    m = s.owner.get(int(p))
+    base = _node_class(m)
+    if base not in ("l2", "store"):
+        return base
+    g = seg_of.get(int(p))
+    if g is None or not g.evictable:
+        return base + "_partial"
+    if g.kind == 3:
+        # KVLEITER-1022 (F2): a mixed segment the group agreed on (same profile everywhere) can go like any
+        # other. Review I1-A: ``_mixed`` only for a profile NOT agreed; a mixed segment behind a device child that
+        # cannot go (an un-backed tail: not ``sub_ok``, never voted) or whose child is not agreed is
+        # ``_child_blocked`` and ``blocked_by`` names that child
+        if not g.sub_ok:
+            return base + "_child_blocked"
+        if not ag.agreed(g):
+            return base + "_mixed"
+        return base + ("_ok" if can_go(g) else "_child_blocked")
+    if not g.sub_ok:
+        return base + "_child_blocked"
+    if not ag.agreed(g):
+        return base + "_not_agreed"
+    return base + ("_ok" if can_go(g) else "_child_blocked")
+
+
+def holder_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> Dict[str, int]:
+    """KVZIEL-1021 instrument (rank-local, log only): WHAT holds the live pages above
+    ``boundary_page`` -- the refusal ``no free page below N for N pages above it after N
+    evictions here`` (rc29 1021_022209 02:27:54, all of S0..S8) named no page and so no
+    witness. Per page one class: the backing of its node (``l2`` / ``store`` / ``unbacked``,
+    or ``move_only`` / ``pinned`` / ``running_rows`` / ``outside_tree``) and for a secured
+    node whether its segment can go (``_ok``), waits behind a device child that cannot
+    (``_child_blocked``), or is not secured on every rank (``_not_agreed``). Plus the free
+    pages at or below the boundary."""
+    B = int(boundary_page)
+    ag, seg_of, can_go = _census_ctx(s, ag)
     out: Dict[str, int] = {}
-
-    def add(cls: str) -> None:
-        out[cls] = out.get(cls, 0) + 1
-
     for p in s.live_above:
         if p <= B:
             continue
-        m = s.owner.get(p)
-        if m is None:
-            add("outside_tree")
-            continue
-        if m.node is None:
-            add("running_rows")
-            continue
-        if m.pinned:
-            add("pinned")
-            continue
-        if m.move_only:
-            add("move_only")
-            continue
-        base = "l2" if m.backed else ("store" if m.store else None)
-        if base is None:
-            add("unbacked")
-            continue
-        g = seg_of.get(int(p))
-        if g is None or not g.evictable:
-            add(base + "_partial")
-        elif g.kind == 3:
-            add(base + "_mixed")        # KVPLAN-1021: L2 and store in one segment here
-        elif not g.sub_ok:
-            add(base + "_child_blocked")
-        elif not ag.agreed(g):
-            add(base + "_not_agreed")
-        elif can_go(g):
-            add(base + "_ok")
-        else:
-            add(base + "_child_blocked")
+        c = _page_class(s, p, ag, seg_of, can_go)
+        out[c] = out.get(c, 0) + 1
     out["free_below"] = sum(1 for p in s.free if p <= B)
     return out
+
+
+def _blocker(g: Segment, ag: Agreement, can_go, memo: Dict[int, str]) -> str:
+    """KVLEITER-1022 (I1): the class of the first device segment below ``g`` that cannot go -- ``unbacked``,
+    ``move_only`` (a running request / a write in flight), ``pinned``, ``partial`` (secured, not whole pages of its
+    own), ``mixed`` (profile not agreed), ``not_agreed``; ``-`` when nothing below blocks."""
+    k = id(g)
+    if k in memo:
+        return memo[k]
+    memo[k] = "-"
+    for c in g.children:
+        if not c.evictable:
+            cls = _node_class(c.nodes[0] if c.nodes else None)
+            memo[k] = "partial" if cls in ("l2", "store") else cls
+            return memo[k]
+        if not ag.agreed(c):
+            memo[k] = "mixed" if c.kind == 3 else "not_agreed"
+            return memo[k]
+        if not can_go(c):
+            b = _blocker(c, ag, can_go, memo)
+            if b != "-":
+                memo[k] = b
+                return b
+    return memo[k]
+
+
+def below_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """KVLEITER-1022 (I1, rank-local, log only): (a) WHAT holds the live pages AT OR BELOW ``boundary_page`` --
+    the same classes as ``holder_census`` (rc32 1022_030836: ``free_below=0`` with the running rows needing fewer
+    pages, and no line said what else lay there), plus ``free`` and ``staged`` (a staged free);
+    (b) for every ``_child_blocked`` page, above or below, WHICH device child blocks it
+    (``above:<blocker>`` / ``below:<blocker>``, see ``_blocker``)."""
+    B = int(boundary_page)
+    ag, seg_of, can_go = _census_ctx(s, ag)
+    below: Dict[str, int] = {}
+    blocked: Dict[str, int] = {}
+    memo: Dict[int, str] = {}
+    pages = [int(p) for p in s.live_below if int(p) <= B] + [int(p) for p in s.live_above]
+    for p in pages:
+        c = _page_class(s, p, ag, seg_of, can_go)
+        if p <= B:
+            below[c] = below.get(c, 0) + 1
+        if c.endswith("_child_blocked"):
+            g = seg_of.get(p)
+            b = _blocker(g, ag, can_go, memo) if g is not None else "-"
+            key = ("below:" if p <= B else "above:") + b
+            blocked[key] = blocked.get(key, 0) + 1
+    below["free"] = sum(1 for p in s.free if p <= B)
+    st = sum(1 for p in s.staged if 1 <= int(p) <= B)
+    if st:
+        below["staged"] = st
+    return below, blocked
 
 
 def plan_digest(stage: int, plan: Plan) -> int:

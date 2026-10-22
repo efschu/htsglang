@@ -883,6 +883,46 @@ def _host_write_claim_np(arena, stems, totals):
         return arena.claim_slots_np(stems, totals)
 
 
+def _ref_found_complete(arena, stems, slots):
+    """KVLEITER-1022 review A1 (#1424f class): the reader reference of the pages a claim found COMPLETE (status 2),
+    taken with the evictor's handshake and checked. ``arena_claim`` takes no reference for status 2, so between the
+    claim and ``ref_slots(+1)`` another rank's clock (since F1 also at every D turn end) could mark the slot
+    EVICTING and free it -- the node then named a FREE (or reused) slot as its page: wrong KV. Now: +1 per slot with
+    its verdict (``ref_slots_mask_np``: refused on a slot no longer COMPLETE/CLAIMED), then the stem must still name
+    THAT slot COMPLETE (``find_slots_np``; a slot freed and claimed again by another page fails here). A reference
+    taken on a slot that fails is released at once. Returns a numpy bool mask (True = referenced, the page's own).
+    A scaffold arena without the two calls keeps the old form."""
+    import numpy as np
+
+    s = np.ascontiguousarray(np.asarray(slots, dtype=np.int64))
+    mk = getattr(arena, "ref_slots_mask_np", None)
+    fs = getattr(arena, "find_slots_np", None)
+    if not callable(mk) or not callable(fs):
+        if s.shape[0]:
+            arena.ref_slots(s.tolist(), +1)
+        return np.ones(s.shape[0], dtype=bool)
+    if not s.shape[0]:
+        return np.zeros(0, dtype=bool)
+    ok = np.asarray(mk(s)) == 1
+    fslots, fst = fs(list(stems))
+    good = ok & (np.asarray(fslots, dtype=np.int64) == s) & (np.asarray(fst) == 2)
+    lost = ok & ~good
+    if lost.any():
+        arena.ref_slots(s[lost].tolist(), -1)
+    return good
+
+
+def _note_found_lost(n_lost: int, n_again: int, site: str) -> None:
+    k = getattr(ArenaMHAHostPool, "_a1_lost_n", 0) + 1
+    ArenaMHAHostPool._a1_lost_n = k
+    ArenaMHAHostPool._a1_lost_pages = getattr(ArenaMHAHostPool, "_a1_lost_pages", 0) + int(n_lost)
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning("#1427 ARENA-CLAIM FOUND-LOST n=%d site=%s pages=%d reclaimed_found_again_lost=%d total=%d "
+                       "(a page found COMPLETE was freed before its reader reference: claimed again, never handed "
+                       "out as the node's page -- KVLEITER-1022 review A1)", k, site, int(n_lost), int(n_again),
+                       ArenaMHAHostPool._a1_lost_pages)
+
+
 def _note_complete_lost(st, slots, site: str) -> int:
     """#1427s: a completion the arena refused, by NAMED reason -- 3 = the
     slot was recycled under the writer (generation moved), 4 = it is no
@@ -2352,7 +2392,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # rows interleaved -> "a page's token rows are not consecutive").
         done2 = st == 2
         if bool(done2.any()):
-            arena.ref_slots(slots[done2].tolist(), +1)
+            self._found_complete_np(arena, stems, slots, st, gens, np.nonzero(done2)[0])
         bad = (st == 3) | (st == 4)
         if bool(bad.any()):
             if bool((st == 4).any()):
@@ -2363,7 +2403,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 s2, st2, g2 = _host_write_claim_np(arena, [stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
                 slots[redo] = s2; st[redo] = st2; gens[redo] = g2
                 if bool((st2 == 2).any()):
-                    arena.ref_slots(s2[st2 == 2].tolist(), +1)
+                    self._found_complete_np(arena, stems, slots, st, gens, redo[st2 == 2])
                 bad = (st == 3) | (st == 4)
             if not bool(bad.any()):
                 bad = _claim_duplicates(slots, st)
@@ -2390,6 +2430,52 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             self._pending_gen[idx] = torch.from_numpy(gens[pend])
             self._pending_fresh[idx] = torch.from_numpy(st[pend] == 0)
         return slots.tolist()
+
+    def _found_complete_np(self, arena, stems, slots, st, gens, idx) -> None:
+        """A1: reference the status-2 pages at ``idx`` (checked, ``_ref_found_complete``); a page lost to another
+        rank's clock is claimed ONCE more without room-making (a fresh claim writes it; found COMPLETE again it is
+        referenced the same checked way); lost twice or no free slot -> status 3, so the claim is refused by name
+        and nothing makes room here (the turn end never runs the clock's later stages)."""
+        import numpy as np
+
+        idx = np.asarray(idx, dtype=np.int64)
+        if not idx.size:
+            return
+        good = _ref_found_complete(arena, [stems[int(i)] for i in idx], slots[idx])
+        lost = idx[~good]
+        if not lost.size:
+            return
+        s2, st2, g2 = _host_write_claim_np(arena, [stems[int(i)] for i in lost], [self._page_bytes] * int(lost.size))
+        slots[lost] = s2; st[lost] = st2; gens[lost] = g2
+        again = lost[st2 == 2]
+        n_again = 0
+        if again.size:
+            g = _ref_found_complete(arena, [stems[int(i)] for i in again], slots[again])
+            st[again[~g]] = 3
+            n_again = int((~g).sum())
+        st[lost[st2 == 4]] = 3
+        _note_found_lost(int(lost.size), n_again, "claim_np")
+
+    def _found_complete_list(self, arena, stems, got, idx) -> None:
+        """A1, the list form of ``_found_complete_np`` (``got`` = [(slot, status, gen)], changed in place)."""
+        if not idx:
+            return
+        good = _ref_found_complete(arena, [stems[i] for i in idx], [got[i][0] for i in idx])
+        lost = [i for i, k in zip(idx, good.tolist()) if not k]
+        if not lost:
+            return
+        again = _host_write_claim(arena, [stems[i] for i in lost], [self._page_bytes] * len(lost))
+        for i, g in zip(lost, again):
+            got[i] = (g[0], 3 if int(g[1]) == 4 else g[1], g[2])
+        re2 = [i for i in lost if int(got[i][1]) == 2]
+        n_again = 0
+        if re2:
+            g2 = _ref_found_complete(arena, [stems[i] for i in re2], [got[i][0] for i in re2])
+            for i, k in zip(re2, g2.tolist()):
+                if not k:
+                    got[i] = (got[i][0], 3, got[i][2])
+                    n_again += 1
+        _note_found_lost(len(lost), n_again, "claim")
 
     def _pend_take(self, slots_t: torch.Tensor):
         """xsn359: (pending-mask over slots_t, gens, fresh) and CLEAR them -- the
@@ -2638,7 +2724,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             _l3s.mark(arena, slot_list)
         return out
 
-    def _evict_for_claim(self, arena, need: int, claim_stem: Optional[str] = None) -> int:
+    def _evict_for_claim(self, arena, need: int, claim_stem: Optional[str] = None, stage_max: int = 3) -> int:
         """H81 (27B 479f6eccb0): make room for a claim that found no free
         slot -- free the ``need`` oldest UNREFERENCED complete slots (the
         arena clock, second chance) WITHOUT writing them to disk. Returns how
@@ -2664,7 +2750,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         nobody; (ii) kept (a hand-off or a D park) WITH an L3 copy -- the D
         demoter wrote it in the background, the page is not lost, the read
         takes it back from disk (arena_fill_from_disk); (iii) kept WITHOUT a
-        copy -- named HANDOFF-LOST / PARK-LOST. ARENA-DROP names the stages."""
+        copy -- named HANDOFF-LOST / PARK-LOST. ARENA-DROP names the stages.
+
+        KVLEITER-1022: ``stage_max=1`` runs stage (i) only -- the turn end's room (``make_secured_room``):
+        unreferenced, kept by nobody, with its L3 copy (S109d); never a hand-off or park page."""
         need = int(need)
         if need <= 0:
             return 0
@@ -2685,6 +2774,11 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
             logger.warning("#243 HANDOFF-PENDING keep list unavailable", exc_info=True)
             keep = None
+            if stage_max < 2:
+                # KVLEITER-1022 review A2: the turn end's room never takes a hand-off / park page -- without a
+                # readable keep list it frees nothing this round (fail closed); the claim's full form keeps the
+                # old order-less clock
+                return len(reaped0)
         stages = [0, 0, 0]
         l3_state = [0, 0, 0]  # #257 (d): on_disk, written, dropped_without_l3
         # S24 CLAIM-ROOM (review 1018, probe P1): the stems of every read that fills right now (any io thread of this
@@ -2726,7 +2820,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 cands = list(arena.evict_candidates(
                     need, keep_lo=keep.keys if _kl is None else _np_s24.union1d(keep.keys, _kl)))
                 stages[0] = len(cands)
-                if len(cands) < need:
+                if len(cands) < need and stage_max >= 2:
                     # (ii) #248: kept, WITH an L3 copy -- freed without I/O,
                     # the copy is the page (arena_fill_from_disk reads it back)
                     # #248e: in hold order -- the rid read last first, each
@@ -2737,7 +2831,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                                                              eligible=copied, protect_lo=_kl, site="claim_ii")
                         stages[1] = len(mid)
                         cands += list(mid)
-                if len(cands) < need:
+                if len(cands) < need and stage_max >= 3:
                     # (iii) kept, WITHOUT a copy: lost, by name -- in the same
                     # order; the keep-less clock only for what the order misses
                     last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), protect_lo=_kl,
@@ -2844,9 +2938,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # #1424f: found-COMPLETE pages are referenced before any room is made
         # (see _claim_np) -- the eviction below may otherwise free one of them
         # and the redo give its slot to another page of this node.
-        early = [slot for slot, st, _ in got if st == 2]
+        got = list(got)
+        early = [i for i, (_s, st, _g) in enumerate(got) if st == 2]
         if early:
-            arena.ref_slots(early, +1)
+            self._found_complete_list(arena, stems, got, early)
         if any(st in (3, 4) for _, st, _ in got):
             if any(st == 4 for _, st, _ in got):
                 # H81 (27B 479f6eccb0): room in C, no disk round in the claim
@@ -2856,9 +2951,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 again = _host_write_claim(arena, [stems[i] for i in redo], [self._page_bytes] * len(redo))
                 for i, g in zip(redo, again):
                     got[i] = g
-                late = [g[0] for g in again if g[1] == 2]
+                late = [i for i in redo if got[i][1] == 2]
                 if late:
-                    arena.ref_slots(late, +1)
+                    self._found_complete_list(arena, stems, got, late)
             if any(st in (3, 4) for _, st, _ in got) or len({s for s, _, _ in got}) != len(got):
                 done = [slot for slot, st, _ in got if st == 2]
                 if done:
@@ -2892,6 +2987,31 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if slots is None:
             return None
         return self.arena_ids(slots)  # x59: P ids per page hash
+
+    def make_secured_room(self, need: int) -> int:
+        """KVLEITER-1022 (NF rc32 ded00bd5a7, boot 1022_030836 D): the turn end's room. S108 (20.10. 14:29) let a
+        turn end claim FREE slots only, because the claim's room-making then wrote to disk in the scheduler thread.
+        S109d (20.10. 17:36) took every write and stat out of that path (``_evict_for_claim`` frees only pages whose
+        L3 copy the write-behind's record AND the #1459 index show; the rest is queued). Under load nobody else made
+        free room: from 03:17:29 to 03:33:47 every turn end deferred its chain (``#1421 BACKUP-REFUSED
+        why=arena_room`` / ``anchor_only_claim``, up to 798 un-backed device nodes), KV-COMPACT found no secured
+        leaf and the KV ladder held S8.
+
+        Frees up to ``need`` slots through stage (i) only: COMPLETE, referenced by no rank, kept by nobody (no P
+        hand-off, no D park), with its L3 copy -- the page stays in L3, nothing is written, nothing waits. Before
+        the clock the KV arena reaps orphan claims (``_reap_orphan_claims``: CLAIMED slots no open writer and no
+        reference holds, aged -- no page anybody can read). Review A2: an unreadable hand-off / park keep list frees
+        nothing. Returns the slots freed (0 without a bound arena)."""
+        arena = getattr(self, "arena", None)
+        if arena is None or getattr(self, "_backend", None) is None or int(need) <= 0:
+            return 0
+        try:   # review A2: no readable hand-off / park keep list -> nothing freed, not even orphan claims
+            _handoff_pending.keep_for(self)
+        except Exception as exc:  # noqa: BLE001 -- fail closed, named
+            logger.warning("S108 TURN-END-ROOM keep list unreadable (%s: %s): nothing freed this turn end",
+                           type(exc).__name__, exc)
+            return 0
+        return int(self._evict_for_claim(arena, int(need), stage_max=1) or 0)
 
     def claim_needs_room(self, hashes) -> bool:
         """S108: would ``alloc_write(hashes)`` have to MAKE room (reap, ``_evict_for_claim`` with its
