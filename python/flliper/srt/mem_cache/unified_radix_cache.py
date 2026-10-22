@@ -5977,7 +5977,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # S108 review A2: a turn end claims an anchor slot only into FREE room -- no H19
             # displacement (_pdflip_release_anchor -> drop_unreferenced -> _secure_before_drop ->
             # arena_secure_to_disk: stat, 56 MiB write + fsync), no park spill. No room = None.
-            mrows = self._s108_mamba_free_claim(mp, last_hash)
+            mrows = self._s108_mamba_free_claim(mp, last_hash, node=node)
             UnifiedRadixCache._s109r_note_written(self, last_hash, mrows)
             return mrows
         mrows = self._pdflip_mamba_claim_h19(node, mp, last_hash)
@@ -6007,15 +6007,76 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - an instrument never breaks a claim
             pass
 
-    def _s108_mamba_free_claim(self, mp, last_hash):
+    def _s108_mamba_free_claim(self, mp, last_hash, node=None):
         """S108 A2: the anchor slot from FREE room only (``claim_needs_room``: no reap, no evict, no
-        I/O), else None. A pool without the probe is not claimed at all at a turn end."""
+        I/O), else None. A pool without the probe is not claimed at all at a turn end.
+
+        KVLEITER-1022: once per turn end the stage-(i) room first (``_s108_make_room``). TURNEND-1022: what
+        that did not pay, the anchor spill pays (``_s108_anchor_spill``: an L3-secured, ref-free tree anchor
+        leaves L2, as the K15 eviction save does) -- at most once per anchor this turn end demands."""
         probe = getattr(mp, "claim_needs_room", None)
         if not callable(probe) or (probe([last_hash]) and (
-                not UnifiedRadixCache._s108_make_room(self, mp, 1, "mamba") or probe([last_hash]))):
+                not UnifiedRadixCache._s108_make_room(self, mp, 1, "mamba") or probe([last_hash])) and (
+                not UnifiedRadixCache._s108_anchor_spill(self, node, mp) or probe([last_hash]))):
             self._s108_mamba_room_n = self.__dict__.get("_s108_mamba_room_n", 0) + 1
             return None
         return mp.alloc_write([last_hash])
+
+    def _s108_anchor_spill(self, node, mp) -> bool:
+        """TURNEND-1022 (NF rc33 fbb680d6d3, boot 1022_060647 D TP0): the turn end's anchor room beyond stage (i).
+
+        Under decode load the 84-slot mamba arena was 84 COMPLETE / 84 referenced, 77 of them by TP0's own tree
+        (ARENA-REF-HOLDERS pool=MAMBA tree=77, handoff_kept=0/0, park_kept=0/0, 06:17-06:35). Stage (i) takes only
+        unreferenced slots, so it freed nothing (TURN-END-ROOM kind=mamba freed=0 from n=12 on; 307 of 979 wanted
+        by n=256), and every turn end deferred its tail anchors (anchor_deferred 2 -> 141 in turn ends 40 -> 120).
+        In the same minutes the K15 eviction save spilled 1219 tree anchors through ``_pdflip_flush_spill_room``,
+        every one ``on_disk=1 written=0`` (its L3 copy by the write-behind's record) -- the room existed, the turn
+        end was not allowed to take it.
+
+        Here the turn end takes it the same way: ``_pdflip_flush_spill_room`` (a ref-free anchor -- its release
+        frees the slot -- whose L3 copy the shared record holds; S109b: no write, no stat, a victim still queued
+        for the write-behind is NOT released). The victim's mamba host value leaves the tree on TP0 and R12
+        (``record_state`` in ``_pdflip_release_anchor``) has the workers drop it too: one decision, TP0's, the
+        workers follow (no rank-local verdict). The victim keeps its bytes in L3 and is marked
+        ``pdflip_anchor_secured`` after ``anchor_held`` confirmed them (S25), so it stays backed and is not
+        re-claimed. Bounded by this turn end's own anchor demand (``_s108_spill_left``): no reserve, no timer.
+        False outside a turn end's sweep, on a PP stage (shared slot), without a node, or when nothing was freed."""
+        left = self.__dict__.get("_s108_spill_left")
+        if left is None or node is None or int(left.get("mamba", 0) or 0) <= 0:
+            return False
+        if int(getattr(self, "pp_size", 1) or 1) > 1:
+            return False   # K15 review A2/B2: a stage-local spill frees no shared slot on P
+        left["mamba"] = int(left["mamba"]) - 1
+        info: dict = {}
+        t0 = time.perf_counter()
+        try:
+            ok = bool(UnifiedRadixCache._pdflip_flush_spill_room(self, node, mp, why="turn_end_spill", info=info))
+        except Exception as exc:  # noqa: BLE001 -- room making never breaks a turn end: defer by name as before
+            logger.warning("S108 TURN-END-SPILL node=%s raised %s: %s (the anchor is deferred by name)",
+                           getattr(node, "id", "?"), type(exc).__name__, exc)
+            return False
+        victim = info.get("victim")
+        if ok and victim is not None:
+            _s25_mark_released_anchor_secured(self, victim.node)
+        st = self.__dict__.get("_s108_spill_stats")
+        if st is None:
+            st = self._s108_spill_stats = {"n": 0, "freed": 0}
+        st["n"] += 1
+        st["freed"] += int(ok)
+        n = st["n"]
+        k = n - st["freed"]   # the failed ones (no victim / pending / shared): their own throttle
+        if (n <= 16 or (n & (n - 1)) == 0) if ok else (k <= 16 or (k & (k - 1)) == 0):
+            logger.info(
+                "S108 TURN-END-SPILL n=%d freed=%d total_freed=%d node=%s victim_node=%s victim_depth=%s "
+                "secured_mark=%s tree_anchors=%s l3_secured=%s pending=%s shared=%s left=%d ms=%.2f (an L3-secured, "
+                "ref-free tree anchor leaves L2 for this turn end's anchor; R12 has the workers drop it too; no "
+                "write, no stat, no wait)",
+                n, int(ok), st["freed"], getattr(node, "id", "?"),
+                getattr(getattr(victim, "node", None), "id", "-"), getattr(victim, "depth", "-"),
+                bool(getattr(getattr(victim, "node", None), "pdflip_anchor_secured", False)),
+                info.get("tree", "?"), info.get("secured", "?"), info.get("pending", "?"),
+                info.get("shared", "?"), int(left.get("mamba", 0)), (time.perf_counter() - t0) * 1000.0)
+        return ok
 
     def _s108_make_room(self, pool, need: int, kind: str) -> bool:
         """KVLEITER-1022 (NF rc32 ded00bd5a7, boot 1022_030836 D 03:17:29-03:33:47): the turn end's room.
@@ -6039,6 +6100,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tried.add(kind)
         mk = getattr(pool, "make_secured_room", None)
         if not callable(mk):
+            # TURNEND-1022: this returned silently -- on the hybrid NF the KV pool is a HostPoolGroup that did not
+            # forward make_secured_room, and no rank made KV room for a whole boot without one line saying so
+            _un = UnifiedRadixCache.__dict__.get("_s108_room_unavailable_kinds")
+            if _un is None:
+                _un = UnifiedRadixCache._s108_room_unavailable_kinds = set()
+            if kind not in _un:
+                _un.add(kind)
+                logger.warning("S108 TURN-END-ROOM UNAVAILABLE kind=%s pool=%s: no make_secured_room -- the turn end "
+                               "claims FREE room only for this pool kind (named once per process)",
+                               kind, type(pool).__name__)
             return False
         want = max(int(need), int((self.__dict__.get("_s108_room_need") or {}).get(kind, 0) or 0))
         try:
@@ -6067,10 +6138,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         value presence), never a device value."""
         kv = an = 0
         mct = ComponentType.MAMBA if ComponentType.MAMBA in getattr(self, "tree_components", ()) else None
+        # TURNEND-1022: a node whose KV is backed but whose anchor is on the device only (the anchor-only backup
+        # the sweep issues for it) claims one anchor slot too -- it counted 0 here
+        _ao = getattr(self, "_pdflip_anchor_only_candidate", None)
         for n in nodes:
             try:
                 cds = n.component_data
                 if cds[BASE_COMPONENT_TYPE].value is None or n.backuped or n.l3_present:
+                    if mct is not None and callable(_ao) and cds[BASE_COMPONENT_TYPE].value is not None and _ao(n):
+                        an += 1
                     continue
                 kv += len(getattr(n, "hash_value", None) or ())
                 if (mct is not None and len(cds) > int(mct) and cds[mct].value is not None
@@ -6811,7 +6887,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: FLUSH-SPILL: anchors spilled to L3 and freed at sleep flushes (per process)
     _pdflip_flush_spill_n = 0
 
-    def _pdflip_flush_spill_room(self, node, mp) -> bool:
+    def _pdflip_flush_spill_room(self, node, mp, why: str = "flush_spill", info: Optional[dict] = None) -> bool:
         """D-NORECOMPUTE (a), y6z 08:24:41: the sleep flush could not back up
         the retained span of a parked request -- '#1421 BACKUP-REFUSED
         why=mamba_claim node=205 depth=45888 rid=None', '#1427 ARENA-CLAIM
@@ -6828,7 +6904,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         on disk is not written again), then released and its slot freed -- the
         read after the wake takes it from disk. A victim whose copy could not
         be secured is NOT released (no anchor is traded for another). Returns
-        True when a slot was freed."""
+        True when a slot was freed.
+
+        TURNEND-1022: ``why`` names the caller in the DISPLACE line (``turn_end_spill`` for the S108 turn end);
+        ``info`` (optional) receives the census of this choice -- ``tree`` anchors, ``secured`` (L3 record),
+        ``pending``, ``shared`` (another process references the slot) -- and the released ``victim``."""
         arena = getattr(mp, "arena", None)
         if arena is None:
             return False
@@ -6843,6 +6923,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # victims the write-behind already copied first; none of them: the usual choice, its copy checked below
         _sec_ok = [a for a in tree if a.slots and bool(_l3s.secured(arena, a.slots, getattr(mp, "_backend", None)).all())]
         _n_pending = len(tree) - len(_sec_ok)
+        if info is not None:
+            info.update(tree=len(tree), secured=len(_sec_ok), pending=_n_pending)
         tree = _sec_ok or tree
         tree = _mad.lane_filter(tree, self._pdflip_claim_lane(node))   # LANE-ANCHOR-RANK
         # K15c: only on the Form A host (D TP0) is "one reference" this group's whole share --
@@ -6855,6 +6937,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         victim = _mad.pick_foreign_victim(tree, rid="")
         if victim is None or not victim.slots:
             victim = self._pdflip_last_resort_victim(node, mp, ref_free=_rf, shared_out=_shared)
+        if info is not None:
+            info["shared"] = len(_shared)
         if (victim is None or not victim.slots) and _shared:
             UnifiedRadixCache._k15c_note_no_free(node, _shared)
         if victim is None or not victim.slots:
@@ -6871,7 +6955,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         sec = {"on_disk": len(victim.slots), "written": 0, "lost": 0, "pending_victims": _n_pending}
         st = self._pdflip_anchor_ledger.of(victim.rid)
-        dropped = int(self._pdflip_release_anchor(victim, mp, st, why="flush_spill", for_rid="flush") or 0)
+        dropped = int(self._pdflip_release_anchor(
+            victim, mp, st, why=why, for_rid="flush" if why == "flush_spill" else "turn_end") or 0)
+        if info is not None and dropped > 0:
+            info["victim"] = victim
+        if why != "flush_spill":
+            return dropped > 0   # TURNEND-1022: the caller names it (S108 TURN-END-SPILL)
         UnifiedRadixCache._pdflip_flush_spill_n += 1
         # K15c review A2 (boot 1016_103428 10:59:57 DISPLACE dropped=0 then "its slot freed"): the
         # success line only when the release dropped a slot; True only then (the caller's retry
@@ -7353,7 +7442,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # never displacement or disk I/O, and never a TP0-only refusal of the node (the KV goes
             # out on every rank alike; the anchor is deferred BY NAME for the anchor-only backup)
             mp = self._pdflip_mamba_pool()
-            mrows = self._s108_mamba_free_claim(mp, hashes[-1]) if mp is not None else None
+            mrows = self._s108_mamba_free_claim(mp, hashes[-1], node=node) if mp is not None else None
             if mrows is None:
                 comp_xfers.pop(mct, None)
                 ad = self.__dict__.get("_s108_anchor_deferred")
@@ -8668,12 +8757,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             old = [n for n in list((self.__dict__.get("_s108_deferred") or {}).values())[-_rp.max_issue():]
                    if id(n) not in _chain_ids and not n.evicted and not n.backuped and not n.l3_present
                    and UnifiedRadixCache._s108_in_tree(self, n, _in_tree_ok)]   # the newest deferred, bounded
+            # TURNEND-1022: an anchor deferred by name (KV backed, anchor on the device only) comes back at the next
+            # turn end as the TURN-END-DEFER line promises -- before, nobody read _s108_anchor_deferred again
+            _ad = self.__dict__.get("_s108_anchor_deferred") or {}
+            _ao = getattr(self, "_pdflip_anchor_only_candidate", None)
+            if _ad and callable(_ao):
+                _old_ids = _chain_ids | {id(x) for x in old}
+                old += [n for n in list(_ad.values())[-_rp.max_issue():]
+                        if id(n) not in _old_ids and not n.evicted and _ao(n)
+                        and UnifiedRadixCache._s108_in_tree(self, n, _in_tree_ok)]
             first = list(chain) + old
             ops0 = int(cc.__dict__.get("_s108_ops_submitted", 0))
             # KVLEITER-1022: the turn end may make its own stage-(i) room once per pool kind (_s108_make_room)
             self._s108_room_need = UnifiedRadixCache._s108_room_demand(self, first)
             match_ms = (time.perf_counter() - _t_match) * 1000.0
             self._s108_room_tried = set()
+            # TURNEND-1022: the anchor spill is bounded by this turn end's own anchor demand (no reserve)
+            self._s108_spill_left = {"mamba": int(self._s108_room_need.get("mamba", 0) or 0)}
             self._s108_turn_end_active = True
             try:
                 with _te.deferred_issue(cc, rid):
@@ -8684,6 +8784,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             finally:
                 self._s108_turn_end_active = False
                 self._s108_room_tried = None
+                self._s108_spill_left = None
             wall, cpu, blocked = clock.read()
             # what is still un-backed and not in flight is deferred (named), the rest is issued
             dq = self.__dict__.get("_s108_deferred")
@@ -8699,6 +8800,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 dq[n.id] = n
             while len(dq) > _te.DEFER_KEEP:
                 dq.pop(next(iter(dq)))
+            # TURNEND-1022: an anchor of this turn end's nodes that is secured now (or gone) leaves the anchor list;
+            # one whose KV write is still in flight (no candidate this moment) stays for the next turn end
+            _adq = self.__dict__.get("_s108_anchor_deferred")
+            if _adq:
+                for n in first:
+                    if n.id in _adq and UnifiedRadixCache._s108_anchor_settled(n):
+                        _adq.pop(n.id, None)
             if left:
                 parts = [f"{k}:{v}" for k, v in (stats.get("refused_by") or {}).items()]
                 if stats.get("skipped_pending"):
@@ -8723,6 +8831,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception as exc:  # noqa: BLE001 -- the copy never takes the finish down
             self._s108_turn_end_active = False
             logger.warning("S108 TURN-END-L2 raised %s: %s", type(exc).__name__, exc)
+
+    @staticmethod
+    def _s108_anchor_settled(node) -> bool:
+        """TURNEND-1022: a deferred anchor needs nothing more -- the node left the device, carries no device anchor,
+        has its anchor's host copy, or its anchor is secured in the store (``pdflip_anchor_secured``). Unreadable =
+        not settled (it stays in the list, bounded by DEFER_KEEP)."""
+        try:
+            if node.evicted or bool(getattr(node, "pdflip_anchor_secured", False)):
+                return True
+            try:
+                cd = node.component_data[ComponentType.MAMBA]
+            except (IndexError, KeyError):
+                return True   # no mamba component on this node: no anchor to save
+            return cd is None or cd.value is None or cd.host_value is not None
+        except Exception:  # noqa: BLE001
+            return False
 
     def _s108_in_tree(self, node, ok: Optional[set] = None) -> bool:
         """A deferred node is retried only while it is still hung into this tree. KVLEITER-1022: ``ok`` (one turn

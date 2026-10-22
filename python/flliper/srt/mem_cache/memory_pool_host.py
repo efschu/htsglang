@@ -2362,8 +2362,13 @@ class HostPoolGroup:
         # (unified_radix_cache._a2_settle_lost) asks the HostPoolGroup for
         # take_lost_slots / settle_lost_rows -- without them here it got None
         # and silently settled nothing on every hybrid (NF) host rank.
+        # TURNEND-1022 (NF rc33 fbb680d6d3, boot 1022_060647 D): KVLEITER F1's turn end asks the group for
+        # make_secured_room -- without it here getattr answered None, _s108_make_room returned False before its
+        # count, and NO rank (TP0 included) ever made KV room at a turn end: 0 'TURN-END-ROOM kind=kv' lines,
+        # 753/712/712 TURN-END-DEFER (arena_room) on TP0/TP1/TP2.
         if name in ("alloc_read", "alloc_write", "complete_write", "abort_write", "pin_slots",
-                    "claim_would_refuse", "claim_needs_room", "take_lost_slots", "settle_lost_rows"):
+                    "claim_would_refuse", "claim_needs_room", "make_secured_room", "take_lost_slots",
+                    "settle_lost_rows"):
             fn = getattr(self.anchor_entry.host_pool, name, None)
             if callable(fn):
                 return fn

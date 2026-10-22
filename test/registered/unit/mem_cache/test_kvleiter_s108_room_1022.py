@@ -117,7 +117,8 @@ def test_no_room_outside_a_turn_end_sweep_or_without_a_room_maker(case):
 def test_the_turn_end_anchor_claim_takes_stage_i_room_once_and_never_h19():
     stub = types.SimpleNamespace(_s108_turn_end_active=True, _s108_room_tried=set(), _s108_room_need={"mamba": 2})
     stub._pdflip_mamba_claim_h19 = lambda *a: (_ for _ in ()).throw(AssertionError("H19 at a turn end"))
-    stub._s108_mamba_free_claim = lambda mp, h: urc.UnifiedRadixCache._s108_mamba_free_claim(stub, mp, h)
+    stub._s108_mamba_free_claim = lambda mp, h, node=None: urc.UnifiedRadixCache._s108_mamba_free_claim(
+        stub, mp, h, node=node)   # TURNEND-1022: the claim hands its node to the spill (no budget here: none)
     mp = _Pool(free=0, room=2)
     a = urc.UnifiedRadixCache._pdflip_mamba_claim(stub, object(), mp, "h1")
     b = urc.UnifiedRadixCache._pdflip_mamba_claim(stub, object(), mp, "h2")
