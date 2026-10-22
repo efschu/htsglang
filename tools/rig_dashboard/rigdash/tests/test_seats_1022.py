@@ -38,7 +38,7 @@ STATE = {
          "devid": "usb:093a:2510", "roles": ["mouse"], "keys": True, "assignable": True, "host_drivers": ["usbhid"],
          "nodes": [{"dev": "/dev/input/event2"}, {"dev": "/dev/hidraw1"}], "seat": 1, "how": "default (monitor)",
          "active": True, "last_input_s": 0.4, "rules": [],
-         "withheld": "not grabbed by seat 1 for 1 s (no gamescope there, or it ended): the host console's until the container runs a new gamescope"},
+         "withheld": "no gamescope of seat 1 reads it"},
         {"id": "sound:0000:0d:00.1", "kind": "sound", "name": "NVidia (0000:0d:00.1)", "path": "pci-0000:0d:00.1",
          "devid": "pci:10de:22e8", "roles": ["sound"], "keys": False, "assignable": True, "host_drivers": [],
          "nodes": [{"dev": "/dev/snd/controlC1"}], "seat": 1, "how": "GPU sound", "active": False, "last_input_s": None, "rules": []},
@@ -178,8 +178,7 @@ class TestSeatsJs(unittest.TestCase):
         self.assertIn('<option value="host" selected>Host console</option>', html)
         self.assertIn('st-dev st-blink" data-id="usb:1-3"', html)
         mouse = html.split('data-id="usb:1-3"')[1].split('class="st-dev')[0]
-        self.assertIn("Withheld: the seat does not grab this keyboard", mouse)        # grab guard
-        self.assertIn(", the host console has it", mouse)
+        self.assertIn("Held by rdx-seatmgr: its keys go nowhere", mouse)             # grab guard
         lan = html.split('data-id="usb:2-4"')[1].split('class="st-dev')[0]
         self.assertIn("Used by the host", lan)
         self.assertNotIn("<select", lan)

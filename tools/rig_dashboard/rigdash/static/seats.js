@@ -3,8 +3,8 @@
    that belongs to at most one seat or to the Proxmox host's own console; a newly plugged device belongs to the host console
    (user 22.10.: "host konsole und seat nur per zuordnung").  "Belongs to" moves it now (until it is unplugged), "Remember by
    port / by device" makes it a rule in /etc/rdx/seatmgr.json (the host console too), "Assign a device by key press" gives the
-   next key press on a host-console device to that seat.  A seat keyboard that the seat does not grab is withheld (grab
-   guard in rdx-seatmgr): shown with a note.  A device that was just used (key, button, mouse motion) blinks for 2 s, so one can see which entry is which.
+   next key press on a host-console device to that seat.  A seat keyboard nobody in the seat reads (no gamescope, or it
+   did not grab it) is held by rdx-seatmgr (grab guard), so its keys reach neither the seat nor the host's console: a note.  A device that was just used (key, button, mouse motion) blinks for 2 s, so one can see which entry is which.
    Computes nothing itself: state and actions go through /api/seats/* (server.py passes them to rdx-seatmgr).  Rig edition
    and LAN only.  RigSeats.render(state, {now}) returns the HTML as text (no DOM, no network) for tests. */
 (function (root) {
@@ -45,8 +45,8 @@
       + '<div class="st-dn"><b>' + esc(d.name || d.id) + "</b> " + chips(d) + "</div>"
       + '<div class="st-how"><span>' + esc(HOW[d.how] || d.how) + "</span>"
       + (d.path ? ' <span class="mono st-path" title="' + esc(d.devid) + '">' + esc(d.path) + "</span>" : "") + "</div>"
-      + (d.withheld ? '<div class="st-note st-warn" title="' + esc(d.withheld) + '">Withheld: the seat does not grab this keyboard'
-        + (d.kind === "virtual" ? ", rdx-seatmgr swallows its keys" : ", the host console has it") + " until the seat's gamescope runs again</div>" : "")
+      + (d.withheld ? '<div class="st-note st-warn" title="' + esc(d.withheld) + '">Held by rdx-seatmgr: its keys go nowhere'
+        + " until a gamescope of the seat takes it</div>" : "")
       + (d.kind === "virtual"
         ? '<div class="st-note">Streamed or virtual input made by this seat itself; it stays with it</div>'
         : locked
