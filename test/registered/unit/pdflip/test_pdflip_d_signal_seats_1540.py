@@ -55,7 +55,7 @@ def _flag(monkeypatch, on):
     if on:
         monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "1")
     else:
-        monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", raising=False)
+        monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "0")              # default on since 22.10.
 
 
 def _publish(id_frac=0.93, arena_complete=118643, arena_slots=720896):
@@ -99,8 +99,11 @@ def test_gate_mutes_only_without_seats():
     assert DP.d_signal_seat_gate(0, "", d_has_seats=False, armed=True) == (0, "")
 
 
-def test_env_switch_exists_and_defaults_off(monkeypatch):
+def test_env_switch_exists_and_defaults_on(monkeypatch):
+    """Default ON since 22.10. (user order 14.10.; dual round 2: P slept at boot on a standing id_space, B9e)."""
     monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", raising=False)
+    assert envs.FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS.get() is True
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "0")
     assert envs.FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS.get() is False
     monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "1")
     assert envs.FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS.get() is True

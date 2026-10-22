@@ -22604,7 +22604,7 @@ class Front:
             # #1540: a standing id-space/arena reading with no D seat and nothing waiting for one is not
             # D's pressure (B9e: P slept and never woke). One front process, so the answer is the same for
             # every rank by construction.
-            _seats = bool(self._d_seats_live) or bool(self._ready_for_d)
+            _seats = bool(getattr(self, "_d_seats_live", None)) or bool(getattr(self, "_ready_for_d", None))
             _g_short, _g_why = _ddp.d_signal_seat_gate(sig_short, sig_why, d_has_seats=_seats, armed=True)
             if not _g_why and sig_why != getattr(self, "_dual_d_signal_idle_why", ""):
                 logger.info("PDFLIP DUAL-KV-PRESSURE d_signal %s ignored -- no D seat and nothing waiting for one "
@@ -22643,7 +22643,9 @@ class Front:
             # the per-card return check reads those (grant/air/weights above stay the old reading)
             stages = card_stages
         if envs.FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE.get():
-            lent = self._dual_lend_gate_lent(lent)
+            # a reading built on a bare stub (no bound gate) still runs the gate: default on since 22.10.
+            gate = getattr(self, "_dual_lend_gate_lent", None) or types.MethodType(Front._dual_lend_gate_lent, self)
+            lent = gate(lent)
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
                 "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights,
                 # #1956: no per-card reading (a rank's stage file missing) is no card_room -- also when the
@@ -22684,7 +22686,7 @@ class Front:
         elif lent > 0 and state == "reclaiming":
             self._dual_lend_gate_held = True
             if now >= float(getattr(self, "_dual_lend_gate_next", 0.0) or 0.0):
-                self._dual_lend_gate_next = now + self.DUAL_LEND_GATE_LOG_S
+                self._dual_lend_gate_next = now + float(getattr(self, "DUAL_LEND_GATE_LOG_S", 5.0))
                 logger.warning("%s verdict=HOLD p_lent=%d per_rank=%s files=%d/%d tag=%s legacy_p_lent=%d p_state=%s "
                                "-- the loan is not back on every P card: P stays stopped, no resume",
                                _pk.LEND_GATE_MARK, lent, per, files, len(per), used, int(legacy_lent), state)
@@ -22764,8 +22766,11 @@ class Front:
         host_ok = True
         if stages.p_state == "lent" and stages.sleep_capable and pressure > 0:
             host_ok = _ddp.host_allows_sleep(_mem_available_bytes(), rd["weights_bytes"])
+        # 22.10. (dual round 2, 01:42:33-01:52Z): P asleep, D without a seat and nothing waiting for one --
+        # no seat can ever end, so the wake must not wait for a seat end (d_idle)
+        d_idle = not (bool(getattr(self, "_d_seats_live", None)) or bool(getattr(self, "_ready_for_d", None)))
         action, line = stages.tick(pressure=pressure, seats_done=int(self.counters.get("d_seat_done", 0)),
-                                   host_ok=host_ok, **rd)
+                                   host_ok=host_ok, d_idle=d_idle, **rd)
         if line:
             logger.warning("%s", line)
         if action is None:

@@ -273,7 +273,8 @@ def test_gate_is_front_dual_ladder_only():
     """The helper is reached only from the stage reading behind the switch (flip / NF / INT8 never)."""
     src = inspect.getsource(FR.Front._dual_p_stage_reading)
     assert "if envs.FLLIPER_PDFLIP_DUAL_LEND_RESUME_GATE.get():" in src
-    assert src.count("_dual_lend_gate_lent") == 1
+    assert src.count("_dual_lend_gate_lent") == 2           # the bound gate, else the class's (22.10.: default on)
     import pathlib
     text = pathlib.Path(FR.__file__).read_text()
-    assert text.count("_dual_lend_gate_lent(") == 2        # the one call + the def
+    assert text.count("_dual_lend_gate_lent(") == 1        # the def; the one call site goes through `gate(lent)`
+    assert text.count("_dual_lend_gate_lent") == 3

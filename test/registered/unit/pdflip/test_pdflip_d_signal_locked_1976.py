@@ -69,8 +69,11 @@ def _short(sig, locked, **kw):
 
 # -- the pure reading -----------------------------------------------------------------
 
-def test_env_switch_exists_and_defaults_off(monkeypatch):
+def test_env_switch_exists_and_defaults_on(monkeypatch):
+    """Default ON since 22.10. (user order 14.10.; dual round 2 01:42:32Z id_space 0.99 put P to sleep at boot)."""
     monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", raising=False)
+    assert envs.FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED.get() is True
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", "0")
     assert envs.FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED.get() is False
     monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", "1")
     assert envs.FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED.get() is True
@@ -218,6 +221,7 @@ def _reading(f):
 
 def test_front_default_off_f11_reading_presses_with_a_seat(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "1")                  # the f11 boot had #1540 on
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", "0")                 # off = the f11 reading
     _publish(dict(F11, ts=time.time()))
     assert _reading(_front(seats=1))["d_short"] > 0, "f11 reproduced: a D seat plus table fill = pressure"
 
@@ -235,6 +239,7 @@ def test_front_on_f11_reading_does_not_press_but_real_demand_does(monkeypatch):
 
 def test_front_on_a_really_locked_d_still_presses(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "0")                  # #1540 (default on) gates seats=0
     _publish(dict(F11, ts=time.time(), locked_frac=0.97))
     assert _reading(_front(seats=0, ))["d_short"] > 0
 
@@ -248,8 +253,7 @@ def _tick(st, d_short, seats_done):
 
 def _seat_burst(monkeypatch, on):
     """One short D seat (f11: pdflip-0-83, 3.8 s) while a leg 1 runs: does P leave 'serving'?"""
-    if on:
-        monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", "1" if on else "0")
     monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "1")
     _publish(dict(F11, ts=time.time()))
     st = DP.PressureStages(sleep_capable=True, sleep_after=3)

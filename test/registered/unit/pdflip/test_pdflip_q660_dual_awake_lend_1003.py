@@ -261,6 +261,10 @@ def test_d_signal_counts_id_space_and_arena_only_when_fresh():
 def test_d_publishes_its_signal_and_the_front_reads_it_as_d_short(monkeypatch):
     tag = os.environ["FLLIPER_PDFLIP_DUAL_KV_TAG"]
     sig_path = DP.d_signal_file(tag)
+    # the Q-660 table-fill reading itself (y8v): #1540 / #1976 are default on since 22.10. and gate it by seats /
+    # locked rows -- their own tests cover that; here both are off
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED", "0")
     monkeypatch.setattr(DK, "_arena_census", lambda: (112, 112))
     actor = types.SimpleNamespace(allocator=types.SimpleNamespace(size=1000, available_size=lambda: 30))
     sched = types.SimpleNamespace(tp_rank=0, tree_cache=types.SimpleNamespace(evictable_size=lambda: 10))

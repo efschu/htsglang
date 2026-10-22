@@ -861,8 +861,10 @@ class Envs:
     # (D holds cache rows, running-req 0) as pressure in every tick, P slept after the lend (stage 2)
     # and never woke (pressure<=0 is a wake condition); only a workaround (D_ID_PRESSURE=1.0) existed.
     # On: no live seat and nothing waiting for one -> d_signal contributes 0 (ledger bytes unchanged).
-    # Default off = byte for byte as before.
-    FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS = EnvBool(False)
+    # DEFAULT ON since 22.10. (user order 14.10.: new features on): with the front's own-tag reading
+    # (31c8d07d72) dual round 2 (01:42:32Z) saw "d_signal id_space=0.99" at boot with no D seat, lent and
+    # slept P, and no LONG request was ever served (B9e again). =0 = byte for byte as before.
+    FLLIPER_PDFLIP_DUAL_D_SIGNAL_SEATS = EnvBool(True)
     # #1986 D-SEAT-LONG-FIRST (dual front, default 0 = off): N > 0 -> a request whose finished P leg 1 COMPUTED
     # >= N tokens (leg1 prompt_tokens - cached_tokens) takes the next free D seat before the waiting requests
     # that did not (pdflip/dual_seat_long_first.py). Only the ORDER OF THE WAITING for a free seat changes: no
@@ -882,8 +884,9 @@ class Envs:
     # tick, so each D seat (56 of 67 stage-1 events within 1 s of a D-ADMIT) stopped P with d_need = one P
     # grant step (92274688 B = 4096 tok x 22528 B) while no card was short; 10 P-PAUSE of the 262k leg, 69 %
     # of the wall clock P asleep (stage 2). On: the front takes locked_frac / arena_pinned from D's published
-    # reading (an older D without them: the old fields). Off = byte for byte as before.
-    FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED = EnvBool(False)
+    # reading (an older D without them: the old fields). DEFAULT ON since 22.10. (user order 14.10.; dual round 2
+    # 01:42:32Z: id_space 0.99 = the 1M-row table counting rows D never mapped). =0 = byte for byte as before.
+    FLLIPER_PDFLIP_DUAL_D_SIGNAL_LOCKED = EnvBool(True)
     # #1989 D-PARK OLDER-LIVE-FREE (dual D, default off): a SEAT-AGE victim (pressure park) that waits only
     # because an OLDER request is RUNNING (``d_seats.admission_gate`` older_live; no older one still waiting
     # for it, no decode-first deferral, nothing parked outside the queue) cannot resume this pass -- so it

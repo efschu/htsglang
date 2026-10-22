@@ -426,7 +426,8 @@ class PressureStages:
     def tick(self, *, pressure: int, p_committed: int, free_min: int, p_grant_bytes: int,
              d_air_bytes: int, seats_done: int, weights_bytes: int = 0,
              host_ok: bool = True, p_lent: int = 0,
-             card_room: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[Optional[str], Optional[str]]:
+             card_room: Optional[Sequence[Tuple[int, int]]] = None,
+             d_idle: bool = False) -> Tuple[Optional[str], Optional[str]]:
         """``card_room``: per card (free bytes, bytes the return needs there = that
         card's loan + one P grant step + D's look-ahead). The return is judged PER
         CARD -- the loan sits on each card separately (gmps12: 7.96 / 3.22 / 3.51
@@ -525,7 +526,11 @@ class PressureStages:
                                             "per-card loan reading, P stays asleep")
                 return None, None
         room_ok = self._room(card_room, free_min, int(weights_bytes) + int(p_grant_bytes) + int(d_air_bytes))
-        if pressure <= 0 and int(seats_done) > self._seat_mark and room_ok:
+        # ``d_idle`` (22.10., dual round 2 01:42:33-01:52Z): D has no live seat and nothing waits for one. The
+        # seat-end condition (D gave rows back) can then never come true: P slept at boot on a standing D
+        # reading, every LONG request waited for P's leg 1, D got no seat, P never woke (9 min, 0 batches).
+        # With no pressure and the room on every card, an idle D is as good as a finished seat.
+        if pressure <= 0 and (int(seats_done) > self._seat_mark or bool(d_idle)) and room_ok:
             self.p_state = "serving"
             self.counts["wake"] += 1
             return "wake", self._line("resume", 0, free_min, " from=sleep")
