@@ -280,27 +280,34 @@ LINE_MARKER = "EXTEND-CORRIDOR-LINE"
 
 
 def _read_corridor_line() -> "tuple[float, str]":
-    """(line MiB, source) -- the guard's derived floor for THIS card (its verdict floor: the measured transient peak of
-    the awake group, the same number ``corridor_trace`` grades a breach against), else the stated law graded the same
-    way. Port of NF rc33 bc9dcc7520 / review 91e56eeec1 (``_read_corridor_line``)."""
+    """(line MiB, source) -- the guard's derived floor for THIS card: its TARGET (``CorridorFloor.mib``, the same
+    number ``corridor_trace`` measures its margin to). On a MEASURED card that is the measured transient peak of the
+    awake group and equals the verdict floor the trace grades a breach against (no band under a measured peak); else
+    the stated law. Port of NF rc33 bc9dcc7520 / review 91e56eeec1 (``_read_corridor_line``).
+
+    NACHT2 review 22.10.: the TARGET, not the verdict floor. For an UNMEASURED-FALLBACK / ENV-OVERRIDE / stated card
+    the verdict floor is the -20 % band edge (819 at 1024): a vote aimed at it spends the band's whole tolerance on a
+    number nobody measured (corridor_guard: the fallback is VERDICT-ONLY and "a mechanism that aims at the edge of its
+    own tolerance has none"). Measured cards keep the port's gain (target == verdict floor, 700/701/767 on the 27B D);
+    an unmeasured card keeps the pre-port line (the stated law), never a wider one."""
     try:
         from flliper.srt.managers.corridor_guard import corridor_floor_for_current_device
 
         fl = corridor_floor_for_current_device()
-        return float(fl.verdict_floor_mib), f"{fl.source}:{int(fl.mib)}"
-    except Exception:  # noqa: BLE001 -- no derived floor: the stated law, graded like the guard grades it
+        return float(fl.mib), f"{fl.source}:{int(fl.mib)}"
+    except Exception:  # noqa: BLE001 -- no derived floor: the stated law itself
         pass
     try:
-        from flliper.srt.managers.corridor_guard import corridor_law_mib, verdict_floor_for_mib
+        from flliper.srt.managers.corridor_guard import corridor_law_mib
 
         law = int(corridor_law_mib())
-        return float(verdict_floor_for_mib(law, "STATED-LAW")), f"stated-law:{law}"
+        return float(law), f"stated-law:{law}"
     except Exception:  # noqa: BLE001 -- no reader at all: the HALT line
         return float(CHUNKING_FLOOR_MIB), "halt-line"
 
 
 def corridor_line_mib(rank: Optional[int] = None) -> float:
-    """The card line the chunk's growth must leave free: THIS card's corridor law (``max(300, verdict floor)``), read
+    """The card line the chunk's growth must leave free: THIS card's corridor law (``max(300, floor target)``), read
     once per process and named once (``EXTEND-CORRIDOR-LINE``) -- never the old 300 MiB halt line under it, and no
     reserve on top (the law is the corridor).
 

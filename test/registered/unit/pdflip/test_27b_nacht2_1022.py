@@ -285,12 +285,12 @@ def test_danger_grid_no_vote_above_the_floor_chunk_ends_under_the_card_line():
                 assert free - w * RATE >= line - 1, (line, free, w)
 
 
-def test_unmeasured_card_falls_back_to_the_stated_law_graded_like_the_guard():
-    from flliper.srt.managers import corridor_guard as CG
-
+def test_unmeasured_card_falls_back_to_the_stated_law_itself():
+    # NACHT2 review 22.10.: the line is the floor's TARGET -- on an unmeasured card the stated law (the pre-port line),
+    # never the -20 % band edge (819) the guard grades a breach against (test_27b_nacht2_review_1022 R-LINE)
     patch, _ = _door(1024, source="UNMEASURED-FALLBACK")
     with patch:
-        assert ET.corridor_line_mib() == float(CG.verdict_floor_for_mib(1024, "UNMEASURED-FALLBACK"))
+        assert ET.corridor_line_mib() == 1024.0
 
 
 def test_no_door_reads_the_stated_law_and_never_under_the_halt_line():

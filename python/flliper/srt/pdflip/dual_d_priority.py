@@ -456,6 +456,19 @@ class PressureStages:
                 self._lend_seat_mark = int(seats_done)
                 self.counts["lend"] += 1
                 return "lend", self._line("1-lend", pressure, 0)
+            if int(p_lent) > 0:
+                # NACHT2 review 22.10.: 'stopped' with P's loan still out -- only after a stage-2 leg that ended
+                # BEFORE its release (quiesce refused, or the leg raised; front._dual_p_sleep falls back here, the
+                # sleep was issued from 'lent'). A plain resume would let P prefill again while the card pool still
+                # counts its awake loan (budget += loan): P's allocator re-caches those bytes outside the ledger and D
+                # may commit into them (over-promise -> cuMemCreate OOM / W-DUAL-P-WAKE-SHORT). The way back is the
+                # reclaim, exactly as from 'lent'.
+                if self._room(card_room, free_min, int(p_grant_bytes) + int(d_air_bytes)):
+                    self.p_state = "reclaiming"
+                    self._calm = 0
+                    self.counts["reclaim"] += 1
+                    return "reclaim", self._line("1-reclaim", 0, free_min, " from=stopped")
+                return None, None
             if free_min >= int(p_grant_bytes) + int(d_air_bytes):
                 self.p_state = "serving"
                 self.counts["resume"] += 1
