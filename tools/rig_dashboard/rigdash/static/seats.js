@@ -16,6 +16,7 @@
     "device rule": "remembered by device",
     "GPU sound": "the seat GPU's own sound",
     "unassigned": "not assigned",
+    "created in this seat": "created inside this seat",
   };
   const ROLE = { keyboard: "keyboard", mouse: "mouse", joystick: "gamepad", touchpad: "touchpad", tablet: "tablet", sound: "sound output" };
   const POLL_MS = 1000, POLL_CLAIM_MS = 400;
@@ -23,6 +24,7 @@
   function chips(d) {
     const out = [];
     (d.roles || []).forEach((r) => { if (ROLE[r] && !out.includes(ROLE[r])) out.push(ROLE[r]); });
+    if (d.kind === "virtual") out.unshift("virtual");
     if (!out.length) out.push(d.kind === "usb" ? "other USB device" : (d.kind === "input" ? "buttons" : d.kind));
     return out.map((c) => '<span class="st-chip">' + esc(c) + "</span>").join(" ");
   }
@@ -37,7 +39,9 @@
       + '<div class="st-dn"><b>' + esc(d.name || d.id) + "</b> " + chips(d) + "</div>"
       + '<div class="st-how"><span>' + esc(HOW[d.how] || d.how) + "</span>"
       + (d.path ? ' <span class="mono st-path" title="' + esc(d.devid) + '">' + esc(d.path) + "</span>" : "") + "</div>"
-      + (locked
+      + (d.kind === "virtual"
+        ? '<div class="st-note">Streamed or virtual input made by this seat itself; it stays with it</div>'
+        : locked
         ? '<div class="st-note">Used by the host, never handed to a seat</div>'
         : '<div class="st-ctl"><label><span>Belongs to</span> <select data-act="seat">' + opts.join("") + "</select></label>"
           + '<button type="button" data-act="port"' + (d.seat == null || !d.path ? " disabled" : "") + ">Remember by port</button>"
@@ -74,9 +78,11 @@
         + (devs.length ? devs.map((d) => device(d, seats)).join("") : '<div class="muted st-empty">No devices</div>') + "</section>";
     });
     const free = (state.devices || []).filter((d) => d.seat == null);
+    const pend = (state.virtual_pending || []).map((v) => '<div class="st-note" title="' + esc(v.why) + '"><span>Virtual device, its seat is not known yet:</span> '
+      + esc(v.name || v.id) + "</div>").join("");
     cols.push('<section class="st-col st-free"><div class="st-head"><h3>Unassigned</h3>'
       + '<div class="st-meta muted">reaches no seat</div></div>'
-      + (free.length ? free.map((d) => device(d, seats)).join("") : '<div class="muted st-empty">No devices</div>') + "</section>");
+      + (free.length ? free.map((d) => device(d, seats)).join("") : '<div class="muted st-empty">No devices</div>') + pend + "</section>");
     return '<div class="st-cols">' + cols.join("") + "</div>";
   }
 
