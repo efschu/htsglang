@@ -1318,7 +1318,14 @@ def holder_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None)
 def _blocker(g: Segment, ag: Agreement, can_go, memo: Dict[int, str]) -> str:
     """KVLEITER-1022 (I1): the class of the first device segment below ``g`` that cannot go -- ``unbacked``,
     ``move_only`` (a running request / a write in flight), ``pinned``, ``partial`` (secured, not whole pages of its
-    own), ``mixed`` (profile not agreed), ``not_agreed``; ``-`` when nothing below blocks."""
+    own), ``mixed`` (profile not agreed), ``not_agreed``; ``-`` when nothing below blocks.
+
+    KVAGREED-1022 (NF rc33 fbb680d6d3, boot 1022_060647 D): ``mixed`` / ``not_agreed`` name ONLY a child that is
+    secured with its whole device subtree HERE (``sub_ok``) and that the group did not agree on -- a peer rank
+    holds it otherwise. A secured child whose OWN subtree is not secured here is never voted (its slot is 0 in this
+    rank's maps, so the group MIN is 0 and ``agreed`` is False on every rank, even on one rank): the walk goes on
+    into that child and names what blocks it. Before, that child was printed ``not_agreed`` -- 06:17:30 TP0
+    ``below:not_agreed=851`` while not one page on TP0 was ``_not_agreed`` (no peer disagreement here at all)."""
     k = id(g)
     if k in memo:
         return memo[k]
@@ -1328,6 +1335,13 @@ def _blocker(g: Segment, ag: Agreement, can_go, memo: Dict[int, str]) -> str:
             cls = _node_class(c.nodes[0] if c.nodes else None)
             memo[k] = "partial" if cls in ("l2", "store") else cls
             return memo[k]
+        if not c.sub_ok:
+            # KVAGREED-1022: secured itself, but a device segment below it is not -- that one blocks
+            b = _blocker(c, ag, can_go, memo)
+            if b != "-":
+                memo[k] = b
+                return b
+            continue
         if not ag.agreed(c):
             memo[k] = "mixed" if c.kind == 3 else "not_agreed"
             return memo[k]

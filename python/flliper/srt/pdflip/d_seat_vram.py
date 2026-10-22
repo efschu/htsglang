@@ -4516,8 +4516,9 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
                 # blocks every child-blocked page (above and below) -- one line, gated with HOLDERS
                 below, blocked = KC.below_census(sv, bounds[0], ag)
                 logger.info("%s n=%d BELOW S%d boundary_page=%d %s | blocked_by %s (pages; rank-local -- the classes "
-                            "of HOLDERS for the pages at or below the boundary; blocked_by = the first device child "
-                            "that cannot go: unbacked / move_only / pinned / partial / mixed / not_agreed)",
+                            "of HOLDERS for the pages at or below the boundary; blocked_by = the first device segment "
+                            "below that cannot go: unbacked / move_only / pinned / partial, or mixed / not_agreed = "
+                            "secured with its subtree HERE, a peer rank holds it otherwise)",
                             KV_COMPACT_MARK, n, cands[0], bounds[0],
                             " ".join("%s=%d" % kv for kv in sorted(below.items())),
                             " ".join("%s=%d" % kv for kv in sorted(blocked.items())) or "-")
