@@ -2638,7 +2638,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             _l3s.mark(arena, slot_list)
         return out
 
-    def _evict_for_claim(self, arena, need: int, claim_stem: Optional[str] = None) -> int:
+    def _evict_for_claim(self, arena, need: int, claim_stem: Optional[str] = None, stage_max: int = 3) -> int:
         """H81 (27B 479f6eccb0): make room for a claim that found no free
         slot -- free the ``need`` oldest UNREFERENCED complete slots (the
         arena clock, second chance) WITHOUT writing them to disk. Returns how
@@ -2664,7 +2664,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         nobody; (ii) kept (a hand-off or a D park) WITH an L3 copy -- the D
         demoter wrote it in the background, the page is not lost, the read
         takes it back from disk (arena_fill_from_disk); (iii) kept WITHOUT a
-        copy -- named HANDOFF-LOST / PARK-LOST. ARENA-DROP names the stages."""
+        copy -- named HANDOFF-LOST / PARK-LOST. ARENA-DROP names the stages.
+
+        KVLEITER-1022: ``stage_max=1`` runs stage (i) only -- the turn end's room (``make_secured_room``):
+        unreferenced, kept by nobody, with its L3 copy (S109d); never a hand-off or park page."""
         need = int(need)
         if need <= 0:
             return 0
@@ -2726,7 +2729,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 cands = list(arena.evict_candidates(
                     need, keep_lo=keep.keys if _kl is None else _np_s24.union1d(keep.keys, _kl)))
                 stages[0] = len(cands)
-                if len(cands) < need:
+                if len(cands) < need and stage_max >= 2:
                     # (ii) #248: kept, WITH an L3 copy -- freed without I/O,
                     # the copy is the page (arena_fill_from_disk reads it back)
                     # #248e: in hold order -- the rid read last first, each
@@ -2737,7 +2740,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                                                              eligible=copied, protect_lo=_kl, site="claim_ii")
                         stages[1] = len(mid)
                         cands += list(mid)
-                if len(cands) < need:
+                if len(cands) < need and stage_max >= 3:
                     # (iii) kept, WITHOUT a copy: lost, by name -- in the same
                     # order; the keep-less clock only for what the order misses
                     last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), protect_lo=_kl,
@@ -2892,6 +2895,23 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if slots is None:
             return None
         return self.arena_ids(slots)  # x59: P ids per page hash
+
+    def make_secured_room(self, need: int) -> int:
+        """KVLEITER-1022 (NF rc32 ded00bd5a7, boot 1022_030836 D): the turn end's room. S108 (20.10. 14:29) let a
+        turn end claim FREE slots only, because the claim's room-making then wrote to disk in the scheduler thread.
+        S109d (20.10. 17:36) took every write and stat out of that path (``_evict_for_claim`` frees only pages whose
+        L3 copy the write-behind's record AND the #1459 index show; the rest is queued). Under load nobody else made
+        free room: from 03:17:29 to 03:33:47 every turn end deferred its chain (``#1421 BACKUP-REFUSED
+        why=arena_room`` / ``anchor_only_claim``, up to 798 un-backed device nodes), KV-COMPACT found no secured
+        leaf and the KV ladder held S8.
+
+        Frees up to ``need`` slots through stage (i) only: COMPLETE, referenced by no rank, kept by nobody (no P
+        hand-off, no D park), with its L3 copy -- the page stays in L3, nothing is written, nothing waits. Returns
+        the slots freed (0 without a bound arena)."""
+        arena = getattr(self, "arena", None)
+        if arena is None or getattr(self, "_backend", None) is None or int(need) <= 0:
+            return 0
+        return int(self._evict_for_claim(arena, int(need), stage_max=1) or 0)
 
     def claim_needs_room(self, hashes) -> bool:
         """S108: would ``alloc_write(hashes)`` have to MAKE room (reap, ``_evict_for_claim`` with its

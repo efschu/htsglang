@@ -6005,10 +6005,74 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """S108 A2: the anchor slot from FREE room only (``claim_needs_room``: no reap, no evict, no
         I/O), else None. A pool without the probe is not claimed at all at a turn end."""
         probe = getattr(mp, "claim_needs_room", None)
-        if not callable(probe) or probe([last_hash]):
+        if not callable(probe) or (probe([last_hash]) and (
+                not UnifiedRadixCache._s108_make_room(self, mp, 1, "mamba") or probe([last_hash]))):
             self._s108_mamba_room_n = self.__dict__.get("_s108_mamba_room_n", 0) + 1
             return None
         return mp.alloc_write([last_hash])
+
+    def _s108_make_room(self, pool, need: int, kind: str) -> bool:
+        """KVLEITER-1022 (NF rc32 ded00bd5a7, boot 1022_030836 D 03:17:29-03:33:47): the turn end's room.
+
+        S108 review A2 kept the claim's room-making out of a turn end because it wrote to disk in the scheduler
+        thread; S109d / S109-A2 (later the same day) made that path write- and stat-free. Under decode load the
+        turn end was then the only claimant that never made room: the KV arena (6485 slots, 5973 COMPLETE, 1274
+        referenced at 03:23:31) and the mamba arena (84 / 84 / 60) had no FREE slot, every chain was deferred
+        (``arena_room`` / ``anchor_only_claim``), the un-backed device nodes grew to 798 and KV-COMPACT, which
+        never evicts what has no copy, found the cached content above S5 child-blocked behind them (S8 held,
+        r3080 >= 26 expert rows need S5).
+
+        Once per turn end and pool kind, ``pool.make_secured_room`` frees up to the turn end's own demand
+        (``_s108_room_need``, from its chain; at least ``need``) through the clock's stage (i) only: COMPLETE,
+        referenced by no rank, no P hand-off or D park keep, with its L3 copy. No H19 displacement, no spill, no
+        tree change, no collective, no timer, no reserve (exactly the demand of this turn end). False outside a
+        turn end's sweep, when this turn end already made its room for ``kind``, or when nothing was freed."""
+        tried = self.__dict__.get("_s108_room_tried")
+        if tried is None or kind in tried:
+            return False
+        tried.add(kind)
+        mk = getattr(pool, "make_secured_room", None)
+        if not callable(mk):
+            return False
+        want = max(int(need), int((self.__dict__.get("_s108_room_need") or {}).get(kind, 0) or 0))
+        try:
+            freed = int(mk(want) or 0)
+        except Exception as exc:  # noqa: BLE001 -- room making never breaks a turn end: defer as before
+            logger.warning("S108 TURN-END-ROOM %s raised %s: %s (the node is deferred by name)",
+                           kind, type(exc).__name__, exc)
+            return False
+        st = self.__dict__.get("_s108_room_stats")
+        if st is None:
+            st = self._s108_room_stats = {"n": 0, "want": 0, "freed": 0}
+        st["n"] += 1
+        st["want"] += want
+        st["freed"] += freed
+        n = st["n"]
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.info("S108 TURN-END-ROOM n=%d kind=%s want=%d freed=%d total_want=%d total_freed=%d "
+                        "(stage (i) only: COMPLETE, unreferenced, unkept, L3-secured slots -- S109d, no write, "
+                        "no stat, no wait; the turn end's own demand, once per turn end)",
+                        n, kind, want, freed, st["want"], st["freed"])
+        return freed > 0
+
+    def _s108_room_demand(self, nodes) -> dict:
+        """KVLEITER-1022: what the turn end's nodes will claim -- KV pages of every un-backed device node, one
+        anchor slot per device anchor without a host copy. Read from the host-side tree only (hash lists,
+        value presence), never a device value."""
+        kv = an = 0
+        mct = ComponentType.MAMBA if ComponentType.MAMBA in getattr(self, "tree_components", ()) else None
+        for n in nodes:
+            try:
+                cds = n.component_data
+                if cds[BASE_COMPONENT_TYPE].value is None or n.backuped or n.l3_present:
+                    continue
+                kv += len(getattr(n, "hash_value", None) or ())
+                if (mct is not None and len(cds) > int(mct) and cds[mct].value is not None
+                        and cds[mct].host_value is None):
+                    an += 1
+            except Exception:  # noqa: BLE001 -- a demand is an upper bound helper, never a wall
+                continue
+        return {"kv": kv, "mamba": an}
 
     def _pdflip_mamba_claim_h19(self, node, mp, last_hash):
         """SHARE: a request at its per-rank share releases its shallowest
@@ -7236,10 +7300,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - room making never breaks a claim
             logger.warning("W3-ROOM-SET apply failed", exc_info=True)
         if self.__dict__.get("_s108_turn_end_active", False):
-            # S108: a turn end claims only into FREE room -- the claim's room-making (reap,
-            # _evict_for_claim + its L3 secure) is disk work in this thread; deferred by name
+            # S108: a turn end claims FREE room. KVLEITER-1022: once per turn end it may first make
+            # stage-(i) room (``_s108_make_room``: only COMPLETE, unreferenced, unkept, L3-secured slots --
+            # S109d, no write, no stat, no wait); what that does not pay is deferred by name as before
             _probe = getattr(pool, "claim_needs_room", None)
-            if callable(_probe) and _probe(hashes):
+            if callable(_probe) and _probe(hashes) and (
+                    not UnifiedRadixCache._s108_make_room(self, pool, len(hashes), "kv") or _probe(hashes)):
                 self._pdflip_sweep_last_refusal = "arena_claim"
                 self._1421_refused("arena_room", node)
                 return False
@@ -8595,6 +8661,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                    and self._s108_in_tree(n)]   # the newest deferred, bounded
             first = list(chain) + old
             ops0 = int(cc.__dict__.get("_s108_ops_submitted", 0))
+            # KVLEITER-1022: the turn end may make its own stage-(i) room once per pool kind (_s108_make_room)
+            self._s108_room_need = UnifiedRadixCache._s108_room_demand(self, first)
+            self._s108_room_tried = set()
             self._s108_turn_end_active = True
             try:
                 with _te.deferred_issue(cc, rid):
@@ -8604,6 +8673,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         max_issue=_rp.max_issue(), clock=None, first=first, chain_only=True) or {}
             finally:
                 self._s108_turn_end_active = False
+                self._s108_room_tried = None
             wall, cpu, blocked = clock.read()
             # what is still un-backed and not in flight is deferred (named), the rest is issued
             dq = self.__dict__.get("_s108_deferred")

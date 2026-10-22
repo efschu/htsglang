@@ -321,6 +321,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
     _claim = ArenaMHAHostPool._claim
     claim_needs_room = ArenaMHAHostPool.claim_needs_room     # S108 A2: the turn end's no-room-making probe
     _evict_for_claim = ArenaMHAHostPool._evict_for_claim     # H81: the claim's room, no disk I/O
+    make_secured_room = ArenaMHAHostPool.make_secured_room   # KVLEITER-1022: the turn end's stage-(i) room
     release_tree_rows = ArenaMHAHostPool.release_tree_rows   # H81: the tree reset's release
     complete_write = ArenaMHAHostPool.complete_write
     take_lost_slots = ArenaMHAHostPool.take_lost_slots   # A2: the anchors a late ack lost

@@ -572,7 +572,10 @@ def test_instrument_lines_and_reset_joins_the_copier(card, caplog, monkeypatch):
 # ----------------------------------------------------------------------------- (5b) no room-making
 def test_turn_end_claims_only_free_room_never_makes_room(monkeypatch):
     """The claim's own room-making (reap, _evict_for_claim with its L3 secure -- y9e: 19-109 ms in
-    the scheduler thread) never runs for a turn end: the probe sees no free room and defers."""
+    the scheduler thread) never runs for a turn end: the probe sees no free room and defers.
+    KVLEITER-1022: still true for the CLAIM's room-making; the turn end's own stage-(i) room
+    (``_s108_make_room``, once per turn end, test_kvleiter_s108_room_1022) needs the sweep's room
+    state, which this stub does not carry -- so it claims FREE room only, as S108 did."""
     from flliper.srt.mem_cache.pool_host import arena_pool as ap
 
     class _Arena:
