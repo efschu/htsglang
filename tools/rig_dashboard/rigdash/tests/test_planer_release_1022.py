@@ -155,7 +155,7 @@ class Cells(unittest.TestCase):
         for n, m, l, row in cells():
             codes = [i["code"] for i in plan(n, m, l)["verdikt"]["items"]]
             if n == 3:
-                self.assertEqual(row["proof"], "metal")
+                self.assertEqual(row["proof"], "dry_run")                                    # review 1022 R4: the count is proven, a 3090 never booted
                 self.assertNotIn("METAL-UNPROVEN", codes, (n, m, l))
                 self.assertNotIn("HW-COUNT", codes, (n, m, l))
             else:
@@ -424,7 +424,8 @@ def render(**case):
 @unittest.skipUnless(NODE, "node missing")
 class Page(unittest.TestCase):
     def test_two_and_four_cards_show_the_dry_run_chip_three_cards_do_not(self):
-        for n, chip in ((2, True), (3, False), (4, True)):
+        # review 1022 R4: three RTX 3090 show the chip too (proof on metal is the card SET of the reference rig, see test_planer_release_1022_review)
+        for n, chip in ((2, True), (3, True), (4, True)):
             h = render(layouts=rec("layouts_%d_qwen38-27b-nvfp4.json" % n))["layouts"]
             self.assertEqual("possible, not booted on metal yet" in h, chip, n)
             self.assertIn("pz-lay", h)

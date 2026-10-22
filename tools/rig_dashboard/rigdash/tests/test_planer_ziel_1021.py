@@ -169,8 +169,8 @@ class Layouts(unittest.TestCase):
                     self.assertEqual(l["status"], "blocked")
                     self.assertIn("short by", " ".join(l["why"]))
         for l in by_id(zp()[0].layouts({"model": "qwen38-27b-nvfp4", "cards": X3090})).values():
-            self.assertEqual(l["proof"], "metal")
-            self.assertNotIn("METAL-UNPROVEN", " ".join(l["why"]))
+            self.assertEqual(l["proof"], "dry_run")                                  # review 1022 R4: no RTX 3090 was ever booted
+            self.assertNotIn("METAL-UNPROVEN", " ".join(l["why"]))                   # ... but the card count is proven (the rig)
 
     def test_an_sm89_card_is_blocked_by_the_arch_gate_of_the_image(self):
         lay = by_id(zp()[0].layouts({"model": "qwen38-nf-int4", "cards": [{"card": "rtx4070-12", "count": 3}]}))
