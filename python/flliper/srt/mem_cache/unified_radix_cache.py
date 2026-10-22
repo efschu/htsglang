@@ -118,6 +118,7 @@ from flliper.srt.pdflip.turn_anchor import SYSGRID_PENDING_ATTR as _SYSGRID_PEND
 from flliper.srt.pdflip.turn_anchor import CLOSE_PENDING_ATTR as _CLOSE_PENDING_ATTR
 from flliper.srt.pdflip.turn_anchor import IMAGE_PENDING_ATTR as _IMAGE_PENDING_ATTR
 from flliper.srt.pdflip.turn_anchor import BRANCH_PENDING_ATTR as _BRANCH_PENDING_ATTR
+from flliper.srt.pdflip.turn_anchor import HEAD_PENDING_ATTR as _HEAD_PENDING_ATTR
 
 
 def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
@@ -3016,7 +3017,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or getattr(req, _SYSGRID_PENDING_ATTR, None)
                 or getattr(req, _CLOSE_PENDING_ATTR, None) is not None
                 or getattr(req, _IMAGE_PENDING_ATTR, None) is not None
-                or getattr(req, _BRANCH_PENDING_ATTR, None) is not None):
+                or getattr(req, _BRANCH_PENDING_ATTR, None) is not None
+                or getattr(req, _HEAD_PENDING_ATTR, None)):
             self._pdflip_turn_insert(req, is_insert=is_insert)
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -3237,7 +3239,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or getattr(req, _SYSGRID_PENDING_ATTR, None)
                 or getattr(req, _CLOSE_PENDING_ATTR, None) is not None
                 or getattr(req, _IMAGE_PENDING_ATTR, None) is not None
-                or getattr(req, _BRANCH_PENDING_ATTR, None) is not None):
+                or getattr(req, _BRANCH_PENDING_ATTR, None) is not None
+                or getattr(req, _HEAD_PENDING_ATTR, None)):
             self._pdflip_turn_insert(req)
 
         token_ids = req.get_fill_ids()

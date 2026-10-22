@@ -112,6 +112,10 @@ BRANCH_PENDING_ATTR = "_pdflip_branch_pending"
 #: the branching point handed from the extend-track setup (``ScheduleBatch._mamba_radix_cache_v2_req_prepare_
 #: for_extend``) to :func:`note_step` of the same step; consumed (cleared) by note_step
 BRANCH_POS_ATTR = "_pdflip_d_branch_at"
+#: HEAD TRACK (22.10., NF rc32 pdflip-14-469, Kopf-Anker): the step's tracks at the '</system-reminder' closes
+#: of the prompt's FIRST user message (the Claude-Code head), a list of plans of the same shape as PENDING_ATTR's,
+#: ascending by position
+HEAD_PENDING_ATTR = "_pdflip_head_pending"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -536,6 +540,11 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if br_stale is not None:
         _free_slot(batch, br_stale[1])
         setattr(req, BRANCH_PENDING_ATTR, None)
+    for hd_pend in getattr(req, HEAD_PENDING_ATTR, None) or ():
+        _free_slot(batch, hd_pend[1])
+        _decline_unconsumed(req, hd_pend[0])
+    if getattr(req, HEAD_PENDING_ATTR, None):
+        setattr(req, HEAD_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     if d_mode():
@@ -560,6 +569,10 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if tok is not None:
         # IMAGE-END TRACK: armed wherever the turn anchor is (``tok``), no own switch
         desc = _note_image_step(batch, desc, req, row, prefix, end, main_track, chunk, page)
+    if tok is not None and not d_mode():
+        # HEAD TRACK (22.10.): armed wherever the turn anchor is on group P, no own switch; last, so a position
+        # another track writes is shared, not doubled
+        desc = _note_head_steps(batch, desc, req, row, prefix, end, main_track, chunk, page, tok)
     if branch_at is not None and d_mode():
         # BRANCH TRACK (review A2): the branching point the step's own track no longer takes, last so that a
         # fork position another track writes is shared, not doubled
@@ -1436,6 +1449,156 @@ def _note_sysgrid_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: i
     return desc
 
 
+# -- HEAD TRACK (NF rc32 22.10., Kopf-Anker) -----------------------------------------
+HEAD_POS_ATTR = "_pdflip_head_pos"
+#: '</' 'system' '-' 'reminder' -- the close of a Claude-Code system-reminder block up to (not including) its '>',
+#: which the tokenizer merges with whatever follows ('><' before the next block, '>' + '\n' before text). Verified
+#: 22.10. against the NF (Qwen3.8-Flash-Next) and the Qwen3.8-27B tokenizer: the same four ids. A constant, not a
+#: switch (order 22.10.: no off switch); another tokenizer simply never matches.
+HEAD_CLOSE_IDS: Tuple[int, ...] = (510, 8678, 12, 75240)
+#: at most this many head tracks per prompt, the lowest. A Claude-Code first user message carries 4 closes (rc32
+#: pdflip-8-255, rebuilt from its transcript: instructions 17503, session context 18040, attribution 18175, the
+#: SubagentHandback note 19468 -- the last one shares the turn track's page); 4 keeps a prompt whose SYS-GRID part
+#: uses its slack (2 slots at a 64k / 131k / 250k system part against the arena share cap of 21) at most 2 over it
+HEAD_MAX = 4
+
+
+def head_positions(ids: Optional[Sequence[int]], tok: Optional[int], page: int,
+                   max_points: int = HEAD_MAX) -> List[int]:
+    """The HEAD positions of a prompt, ascending, distinct, at most ``max_points``: ``floor_page(b - 1)`` for every
+    close ``ids[b-4:b] == HEAD_CLOSE_IDS`` inside the FIRST user message ``ids[u:v]`` (``u`` = :func:`segment_end`,
+    the second turn-start; ``v`` = the next turn-start). ``b`` is the token that holds the close's ``>`` -- the first
+    token a branching prompt may tokenize differently ('><system-reminder>' vs '>\nThis session ...'), so a reader
+    that shares the head through the close shares ``ids[:b]`` and claims at most ``floor_page(b - 1)`` (the turn
+    anchor's rule: a reader sharing ``ids[:i + 1]`` claims ``floor_page(i)``). The anchor sits exactly where that
+    claim ends. Pure: the ids, the env token, the page and the constant close ids."""
+    u = segment_end(ids, tok)
+    if u is None:
+        return []
+    page = max(1, int(page))
+    n = len(ids)
+    try:
+        v = int(ids.index(int(tok), int(u) + 1))
+    except ValueError:
+        v = n
+    close = HEAD_CLOSE_IDS
+    pts: List[int] = []
+    i = int(u) + 1
+    while len(pts) < int(max_points):
+        j = _find(ids, close, i, v)
+        if j is None:
+            break
+        b = j + len(close)
+        if b > v:
+            break
+        t = ((b - 1) // page) * page
+        if t > 0 and (not pts or t != pts[-1]):
+            pts.append(t)
+        i = b
+    return pts
+
+
+def req_head_pos(req: Any, tok: int, grain: int) -> List[int]:
+    """:func:`head_positions` of a request's PROMPT, cached on the request (one scan per request, not per step)."""
+    ids = getattr(req, "origin_input_ids", None)
+    if ids is None:
+        return []
+    key = (len(ids), int(tok), int(grain), HEAD_CLOSE_IDS, HEAD_MAX)
+    cached = getattr(req, HEAD_POS_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    pts = head_positions(ids, tok, grain)
+    try:
+        setattr(req, HEAD_POS_ATTR, (key, pts))
+    except Exception:  # noqa: BLE001
+        pass
+    return pts
+
+
+def _note_head_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                     prefix: int, end: int, main_track: Optional[int], chunk: int,
+                     page: int, tok: int) -> Optional[TurnTracks]:
+    """HEAD TRACK (NF rc32 22.10., boot ..._ded00bd5a7_1022_030836, pdflip-14-469: 6976 tokens recomputed on P).
+
+    THE MEASURED GAP. A Claude-Code prompt's first user message is a run of system-reminder blocks (CLAUDE.md +
+    memory, session context, attribution) and then the task text. Prompts of one head family branch at the END of
+    such a block: a compaction keeps the instructions and the session context and replaces the rest with its summary
+    ('PREFIX-DIVERGE-TEXT rid=pdflip-14-469 ... seg=1 seg_role=user ... before="...reported back.\n</system-reminder"
+    prev_after="><system-reminder>\nAttribution ..." cur_after=">\nThis session is being continued ..."', common=18040),
+    sibling agents share the head through the attribution block and the first words of the task. The front's
+    PROMPT-DIVERGE saw 30 such 'moved' prompts in that boot: 9 left exactly at a close (17936 x8, 18040), 13 inside
+    the text right after one, on the close's page (17977, 18098, 18102). The store holds their KV to that page; the
+    recurrent state only where a P step ended or another track sat. pdflip-8-255 had written the head of the 18040
+    family in ONE step [10816, 19792) with tracks at 11008 (fork), 19456 (turn) and 19776 (END) only, so 14-469
+    claimed 172 of 281 pages ('PDFLIP-CLAIM-SHORT ... lost=109 by=mamba tokens=11008', 'S80 STORE-HOLE have=11008
+    kv_end=17984 class=anchor'): 6976 tokens computed again. The FIRST branch at a close of a new head family pays;
+    P-FORK-CUT / FORK TRACK anchor the fork only for the second reader.
+
+    THE REPAIR: while a P step computes the first user message, one more track per head close
+    (:func:`req_head_pos`) strictly inside the step, below its own track, on its FLA grid -- the turn anchor's
+    machinery, exactly as the SYS-GRID track does for the system part (one gather row per GDN/PLE layer, one mamba
+    slot from the free list; none free = that point skipped and counted, no eviction, no reserve, no timer), each
+    inserted as its own node before the step's insert and published with the chain. A later prompt of the same head
+    hits the head in the cache and runs no head step: the cost is paid once per head family (pdflip-8-255: three
+    anchors 17472 / 17984 / 18112, 3 x 58834944 B). Skipped where another track writes the same position. A promise
+    to a later twin like the other tracks (S52).
+
+    GROUP P ONLY (R11): the positions are a pure function of the ids, so every PP stage plans the same ones; a stage
+    without a free slot plans a subset, never another position. Group D is left out deliberately: at this base a D
+    step's own track can be rank-local (TP0's branching point replaces it, review A2 of nf-rc31-forkanchor, fixed on
+    desk/nf-rc32-forkanchor2-1022 as the 'branch' second track) and a head plan bounded by it would split the group's
+    tree; the rc32 boot had 0 head branches recomputed on D (5 of 5 requests that prefilled through the head ran on
+    P)."""
+    pts = req_head_pos(req, tok, page)
+    if not pts:
+        return desc
+    rid = str(getattr(req, "rid", "?"))
+    protected = int(getattr(req, "cache_protected_len", 0) or 0)
+    taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
+    taken |= {int(p[0]) for p in (getattr(req, SYSGRID_PENDING_ATTR, None) or ())}
+    for attr in (PENDING_ATTR, FORK_PENDING_ATTR, GEN_PENDING_ATTR, CLOSE_PENDING_ATTR, IMAGE_PENDING_ATTR):
+        p = getattr(req, attr, None)
+        if p is not None:
+            taken.add(int(p[0]))
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    plans = []
+    for t in pts:
+        if step_target(prefix, end, t, chunk, main_track) is None:
+            continue
+        if t % max(1, int(page)) != 0 or t <= protected:
+            continue
+        if t in taken:
+            n = _count("head_shared")
+            if _log_due(n):
+                logger.info("PDFLIP HEAD-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; another track writes "
+                            "this very position)", rid, t, prefix, end, n)
+            continue
+        slot = _alloc_slot(batch)
+        if slot is None:
+            n = _count("head_no_slot")
+            if _log_due(n):
+                logger.info("PDFLIP HEAD-ANCHOR SKIP rid=%s reason=no_free_slot at=%d step=[%d,%d) (n=%d; no "
+                            "eviction, no reserve)", rid, t, prefix, end, n)
+            continue
+        if desc is None:
+            desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+        desc.add(row, slot, t, prefix, end - prefix)
+        plans.append((t, slot, desc, int(prefix), int(end)))
+        taken.add(t)
+        _tw.note_track_planned(rid, t)
+        n = _count("head_planned")
+        if _log_due(n):
+            logger.info(
+                "PDFLIP HEAD-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d heads=%s main=%s (extra extend track at "
+                "a system-reminder close of the first user message: a prompt of this head family branching there "
+                "-- a compaction, a sibling agent -- reads its KV up to here instead of the previous chunk anchor)",
+                n, rid, prefix, end, t, pts, main_track)
+    if plans:
+        setattr(req, HEAD_PENDING_ATTR, plans)
+    return desc
+
+
 def has_pending(req: Any) -> bool:
     """A turn, twin or fork plan waits for the tree's next insert of ``req``."""
     return (getattr(req, PENDING_ATTR, None) is not None
@@ -1445,7 +1608,8 @@ def has_pending(req: Any) -> bool:
             or bool(getattr(req, SYSGRID_PENDING_ATTR, None))
             or getattr(req, CLOSE_PENDING_ATTR, None) is not None
             or getattr(req, IMAGE_PENDING_ATTR, None) is not None
-            or getattr(req, BRANCH_PENDING_ATTR, None) is not None)
+            or getattr(req, BRANCH_PENDING_ATTR, None) is not None
+            or bool(getattr(req, HEAD_PENDING_ATTR, None)))
 
 
 def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
@@ -1483,6 +1647,10 @@ def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
     if branch is not None:
         setattr(req, BRANCH_PENDING_ATTR, None)
         out.append(("branch", branch))
+    heads = getattr(req, HEAD_PENDING_ATTR, None) or ()
+    if heads:
+        setattr(req, HEAD_PENDING_ATTR, None)
+        out.extend(("head", p) for p in heads)
     out.sort(key=lambda kp: int(kp[1][0]))
     return out
 
@@ -1729,11 +1897,11 @@ def _label(kind: str) -> str:
     return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR",
             "gen": "GEN-FORK-ANCHOR", "grid": "SYS-GRID-ANCHOR",
             "close": "CLOSE-FORK-ANCHOR", "image": "IMAGE-END-ANCHOR",
-            "branch": "BRANCH-ANCHOR"}.get(kind, "TURN-ANCHOR")
+            "branch": "BRANCH-ANCHOR", "head": "HEAD-ANCHOR"}.get(kind, "TURN-ANCHOR")
 
 
 def _kind_prefix(kind: str) -> str:
-    return kind + "_" if kind in ("twin", "fork", "gen", "grid", "close", "image", "branch") else ""
+    return kind + "_" if kind in ("twin", "fork", "gen", "grid", "close", "image", "branch", "head") else ""
 
 
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,
