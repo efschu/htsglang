@@ -408,6 +408,13 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         # EXTEND-KORRIDOR (22.10.): fund the chunk down to the corridor law, not to the 300 MiB HALT line
         line_mib = corridor_line_mib(rank)
         cap = rows_cap(post_mib, rate, page_size, line_mib)
+        src_class = None
+        if cap < int(configured):
+            # CLASS-VOTE (review 22.10.): a width whose row class this rank has MEASURED (LEND-COST, rows <= the
+            # class's widest reading) is priced by that reading instead of the linear worst-case rate
+            wide = class_rows_cap(post_mib, line_mib, page_size, int(configured), rank)
+            if wide is not None and wide[0] > cap:
+                cap, src_class = wide
         if cap >= int(configured):
             _CACHE["logged_cap"] = None
             return None
@@ -416,12 +423,57 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
             logger.info(
                 f"{CHUNKING_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
                 f"post={post_mib:.0f} rate={rate:.4f} floor={line_mib:.0f}"
+                + ("" if src_class is None else f" class={src_class[0]} class_cost_mib={src_class[1]:.0f}")
                 + ("" if not (measure_armed(rank) or lend_rate(rank) is not None) else
                    f" rate_src={rate_source(start_rate, rank)} start_rate={start_rate:.4f}")
             )
         return cap
     except Exception as exc:  # noqa: BLE001 -- a vote that cannot price abstains
         logger.debug("%s skipped: %s", CHUNKING_MARKER, exc)
+        return None
+
+
+# --------------------------------------------------------------------------
+# CLASS-VOTE (review 22.10., planner item 3): the linear vote ``floor((post - line) / rate)`` prices every width
+# with the WORST per-row cost seen on a wide extend (TP0 rc33: 0.7547 at 2629 rows), but the card cost is not
+# linear in the rows: rc33 TP0 extends of 1000-2000 rows cost 0.54-0.63 MiB/row (1956 rows at 89856 cached:
+# 1192 MiB; 1944 at 98560: 1186; 2024: 1248), the 2100+-row ones 0.67-0.755. In the rc33 replay the linear vote
+# split 59 of 70 wide TP0 extends, 31 of them needlessly (the old run ended above the 767 law); the class vote
+# splits 45, letting none of the 28 breaches through.
+#
+# The LEND-COST table already holds, per row class, the MAXIMUM measured card cost and the WIDEST extend measured
+# in it (``lend_cost_mib``: a width is priced only inside its class and only up to that widest reading -- never
+# extrapolated). The vote may therefore WIDEN its linear cap to the largest page-aligned width ``w`` (<= the
+# configured chunk) with ``line + lend_cost_mib(w) <= post``. It never narrows (the linear cap stays the floor),
+# never prices an unmeasured width, and the result is still this rank's vote in the group MIN (R11). Same
+# depth caveat as ``lend_rate``: a prefix deeper than any measured one can cost more than the class maximum.
+# --------------------------------------------------------------------------
+
+
+def class_rows_cap(post_mib: float, line_mib: float, page_size: int, configured: int,
+                   rank: Optional[int] = None) -> "Optional[tuple]":
+    """``(width, (class, cost_mib))`` -- the widest page-aligned width up to ``configured`` whose row class this
+    rank measured (LEND-COST, ``rows <= widest``) and whose measured cost leaves ``line`` free; ``None`` when no
+    measured width fits or LEND-COST is not armed on this rank. Never raises."""
+    try:
+        if not lend_cost_armed(rank):
+            return None
+        table = _CACHE["lend_cost"]
+        if not table:
+            return None
+        page = max(1, int(page_size or 1))
+        best = None
+        for cls, (_cost, widest) in list(table.items()):
+            w = (min(int(widest), int(configured)) // page) * page
+            if w <= 0:
+                continue
+            c = lend_cost_mib(w)   # the class maximum of w's OWN class, None outside a measured reach
+            if c is None or float(line_mib) + float(c) > float(post_mib):
+                continue
+            if best is None or w > best[0]:
+                best = (w, (lend_cost_class(w), float(c)))
+        return best
+    except Exception:  # noqa: BLE001 -- a vote that cannot price abstains from widening
         return None
 
 
