@@ -272,7 +272,7 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 # rows of exactly these two images had been computed by this very rank one
 # turn earlier.
 #
-# Upstream SGLang keeps such rows in ``MultiModalStaticCache`` keyed by the
+# In upstream SGLang such rows live in ``MultiModalStaticCache``, keyed by the
 # item's content hash (``mm_utils.embedding_cache``, ``get_single``/``set``,
 # consulted in ``_get_chunked_embedding_by_item`` before the ViT). On P that
 # path is never reached for a staged image: the transient stage decides

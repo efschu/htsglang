@@ -197,6 +197,8 @@ def main(argv=None) -> int:
     src = sources.Sources({"gpu_period": 1.0, "docker_ssh": ssh, "docker_host_prefix": args.docker_host_prefix,
                            "pdflip_fronts": args.front, "gpuq": args.gpuq, "state_dir": args.state_dir})
     threading.Thread(target=src.run_forever, args=(stop,), name="sampler-sources", daemon=True).start()
+    # 23.10.: the state roots the containers have mounted (docker inspect) feed the IPC reader (ipcstate.StateRoots)
+    boots.ipc.attach_containers(lambda: sources.state_roots_from_view(src.view()))
     if bridge is not None:
         bridge.pcie_source = lambda: list(src.pcie_hist)
     book = energy.EnergyBook(args.state_dir, live.BUCKET_S)

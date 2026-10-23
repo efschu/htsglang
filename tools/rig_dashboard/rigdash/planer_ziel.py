@@ -316,20 +316,20 @@ def slow_hint(outcome: Optional[str], plan: Optional[dict]) -> Optional[dict]:
     if not over and not fb:
         return None
     waves, std = d.get("waves"), d.get("waves_default")
-    saetze: List[str] = []
+    sets: List[str] = []
     if est is not None:
-        saetze.append("The planner estimates %.1f ms per bs1 decode round on the slowest card, against %.1f ms to %.1f ms measured on the reference rig "
+        sets.append("The planner estimates %.1f ms per bs1 decode round on the slowest card, against %.1f ms to %.1f ms measured on the reference rig "
                       "(the hint starts above %.1f ms, twice the reference)." % (est, REFERENCE_BS1_ROUND_MS[0], REFERENCE_BS1_ROUND_MS[1], SLOW_BS1_ROUND_MS))
     if fb:
-        saetze.append("No form of the decode group held the standard %d overflow waves; the solver searched again with up to %d, the waves Form A needs."
+        sets.append("No form of the decode group held the standard %d overflow waves; the solver searched again with up to %d, the waves Form A needs."
                       % (int(fb.get("env_waves") or 0), int(fb.get("form_a_waves") or 0)))
     if waves is not None and std is not None and int(waves) > int(std):
-        saetze.append("The decode group runs up to %d overflow waves (Form A standard: %d)." % (int(waves), int(std)))
-        saetze.append("The overflow waves are not priced, so the figure is a lower bound.")
+        sets.append("The decode group runs up to %d overflow waves (Form A standard: %d)." % (int(waves), int(std)))
+        sets.append("The overflow waves are not priced, so the figure is a lower bound.")
     if "UNMEASURED" in str(d.get("miss_cost_source") or ""):
-        saetze.append("The cost per missed expert row is the unmeasured seed; the first boot is the measurement.")
-    saetze.append("No lock: the layout can be started.")
-    return {"code": "SLOW-ESTIMATE", "label": "startable, slow (estimate)", "saetze": saetze,
+        sets.append("The cost per missed expert row is the unmeasured seed; the first boot is the measurement.")
+    sets.append("No lock: the layout can be started.")
+    return {"code": "SLOW-ESTIMATE", "label": "startable, slow (estimate)", "saetze": sets,
             "round_bs1_ms": est, "reference_ms": list(REFERENCE_BS1_ROUND_MS), "threshold_ms": SLOW_BS1_ROUND_MS,
             "waves": waves, "waves_default": std, "wave_fallback": fb}
 

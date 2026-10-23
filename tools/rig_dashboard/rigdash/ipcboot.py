@@ -1510,7 +1510,7 @@ class IpcBoots:
     (sampler.RingStore); "reader" = the web server: reads state.json/events and the rank files for the
     fields, but the ring comes from ``store`` -- the reading moment is never on the web server's GIL."""
 
-    def __init__(self, roots=ipcstate.STATE_ROOTS, store=None, role: str = "both"):
+    def __init__(self, roots=None, store=None, role: str = "both"):
         self.store, self.role = store, role
         self._synced_t = 0.0
         self._extent_t = 0.0
