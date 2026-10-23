@@ -3099,7 +3099,7 @@ class HiCacheFile(HiCacheStorage):
         if self.exists(key):
             # A complete blob is content-addressed: it already holds exactly
             # these bytes. Refresh recency, write nothing.
-            self._evictor.touch(suffixed, self._existing_path(suffixed))
+            self._touch_present([suffixed])
             return True
 
         tensor_path = self._sharded_path(suffixed)
@@ -3497,7 +3497,7 @@ class HiCacheFile(HiCacheStorage):
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
-            self._evictor.touch(suffixed, self._existing_path(suffixed))
+            self._touch_present([suffixed])
             return True
 
         # New pages are always sharded, whatever the directory looked like before.
@@ -3649,11 +3649,17 @@ class HiCacheFile(HiCacheStorage):
                 return results
         # Presence for the whole batch in one call: a complete blob is
         # content-addressed and only gets its recency refreshed.
-        present = self._stat_stems([p[2] for p in plan])
+        _prev_pm = getattr(_FILL_TL, "paths", None)
+        _FILL_TL.paths = {} if write_nostat_on() else None   # WAKEEXT-1023: the batched stat names the paths
+        try:
+            present = self._stat_stems([p[2] for p in plan])
+            _pm = _FILL_TL.paths
+        finally:
+            _FILL_TL.paths = _prev_pm
+        self._touch_present([p[2] for p in plan if p[2] in present], _pm)
         todo = []
         for i, key, suffixed, window, flat in plan:
             if suffixed in present:
-                self._evictor.touch(suffixed, self._existing_path(suffixed))
                 continue
             if not self._evictor.reserve(
                 suffixed,
@@ -3980,7 +3986,10 @@ class HiCacheFile(HiCacheStorage):
             listed = idx.has(list(stems))
         except Exception:  # noqa: BLE001 -- cannot re-read: void (the next pass stats again)
             listed = [False] * len(stems)
-        bad = [int(s_) for s_, ok in zip(np.asarray(slots, dtype=np.int64).tolist(), listed) if not ok]
+        _slots_l = np.asarray(slots, dtype=np.int64).tolist()
+        if not all(listed) and self._l3wb_publish_heal_on():
+            listed = self._l3wb_publish_heal(idx, list(stems), list(listed))
+        bad = [int(s_) for s_, ok in zip(_slots_l, listed) if not ok]
         if not bad:
             return 0
         _b = np.asarray(bad, dtype=np.int64)
@@ -3990,10 +3999,82 @@ class HiCacheFile(HiCacheStorage):
             sec[0][_b] = -1
         n = getattr(HiCacheFile, "_a5n1_voided", 0) + len(bad)
         HiCacheFile._a5n1_voided = n
-        logger.info("S109-A5-N1 L3WB-PUBLISH-RACE voided=%d (total %d): the L3 LRU took the file between the pass's "
-                    "stat/commit and its publish -- not recorded as copied; the next pass copies it again",
-                    len(bad), n)
+        if self._l3wb_publish_log_ok("race"):
+            logger.info("S109-A5-N1 L3WB-PUBLISH-RACE voided=%d (total %d): the L3 LRU took the file between the "
+                        "pass's stat/commit and its publish -- not recorded as copied; the next pass copies it again",
+                        len(bad), n)
         return len(bad)
+
+    @staticmethod
+    def _l3wb_publish_heal_on() -> bool:
+        """WAKEEXT-1023 (A5-N1 false positive): ``FLLIPER_PDFLIP_L3WB_PUBLISH_HEAL`` -- default ON, "0" = the
+        re-read voids every stem the index does not list (the 20.10. form)."""
+        return os.environ.get("FLLIPER_PDFLIP_L3WB_PUBLISH_HEAL", "1").strip() not in ("0", "false", "")
+
+    def _l3wb_publish_heal(self, idx, stems: list, listed: list) -> list:
+        """WAKEEXT-1023: tell the index LAG from the LRU unlink before :meth:`_l3wb_publish` voids.
+
+        Metal (27B AutoRound rc35i4ar, boot 1023_140032): P PP0 logged ``L3WB-PUBLISH-RACE`` 13867 times, D TP0
+        4992 -- and the L3 LRU took NO file in that boot (no ``L3-EVICT-FILE`` line in P or D, every journal apply
+        ``-0 files``, cap 150 GB against 35 GB on disk). The re-read missed for another reason: since S36 both groups'
+        write-behind threads walk the SAME shared arena; the sibling's ``pageio.write_pages`` renames the final file
+        in C, and its Python ``commit`` (the ``#1459`` add) follows only after its whole chunk returned. This pass's
+        write in that window gets status 2 (file complete), adopts it (``adopt_foreign`` indexes nothing), publishes,
+        re-reads -- and the stem is not listed YET. The void then wrote -1 into the SHARED record, possibly over the
+        sibling's own publish of the same generation.
+
+        Linearizable against the LRU (``os.remove`` -> ``idx.remove`` -> ``on_evict``): first ADD the missing stems,
+        then stat them (``_stat_stems``, which asks the index and strikes a listed stem whose file is gone from the
+        index and the evictor). A stem whose file is on disk after the add stays listed and published: an unlink
+        after this stat removes it from the index and voids the record through ``on_evict`` after this publish. A
+        stem whose file is gone is struck and voided exactly as before. Returns the new ``listed``."""
+        miss = [st for st, ok in zip(stems, listed) if not ok]
+        if not miss:
+            return listed
+        try:
+            idx.add(miss)
+            present = self._stat_stems(miss)
+        except Exception:  # noqa: BLE001 -- cannot verify: void as before (the next pass stats again)
+            return listed
+        healed = 0
+        out = []
+        for st, ok in zip(stems, listed):
+            if not ok and st in present:
+                ok = True
+                healed += 1
+            out.append(ok)
+        if healed:
+            n = getattr(HiCacheFile, "_a5n1_healed", 0) + healed
+            HiCacheFile._a5n1_healed = n
+            if self._l3wb_publish_log_ok("heal"):
+                logger.info("S109-A5-N1 L3WB-INDEX-LAG healed=%d (total %d, voided total %d): the file is on disk "
+                            "(the sibling group's write-behind completed it and had not yet listed it in #1459) -- "
+                            "listed now and kept as copied, no void (WAKEEXT-1023)",
+                            healed, n, int(getattr(HiCacheFile, "_a5n1_voided", 0)))
+        return out
+
+    #: WAKEEXT-1023: per kind ("race" / "heal") at most this many lines per window; the window's first line after
+    #: a suppression names how many were suppressed. The counters in the lines stay exact.
+    _A5N1_LOG_WINDOW_S = 10.0
+    _A5N1_LOG_PER_WINDOW = 8
+
+    def _l3wb_publish_log_ok(self, kind: str) -> bool:
+        st = HiCacheFile.__dict__.get("_a5n1_logwin")
+        if st is None:
+            st = {}
+            HiCacheFile._a5n1_logwin = st
+        now = time.monotonic()
+        t0, n, sup = st.get(kind, (0.0, 0, 0))
+        if now - t0 >= self._A5N1_LOG_WINDOW_S:
+            if sup:
+                logger.info("S109-A5-N1 L3WB-PUBLISH log window kind=%s suppressed=%d (counters in the lines are "
+                            "totals)", kind, sup)
+            t0, n, sup = now, 0, 0
+        if n < self._A5N1_LOG_PER_WINDOW:
+            st[kind] = (t0, n + 1, sup)
+            return True
+        st[kind] = (t0, n, sup + 1)
+        return False
 
     def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None,
                              cont: bool = False, slice_s: Optional[float] = None) -> dict:
@@ -5063,6 +5144,46 @@ class HiCacheFile(HiCacheStorage):
                 _touch(force=True)
         finally:
             _wb.read_exit()
+
+    def _known_paths(self, stems, pm: Optional[dict] = None) -> list:
+        """WAKEEXT-1023 (write path, ``qwen-schreibpfad-stat-1023``): the file path of stems KNOWN to be on disk
+        (a batched stat, ``exists`` or the read just found them) without a stat of its own. Without a legacy flat
+        layout every file is sharded (new pages are always sharded; ``_flat_layout_present`` is decided once), so
+        the path is ``_sharded_path``. With one, the batched stat's path map ``pm`` names it, else ``_existing_path``
+        (one stat) as before. ``FLLIPER_HICACHE_L3_WRITE_NOSTAT=0`` = ``_existing_path`` per page."""
+        if not write_nostat_on():
+            return [self._existing_path(st) for st in stems]
+        if not self._flat_layout_present():
+            return [self._sharded_path(st) for st in stems]
+        pm = pm or {}
+        return [pm.get(st) or self._existing_path(st) for st in stems]
+
+    def _touch_present(self, stems, pm: Optional[dict] = None) -> None:
+        """WAKEEXT-1023: refresh the recency of pages a write found complete on disk. Was one ``_existing_path``
+        (1-2 Python ``os.stat``) plus one ``os.utime`` per page, each a GIL hand-off in the rank process
+        (``_batch_set_each``: hundreds to thousands of stems per backup batch). Now the paths come without a stat
+        (:meth:`_known_paths`) and the eviction owner's mtime bump is ONE C call (``pageio.touch_paths``); the
+        in-memory LRU and the journal ``T`` line are the evictor's ``touch`` as before (``mtime=False``)."""
+        if not stems:
+            return
+        if not write_nostat_on():
+            for st in stems:
+                self._evictor.touch(st, self._existing_path(st))
+            return
+        paths = self._known_paths(stems, pm)
+        mtime = True
+        if getattr(self._evictor, "enabled", False):
+            try:
+                from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+                _pio = _load_pageio()
+                if _pio is not None and getattr(_pio, "has_touch_paths", False):
+                    _pio.touch_paths(paths)
+                    mtime = False
+            except Exception:  # noqa: BLE001 -- best effort, the per-page utime below
+                mtime = True
+        for st, p in zip(stems, paths):
+            self._evictor.touch(st, p, mtime=mtime)
 
     def _fill_read_paths(self, stems) -> list:
         """STOREREAD-1023: the file path of every stem a fill reads.
@@ -7134,6 +7255,15 @@ def l3_read_mt_on() -> bool:
 
 def fill_read_nostat_on() -> bool:
     return _env_on(L3_FILL_NOSTAT_ENV)
+
+
+#: WAKEEXT-1023: the write path's recency touch of pages already on disk without a Python stat per page and with
+#: one C utime call (``HiCacheFile._touch_present``). Default ON, "0" = ``_existing_path`` + ``os.utime`` per page.
+L3_WRITE_NOSTAT_ENV = "FLLIPER_HICACHE_L3_WRITE_NOSTAT"
+
+
+def write_nostat_on() -> bool:
+    return _env_on(L3_WRITE_NOSTAT_ENV)
 _l3_pool = None
 _l3_pool_n = 0
 _l3_pool_lock = threading.Lock()

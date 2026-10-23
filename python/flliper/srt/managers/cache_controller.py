@@ -188,6 +188,18 @@ def arena_ref_recheck_enabled(env=None) -> bool:
     return (e.get(ENV_REF_RECHECK, "") or "").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _kv_dl_paths(be, stems) -> list:
+    """WAKEEXT-1023: the DURCHLAUF pages' file paths -- the store read just found them on disk, so no Python stat
+    per page (``HiCacheFile._known_paths``); a backend without it (test double) keeps ``_existing_path``."""
+    kp = getattr(be, "_known_paths", None)
+    if callable(kp):
+        try:
+            return kp(stems)
+        except Exception:  # noqa: BLE001 -- the per-page path below
+            pass
+    return [be._existing_path(st) for st in stems]
+
+
 def _kv_dl_resolve(ctl, pool, slots, stems, hash_values, held) -> int:
     """S36 KV-DURCHLAUF: the DURCHLAUF pages of a store read's slot list become disk pages -- the L3 file held open
     in ``kv_durchlauf.REGISTRY`` (``DiskRef``). A file that cannot be opened (gone since the stat) ends the prefix
@@ -201,7 +213,7 @@ def _kv_dl_resolve(ctl, pool, slots, stems, hash_values, held) -> int:
     be = ctl.storage_backend
     _kv_dl.REGISTRY.backend = be
     ds = _kv_dl.REGISTRY.alloc([hash_values[j] for j in pos], [stems[j] for j in pos],
-                               [be._existing_path(stems[j]) for j in pos], int(pool._page_bytes))
+                               _kv_dl_paths(be, [stems[j] for j in pos]), int(pool._page_bytes))
     cut = None
     for j, d in zip(pos, ds):
         if d is None:

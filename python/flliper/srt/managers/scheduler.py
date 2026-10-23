@@ -1706,6 +1706,19 @@ def _pdflip_resume_warm_tick(sched) -> int:
         return 0
 
 
+def _pdflip_wake_defer_note(scheduler, batch) -> None:
+    """WAKEEXT-1023: tell ``pdflip.wake_cpu_defer`` that a launch returned (one attribute read while not armed)."""
+    try:
+        from flliper.srt.pdflip import wake_cpu_defer as _wcd
+
+        if not _wcd.armed():
+            return
+        mode = getattr(getattr(batch, "forward_mode", None), "name", None)
+        _wcd.note_pass(mode, len(getattr(scheduler, "waiting_queue", None) or ()))
+    except Exception:  # noqa: BLE001 -- the deferral is never a gate
+        pass
+
+
 def _pdflip_resume_first_token_note(sched, batch) -> bool:
     """RW instrument (NF's three numbers, one line per wake): wake -> first
     decode forward, the resume leg's duration, and the first eager extend's
@@ -4731,6 +4744,7 @@ class Scheduler(
                     self.idle_sleeper.reset()
                 result = self.run_batch(batch)
                 _pdflip_decode_first_note(self, batch)  # F3: decode rounds since the wake
+                _pdflip_wake_defer_note(self, batch)  # WAKEEXT-1023
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -4849,6 +4863,7 @@ class Scheduler(
                 _slow.span("run_ms", _t_slow)
                 self.result_queue.append((batch.copy(), batch_result))
                 self._pdflip_post_wake_pass_log(batch)  # Wake-Parallel item 2
+                _pdflip_wake_defer_note(self, batch)  # WAKEEXT-1023: deferred wake work after the first launches
                 _pdflip_resume_first_token_note(self, batch)  # RW: one line per wake
                 _pdflip_wake_cohort_note(self, batch)  # L1: wake -> last cohort member's first decode
                 _pdflip_decode_first_note(self, batch)  # F3: decode rounds since the wake

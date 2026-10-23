@@ -12561,6 +12561,14 @@ class SchedulerPPMixin:
                     _gap_host["proxy_recv"] = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
                     _gap.begin()
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                try:  # WAKEEXT-1023: deferred wake work (the store rescan) after the first launches
+                    from flliper.srt.pdflip import wake_cpu_defer as _wcd
+
+                    if _wcd.armed():
+                        _wcd.note_pass(getattr(getattr(cur_batch, "forward_mode", None), "name", None),
+                                       len(getattr(self, "waiting_queue", None) or ()))
+                except Exception:  # noqa: BLE001 -- the deferral is never a gate
+                    pass
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
