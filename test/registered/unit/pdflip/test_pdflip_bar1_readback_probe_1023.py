@@ -233,3 +233,102 @@ class TestProbeOnTheMapping(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The lane-time line separates the collector's START from the transport
+# (boot dkr27bnvfp4duorebarbar1duo10230932, ACS 0011: 25 of the 49 tags under
+# 10 GB/s had a depositor span 0.1-0.27 s longer than the collector's whole
+# collect -- the depositor waited for free(0) while its collector had not
+# begun). ``first_free_ms`` is that wait, ``xfer_GBs`` the rate without it.
+# ---------------------------------------------------------------------------
+
+def _late_collector_run(delay_s, ring=3, n=7):
+    import ctypes
+    import os
+    import tempfile
+    import threading
+    from types import SimpleNamespace
+
+    from flliper.srt.pdflip import weight_exchange_transport as tp
+
+    slot = 4096
+
+    def addr(buf):
+        return ctypes.addressof(ctypes.c_char.from_buffer(buf))
+
+    class Ops:
+        def __init__(self):
+            self._n, self._keep = 0, []
+
+        def create_stream(self, device):
+            self._n += 1
+            return 100 + self._n
+
+        def synchronize(self, stream):
+            pass
+
+        def memcpy_async(self, dst, src, nb, stream):
+            ctypes.memmove(dst, src, nb)
+
+        def memcpy2d_async(self, *a):
+            raise AssertionError("flat only")
+
+        def ptr_attrs(self, a):
+            return (0, 2, 0)
+
+        def raw_malloc(self, device, nb):
+            b = bytearray(nb)
+            self._keep.append(b)
+            return addr(b)
+
+        def rdma_flush(self, device):
+            pass
+
+    bl._RB_SCRATCH.clear()
+    root = tempfile.mkdtemp(prefix="ff1023")
+    pairs = ((0, 1),)
+    window = bytearray(slot * ring)
+    dep = bl.Bar1Lanes("n1", "P", 0, 0, pairs, log=lambda *_a: None, root=root)
+    col = bl.Bar1Lanes("n1", "D", 1, 0, pairs, log=lambda *_a: None, root=root)
+    col.recv["p0"] = SimpleNamespace(dptr=addr(window), slot_bytes=slot, ring=ring)
+    dep.peers["p0"] = SimpleNamespace(dev_ptr=addr(window), slot_bytes=slot, ring=ring)
+    srcs = [bytearray(os.urandom(slot)) for _ in range(n)]
+    dsts = [bytearray(slot) for _ in range(n)]
+    descs = [SimpleNamespace(kind=tp.FLAT, nbytes=slot, src_off=0, dst_off=0,
+                             param_name=f"w{i}", tag="weights_9",
+                             src_ptr=addr(srcs[i]), dst_ptr=addr(dsts[i]))
+             for i in range(n)]
+    out, dlog = {}, []
+
+    def collect():
+        time.sleep(delay_s)
+        out["c"] = bl.run_bar1_units(descs, Ops(), lanes=col, lane_key="p0", role="dst",
+                                     seq="5-weights_9", phase="collect", budget_s=10.0,
+                                     log=lambda *_a: None)
+
+    th = threading.Thread(target=collect)
+    th.start()
+    out["d"] = bl.run_bar1_units(descs, Ops(), lanes=dep, lane_key="p0", role="src",
+                                 seq="5-weights_9", phase="deposit", budget_s=10.0,
+                                 log=dlog.append)
+    th.join(20)
+    assert out == {"c": "", "d": ""}, out
+    assert all(bytes(s) == bytes(d) for s, d in zip(srcs, dsts))
+    line = [x for x in dlog if "lane-time" in x][0]
+    f = dict(re.findall(r"(\w+)=([\d.]+)", line))
+    return float(f["first_free_ms"]), float(f["rate_GBs"]), float(f["xfer_GBs"]), float(f["total_ms"])
+
+
+class TestFirstFreeSeparatesTheCollectorStart(CustomTestCase):
+    def test_a_late_collector_shows_as_first_free_not_as_transport(self):
+        ff, rate, xfer, total = _late_collector_run(0.3)
+        self.assertGreater(ff, 250.0)
+        self.assertGreater(total - ff, 0.0)
+        self.assertLess(total - ff, 0.5 * total)
+        self.assertGreaterEqual(xfer, rate)
+
+    def test_a_ready_collector_has_a_small_first_free(self):
+        ff, _rate, _xfer, total = _late_collector_run(0.0)
+        self.assertLess(ff, 200.0)
+        self.assertLessEqual(ff, total)

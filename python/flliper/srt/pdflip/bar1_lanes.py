@@ -1634,9 +1634,17 @@ class LaneClock:
     """
 
     __slots__ = ("credit", "issue", "sync", "sync_cpu", "max_sync", "send",
-                 "syncs", "sync_skipped")
+                 "syncs", "sync_skipped", "first_free")
 
     def __init__(self) -> None:
+        #: barlink-switch-1023: the depositor's wait for ``free(0)`` -- the
+        #: first slot coming back. It holds the collector's START (its turn,
+        #: its wake) plus one slot's round trip, not the transport: boot
+        #: dkr27bnvfp4duorebarbar1duo10230932 had 25 of its 49 tags under
+        #: 10 GB/s with the depositor span 0.1-0.27 s longer than the
+        #: collector's whole collect. ``xfer_GBs`` on the lane-time line is
+        #: the rate without it.
+        self.first_free = 0.0
         self.syncs = 0          # FLIP-LEGS: per-batch syncs asked for ...
         self.sync_skipped = 0   # ... and how many found the stream drained
         self.credit = 0.0
@@ -1655,7 +1663,8 @@ class LaneClock:
         ms = 1000.0
         return (f"credit_ms={self.credit * ms:.0f} issue_ms={self.issue * ms:.0f} "
                 f"sync_ms={self.sync * ms:.0f} sync_cpu_ms={self.sync_cpu * ms:.0f} "
-                f"max_sync_ms={self.max_sync * ms:.1f} send_ms={self.send * ms:.0f}")
+                f"max_sync_ms={self.max_sync * ms:.1f} send_ms={self.send * ms:.0f} "
+                f"first_free_ms={self.first_free * ms:.0f}")
 
 
 def timed_sync(ops, stream, clock: LaneClock, query: bool = False) -> None:
@@ -2030,6 +2039,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                                 f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
                     clk.credit += time.perf_counter() - tw
+                    if g == ring:
+                        clk.first_free += time.perf_counter() - tw
                 if _gate is not None:
                     _gate_ms += _gate.before_issue(lane_key, ops)
                 ti = time.perf_counter()
@@ -2138,6 +2149,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             tw = time.perf_counter()
             if via == "sock":
                 for g in range(max(0, nb - ring), nb):
+                    tf = time.perf_counter()
                     try:
                         got_free = _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
                                                 lanes.rank, "trailing-free", on_tick=tick, own_state=tick_state)
@@ -2147,6 +2159,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     if got_free is None:
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no trailing 'free' for "
                                 f"batch {g} within {budget_s:.0f} s")
+                    if g == 0:      # a tag of <= ring batches: free(0) comes back here
+                        clk.first_free += time.perf_counter() - tf
             try:
                 got_done = _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
                                         lanes.rank, "done", on_tick=tick, own_state=tick_state)
@@ -2173,7 +2187,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     log(f"PDFLIP-BAR1 lane-time lane={lane_key} phase={phase} seq={seq} units={npieces} "
         f"batches={nb} bytes={total} total_ms={total_s * 1000:.0f} "
         f"wait_ms={clk.credit * 1000:.0f} copy_sync_ms={clk.sync * 1000:.0f} "
-        f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
+        f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} "
+        f"xfer_GBs={(total / max(total_s - clk.first_free, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
         f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
         f"lag={lag} prep_ms={prep_s * 1000:.0f}"
         + (f" issue_gil={gil_mode}" if gil_mode else "")
