@@ -754,6 +754,12 @@ class Envs:
     # read once from P's /get_server_info (top112: --dual-p-kv-max-tokens 114688 -> 114682), so prompts between P's
     # ceiling and max-kv no longer reach P. 0 = off (default).
     FLLIPER_PDFLIP_FRONT_REJECT_OVERLONG = EnvBool(False)
+    # CONTEXT-GATE-KV-CAP (27b-int4ar 23.10., pdflip-4-82): in EVERY form the CONTEXT-GATE refuses against
+    # min(the groups' context_length, their --max-kv-per-request) -- a prompt above the request cap but under the
+    # context (131360 tokens against max-kv 131072, context 262144) was routed, reached D and died there with
+    # REQ RE-CONSTRUCTED / #801 aborts instead of the clean 400 a client (Claude Code) compacts on. Default on;
+    # 0 = the gate uses the context length alone (as before).
+    FLLIPER_PDFLIP_CONTEXT_GATE_KV_CAP = EnvBool(True)
     # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
     # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
     # held the whole queue): when P is idle (no leg in flight) and the only

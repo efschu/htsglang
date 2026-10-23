@@ -8418,13 +8418,21 @@ class Front:
     _DATAURI_RE = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
 
     def _context_len(self) -> int:
-        """The groups' context length: their server info, else the checkpoint's."""
+        """The groups' context length: their server info, else the checkpoint's -- capped at the groups'
+        ``max_kv_per_request`` (CONTEXT-GATE-KV-CAP, default on): the scheduler refuses a prompt whose length
+        reaches that cap (validate_input_length), so it is the length the groups actually serve."""
         info = self.__dict__.get("_store_probe_info") or {}
         v = info.get("context_length")
-        if isinstance(v, int) and v > 0:
-            return v
-        v = getattr(getattr(self, "ftok", None), "context_len", None)
-        return int(v) if isinstance(v, int) and v > 0 else 0
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            ctx = int(v)
+        else:
+            v = getattr(getattr(self, "ftok", None), "context_len", None)
+            ctx = int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+        if ctx > 0 and envs.FLLIPER_PDFLIP_CONTEXT_GATE_KV_CAP.get():
+            kv = info.get("max_kv_per_request")
+            if isinstance(kv, int) and not isinstance(kv, bool) and 0 < kv < ctx:
+                return int(kv)
+        return ctx
 
     def _context_gate(self, rid: str, text: str, xx: Any, est_prompt: int):
         """400 for a request the groups would refuse as over-context, else None."""
