@@ -9936,10 +9936,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # sweep, so a memo left by a sweep that raised is never read by the next one
         self._pdflip_sweep_room_memo = _sweep_room_memo()
         queue = list(first or []) + ([] if chain_only else [self.root_node])   # xsn344: the retain's own chain first
+        # SWEEPCENSUS-1023: a chain node is queued from ``first`` AND as its parent's child, so a chain walk visited
+        # node k k times (S108 TURN-END-L2 rid=pdflip-50-349 chain=88 unbacked=1965, issue_ms=43985 cpu 43819, D TP0
+        # 23:30-23:35Z) -- each visit of a refused node asked the room again. One walk per node; the membership test
+        # is a set (it was a list scan per pop).
+        _first_ids = {id(n) for n in (first or [])} if chain_only else None
+        _walked_ids = set() if chain_only else None
         while queue:
             node = queue.pop(0)
-            if chain_only and node is not self.root_node and node not in first:
-                continue   # xsn347: the chunk sweep walks the chain only (the BFS cost 109 ms per chunk)
+            if chain_only and node is not self.root_node:
+                if id(node) not in _first_ids or id(node) in _walked_ids:
+                    continue   # xsn347: the chunk sweep walks the chain only (the BFS cost 109 ms per chunk)
+                _walked_ids.add(id(node))
             # xsn342: a bounded sweep -- wall budget (retain) and a full mamba
             # arena end it; the remaining nodes stay unbacked for the next one.
             if clock is not None and clock.expired():
