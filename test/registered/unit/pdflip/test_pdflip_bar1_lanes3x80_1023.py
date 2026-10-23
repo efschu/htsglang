@@ -499,7 +499,7 @@ class TestLaneIntegrity(CustomTestCase):
         self.assertEqual(a, bl.integrity_plan(batches, "9-weights_3", 8, tp))
         self.assertEqual(len(a), 8)
         self.assertEqual(a[0][:2], (0, 0))
-        self.assertEqual(a[1][:2], (0, 1))
+        self.assertEqual(a[1][:2], (0, len(pcs) - 1))
         for g, i, row, off, n in a:
             pc = pcs[i]
             span = pc.nbytes if pc.kind == tp.FLAT else pc.run_bytes
