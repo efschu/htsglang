@@ -48,6 +48,8 @@ from flliper.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    SELECTOR_Q_GUARD_STATS,
+    selector_q_guard_scatter,
 )
 from flliper.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -520,6 +522,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
+        self._q_guard_stats = None  # 27b-specverify-1023: device counters
+        self._q_guard_rounds = 0
+        self._q_guard_last = None
         self._selector_sample = None  # DFlash2: (candidate_ids, q_rows) of a sampling round
         self._logged_first_verify = False
         # T156 stage 3 (cross-algorithm schedule mode, set by CrossAlgoWorker):
@@ -2002,8 +2007,29 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._draft_probs_buf = buffer
         draft_probs = buffer[:bs]
+        draft_tokens = candidates[:, 1:]
+        guard = envs.FLLIPER_DFLASH_Q_GUARD.get()
         try:
-            draft_probs.scatter_(-1, candidate_ids, q_rows.float())
+            if guard:
+                # 27b-specverify-1023: a q row that is no valid proposal for the
+                # drafted token (non-finite, off-sum, token not among the ids,
+                # duplicates) verifies target-only -- exact for any proposal.
+                stats = self._q_guard_stats
+                if stats is None or stats.device != candidates.device:
+                    stats = self._q_guard_stats = torch.zeros(
+                        len(SELECTOR_Q_GUARD_STATS),
+                        dtype=torch.int64,
+                        device=candidates.device,
+                    )
+                selector_q_guard_scatter(
+                    draft_probs=draft_probs,
+                    candidate_ids=candidate_ids,
+                    q_rows=q_rows,
+                    draft_tokens=draft_tokens,
+                    stats=stats,
+                )
+            else:
+                draft_probs.scatter_(-1, candidate_ids, q_rows.float())
             accept_len, bonus, _ = accept_sampling(
                 candidates=candidates,
                 target_logits=next_token_logits,
@@ -2019,7 +2045,34 @@ class DFlashWorkerV2(BaseSpecWorker):
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
+            if guard:
+                # the fallback's point mass sits at x, which need not be a candidate
+                draft_probs.scatter_(-1, draft_tokens.to(torch.int64).unsqueeze(-1), 0.0)
+        if guard:
+            self._q_guard_report()
         return accept_len.to(torch.int32), bonus.to(torch.int64)
+
+    def _q_guard_report(self) -> None:
+        """DFLASH-Q-INVALID (27b-specverify-1023): every 256 guarded sampling rounds
+        one host read of the device counters; a line on TP0 when a slot fell back
+        since the last line (plus the first read, so an armed guard is visible)."""
+        self._q_guard_rounds += 1
+        if self._q_guard_rounds % 256 != 0 or self._q_guard_stats is None:
+            return
+        vals = [int(v) for v in self._q_guard_stats.tolist()]
+        last = self._q_guard_last
+        self._q_guard_last = vals
+        if self.tp_rank != 0:
+            return
+        if last is not None and vals[1] == last[1]:
+            return
+        logger.warning(
+            "DFLASH-Q-INVALID rounds=%d %s (a fallback slot verifies target-only; "
+            "a non-zero count means the draft handed the verify a q row that is "
+            "no proposal distribution -- FLLIPER_DFLASH_Q_GUARD=1)",
+            self._q_guard_rounds,
+            " ".join(f"{k}={v}" for k, v in zip(SELECTOR_Q_GUARD_STATS, vals)),
+        )
 
     def _greedy_sample_from_quantized_head(
         self,
