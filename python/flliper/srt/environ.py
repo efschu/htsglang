@@ -2553,6 +2553,14 @@ class Envs:
     # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
     # else /tmp); see debug_utils/cuda_coredump.py.
     FLLIPER_CUDA_COREDUMP_DIR = EnvStr(None)
+    # NF #162 (23.10.): with FLLIPER_CUDA_COREDUMP=1 every process importing
+    # debug_utils/cuda_coredump adds skip_abort to CUDA_COREDUMP_GENERATION_FLAGS
+    # -- effective for the scheduler ranks through the launch_server group
+    # process, before it spawns them (a rank's driver latches the env it was
+    # spawned with). The driver then writes the GPU dump and RETURNS the error
+    # (the rank dies down its logged exception path) instead of calling abort(),
+    # which drops the traceback/W113 lines and writes a CPU core of the rank.
+    FLLIPER_CUDA_COREDUMP_SKIP_ABORT = EnvBool(True)
     FLLIPER_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
