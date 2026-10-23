@@ -3103,6 +3103,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ) = self._solo_pool_filter_prefill(
                     batch, target_hidden, batch.out_cache_loc, positions
                 )
+            if self._solo_pool_mapper is not None:
+                # 27b-ddeath-1023: a prefill forward is a mapper ROUND. The LRU
+                # reclaim only frees slots "not touched in the current round",
+                # and the round used to advance on the DECODE prep alone. A
+                # long chunked D prefill with no decode in between (idle D,
+                # #running-req 0) therefore wrote every chunk at ONE epoch:
+                # boot ...10231804 died at 18:10:03Z with 'DFLASH small solo
+                # pool exhausted: need 87 more draft slots but only 0
+                # reclaimable of 24673 total (ctx cap 2048)' at 22872 of a
+                # 32k-token prompt -- the request's own earlier chunks (outside
+                # any future window of it) were pinned by the stale epoch.
+                # Advancing here makes earlier forwards' rows reclaimable,
+                # oldest first; this forward's rows are protected as before.
+                self._solo_pool_mapper.begin_round()
             if prefill_cache_loc is not None and prefill_cache_loc.numel() > 0:
                 self._append_target_hidden_to_draft_kv_by_loc(
                     target_hidden=prefill_hidden,
