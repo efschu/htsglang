@@ -5782,6 +5782,26 @@ class HiCacheFile(HiCacheStorage):
         except Exception:  # noqa: BLE001 -- fail closed
             return [False] * len(stems)
 
+    l3_listed._l3sec_ptrs_twin = True   # FLIPTIME-1023: ``l3_listed_ptrs`` below answers for it (l3_secured._listed_mask)
+
+    def l3_listed_ptrs(self, ptrs, n: int):
+        """FLIPTIME-1023: ``l3_listed`` over a ready ``char **`` (``ShmArena.slot_stem_ptrs``) -- int8 numpy array, 1 =
+        listed; the same index, the same fail-closed answer (no index opened here = nothing listed). None = this index
+        has no pointer form (a stand-in index): the caller asks ``l3_listed`` per stem instead."""
+        import numpy as np
+
+        n = max(0, int(n))
+        idx = getattr(self, "_l3idx", None)
+        if idx is None or n == 0:
+            return np.zeros((n,), dtype=np.int8)
+        fn = getattr(idx, "has_ptrs", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(ptrs, n)
+        except Exception:  # noqa: BLE001 -- fail closed
+            return np.zeros((n,), dtype=np.int8)
+
     def _stat_stems(self, stems: List[str]) -> dict:
         """``{stem: size}`` for the stems that are on disk; one C call when
         the #1402 helper is available, else ``_stat_stem`` each.

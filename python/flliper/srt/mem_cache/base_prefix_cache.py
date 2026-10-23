@@ -523,7 +523,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Element-wise MAX of ``values`` over the group ``check_hicache_events``
         synchronizes on (fnFL2x105: a verdict that decides how often a rank
         polls it must be read over that same group). A cache that posts no
-        HiCache collectives has no such group: the rank's own values."""
+        HiCache collectives has no such group: the rank's own values (FLIPTIME-1023: a tensor comes back as a copy)."""
+        if isinstance(values, torch.Tensor):
+            return values.detach().to(device="cpu", dtype=torch.int64).reshape(-1).clone()
         return list(values)
 
     def take_events(self):

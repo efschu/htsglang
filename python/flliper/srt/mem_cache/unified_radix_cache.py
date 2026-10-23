@@ -1462,7 +1462,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def hicache_group_max(self, values: List[int], *, label: str) -> List[int]:
         """fnFL2x105: MAX over the group ``drain_storage_control_queues`` reduces
         over, so a loop that polls ``check_hicache_events`` on this verdict
-        polls it the same number of times on every rank."""
+        polls it the same number of times on every rank.
+
+        FLIPTIME-1023: ``values`` may be a tensor -- the SAME all-reduce (int64, CPU, MAX, the same groups and labels) on a
+        copy, and the reduced TENSOR comes back (S86 reduces a 720896-slot veto vector: ~120 ms of ``tolist`` /
+        ``torch.tensor`` per reduce on boot 1023_140032). A list in, a list out, as before."""
+        if isinstance(values, torch.Tensor):
+            tensor = values.detach().to(device="cpu", dtype=torch.int64).reshape(-1).clone()
+            self._all_reduce_attn_groups(
+                tensor, torch.distributed.ReduceOp.MAX, label=label
+            )
+            return tensor
         tensor = torch.tensor(list(values), dtype=torch.int64)
         self._all_reduce_attn_groups(
             tensor, torch.distributed.ReduceOp.MAX, label=label
@@ -2130,9 +2140,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 own_refs = int(held.sum())
                 own_slots = int((held > 0).sum())
                 try:
-                    srefs = arena.slot_refs(list(range(slots)))
-                    other_only = sum(1 for s, r in enumerate(srefs)
-                                     if int(r) > 0 and (s >= int(held.numel()) or int(held[s]) == 0))
+                    _srn = getattr(arena, "slot_refs_np", None)
+                    if callable(_srn):
+                        # FLIPTIME-1023: the same count as arrays (the per-slot form cost 1.3-1.75 s of every D>P
+                        # quiesce on the flush_end site, boot 1023_140032 D TP0)
+                        import numpy as _np_s83
+
+                        _r = _np_s83.asarray(_srn(), dtype=_np_s83.int64)
+                        _h = _np_s83.zeros(_r.shape[0], dtype=_np_s83.int64)
+                        _hn = held.detach().to("cpu").reshape(-1).numpy().astype(_np_s83.int64)
+                        _k = min(_h.shape[0], _hn.shape[0])
+                        _h[:_k] = _hn[:_k]
+                        other_only = int(((_r > 0) & (_h == 0)).sum())
+                    else:
+                        srefs = arena.slot_refs(list(range(slots)))
+                        other_only = sum(1 for s, r in enumerate(srefs)
+                                         if int(r) > 0 and (s >= int(held.numel()) or int(held[s]) == 0))
                 except Exception:  # noqa: BLE001
                     other_only = -1
             tree_dev, tree_host = set(), set()

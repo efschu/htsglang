@@ -255,6 +255,12 @@ class HiRadixCache(RadixCache):
 
     def hicache_group_max(self, values: List[int], *, label: str) -> List[int]:
         """fnFL2x105: MAX over the group ``check_hicache_events`` reduces over."""
+        if isinstance(values, torch.Tensor):   # FLIPTIME-1023: a tensor in, the reduced tensor out (same all-reduce)
+            tensor = values.detach().to(device="cpu", dtype=torch.int64).reshape(-1).clone()
+            self._all_reduce_attn_groups(
+                tensor, torch.distributed.ReduceOp.MAX, label=label
+            )
+            return tensor
         tensor = torch.tensor(list(values), dtype=torch.int64)
         self._all_reduce_attn_groups(
             tensor, torch.distributed.ReduceOp.MAX, label=label
