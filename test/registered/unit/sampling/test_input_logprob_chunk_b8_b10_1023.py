@@ -335,5 +335,30 @@ class TestB10PrefixCapSemantics(CustomTestCase):
                            full_untruncated_fill_len=3080), 8)
 
 
+class TestB10RowHashInstrument(CustomTestCase):
+    def test_digest_is_bitwise_and_blockwise(self):
+        g = torch.Generator().manual_seed(2)
+        a = torch.randn(130, 16, generator=g).to(torch.bfloat16)
+        b = a.clone()
+        self.assertEqual(lp_mod._rowhash_blocks(a), lp_mod._rowhash_blocks(b))
+        self.assertEqual(len(lp_mod._rowhash_blocks(a).split(",")), 3)  # 64+64+2
+        b[70, 3] = b[70, 3] + 1
+        da, db = lp_mod._rowhash_blocks(a).split(","), lp_mod._rowhash_blocks(b).split(",")
+        self.assertEqual(da[0], db[0])
+        self.assertNotEqual(da[1], db[1])  # only the block holding row 70
+        self.assertEqual(da[2], db[2])
+
+    def test_forward_logs_one_line_per_logprob_forward(self):
+        m = _Model(300, seed=3)
+        with self.assertLogs(lp_mod.logger.name, level="INFO") as cm:
+            m.run(_bare_lp(True, 64), [(0, 300)], 10)
+        lines = [r for r in cm.output if "LOGPROB-ROWHASH" in r]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("rows=290", lines[0])
+        with mock.patch.dict(os.environ, {"FLLIPER_LOGPROB_ROWHASH": "0"}):
+            with self.assertNoLogs(lp_mod.logger.name, level="INFO"):
+                m.run(_bare_lp(False, 2048), [(0, 300)], 10)
+
+
 if __name__ == "__main__":
     unittest.main()
