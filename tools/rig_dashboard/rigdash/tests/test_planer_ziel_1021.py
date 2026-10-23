@@ -32,7 +32,7 @@ FIX = os.path.join(HERE, "fixtures", "planer_ziel_1021")
 
 RIG = [{"card": "rtx5090-32", "count": 1}, {"card": "rtx3080-20", "count": 2}]
 X3090 = [{"card": "rtx3090-24", "count": 3}]
-MODELS = ("qwen38-27b-int8", "qwen38-27b-nvfp4", "qwen38-nf-int4")
+MODELS = ("qwen38-27b-int8", "qwen38-27b-nvfp4", "qwen38-nf-int4", "qwen38-27b-int4ar")   # planer-n2fix2 1023 (A4): int4ar
 
 
 def hw_rig(measured=True):
@@ -112,8 +112,8 @@ class Pins(unittest.TestCase):
 class Katalog(unittest.TestCase):
     def test_models_by_name_and_cards_with_origin(self):
         k = zp()[0].katalog()
-        self.assertEqual([m["name"] for m in k["models"]], ["Qwen3.8-27B INT8", "Qwen3.8-27B NVFP4", "Qwen3.8-Flash-Next INT4"])
-        self.assertEqual([m["layouts"] for m in k["models"]], [["solo", "flip"], ["solo", "flip", "dual"], ["solo", "flip"]])
+        self.assertEqual([m["name"] for m in k["models"]], ["Qwen3.8-27B INT8", "Qwen3.8-27B NVFP4", "Qwen3.8-Flash-Next INT4", "Qwen3.8-27B INT4 AutoRound (abliterated)"])   # + int4ar (planer-n2fix2 1023, A4)
+        self.assertEqual([m["layouts"] for m in k["models"]], [["solo", "flip"], ["solo", "flip", "dual"], ["solo", "flip"], ["solo", "flip"]])
         self.assertEqual(k["supported_n"], list(Z.SUPPORTED_N))
         self.assertEqual([c["id"] for c in k["cards"] if c["preset"]], ["rtx5090-32", "rtx3090-24", "rtx3080-20"])
         self.assertIsNone(k["machine"])                                         # no hardware profile: no "this machine" shortcut

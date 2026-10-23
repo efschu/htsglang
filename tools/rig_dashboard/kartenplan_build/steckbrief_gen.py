@@ -27,6 +27,9 @@ SOURCES = {
     "qwen38-27b-int8": ("Qwen3.8-27B-INT8-gdncov-vocabembed", "Qwen3.8-27B-DFlash2-W8-lued"),
     "qwen38-27b-nvfp4": ("Qwen3.8-27B-NVFP4-RadixArk", "Qwen3.8-27B-DFlash2-NVFP4-RTNcal"),
     "qwen38-nf-int4": ("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp", None),
+    # planer-n2fix2 1023 (A4): Huihui-Qwen3.8-27B-Abliterated INT4 W4A16 AutoRound, losslessly repacked to compressed-tensors
+    # (tools/quant/autoround_gptq_to_ct.py on desk/27b-int4ar-1023); the W8 draft as in profiles_release/27b-int4ar.env
+    "qwen38-27b-int4ar": ("Huihui-Qwen3.8-27B-Abliterated-INT4-W4A16-AutoRound-ct", "Qwen3.8-27B-DFlash2-W8-lued"),
 }
 
 
@@ -36,6 +39,47 @@ def _v(node, default=None):
 
 def _readable(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "config.json"))
+
+
+def _quant(path: str) -> dict:
+    """planer-n2fix2 1023 (A4): the checkpoint's quantization as its config.json states it (no interpretation): method, the weight scheme
+    of every config group (type, bits, group size, symmetric, strategy, act-order) and the module patterns it leaves unquantized."""
+    with open(os.path.join(path, "config.json"), encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    q = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
+    out = {"method": q.get("quant_method")}
+    groups = []
+    for g in (q.get("config_groups") or {}).values():
+        w = g.get("weights") or {}
+        groups.append({k: w.get(k) for k in ("type", "num_bits", "group_size", "symmetric", "strategy", "actorder")})
+    if groups:
+        out["weight_groups"] = groups
+    if q.get("quant_algo"):
+        out["algo"] = q.get("quant_algo")
+    if q.get("ignore"):
+        ign = list(q["ignore"])
+        out["unquantized"] = ign[:12]                   # NF lists every vision module by name (hundreds): the first ones + the count
+        if len(ign) > 12:
+            out["unquantized_n"] = len(ign)
+    if q.get("_converted_from"):
+        out["converted_from"] = dict(q["_converted_from"])
+    return out
+
+
+def _tensor_mib(path: str, needle: str) -> float:
+    """MiB of the tensors whose name contains ``needle``, from the safetensors HEADERS (no weight byte read) -- read with the planner's own
+    header reader (``model_profile._read_safetensors_header``), the same bytes the model profile prices."""
+    import glob
+
+    from flliper.srt.pdflip import model_profile as MP
+
+    tot = 0
+    for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+        for name, t in MP._read_safetensors_header(f).items():
+            if not name.startswith("__") and needle in name:
+                a, b = t["data_offsets"]
+                tot += b - a
+    return round(tot / MIB, 1)
 
 
 def row(model_id: str, tmp: str) -> dict:
@@ -67,6 +111,9 @@ def row(model_id: str, tmp: str) -> dict:
         "state_mib_per_seat_bf16": round(st["variants_mib"]["bfloat16"] * _v(st["linear_layers"]), 1),
         "experts": None,
     }
+    row["quant"] = _quant(path)
+    row["vision_tower_mib"] = _tensor_mib(path, "visual")
+    row["mtp_mib"] = round(_v(p.get("draft", {}).get("mtp_bytes"), 0) / MIB, 1) if _v(p.get("draft", {}).get("mtp_bytes")) else None
     if (_v(ex.get("n")) or 0) > 0:
         row["experts"] = {"n": _v(ex["n"]), "top_k": _v(ex.get("top_k")), "moe_layers": _v(ex.get("moe_layers")),
                           "total_mib": round(_v(ex["total_bytes"]) / MIB), "bytes_per_expert": _v(ex.get("bytes_per_expert"))}

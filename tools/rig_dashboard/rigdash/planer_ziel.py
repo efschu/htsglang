@@ -79,6 +79,12 @@ MODELS = [
     {"id": "qwen38-nf-int4", "name": "Qwen3.8-Flash-Next INT4", "line": "nf", "format": "int4",
      "profiles": {"solo": "nf-int4", "flip": "nf-int4", "dual": None}, "ncards": {"solo": "nf", "flip": "nf"},
      "no_dual": "Dual exists only in the 27B line (user decision 07.10.: the NF line has no dual form)."},
+    # planer-n2fix2 1023 (review A4): Huihui-Qwen3.8-27B-Abliterated INT4 W4A16 AutoRound (group 128, symmetric; bf16 embed/lm_head/vision tower/GDN
+    # in_proj_a/b; MTP), losslessly repacked to compressed-tensors (desk/27b-int4ar-1023).  Release profile profiles_release/27b-int4ar.env (form of
+    # 27b-fp8: 27b-base + --model + census-foreign + P chunk fixed, W8 draft).  No 3090 release profiles (no "ncards" stem): never calculated for them.
+    {"id": "qwen38-27b-int4ar", "name": "Qwen3.8-27B INT4 AutoRound (abliterated)", "line": "27b", "format": "int4",
+     "profiles": {"solo": "27b-int4ar", "flip": "27b-int4ar", "dual": None}, "ncards": {},
+     "no_dual": "Dual is calibrated on the NVFP4 weights only (the launcher's dual form has no INT4 reference profile)."},
 ]
 _MODEL_BY_ID = {m["id"]: m for m in MODELS}
 
