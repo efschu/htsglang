@@ -744,6 +744,10 @@ def _partial_reap_age_s() -> float:
         return 30.0
 
 
+#: SWEEPCENSUS-1023: header census reads of claim_would_refuse (process-wide; the desk counts them)
+_ROOM_CENSUS_N = [0]
+
+
 def _arena_free_slots(arena) -> int:
     """FREE slots of the arena now (arena.c keeps COMPLETE and CLAIMED
     disjoint, so free = slots - complete - claimed)."""
@@ -2997,7 +3001,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         absent = sum(1 for s in arena.find_states(self._stems(hashes)) if int(s) == 0)
         return absent > _arena_free_slots(arena)
 
-    def claim_would_refuse(self, hashes) -> bool:
+    def claim_would_refuse(self, hashes, room_cache=None) -> bool:
         """SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2): would
         ``alloc_write(hashes)`` be refused right now for want of room?
 
@@ -3008,17 +3012,35 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         arena (claimed or complete) needs no room. Pins are not subtracted, so
         the room can only be OVER-estimated -- an over-estimate answers False
         and the caller claims as before. Never claims, never evicts.
-        False when the pool has no bound arena (the claim decides)."""
+        False when the pool has no bound arena (the claim decides).
+
+        ``room_cache`` (SWEEPCENSUS-1023, the publish sweep's room memo): the
+        room -- free slots after the reap plus the unreferenced COMPLETE
+        slots -- is read from it when it was taken under the memo's current
+        generation, else the reap and the header census run (a strided read
+        of every slot header: 720896 headers, ~20 ms idle and several times
+        that under host load) and the room is stored there. The sweep bumps
+        the generation on every claim, release or spill, so a cached room is
+        never older than this sweep's last room change."""
         arena = self.arena
         if arena is None or self._backend is None or not hashes:
             return False
         absent = sum(1 for s in arena.find_states(self._stems(hashes)) if int(s) == 0)
         if absent <= _arena_free_slots(arena):
             return False   # the claim needs no room-making: it is not refused for room
+        if (room_cache is not None and room_cache.get("room") is not None
+                and room_cache.get("room_gen") == room_cache.get("gen")):
+            return absent > int(room_cache["room"])
         if not self._pdflip_reaps_orphan_claims:
             _reap_orphan_claims(arena)   # the claim's own first step (#231 / OS)
         referenced, _refs, complete = arena.ref_census()
-        return absent > _arena_free_slots(arena) + int(complete) - int(referenced)
+        _ROOM_CENSUS_N[0] += 1
+        room = _arena_free_slots(arena) + int(complete) - int(referenced)
+        if room_cache is not None:
+            room_cache["room"] = room
+            room_cache["room_gen"] = room_cache.get("gen")
+            room_cache["censuses"] = int(room_cache.get("censuses", 0)) + 1
+        return absent > room
 
     def alloc_write_draft(self, kv_host_indices: torch.Tensor, hashes, comp: str) -> bool:
         """Draft role: claim the draft slot behind each KV arena row."""

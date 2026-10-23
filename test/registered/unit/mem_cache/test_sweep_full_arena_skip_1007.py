@@ -80,7 +80,7 @@ class _DirectPool:
         self._next += len(hashes)
         return rows
 
-    def claim_would_refuse(self, hashes):
+    def claim_would_refuse(self, hashes, room_cache=None):   # SWEEPCENSUS-1023: the sweep hands its room memo
         self.asked.append(hashes[0])
         return hashes[0] not in self.room
 

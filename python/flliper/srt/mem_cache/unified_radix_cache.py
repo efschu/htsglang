@@ -9932,6 +9932,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # SWEEP-FULL-ARENA: armed for this sweep; engaged by its first arena_claim refusal
         _full_arena_armed = self._pdflip_full_arena_skip_armed()
         _full_arena = False
+        # SWEEPCENSUS-1023: one room memo per sweep (see _pdflip_full_arena_refuses); a fresh one on every
+        # sweep, so a memo left by a sweep that raised is never read by the next one
+        self._pdflip_sweep_room_memo = _sweep_room_memo()
         queue = list(first or []) + ([] if chain_only else [self.root_node])   # xsn344: the retain's own chain first
         while queue:
             node = queue.pop(0)
@@ -9970,7 +9973,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     stats["unbacked"] += 1
                     stats["anchor_only"] = stats.get("anchor_only", 0) + 1
                     if stats["issued"] < max_issue:
-                        if self.write_backup_anchor_only(node) > 0:
+                        _ao = self.write_backup_anchor_only(node)
+                        _sweep_room_changed(self)   # SWEEPCENSUS-1023: a claim may have moved the room
+                        if _ao > 0:
                             stats["issued"] += 1
                         else:
                             stats["refused"] += 1
@@ -10055,6 +10060,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 got = 0
             finally:
                 self._pdflip_bg_publish = _bg_prev
+                # SWEEPCENSUS-1023: a claim, its #1427r release or an ARENA-DROP inside it moved the room --
+                # the memo's census and its refusals are void from here on (never a stale permission)
+                _sweep_room_changed(self)
             _issue_s += time.perf_counter() - _t_iss
             if got > 0:
                 stats["issued"] += 1
@@ -10073,6 +10081,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _full_arena = _full_arena or (
                     _full_arena_armed and self._pdflip_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
+        _rm = self.__dict__.pop("_pdflip_sweep_room_memo", None)
+        if _rm is not None and (_rm["censuses"] or _rm["hits"]):
+            stats["room_censuses"] = _rm["censuses"]
+            stats["room_memo_hits"] = _rm["hits"]
         _sm1 = _smemo.counters(self)
         if _sm1 != _sm0:
             stats["spill_walks"] = _sm1[0] - _sm0[0]
@@ -10188,9 +10200,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         pool = self._pdflip_direct_pool()
         if pool is None or not top.hash_value:
             return False
+        # SWEEPCENSUS-1023 (27B int4ar boot 1023_223241, D TP0/TP1 23:26:52-23:35:26Z): with the FULL arena
+        # full (720771 of 720896 slots COMPLETE) every node of a finished turn's chain asked this question on
+        # its own -- the chain's nodes below a refused top get the SAME top, and every ask paid a strided read
+        # of all 720896 slot headers (ref_census, reap_partial): 'result' host span 116.7 s and 218.4 s per
+        # 5 min, 10 of 10 WEDGE-STACKs in ref_census/find_states/reap_partial. Inside one sweep a top refused
+        # under the current room generation stays refused, and the room census is read once; any claim,
+        # release or spill of this sweep bumps the generation and voids both.
+        memo = self.__dict__.get("_pdflip_sweep_room_memo")
+        if memo is not None and memo["refused"].get(top.id) == memo["gen"]:
+            memo["hits"] += 1
+            return True
         if self._w3_arena_spill(pool, len(top.hash_value), claimer=top) > 0:
+            _sweep_room_changed(self)
             return False
-        return pool.claim_would_refuse(top.hash_value)
+        if memo is None:
+            return pool.claim_would_refuse(top.hash_value)
+        refused = pool.claim_would_refuse(top.hash_value, room_cache=memo)
+        if refused:
+            memo["refused"][top.id] = memo["gen"]
+        return refused
 
     def pdflip_lbv_pp0_room(self, kv_tokens: int, rid=None) -> bool:
         """LBV-ADMIT (pdflip/pp_loadback_verdict.admit_holds): PP0's room verdict for its
@@ -16599,13 +16628,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stack.append((child, indent + 2))
 
 
+def _sweep_room_memo() -> dict:
+    """SWEEPCENSUS-1023: the room memo of ONE publish sweep. ``gen`` is the room generation (bumped by every
+    claim, release or spill of the sweep), ``refused`` maps a top node id to the generation its refusal was
+    answered under, ``room`` is the census room (free + unreferenced COMPLETE) read under ``room_gen``
+    (``ArenaMHAHostPool.claim_would_refuse``), ``censuses`` counts the census reads, ``hits`` the answers
+    taken from the memo."""
+    return {"gen": 0, "refused": {}, "room": None, "room_gen": -1, "censuses": 0, "hits": 0}
+
+
+def _sweep_room_changed(tree) -> None:
+    """SWEEPCENSUS-1023: the room of the arena may have moved (a claim, a release, a spill): every memoised
+    refusal and the census are void -- the next question reads the census again."""
+    memo = tree.__dict__.get("_pdflip_sweep_room_memo")
+    if memo is not None:
+        memo["gen"] += 1
+        memo["room"] = None
+
+
 def _full_arena_suffix(stats: dict) -> str:
     """The PUBLISH-SWEEP line's SWEEP-FULL-ARENA tail; empty unless it skipped."""
     n = int(stats.get("arena_full_skipped", 0))
     if not n:
         return ""
     return (" arena_full_skipped=%d (SWEEP-FULL-ARENA: counted refused without the claim -- "
-            "the KV arena has no room for them after this sweep's arena_claim refusal)" % n)
+            "the KV arena has no room for them after this sweep's arena_claim refusal)"
+            " room_censuses=%d room_memo_hits=%d (SWEEPCENSUS-1023: header census reads / answers from the "
+            "sweep's room memo)" % (n, int(stats.get("room_censuses", 0)), int(stats.get("room_memo_hits", 0))))
 
 
 class _W3SpillKeys:
