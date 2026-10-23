@@ -667,6 +667,52 @@ def _basis_from(req: Mapping[str, Any], scratch: str) -> Any:
     raise ValueError("basis needs env_path or env_text")
 
 
+def path_pattern(old: str) -> "re.Pattern[str]":
+    """The directory ``old`` as a whole path inside a token: not a prefix of a longer name (``.../X`` never matches ``.../X-ct``)."""
+    return re.compile(re.escape(old.rstrip("/")) + r"(?=$|[/\s,;:'\"=)])")
+
+
+def retarget_paths(li: Any, model_path: Optional[str], draft_path: Optional[str]) -> Tuple[Any, List[str]]:
+    """planer-n2fix2 1023 (B11): a request's ``model_path`` / ``draft_path`` is the model the proposal is FOR.  Before, only the model
+    profile of ``propose()`` read it; the launcher dry run kept the base profile's ``--model`` / ``--dflash-draft-path`` (the int4ar seat's
+    planner call of 23.10. 13:35Z ran the dry run on the NVFP4 weights of the base profile).  Here the base launch is retargeted: every
+    argv token, environment value and PROFILE_* variable that names the base profile's model (draft) directory names the requested one,
+    and ``PROFILE_MODEL`` / ``PROFILE_DRAFT`` are the requested paths (so ``run_profile`` adds ``--model`` / ``--dflash-draft-path`` from
+    them where the profile names none).  Returns ``(launch input, notes)``; the input is unchanged when nothing differs."""
+    from flliper.srt.pdflip import propose_oracle as O
+
+    subs: List[Tuple["re.Pattern[str]", str]] = []
+    vars_ = dict(getattr(li, "vars", {}) or {})
+    notes: List[str] = []
+    for what, var, new in (("model", "PROFILE_MODEL", model_path), ("draft", "PROFILE_DRAFT", draft_path)):
+        new = str(new or "").rstrip("/")
+        old = str(vars_.get(var) or "").rstrip("/")
+        if not new or new == old:
+            continue
+        if old:
+            subs.append((path_pattern(old), new))
+        vars_[var] = new
+        notes.append("%s: %s replaces the base profile's %s %s everywhere the launch names it (argv, environment, PROFILE_* variables)"
+                     % (what, new, what, old or "(none)"))
+    if not notes:
+        return li, notes
+
+    def sub(t: Any) -> Any:
+        if not isinstance(t, str):
+            return t
+        for pat, new in subs:
+            t = pat.sub(new, t)
+        return t
+
+    for k in list(vars_):
+        if k not in ("PROFILE_MODEL", "PROFILE_DRAFT"):
+            v = vars_[k]
+            vars_[k] = [sub(x) for x in v] if isinstance(v, list) else sub(v)
+    out = O.LaunchInput([sub(t) for t in li.argv], {k: sub(v) for k, v in li.env.items()}, vars_, list(li.unresolved_paths or []),
+                        li.source, li.instruments)
+    return out, notes
+
+
 def _devices_of(req: Mapping[str, Any]) -> List[Dict[str, Any]]:
     from flliper.srt.pdflip import propose_oracle as O
 
@@ -886,8 +932,10 @@ def run_propose(req: Mapping[str, Any], *, tree: str) -> Dict[str, Any]:
         return run_propose_single(req)                     # N=1: no launcher, no oracle run (topology.py MIN_CARDS=2)
     with tempfile.TemporaryDirectory(prefix="apd-") as scratch:
         li = _basis_from(req, scratch)
+        li, retarget_notes = retarget_paths(li, req.get("model_path"), req.get("draft_path"))      # B11: the dry run runs the requested model
         devices = _devices_of(req)
         model, draft, notes = _model_profiles(li, req)
+        notes = retarget_notes + notes
         if model is None:
             return {"ok": False, "error": "no model profile: %s" % ("; ".join(notes) or "Model path missing"), "notizen": notes}
         try:

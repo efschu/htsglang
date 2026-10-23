@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import shlex
 import tempfile
@@ -1422,7 +1423,46 @@ class ProfilEditor:
                          % "; ".join("%s %s %s" % (k.split(":", 2)[1], k.split(":", 2)[2], v) for k, v in records.items()))
         return pins, records, notes
 
-    def _startprofil(self, base: dict, proposal: dict, basis_name: str, plan: Optional[tuple] = None) -> tuple:
+    #: planer-n2fix2 1023 (B11): the request's model / draft directory against the variable of the base profile that names it
+    PATH_FIELDS = (("model_path", "PROFILE_MODEL"), ("draft_path", "PROFILE_DRAFT"))
+
+    @staticmethod
+    def _path_re(old: str):
+        """``old`` as a whole directory inside a value (never the prefix of a longer name); the same rule as the oracle's
+        ``propose_verdict.path_pattern``."""
+        return re.compile(re.escape(old.rstrip("/")) + r"(?=$|[/\s,;:'\"=)])")
+
+    def _path_edits(self, base: Optional[dict], paths: Dict[str, str]) -> tuple:
+        """planer-n2fix2 1023 (B11): ``({profile key: value}, notes)`` that put the request's ``model_path`` / ``draft_path`` into the start
+        profile.  Before, the start profile kept the base profile's ``--model`` / ``--dflash-draft-path`` / ``PROFILE_MODEL`` /
+        ``PROFILE_DRAFT`` / ``PROFILE_REQUIRED_PATHS`` although the proposal was asked for another model (the int4ar seat set them by hand,
+        deskq/bl/27b-int4ar-1023/mkprofile.py).  Every row whose value names the base profile's directory names the requested one (the
+        oracle retargets the dry run the same way, ``propose_verdict.retarget_paths``)."""
+        pj, _ref = self.mods()
+        vars_ = {v["name"]: str(v.get("value", "")) for v in (base or {}).get("vars") or [] if "name" in v and "value" in v}
+        out: Dict[str, str] = {}
+        notes: List[str] = []
+        rows = None
+        for fld, var in self.PATH_FIELDS:
+            new = str(paths.get(fld) or "").rstrip("/")
+            old = vars_.get(var, "").rstrip("/")
+            if not new or new == old:
+                continue
+            out["var:" + var] = new
+            if old:
+                pat = self._path_re(old)
+                if rows is None:
+                    rows = pj.rows(base, self.specs())
+                for r in rows:
+                    val = r.get("value")
+                    if r["key"] != "var:" + var and isinstance(val, str) and pat.search(val):
+                        out[r["key"]] = pat.sub(new, out.get(r["key"], val))
+            notes.append("%s %s chosen for this proposal: it replaces %s of the base profile in every row that names it (%s)"
+                         % ("Model" if fld == "model_path" else "Draft", new, old or "(none)",
+                            ", ".join(sorted(k for k, v in out.items() if new in v))))
+        return out, notes
+
+    def _startprofil(self, base: dict, proposal: dict, basis_name: str, plan: Optional[tuple] = None, chosen: Optional[tuple] = None) -> tuple:
         """Das Startprofil ``flliper.server/1``: das Basisprofil mit den Werten, die der Vorschlag ändert (Herkunft ``planer``).  Gibt
         ``(doc, keys, nicht_uebernommen)``: ``keys`` = Label -> Profilschlüssel der geänderten Zeilen.  ``plan`` = ``_plan_values`` (B1/B2): die
         Kartenvariablen und Layout-Pins kommen als Werte des Planers dazu, die Budgets nur nach ``meta.planner``."""
@@ -1448,12 +1488,18 @@ class ProfilEditor:
                 edits.append({"key": key, "op": "set", "value": str(w["value"])})
         done = {e["key"] for e in edits}
         edits += [{"key": k, "op": "set", "value": v} for k, v in pins.items() if k not in done]     # B1/B2: card variables, layout pins
-        new = pj.apply_edits(base, edits, self.specs())
+        path_vals, path_notes = chosen or ({}, [])
+        done = {e["key"] for e in edits}
+        path_edits = [{"key": k, "op": "set", "value": v} for k, v in path_vals.items() if k not in done]    # B11: the chosen model/draft
+        new = pj.apply_edits(base, edits + path_edits, self.specs())
         meta = new.setdefault("meta", {"origins": {}, "planner": {}, "notes": []})
         for e in edits:                                  # ein Wert des Planers ist nicht "vom Nutzer": Herkunft planer
             meta["origins"][e["key"]] = pj.ORIGIN_PLANER
             if e["op"] == "set":
                 meta.setdefault("planner", {})[e["key"]] = e["value"]
+        for e in path_edits:                             # B11: the model/draft the request named is the user's choice, not a planner value
+            meta["origins"][e["key"]] = pj.ORIGIN_NUTZER
+        meta.setdefault("notes", []).extend(path_notes)
         meta.setdefault("planner", {}).update(planner_only)
         meta["planner"].update(records)                  # B2: the dry run's split and budgets as the planner's values, never a row (see PLAN_RECORDS)
         meta.setdefault("notes", []).extend(plan_notes)
@@ -1569,7 +1615,8 @@ class ProfilEditor:
         v = res["proposal"]
         if single:
             doc = self._single_base(name, paths["model_path"])
-        new, keys, skipped = self._startprofil(doc, v, name, self._plan_values(doc, v, res.get("verdict") or {}, form))
+        new, keys, skipped = self._startprofil(doc, v, name, self._plan_values(doc, v, res.get("verdict") or {}, form),
+                                               None if single else self._path_edits(doc, paths))
         problems = self.verify_render(new, pj.render_env(new))
         new["meta"]["proposal"] = {"schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"], "goals": v["goals"], "basis": [kind, name], "basis_sha256": bsha,
                                     "outcome": res["verdict"].get("outcome"), "argv_sha256": res["verdict"].get("argv_sha256")}
