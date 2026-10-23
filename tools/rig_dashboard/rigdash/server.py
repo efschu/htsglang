@@ -268,6 +268,8 @@ class App:
         # the cards (NVML), docker, gpuq, fronts and the energy book are the sampler's too (30.09. ~22Z):
         # this process reads what it published and measures nothing
         self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
+        # 23.10.: the state roots the containers have mounted (the sampler's docker inspect) feed this process's IPC reader too
+        self.boots.ipc.attach_containers(lambda: sources.state_roots_from_view(self.src.view()))
         self.pdflip = weg2line.PdFlipLines(cfg["docker_ssh"], args.release_profile or [])
         # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
         # Auftrag 1984 (B): EIN Baum für Editor, Modell, Hardware, Worker.  The argparse flag is ``--profil-tree`` (dest ``profil_tree``): the old read of
@@ -307,7 +309,7 @@ class App:
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
         self.imgchg_lock = threading.Lock()
-        self.features = features.Features(args.features, args.features_repo)
+        self.features = features.Features(args.features, args.features_repo, extra_roots=lambda: self.boots.ipc.roots_used)
         self.stop = threading.Event()
         # DASHBOARD-GRAFIKEN: the persistent history of the Grafana-style panels (history.py)
         self.hist = history.HistoryDB(os.path.join(args.state_dir, "history.sqlite") if args.state_dir else None)
@@ -451,6 +453,9 @@ class App:
             "gpuq": sv.get("gpuq"),
             "fronts": {k: {kk: vv for kk, vv in v.items() if kk != "value"} for k, v in fronts.items()},
             "collector_error": self.boots.last_error,
+            # 23.10.: which state roots the IPC reader scans and what they came from (containers / glob fallback / static)
+            "state_roots": {"roots": list(self.boots.ipc.roots_used),
+                            "source": getattr(self.boots.ipc.roots, "source", "fixed")},
             "sampler": self.sampler_status(),
             "energy_error": getattr(self, "energy_error", None),
             "image_changes": imagechanges.view(boots, images, img_err, self.imgchg.path),

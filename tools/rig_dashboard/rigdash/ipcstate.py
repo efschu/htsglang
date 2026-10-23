@@ -18,18 +18,26 @@ log carries the label "aus Log (Übergang)" in the page.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
+import stat
 import threading
 import time
 
-from typing import Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from . import names as N
 
 # 21.10.: state-dev = the NF dev container (flliper-nf-dev, Dev-Staende im Fenster) writes its boots there; without it the page says
 # "no IPC sample" while the dev container serves (patched into the running release 8d32c66997 at 06:50Z, carried here)
 STATE_ROOTS = ("/spinning/docker-acceptance/nf/state", "/spinning/docker-acceptance/nf/state-dev", "/spinning/docker-acceptance/27b/state")
+# 23.10.: flliper-27b-nvfp4-duo writes to 27b/state-duo, a root none of the fixed ones names -- /api/live showed "boots: []" while
+# it served.  The roots are now taken from the containers themselves (``StateRoots``): every docker container's bind mount on the
+# state volume (``CONTAINER_STATE_DEST``, sources.container_state_roots); the fixed roots stay (a removed container's last boot);
+# the glob is only the fallback for a process that has no docker reading (no ssh, the docker sample failed, not yet sampled).
+CONTAINER_STATE_DEST = "/var/lib/htsglang/stateroot"
+STATE_ROOT_GLOB = "/spinning/docker-acceptance/*/state*"
 SCHEMA = "pdflip.state/1"
 EVENT_SCHEMA = "pdflip.event/1"
 TERMINAL = ("refused_preflight", "stopped_clean", "dead")
@@ -203,48 +211,178 @@ def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
     }
 
 
-class IpcStates:
-    """All boot state dirs of the last SHOW_S; ``for_tag`` finds a log boot's one."""
+def _dir_ident(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        s = os.stat(path)
+    except OSError:
+        return None
+    return (s.st_dev, s.st_ino)
 
-    def __init__(self, roots=STATE_ROOTS):
-        self.roots = roots
+
+def dedupe_roots(roots: Iterable[str]) -> List[str]:
+    """``roots`` in order, each directory once: by normalised path, and by (st_dev, st_ino) for one that exists (a symlinked or
+    bind-mounted second name of a root is the same root).  A root that does not exist (yet) is kept: ``poll`` skips it."""
+    out, paths, idents = [], set(), set()
+    for r in roots:
+        if not r:
+            continue
+        p = os.path.normpath(str(r))
+        if p in paths:
+            continue
+        paths.add(p)
+        ident = _dir_ident(p)
+        if ident is not None:
+            if ident in idents:
+                continue
+            idents.add(ident)
+        out.append(p)
+    return out
+
+
+class StateRoots:
+    """The state roots to scan, as a callable (``IpcStates(roots=StateRoots())``).
+
+    Order: the roots the containers have mounted (``containers()`` -> a list of host paths; sources.Sources' docker rows carry
+    them as ``state_root``), then every container root seen before in this process (a container that is removed keeps its
+    root here until the process restarts), then the fixed ``STATE_ROOTS``.  Only when there is no container reading at all
+    (``containers`` unset, or it returns None: no ssh, the docker sample failed before its first value) the glob
+    ``STATE_ROOT_GLOB`` is added as the fallback.  Resolved at most every ``refresh_s``; duplicates removed (``dedupe_roots``)."""
+
+    def __init__(self, static: Sequence[str] = STATE_ROOTS, containers: Optional[Callable[[], Optional[List[str]]]] = None,
+                 pattern: Optional[str] = STATE_ROOT_GLOB, refresh_s: float = 5.0):
+        self.static = tuple(static)
+        self.containers = containers
+        self.pattern = pattern
+        self.refresh_s = refresh_s
+        self.seen: List[str] = []            # container roots, first seen first
+        self.source = "static"               # "containers" | "glob" | "static": what the last resolution was based on
+        self.last_error: Optional[str] = None
+        self._t: Optional[float] = None
+        self._val: List[str] = []
+
+    def _container_roots(self) -> Optional[List[str]]:
+        if self.containers is None:
+            return None
+        try:
+            got = self.containers()
+        except Exception as e:  # noqa: BLE001 -- a broken reading falls back to the glob, it never stops the poll
+            self.last_error = "%s: %s" % (type(e).__name__, e)
+            return None
+        self.last_error = None
+        if got is None:
+            return None
+        return [os.path.normpath(str(r)) for r in got if r]
+
+    def resolve(self) -> List[str]:
+        cont = self._container_roots()
+        extra: List[str] = []
+        if cont is not None:
+            for r in cont:
+                if r not in self.seen:
+                    self.seen.append(r)
+            self.source = "containers"
+        elif self.pattern:
+            extra = sorted(p for p in glob.glob(self.pattern) if os.path.isdir(p))
+            self.source = "glob"
+        else:
+            self.source = "static"
+        return dedupe_roots(list(cont or ()) + self.seen + list(self.static) + extra)
+
+    def __call__(self, now: Optional[float] = None) -> List[str]:
+        now = now or time.time()
+        if self._t is None or now - self._t >= self.refresh_s or now < self._t:
+            self._val = self.resolve()
+            self._t = now
+        return list(self._val)
+
+
+class IpcStates:
+    """All boot state dirs of the last SHOW_S; ``for_tag`` finds a log boot's one.
+
+    ``roots``: a sequence of root dirs (tests, fixed setups) or a callable returning them (default: ``StateRoots()``).  One boot
+    dir reachable under two roots (23.10.: a boot dir of 27b/state-duo bind-mounted into 27b/state) is read once: dirs are told
+    apart by (st_dev, st_ino), and the name it was first read under is kept while it is still there."""
+
+    def __init__(self, roots: Union[Sequence[str], Callable[..., Sequence[str]], None] = None):
+        self.roots = StateRoots() if roots is None else roots
+        self.roots_used: List[str] = []
         self.lock = threading.Lock()
+        self._ident: Dict[Tuple[int, int], str] = {}
         self._mt: Dict[str, float] = {}
         self._st: Dict[str, dict] = {}
         self._ev: Dict[str, _Events] = {}
         self.last_error: Optional[str] = None
         self.last_poll: Optional[float] = None     # history.py waits for the first poll before a backfill
 
-    def poll(self, now: Optional[float] = None):
-        now = now or time.time()
-        seen = set()
-        for root in self.roots:
+    def attach_containers(self, fn: Callable[[], Optional[List[str]]]) -> None:
+        """Feed the default ``StateRoots`` the container roots (``fn`` -> host paths, None = no docker reading)."""
+        if isinstance(self.roots, StateRoots):
+            self.roots.containers = fn
+
+    def _current_roots(self, now: float) -> List[str]:
+        if callable(self.roots):
+            return list(self.roots(now))
+        return list(self.roots)
+
+    def _boot_dirs(self, now: float) -> List[str]:
+        """Every boot dir under the roots, each directory once (see the class doc)."""
+        roots = self._current_roots(now)
+        self.roots_used = roots
+        by_ident: Dict[Tuple[int, int], List[str]] = {}
+        order: List[Tuple[int, int]] = []
+        for root in roots:
             try:
                 names = os.listdir(root)
             except OSError:
                 continue
             for n in names:
                 d = os.path.join(root, n)
-                if n.startswith("current") or os.path.islink(d) or not os.path.isdir(d):
+                if n.startswith("current"):
                     continue
-                p = os.path.join(d, "state.json")
                 try:
-                    mt = os.stat(p).st_mtime
+                    ls = os.lstat(d)
                 except OSError:
                     continue
-                if now - mt > SHOW_S:
+                if stat.S_ISLNK(ls.st_mode) or not stat.S_ISDIR(ls.st_mode):
                     continue
-                seen.add(d)
-                if self._mt.get(d) != mt:
-                    st = _read_json(p)
-                    if st and N.schema_ok(st.get("schema"), SCHEMA):
-                        with self.lock:
-                            self._st[d] = st
-                            self._mt[d] = mt
-                ev = self._ev.get(d)
-                if ev is None:
-                    ev = self._ev[d] = _Events(os.path.join(d, "events.jsonl"))
-                ev.poll()
+                ident = (ls.st_dev, ls.st_ino)
+                if ident not in by_ident:
+                    by_ident[ident] = []
+                    order.append(ident)
+                by_ident[ident].append(d)
+        out = []
+        for ident in order:
+            names = by_ident[ident]
+            prev = self._ident.get(ident)
+            d = prev if prev in names else names[0]
+            self._ident[ident] = d
+            out.append(d)
+        for ident in [i for i in self._ident if i not in by_ident]:
+            self._ident.pop(ident, None)
+        return out
+
+    def poll(self, now: Optional[float] = None):
+        now = now or time.time()
+        seen = set()
+        for d in self._boot_dirs(now):
+            p = os.path.join(d, "state.json")
+            try:
+                mt = os.stat(p).st_mtime
+            except OSError:
+                continue
+            if now - mt > SHOW_S:
+                continue
+            seen.add(d)
+            if self._mt.get(d) != mt:
+                st = _read_json(p)
+                if st and N.schema_ok(st.get("schema"), SCHEMA):
+                    with self.lock:
+                        self._st[d] = st
+                        self._mt[d] = mt
+            ev = self._ev.get(d)
+            if ev is None:
+                ev = self._ev[d] = _Events(os.path.join(d, "events.jsonl"))
+            ev.poll()
         with self.lock:
             for d in list(self._st):
                 if d not in seen:

@@ -35,7 +35,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from . import names as N
 from . import redact
@@ -175,6 +175,22 @@ def last_boot(root: str) -> Optional[dict]:
 def roots_of(state_roots: dict, model: str) -> list:
     """The state roots of ``model``: its own key and every ``<model>-<suffix>`` key (NF -> NF, NF-DEV), in dict order."""
     return [r for k, r in state_roots.items() if r and (k == model or str(k).startswith(model + "-"))]
+
+
+def with_roots(state_roots: dict, roots) -> dict:
+    """``state_roots`` plus every further root in ``roots`` (23.10.: the roots the IPC reader scans, ipcstate.StateRoots, e.g. the
+    27b/state-duo of flliper-27b-nvfp4-duo), keyed ``<MODEL>-<dir name>`` after its line dir (``.../27b/state-duo`` -> ``27B-state-duo``),
+    so ``roots_of`` gives it to that model.  A root already in ``state_roots`` is not added twice."""
+    out = dict(state_roots)
+    have = {os.path.normpath(r) for r in out.values() if r}
+    for r in roots or ():
+        p = os.path.normpath(str(r))
+        if not r or p in have:
+            continue
+        have.add(p)
+        model = os.path.basename(os.path.dirname(p)).upper()
+        out.setdefault("%s-%s" % (model, os.path.basename(p)), p)
+    return out
 
 
 def last_boot_of(state_roots: dict, model: str) -> Optional[dict]:
@@ -949,10 +965,11 @@ class Features:
     """
 
     def __init__(self, path: str = DEFAULT_PATH, repo: str = DEFAULT_REPO, state_roots: Optional[dict] = None,
-                 background: bool = True):
+                 background: bool = True, extra_roots: Optional[Callable[[], list]] = None):
         self.file = FeatureFile(path)
         self.repo = repo
         self.state_roots = state_roots or STATE_ROOTS
+        self.extra_roots = extra_roots      # 23.10.: () -> the IPC reader's roots (server: ipcstate.IpcStates.roots_used)
         self.background = background
         self._lock = threading.Lock()
         self._cache: dict = {}        # (model, rev, file sig) -> {"im": {id: im_image}, "s": seconds}
@@ -1014,8 +1031,14 @@ class Features:
     def view(self) -> dict:
         feats, err, sig = self.file.load()
         models, problems = [], []
+        roots = self.state_roots
+        if self.extra_roots is not None:
+            try:
+                roots = with_roots(roots, self.extra_roots())
+            except Exception:  # noqa: BLE001 -- the fixed roots still answer
+                roots = self.state_roots
         for model in MODELS:
-            st = last_boot_of(self.state_roots, model)
+            st = last_boot_of(roots, model)
             bv = boot_view(st)
             ov = self.file.boot_overrides.get((bv or {}).get("boot_id") or "")
             if bv and isinstance(ov, dict) and ov.get("lifecycle"):

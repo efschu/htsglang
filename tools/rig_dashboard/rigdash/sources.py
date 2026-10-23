@@ -95,6 +95,39 @@ def container_log_dirs(inspect: List[dict], host_prefix: str) -> Dict[str, str]:
     return res
 
 
+def container_state_roots(inspect: List[dict], host_prefix: str) -> Dict[str, str]:
+    """name -> local state root (the boots' ``state.json`` dirs, ipcstate), from the container's bind mount on the state volume
+    (``/var/lib/<product>/stateroot``, either product spelling).  23.10.: flliper-27b-nvfp4-duo mounts 27b/state-duo, which no fixed
+    root named; the dashboard takes the roots from here.  Stopped containers count too: their last boot stays visible."""
+    from . import ipcstate
+    dests = N.state_path_variants(ipcstate.CONTAINER_STATE_DEST)
+    res = {}
+    for c in inspect:
+        name = (c.get("Name") or "").lstrip("/")
+        for m in c.get("Mounts") or []:
+            if m.get("Destination") in dests:
+                src = m.get("Source") or ""
+                if host_prefix and src.startswith(host_prefix):
+                    src = src[len(host_prefix):] or "/"
+                if src:
+                    res[name] = src
+    return res
+
+
+def state_roots_from_view(view: Optional[dict]) -> Optional[List[str]]:
+    """The container state roots out of a ``Sources.view()`` / ``SourcesReader.view()``; None when there is no docker reading
+    (not sampled yet, or the sample failed before its first value) -- ipcstate.StateRoots then falls back to its glob."""
+    rows = ((view or {}).get("docker") or {}).get("value")
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows:
+        root = r.get("state_root") if isinstance(r, dict) else None
+        if root and root not in out:
+            out.append(root)
+    return out
+
+
 def container_health_output(inspect: List[dict]) -> Dict[str, str]:
     """name -> the last healthcheck's output (redacted, one line, 300 chars)."""
     from . import redact
@@ -358,19 +391,26 @@ class Sources:
         ps = run(ssh + ["docker ps -a %s --format '%s'" % (N.docker_name_filters(), DOCKER_PS_FORMAT)], 12.0)
         rows = parse_docker_ps(ps)
         running = [r["Names"] for r in rows if (r.get("State") == "running")]
-        dirs, health_out = {}, {}
-        if running:
-            ins = run(ssh + ["docker inspect " + " ".join(running)], 12.0)
+        dirs, health_out, roots = {}, {}, {}
+        # every listed container is inspected (23.10.), not only the running ones: the state roots of a stopped container keep
+        # its last boot visible (ipcstate.StateRoots).  evidence_dir / health_output stay the running containers' only.
+        names = [r["Names"] for r in rows if r.get("Names")]
+        if names:
+            ins = run(ssh + ["docker inspect " + " ".join(names)], 12.0)
             try:
                 parsed = json.loads(ins)
-                dirs = container_log_dirs(parsed, self.cfg.get("docker_host_prefix", ""))
-                health_out = container_health_output(parsed)
             except ValueError:
-                dirs = {}
+                parsed = []
+            prefix = self.cfg.get("docker_host_prefix", "")
+            live = [c for c in parsed if (c.get("Name") or "").lstrip("/") in running]
+            dirs = container_log_dirs(live, prefix)
+            health_out = container_health_output(live)
+            roots = container_state_roots(parsed, prefix)
         rows.sort(key=lambda r: (r.get("State") != "running", r.get("CreatedAt", "")), reverse=False)
         for r in rows:
             r["evidence_dir"] = dirs.get(r.get("Names"))
             r["health_output"] = health_out.get(r.get("Names"))
+            r["state_root"] = roots.get(r.get("Names"))
         return rows[:12]
 
     def sample_gpuq(self):
