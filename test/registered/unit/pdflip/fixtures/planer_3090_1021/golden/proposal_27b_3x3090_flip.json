@@ -28,7 +28,7 @@
   "authoritative",
   "--p-bs",
   "1",
-  "--extra-p=--max-running-requests=2",
+  "--extra-p=--max-running-requests=2 --hicache-mamba-host-mib 225",
   "--pdflip-weights-cpu-backup",
   "off",
   "--spec-form",
@@ -67,7 +67,9 @@
   "--env-d",
   "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=0,0,0",
   "--model",
-  "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+  "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+  "--extra-d",
+  "--hicache-mamba-host-mib 524"
  ],
  "env": {
   "FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG": "64",
@@ -138,6 +140,18 @@
    "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB",
    "0,0,0",
    "unverified",
+   true
+  ],
+  [
+   "--extra-d --hicache-mamba-host-mib",
+   "524",
+   "vorgeschlagen",
+   true
+  ],
+  [
+   "--extra-p --hicache-mamba-host-mib",
+   "225",
+   "vorgeschlagen",
    true
   ],
   [

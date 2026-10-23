@@ -1,0 +1,2329 @@
+{
+ "schema": "flliper.hardware/1",
+ "driver": "595.58.03",
+ "cuda": "13.0",
+ "torch": "2.11.0+cu130",
+ "inventory_sig": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ],
+ "cards": [
+  {
+   "ord": 0,
+   "nvml_index": 0,
+   "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+   "pci_bus_id": "00000000:15:00.0",
+   "name": "NVIDIA GeForce RTX 5090",
+   "class_key": "RTX5090",
+   "card_key": "RTX5090/32607MiB/sm120",
+   "cc": [
+    12,
+    0
+   ],
+   "sm_count": {
+    "v": 170.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json"
+   },
+   "l2_mib": {
+    "v": 96.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "MiB"
+   },
+   "vram_total_mib": {
+    "v": 32607,
+    "src": "NVML",
+    "unit": "MiB"
+   },
+   "bar1_total_mib": {
+    "v": 32768,
+    "src": "NVML",
+    "unit": "MiB"
+   },
+   "pcie": {
+    "max_gen": {
+     "v": 4,
+     "src": "NVML"
+    },
+    "max_width": {
+     "v": 16,
+     "src": "NVML"
+    },
+    "cur_gen": {
+     "v": 1,
+     "src": "NVML",
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)"
+    },
+    "cur_width": {
+     "v": 16,
+     "src": "NVML",
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)"
+    }
+   },
+   "mem_gbs": {
+    "read": {
+     "v": 1742.3,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "copy": {
+     "v": 1622.8,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "gemv": {
+     "v": 1616.2,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "nameplate": {
+     "v": 1920.1,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "bus width x max memory clock x 2 from NVML (peak value, not a measurement)"
+    },
+    "nominal": {
+     "v": 1792,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "Datasheet [catalog kartenplan_catalog.py: rtx5090-32]"
+    }
+   },
+   "compute": {
+    "bf16": {
+     "v": 205.31,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    },
+    "fp8_native": {
+     "v": 443.23,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    },
+    "fp8_marlin": {
+     "v": 216.34,
+     "src": "gemessen",
+     "at": 1785448528.0,
+     "probe": "hw_profile-9a5e9b49b7dc.json",
+     "unit": "TFLOPS"
+    },
+    "fp8_w8a16": {
+     "v": 181.43,
+     "src": "gemessen",
+     "at": 1785448528.0,
+     "probe": "hw_profile-9a5e9b49b7dc.json",
+     "unit": "TFLOPS"
+    },
+    "int8": {
+     "v": 528.86,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TOPS"
+    },
+    "nvfp4_w4a8": {
+     "v": null,
+     "src": "nicht gemessen",
+     "unit": "TOPS",
+     "note": "compute capability 12.0: the NVFP4 W4A8-on-int8 kernel is the sm_8x one (native-mixed resolves it there only); this architecture serves NVFP4 natively (W4A4) or through Marlin"
+    },
+    "nvfp4_marlin": {
+     "v": 223.89,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    },
+    "nvfp4_w4a4": {
+     "v": 956.76,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    }
+   },
+   "d2d_intra_gbs": {
+    "v": 1622.8,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "copy kernel inside the card (read+write), the same measurement as mem_gbs.copy"
+   },
+   "h2d": {
+    "gbs": {
+     "v": 14.42,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "lat_us": {
+     "v": 10.1,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b5s",
+     "note": "H2D latency: median, 4 kB pinned, copy + synchronisation; minimum of the sample 9.1 \u00b5s"
+    }
+   },
+   "d2h": {
+    "gbs": {
+     "v": 14.27,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "lat_us": {
+     "v": 9.7,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b5s",
+     "note": "D2H latency: median, 4 kB pinned, copy + synchronisation; minimum of the sample 8.7 \u00b5s"
+    }
+   },
+   "power": {
+    "limit_w": {
+     "v": 400.0,
+     "src": "NVML",
+     "unit": "W"
+    },
+    "default_w": {
+     "v": 575.0,
+     "src": "NVML",
+     "unit": "W"
+    }
+   },
+   "clocks": {
+    "sm_max_mhz": {
+     "v": 3090,
+     "src": "NVML",
+     "unit": "MHz"
+    },
+    "mem_max_mhz": {
+     "v": 15001,
+     "src": "NVML",
+     "unit": "MHz"
+    }
+   },
+   "mem_bus_bits": {
+    "v": 512,
+    "src": "NVML",
+    "unit": "bit"
+   },
+   "state": {
+    "sm_mhz": {
+     "v": 2542.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "MHz"
+    },
+    "sm_max_mhz": {
+     "v": 3090.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "MHz"
+    },
+    "temp_c": {
+     "v": 49.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b0C"
+    },
+    "throttle": [],
+    "throttled": false
+   },
+   "link": {
+    "gen_cur": {
+     "v": 4,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "width_cur": {
+     "v": 8,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "gen_max": {
+     "v": 4,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "width_max": {
+     "v": 16,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "theory_gbs": {
+     "v": 15.75,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "theoretical rate per direction for Gen4 x8 (measured generation and width, after line coding): a calculated value, not a measurement"
+    },
+    "h2d_pct": {
+     "v": 91.6,
+     "src": "gesch\u00e4tzt",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "%",
+     "note": "derived: measured H2D rate 14.42 GB/s / theoretical 15.75 GB/s (Gen4 x8); a calculation, no measurement of its own"
+    },
+    "d2h_pct": {
+     "v": 90.6,
+     "src": "gesch\u00e4tzt",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "%",
+     "note": "derived: measured D2H rate 14.27 GB/s / theoretical 15.75 GB/s (Gen4 x8); a calculation, no measurement of its own"
+    }
+   },
+   "probed_at": 1791316941.7129169,
+   "catalog": {
+    "id": "rtx5090-32",
+    "label": "RTX 5090 32 GB",
+    "preset": true,
+    "origin": "measured_on_rig",
+    "origin_label": "measured on the rig",
+    "origin_fields": {
+     "vram": "measured_on_rig",
+     "mem_bw": "Datasheet",
+     "pcie": "Datasheet"
+    }
+   },
+   "age_s": 1430904.1,
+   "stale": true,
+   "bar1_free_mib": {
+    "v": 32751,
+    "src": "NVML",
+    "unit": "MiB",
+    "note": "nvidia-smi -q -d MEMORY 23.10. ~09:30Z (snapshot; NVML 2 carries a display seat: Used 67 MiB)"
+   }
+  },
+  {
+   "ord": 1,
+   "nvml_index": 1,
+   "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+   "pci_bus_id": "00000000:18:00.0",
+   "name": "NVIDIA GeForce RTX 3080",
+   "class_key": "RTX3080",
+   "card_key": "RTX3080/20480MiB/sm86",
+   "cc": [
+    8,
+    6
+   ],
+   "sm_count": {
+    "v": 68.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json"
+   },
+   "l2_mib": {
+    "v": 5.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "MiB"
+   },
+   "vram_total_mib": {
+    "v": 20480,
+    "src": "NVML",
+    "unit": "MiB"
+   },
+   "bar1_total_mib": {
+    "v": 256,
+    "src": "NVML",
+    "unit": "MiB"
+   },
+   "pcie": {
+    "max_gen": {
+     "v": 4,
+     "src": "NVML"
+    },
+    "max_width": {
+     "v": 16,
+     "src": "NVML"
+    },
+    "cur_gen": {
+     "v": 1,
+     "src": "NVML",
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)"
+    },
+    "cur_width": {
+     "v": 16,
+     "src": "NVML",
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)"
+    }
+   },
+   "mem_gbs": {
+    "read": {
+     "v": 756.7,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "copy": {
+     "v": 723.6,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "gemv": {
+     "v": 757.2,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "nameplate": {
+     "v": 800.1,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "bus width x max memory clock x 2 from NVML (peak value, not a measurement)"
+    },
+    "nominal": {
+     "v": 760,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "BORROWED, unverified: datasheet of the 10 GB card (same 320-bit board; modded card not measured separately on the rig) [catalog kartenplan_catalog.py: rtx3080-20]"
+    }
+   },
+   "compute": {
+    "bf16": {
+     "v": 57.33,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    },
+    "fp8_native": {
+     "v": null,
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "note": "compute capability 8.6 has no fp8 tensor path (needs 8.9+)"
+    },
+    "fp8_marlin": {
+     "v": 59.15,
+     "src": "gemessen",
+     "at": 1785448528.0,
+     "probe": "hw_profile-9a5e9b49b7dc.json",
+     "unit": "TFLOPS"
+    },
+    "fp8_w8a16": {
+     "v": 53.78,
+     "src": "gemessen",
+     "at": 1785448528.0,
+     "probe": "hw_profile-9a5e9b49b7dc.json",
+     "unit": "TFLOPS"
+    },
+    "int8": {
+     "v": 134.99,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TOPS"
+    },
+    "nvfp4_w4a8": {
+     "v": 65.51,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TOPS"
+    },
+    "nvfp4_marlin": {
+     "v": 54.91,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    },
+    "nvfp4_w4a4": {
+     "v": null,
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "note": "compute capability 8.6: no native FP4 tensor cores (needs 10.0+); this card serves NVFP4 through Marlin (W4A16) or the int8 cores (W4A8), not natively"
+    }
+   },
+   "d2d_intra_gbs": {
+    "v": 723.6,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "copy kernel inside the card (read+write), the same measurement as mem_gbs.copy"
+   },
+   "h2d": {
+    "gbs": {
+     "v": 13.4,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "lat_us": {
+     "v": 9.6,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b5s",
+     "note": "H2D latency: median, 4 kB pinned, copy + synchronisation; minimum of the sample 9.1 \u00b5s"
+    }
+   },
+   "d2h": {
+    "gbs": {
+     "v": 13.16,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "lat_us": {
+     "v": 9.3,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b5s",
+     "note": "D2H latency: median, 4 kB pinned, copy + synchronisation; minimum of the sample 9.1 \u00b5s"
+    }
+   },
+   "power": {
+    "limit_w": {
+     "v": 230.0,
+     "src": "NVML",
+     "unit": "W"
+    },
+    "default_w": {
+     "v": 320.0,
+     "src": "NVML",
+     "unit": "W"
+    }
+   },
+   "clocks": {
+    "sm_max_mhz": {
+     "v": 2100,
+     "src": "NVML",
+     "unit": "MHz"
+    },
+    "mem_max_mhz": {
+     "v": 10001,
+     "src": "NVML",
+     "unit": "MHz"
+    }
+   },
+   "mem_bus_bits": {
+    "v": 320,
+    "src": "NVML",
+    "unit": "bit"
+   },
+   "state": {
+    "sm_mhz": {
+     "v": 1665.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "MHz"
+    },
+    "sm_max_mhz": {
+     "v": 2100.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "MHz"
+    },
+    "temp_c": {
+     "v": 68.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b0C"
+    },
+    "throttle": [
+     "sw_power_cap"
+    ],
+    "throttled": true
+   },
+   "link": {
+    "gen_cur": {
+     "v": 4,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "width_cur": {
+     "v": 8,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "gen_max": {
+     "v": 4,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "width_max": {
+     "v": 16,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "theory_gbs": {
+     "v": 15.75,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "theoretical rate per direction for Gen4 x8 (measured generation and width, after line coding): a calculated value, not a measurement"
+    },
+    "h2d_pct": {
+     "v": 85.1,
+     "src": "gesch\u00e4tzt",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "%",
+     "note": "derived: measured H2D rate 13.4 GB/s / theoretical 15.75 GB/s (Gen4 x8); a calculation, no measurement of its own"
+    },
+    "d2h_pct": {
+     "v": 83.6,
+     "src": "gesch\u00e4tzt",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "%",
+     "note": "derived: measured D2H rate 13.16 GB/s / theoretical 15.75 GB/s (Gen4 x8); a calculation, no measurement of its own"
+    }
+   },
+   "probed_at": 1791316941.7129169,
+   "catalog": {
+    "id": "rtx3080-20",
+    "label": "RTX 3080 20 GB (modded)",
+    "preset": true,
+    "origin": "measured_on_rig",
+    "origin_label": "measured on the rig",
+    "origin_fields": {
+     "vram": "measured_on_rig",
+     "mem_bw": "borrowed-unverified",
+     "pcie": "Datasheet"
+    }
+   },
+   "age_s": 1430904.1,
+   "stale": true,
+   "bar1_free_mib": {
+    "v": 255,
+    "src": "NVML",
+    "unit": "MiB",
+    "note": "nvidia-smi -q -d MEMORY 23.10. ~09:30Z (snapshot; NVML 2 carries a display seat: Used 67 MiB)"
+   }
+  },
+  {
+   "ord": 2,
+   "nvml_index": 2,
+   "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+   "pci_bus_id": "00000000:19:00.0",
+   "name": "NVIDIA GeForce RTX 3080",
+   "class_key": "RTX3080",
+   "card_key": "RTX3080/20480MiB/sm86",
+   "cc": [
+    8,
+    6
+   ],
+   "sm_count": {
+    "v": 68.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json"
+   },
+   "l2_mib": {
+    "v": 5.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "MiB"
+   },
+   "vram_total_mib": {
+    "v": 20480,
+    "src": "NVML",
+    "unit": "MiB"
+   },
+   "bar1_total_mib": {
+    "v": 256,
+    "src": "NVML",
+    "unit": "MiB"
+   },
+   "pcie": {
+    "max_gen": {
+     "v": 4,
+     "src": "NVML"
+    },
+    "max_width": {
+     "v": 16,
+     "src": "NVML"
+    },
+    "cur_gen": {
+     "v": 4,
+     "src": "NVML",
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)"
+    },
+    "cur_width": {
+     "v": 16,
+     "src": "NVML",
+     "note": "Momentaufnahme, im Leerlauf meist abgesenkt (ASPM)"
+    }
+   },
+   "mem_gbs": {
+    "read": {
+     "v": 755.9,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "copy": {
+     "v": 723.4,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "gemv": {
+     "v": 757.2,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "nameplate": {
+     "v": 800.1,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "bus width x max memory clock x 2 from NVML (peak value, not a measurement)"
+    },
+    "nominal": {
+     "v": 760,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "BORROWED, unverified: datasheet of the 10 GB card (same 320-bit board; modded card not measured separately on the rig) [catalog kartenplan_catalog.py: rtx3080-20]"
+    }
+   },
+   "compute": {
+    "bf16": {
+     "v": 56.93,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    },
+    "fp8_native": {
+     "v": null,
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "note": "compute capability 8.6 has no fp8 tensor path (needs 8.9+)"
+    },
+    "fp8_marlin": {
+     "v": 58.44,
+     "src": "gemessen",
+     "at": 1785448528.0,
+     "probe": "hw_profile-9a5e9b49b7dc.json",
+     "unit": "TFLOPS"
+    },
+    "fp8_w8a16": {
+     "v": 53.43,
+     "src": "gemessen",
+     "at": 1785448528.0,
+     "probe": "hw_profile-9a5e9b49b7dc.json",
+     "unit": "TFLOPS"
+    },
+    "int8": {
+     "v": 127.85,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TOPS"
+    },
+    "nvfp4_w4a8": {
+     "v": 62.2,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TOPS"
+    },
+    "nvfp4_marlin": {
+     "v": 55.22,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "TFLOPS"
+    },
+    "nvfp4_w4a4": {
+     "v": null,
+     "src": "nicht gemessen",
+     "unit": "TFLOPS",
+     "note": "compute capability 8.6: no native FP4 tensor cores (needs 10.0+); this card serves NVFP4 through Marlin (W4A16) or the int8 cores (W4A8), not natively"
+    }
+   },
+   "d2d_intra_gbs": {
+    "v": 723.4,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "copy kernel inside the card (read+write), the same measurement as mem_gbs.copy"
+   },
+   "h2d": {
+    "gbs": {
+     "v": 6.47,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "lat_us": {
+     "v": 12.7,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b5s",
+     "note": "H2D latency: median, 4 kB pinned, copy + synchronisation; minimum of the sample 12.4 \u00b5s"
+    }
+   },
+   "d2h": {
+    "gbs": {
+     "v": 6.57,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "GB/s"
+    },
+    "lat_us": {
+     "v": 12.4,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b5s",
+     "note": "D2H latency: median, 4 kB pinned, copy + synchronisation; minimum of the sample 12.1 \u00b5s"
+    }
+   },
+   "power": {
+    "limit_w": {
+     "v": 230.0,
+     "src": "NVML",
+     "unit": "W"
+    },
+    "default_w": {
+     "v": 320.0,
+     "src": "NVML",
+     "unit": "W"
+    }
+   },
+   "clocks": {
+    "sm_max_mhz": {
+     "v": 2100,
+     "src": "NVML",
+     "unit": "MHz"
+    },
+    "mem_max_mhz": {
+     "v": 10001,
+     "src": "NVML",
+     "unit": "MHz"
+    }
+   },
+   "mem_bus_bits": {
+    "v": 320,
+    "src": "NVML",
+    "unit": "bit"
+   },
+   "state": {
+    "sm_mhz": {
+     "v": 1680.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "MHz"
+    },
+    "sm_max_mhz": {
+     "v": 2100.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "MHz"
+    },
+    "temp_c": {
+     "v": 62.0,
+     "src": "gemessen",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "\u00b0C"
+    },
+    "throttle": [
+     "sw_power_cap"
+    ],
+    "throttled": true
+   },
+   "link": {
+    "gen_cur": {
+     "v": 4,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "width_cur": {
+     "v": 4,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "gen_max": {
+     "v": 4,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "width_max": {
+     "v": 16,
+     "src": "NVML",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "note": "read during the measurement (under the load of the transfer arm)"
+    },
+    "theory_gbs": {
+     "v": 7.88,
+     "src": "Datasheet",
+     "unit": "GB/s",
+     "note": "theoretical rate per direction for Gen4 x4 (measured generation and width, after line coding): a calculated value, not a measurement"
+    },
+    "h2d_pct": {
+     "v": 82.1,
+     "src": "gesch\u00e4tzt",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "%",
+     "note": "derived: measured H2D rate 6.47 GB/s / theoretical 7.88 GB/s (Gen4 x4); a calculation, no measurement of its own"
+    },
+    "d2h_pct": {
+     "v": 83.4,
+     "src": "gesch\u00e4tzt",
+     "at": 1791316941.7129169,
+     "probe": "card_probe-20ae5edfc9b2.json",
+     "unit": "%",
+     "note": "derived: measured D2H rate 6.57 GB/s / theoretical 7.88 GB/s (Gen4 x4); a calculation, no measurement of its own"
+    }
+   },
+   "probed_at": 1791316941.7129169,
+   "catalog": {
+    "id": "rtx3080-20",
+    "label": "RTX 3080 20 GB (modded)",
+    "preset": true,
+    "origin": "measured_on_rig",
+    "origin_label": "measured on the rig",
+    "origin_fields": {
+     "vram": "measured_on_rig",
+     "mem_bw": "borrowed-unverified",
+     "pcie": "Datasheet"
+    }
+   },
+   "age_s": 1430904.1,
+   "stale": true,
+   "bar1_free_mib": {
+    "v": 189,
+    "src": "NVML",
+    "unit": "MiB",
+    "note": "nvidia-smi -q -d MEMORY 23.10. ~09:30Z (snapshot; NVML 2 carries a display seat: Used 67 MiB)"
+   }
+  }
+ ],
+ "links": [
+  {
+   "src": 0,
+   "dst": 1,
+   "transport": "host_staging",
+   "transport_label": "host staging (pinned)",
+   "gbs": {
+    "v": 11.24,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+   },
+   "lat_us": {
+    "v": 22.9,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s"
+   },
+   "peer_access": false,
+   "note": "no peer access in this direction; bytes went device -> pinned host -> device. bandwidth_gbs = PIPELINED (8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7); bandwidth_serial_gbs = whole copy D2H then whole copy H2D, no overlap. latency = 4 kB two-hop copy with a sync after each, median of 200",
+   "gbs_serial": {
+    "v": 6.91,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+   }
+  },
+  {
+   "src": 0,
+   "dst": 2,
+   "transport": "host_staging",
+   "transport_label": "host staging (pinned)",
+   "gbs": {
+    "v": 5.88,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+   },
+   "lat_us": {
+    "v": 25.4,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s"
+   },
+   "peer_access": false,
+   "note": "no peer access in this direction; bytes went device -> pinned host -> device. bandwidth_gbs = PIPELINED (8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7); bandwidth_serial_gbs = whole copy D2H then whole copy H2D, no overlap. latency = 4 kB two-hop copy with a sync after each, median of 200",
+   "gbs_serial": {
+    "v": 4.44,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+   }
+  },
+  {
+   "src": 1,
+   "dst": 0,
+   "transport": "host_staging",
+   "transport_label": "host staging (pinned)",
+   "gbs": {
+    "v": 11.69,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+   },
+   "lat_us": {
+    "v": 23.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s"
+   },
+   "peer_access": false,
+   "note": "no peer access in this direction; bytes went device -> pinned host -> device. bandwidth_gbs = PIPELINED (8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7); bandwidth_serial_gbs = whole copy D2H then whole copy H2D, no overlap. latency = 4 kB two-hop copy with a sync after each, median of 200",
+   "gbs_serial": {
+    "v": 6.87,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+   }
+  },
+  {
+   "src": 1,
+   "dst": 2,
+   "transport": "host_staging",
+   "transport_label": "host staging (pinned)",
+   "gbs": {
+    "v": 5.85,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+   },
+   "lat_us": {
+    "v": 24.9,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s"
+   },
+   "peer_access": false,
+   "note": "no peer access in this direction; bytes went device -> pinned host -> device. bandwidth_gbs = PIPELINED (8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7); bandwidth_serial_gbs = whole copy D2H then whole copy H2D, no overlap. latency = 4 kB two-hop copy with a sync after each, median of 200",
+   "gbs_serial": {
+    "v": 4.33,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+   }
+  },
+  {
+   "src": 2,
+   "dst": 0,
+   "transport": "host_staging",
+   "transport_label": "host staging (pinned)",
+   "gbs": {
+    "v": 6.18,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+   },
+   "lat_us": {
+    "v": 25.9,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s"
+   },
+   "peer_access": false,
+   "note": "no peer access in this direction; bytes went device -> pinned host -> device. bandwidth_gbs = PIPELINED (8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7); bandwidth_serial_gbs = whole copy D2H then whole copy H2D, no overlap. latency = 4 kB two-hop copy with a sync after each, median of 200",
+   "gbs_serial": {
+    "v": 4.52,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+   }
+  },
+  {
+   "src": 2,
+   "dst": 1,
+   "transport": "host_staging",
+   "transport_label": "host staging (pinned)",
+   "gbs": {
+    "v": 6.16,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+   },
+   "lat_us": {
+    "v": 25.3,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s"
+   },
+   "peer_access": false,
+   "note": "no peer access in this direction; bytes went device -> pinned host -> device. bandwidth_gbs = PIPELINED (8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7); bandwidth_serial_gbs = whole copy D2H then whole copy H2D, no overlap. latency = 4 kB two-hop copy with a sync after each, median of 200",
+   "gbs_serial": {
+    "v": 4.41,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+   }
+  },
+  {
+   "src": 0,
+   "dst": 1,
+   "transport": "nccl",
+   "transport_label": "NCCL via host (stage-0 probe, 30.07.2026)",
+   "gbs": {
+    "v": 9.06,
+    "src": "gemessen",
+    "at": 1785448528.0,
+    "probe": "hw_profile-9a5e9b49b7dc.json",
+    "unit": "GB/s"
+   },
+   "lat_us": {
+    "v": null,
+    "src": "nicht gemessen",
+    "unit": "\u00b5s",
+    "note": "the stage-0 probe measures no latency per pair"
+   },
+   "peer_access": null,
+   "note": ""
+  },
+  {
+   "src": 1,
+   "dst": 0,
+   "transport": "nccl",
+   "transport_label": "NCCL via host (stage-0 probe, 30.07.2026)",
+   "gbs": {
+    "v": 9.06,
+    "src": "gesch\u00e4tzt",
+    "at": 1785448528.0,
+    "probe": "hw_profile-9a5e9b49b7dc.json",
+    "unit": "GB/s",
+    "note": "mirrored from the reverse direction, not measured"
+   },
+   "lat_us": {
+    "v": null,
+    "src": "nicht gemessen",
+    "unit": "\u00b5s",
+    "note": "the stage-0 probe measures no latency per pair"
+   },
+   "peer_access": null,
+   "note": ""
+  },
+  {
+   "src": 0,
+   "dst": 2,
+   "transport": "nccl",
+   "transport_label": "NCCL via host (stage-0 probe, 30.07.2026)",
+   "gbs": {
+    "v": 5.1,
+    "src": "gemessen",
+    "at": 1785448528.0,
+    "probe": "hw_profile-9a5e9b49b7dc.json",
+    "unit": "GB/s"
+   },
+   "lat_us": {
+    "v": null,
+    "src": "nicht gemessen",
+    "unit": "\u00b5s",
+    "note": "the stage-0 probe measures no latency per pair"
+   },
+   "peer_access": null,
+   "note": ""
+  },
+  {
+   "src": 2,
+   "dst": 0,
+   "transport": "nccl",
+   "transport_label": "NCCL via host (stage-0 probe, 30.07.2026)",
+   "gbs": {
+    "v": 5.1,
+    "src": "gesch\u00e4tzt",
+    "at": 1785448528.0,
+    "probe": "hw_profile-9a5e9b49b7dc.json",
+    "unit": "GB/s",
+    "note": "mirrored from the reverse direction, not measured"
+   },
+   "lat_us": {
+    "v": null,
+    "src": "nicht gemessen",
+    "unit": "\u00b5s",
+    "note": "the stage-0 probe measures no latency per pair"
+   },
+   "peer_access": null,
+   "note": ""
+  },
+  {
+   "src": 2,
+   "dst": 1,
+   "transport": "nccl",
+   "transport_label": "NCCL via host (stage-0 probe, 30.07.2026)",
+   "gbs": {
+    "v": 5.83,
+    "src": "gemessen",
+    "at": 1785448528.0,
+    "probe": "hw_profile-9a5e9b49b7dc.json",
+    "unit": "GB/s"
+   },
+   "lat_us": {
+    "v": null,
+    "src": "nicht gemessen",
+    "unit": "\u00b5s",
+    "note": "the stage-0 probe measures no latency per pair"
+   },
+   "peer_access": null,
+   "note": ""
+  },
+  {
+   "src": 1,
+   "dst": 2,
+   "transport": "nccl",
+   "transport_label": "NCCL via host (stage-0 probe, 30.07.2026)",
+   "gbs": {
+    "v": 5.83,
+    "src": "gesch\u00e4tzt",
+    "at": 1785448528.0,
+    "probe": "hw_profile-9a5e9b49b7dc.json",
+    "unit": "GB/s",
+    "note": "mirrored from the reverse direction, not measured"
+   },
+   "lat_us": {
+    "v": null,
+    "src": "nicht gemessen",
+    "unit": "\u00b5s",
+    "note": "the stage-0 probe measures no latency per pair"
+   },
+   "peer_access": null,
+   "note": ""
+  },
+  {
+   "src": 0,
+   "dst": 1,
+   "transport": "bar1",
+   "transport_label": "bar1 (direct write into the destination's BAR1)",
+   "gbs": {
+    "v": 14.211,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.0 us"
+   },
+   "lat_us": {
+    "v": 10.2,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.0 us"
+   },
+   "lat_dev_us": {
+    "v": 6.09,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+   },
+   "peer_access": true,
+   "note": ""
+  },
+  {
+   "src": 0,
+   "dst": 2,
+   "transport": "bar1",
+   "transport_label": "bar1 (direct write into the destination's BAR1)",
+   "gbs": {
+    "v": 7.131,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+   },
+   "lat_us": {
+    "v": 10.5,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+   },
+   "lat_dev_us": {
+    "v": 6.06,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+   },
+   "peer_access": true,
+   "note": ""
+  },
+  {
+   "src": 1,
+   "dst": 0,
+   "transport": "bar1",
+   "transport_label": "bar1 (direct write into the destination's BAR1)",
+   "gbs": {
+    "v": 13.139,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.2 us"
+   },
+   "lat_us": {
+    "v": 12.5,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.2 us"
+   },
+   "lat_dev_us": {
+    "v": 6.05,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+   },
+   "peer_access": true,
+   "note": ""
+  },
+  {
+   "src": 1,
+   "dst": 2,
+   "transport": "bar1",
+   "transport_label": "bar1 (direct write into the destination's BAR1)",
+   "gbs": {
+    "v": 6.575,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+   },
+   "lat_us": {
+    "v": 10.4,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+   },
+   "lat_dev_us": {
+    "v": 6.12,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+   },
+   "peer_access": true,
+   "note": ""
+  },
+  {
+   "src": 2,
+   "dst": 0,
+   "transport": "bar1",
+   "transport_label": "bar1 (direct write into the destination's BAR1)",
+   "gbs": {
+    "v": 6.572,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.8 us"
+   },
+   "lat_us": {
+    "v": 12.2,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.8 us"
+   },
+   "lat_dev_us": {
+    "v": 5.88,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+   },
+   "peer_access": true,
+   "note": ""
+  },
+  {
+   "src": 2,
+   "dst": 1,
+   "transport": "bar1",
+   "transport_label": "bar1 (direct write into the destination's BAR1)",
+   "gbs": {
+    "v": 6.574,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.6 us"
+   },
+   "lat_us": {
+    "v": 12.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.6 us"
+   },
+   "lat_dev_us": {
+    "v": 6.36,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+   },
+   "peer_access": true,
+   "note": ""
+  },
+  {
+   "src": 0,
+   "dst": 1,
+   "transport": "nccl_pair",
+   "transport_label": "nccl send/recv (transport not readable from the NCCL log)",
+   "gbs": {
+    "v": 12.733,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_us": {
+    "v": 38.7,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_dev_us": {
+    "v": 36.21,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+   },
+   "peer_access": false,
+   "note": ""
+  },
+  {
+   "src": 0,
+   "dst": 2,
+   "transport": "nccl_pair",
+   "transport_label": "nccl send/recv (transport not readable from the NCCL log)",
+   "gbs": {
+    "v": 6.415,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_us": {
+    "v": 36.4,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_dev_us": {
+    "v": 32.12,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+   },
+   "peer_access": false,
+   "note": ""
+  },
+  {
+   "src": 1,
+   "dst": 0,
+   "transport": "nccl_pair",
+   "transport_label": "nccl send/recv (transport not readable from the NCCL log)",
+   "gbs": {
+    "v": 12.532,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_us": {
+    "v": 36.1,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_dev_us": {
+    "v": 30.53,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+   },
+   "peer_access": false,
+   "note": ""
+  },
+  {
+   "src": 1,
+   "dst": 2,
+   "transport": "nccl_pair",
+   "transport_label": "nccl send/recv (transport not readable from the NCCL log)",
+   "gbs": {
+    "v": 6.372,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_us": {
+    "v": 44.1,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_dev_us": {
+    "v": 37.16,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+   },
+   "peer_access": false,
+   "note": ""
+  },
+  {
+   "src": 2,
+   "dst": 0,
+   "transport": "nccl_pair",
+   "transport_label": "nccl send/recv (transport not readable from the NCCL log)",
+   "gbs": {
+    "v": 6.473,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_us": {
+    "v": 37.4,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_dev_us": {
+    "v": 33.08,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+   },
+   "peer_access": false,
+   "note": ""
+  },
+  {
+   "src": 2,
+   "dst": 1,
+   "transport": "nccl_pair",
+   "transport_label": "nccl send/recv (transport not readable from the NCCL log)",
+   "gbs": {
+    "v": 6.462,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "GB/s",
+    "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_us": {
+    "v": 43.0,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+   },
+   "lat_dev_us": {
+    "v": 36.47,
+    "src": "gemessen",
+    "at": 1791316941.7129169,
+    "probe": "card_probe-20ae5edfc9b2.json",
+    "unit": "\u00b5s",
+    "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+   },
+   "peer_access": false,
+   "note": ""
+  }
+ ],
+ "sources": {
+  "card_probe": [
+   {
+    "file": "card_probe-20ae5edfc9b2.json",
+    "created": 1791316941.7129169,
+    "driver": "595.58.03",
+    "cards": 3
+   }
+  ],
+  "stage0": [
+   {
+    "file": "hw_profile-20ae5edfc9b2.json",
+    "created": 1784617603.0,
+    "driver": "595.58.03",
+    "cards": 3
+   },
+   {
+    "file": "hw_profile-124a7190f860.json",
+    "created": 1785166470.0,
+    "driver": "595.58.03",
+    "cards": 3
+   },
+   {
+    "file": "hw_profile-9a5e9b49b7dc.json",
+    "created": 1785448528.0,
+    "driver": "595.58.03",
+    "cards": 3
+   }
+  ],
+  "nvml": {
+   "issues": [],
+   "cards": 3
+  }
+ },
+ "unmeasured": {
+  "0": [],
+  "1": [],
+  "2": []
+ },
+ "measure_needed": false,
+ "bar1": {
+  "measured": true,
+  "complete": true,
+  "pairs_measured": 6,
+  "pairs_total": 6,
+  "note": "BAR1 stretch: all 6 ordered pairs measured (write rate into the BAR1 window of the target, through the production transport layer)."
+ },
+ "nccl": {
+  "measured": true,
+  "complete": true,
+  "pairs_measured": 6,
+  "pairs_total": 6,
+  "note": "NCCL send/recv: all 6 ordered pairs measured."
+ },
+ "d2d": {
+  "headline": "barlink_bar1",
+  "columns": [
+   {
+    "key": "barlink_bar1",
+    "label": "barlink BAR1 direct (operating path, headline figure)"
+   },
+   {
+    "key": "nccl",
+    "label": "NCCL card to card (comparison without barlink)"
+   },
+   {
+    "key": "host_staging",
+    "label": "Host staging pinned (fallback, not the operating path)"
+   }
+  ],
+  "definitions": {
+   "barlink_bar1": "Rate: one-sided writes of the source card into the BAR1 window of the target card (16 MiB, median of 3). Latency 1 (start + sync): completion time of ONE 4 kB write on the SENDER side with one kernel/copy launch and one host synchronisation (median of 200); contains this floor, no wire latency, and a posted write is no delivery time at the receiver. Latency 2 (without host sync per round): 1000 such writes back to back in the stream, one synchronize at the end, time per write; NOT a round trip (a flag round trip in the kernel is not built). barlink offers only collectives itself, no send/recv.",
+   "nccl": "Rate: send/recv, 4 x 64 MiB, receiver time, median of 5. Latency 1 (start + sync): 4 kB ping-pong, round trip / 2, with host synchronisation per round, median of 200 (delivery time incl. turnaround time of the receiver, contains the start/synchronisation floor). Latency 2 (without host sync per round): the same ping-pong, 200 rounds back to back in the stream, one synchronize at the end, round trip / 2. NCCL chooses the transport itself; it is shown per pair on hover.",
+   "host_staging": "pipelined: 8 MiB chunks over two pinned buffers, D2H and H2D overlapped (median of 7); serial: whole copy D2H, then whole copy H2D, without overlap. Latency: 4 kB copy in two hops via the host with synchronisation after each (median of 200); contains the start/synchronisation floor."
+  },
+  "references": [
+   {
+    "what": "barlink BAR1 collectives, 3 ranks, p50, whole operation (measured 07.09.): all_reduce 20 KiB hub 28.22 \u00b5s, 80 KiB mesh 50.81 \u00b5s, 1 MiB ring 328.60 \u00b5s, 4 MiB mesh 1301.05 \u00b5s, 16 MiB ring 4077.43 \u00b5s (NCCL of the same runs: 41.75 / 73.58 / 372.79 / 1356.69 / 5172.83 \u00b5s)",
+    "source": "python/flliper/srt/distributed/device_communicators/barlink_bar1.py:75-83 (module docstring)"
+   },
+   {
+    "what": "barlink BAR1 round term 323.2 \u00b5s per round and wire 6.02 GB/s (joint fit, gpuq window jpvycx, 07.09.)",
+    "source": "/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.out:19; barlink_bar1.py:1528 (DEFAULT_ROUND_US), :1537 (DEFAULT_WIRE_GBPS)"
+   },
+   {
+    "what": "barlink_host (pinned host, flags in host memory) ping-pong 20 KiB 7.30 \u00b5s against NCCL 37.41 \u00b5s (measured on this rig)",
+    "source": "benchmark/bench_host_transport.py:10-12; docs/dev/ANALYSE_732_bar1_repricing.md (section B)"
+   },
+   {
+    "what": "BAR1 three-rank all_reduce 20 KiB 45.59 \u00b5s; aperture 3080 256 MiB (96 MiB contiguous), 5090 32 GiB (ReBAR)",
+    "source": "docs/dev/ANALYSE_732_bar1_repricing.md:58-64 (source there: FEATURES_VS_UPSTREAM.md:1339,1341)"
+   },
+   {
+    "what": "D decode collective under simultaneous P load: ~0.08 ms with --dual-mps on against 0.53-0.80 ms without (measurement 29.09.); a value for the utilisation by P, not a link latency",
+    "source": "/spinning/gpu-arb/docker/profiles_release/27b-nvfp4-dual.env:122"
+   },
+   {
+    "what": "NCCL transport on this rig: SHM/direct/direct for the measured pairs; CUDA peer access false for all 6 directed pairs (30.07.)",
+    "source": "/spinning/gpu-battery-results/2026-07-30_bar1/s01_p2p_reprobe/results/nccl_transport.json; capability_matrix.json"
+   },
+   {
+    "what": "NCCL all_reduce of the stage-0 group (3 cards): 10 KB 32.4 \u00b5s, 1 MB 361.3 \u00b5s (30.07.)",
+    "source": "~/.cache/flliper/hw_profile-9a5e9b49b7dc.json (links.__group__.ar_10kb_us / ar_1mb_us)"
+   },
+   {
+    "what": "Stage-0 NCCL rate per pair, one direction measured, reverse direction mirrored (estimated) (30.07.): see table \"NCCL via host (stage-0 probe)\"",
+    "source": "~/.cache/flliper/hw_profile-9a5e9b49b7dc.json (links[*].p2p_gbs; historical key name, there is no P2P here)"
+   }
+  ],
+  "pairs": [
+   {
+    "src": 0,
+    "dst": 1,
+    "barlink_bar1": {
+     "gbs": {
+      "v": 14.211,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.0 us"
+     },
+     "lat_us": {
+      "v": 10.2,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.0 us"
+     },
+     "lat_dev_us": {
+      "v": 6.09,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+     }
+    },
+    "nccl": {
+     "gbs": {
+      "v": 12.733,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_us": {
+      "v": 38.7,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_dev_us": {
+      "v": 36.21,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+     },
+     "transport": "nccl send/recv (transport not readable from the NCCL log)"
+    },
+    "host_staging": {
+     "gbs": {
+      "v": 11.24,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+     },
+     "gbs_serial": {
+      "v": 6.91,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+     },
+     "lat_us": {
+      "v": 22.9,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s"
+     },
+     "path": "host_staging"
+    }
+   },
+   {
+    "src": 0,
+    "dst": 2,
+    "barlink_bar1": {
+     "gbs": {
+      "v": 7.131,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+     },
+     "lat_us": {
+      "v": 10.5,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+     },
+     "lat_dev_us": {
+      "v": 6.06,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+     }
+    },
+    "nccl": {
+     "gbs": {
+      "v": 6.415,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_us": {
+      "v": 36.4,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_dev_us": {
+      "v": 32.12,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+     },
+     "transport": "nccl send/recv (transport not readable from the NCCL log)"
+    },
+    "host_staging": {
+     "gbs": {
+      "v": 5.88,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+     },
+     "gbs_serial": {
+      "v": 4.44,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+     },
+     "lat_us": {
+      "v": 25.4,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s"
+     },
+     "path": "host_staging"
+    }
+   },
+   {
+    "src": 1,
+    "dst": 0,
+    "barlink_bar1": {
+     "gbs": {
+      "v": 13.139,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.2 us"
+     },
+     "lat_us": {
+      "v": 12.5,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.2 us"
+     },
+     "lat_dev_us": {
+      "v": 6.05,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+     }
+    },
+    "nccl": {
+     "gbs": {
+      "v": 12.532,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_us": {
+      "v": 36.1,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_dev_us": {
+      "v": 30.53,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+     },
+     "transport": "nccl send/recv (transport not readable from the NCCL log)"
+    },
+    "host_staging": {
+     "gbs": {
+      "v": 11.69,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+     },
+     "gbs_serial": {
+      "v": 6.87,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+     },
+     "lat_us": {
+      "v": 23.0,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s"
+     },
+     "path": "host_staging"
+    }
+   },
+   {
+    "src": 1,
+    "dst": 2,
+    "barlink_bar1": {
+     "gbs": {
+      "v": 6.575,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+     },
+     "lat_us": {
+      "v": 10.4,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 10.1 us"
+     },
+     "lat_dev_us": {
+      "v": 6.12,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+     }
+    },
+    "nccl": {
+     "gbs": {
+      "v": 6.372,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_us": {
+      "v": 44.1,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_dev_us": {
+      "v": 37.16,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+     },
+     "transport": "nccl send/recv (transport not readable from the NCCL log)"
+    },
+    "host_staging": {
+     "gbs": {
+      "v": 5.85,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+     },
+     "gbs_serial": {
+      "v": 4.33,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+     },
+     "lat_us": {
+      "v": 24.9,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s"
+     },
+     "path": "host_staging"
+    }
+   },
+   {
+    "src": 2,
+    "dst": 0,
+    "barlink_bar1": {
+     "gbs": {
+      "v": 6.572,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.8 us"
+     },
+     "lat_us": {
+      "v": 12.2,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.8 us"
+     },
+     "lat_dev_us": {
+      "v": 5.88,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+     }
+    },
+    "nccl": {
+     "gbs": {
+      "v": 6.473,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_us": {
+      "v": 37.4,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_dev_us": {
+      "v": 33.08,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+     },
+     "transport": "nccl send/recv (transport not readable from the NCCL log)"
+    },
+    "host_staging": {
+     "gbs": {
+      "v": 6.18,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+     },
+     "gbs_serial": {
+      "v": 4.52,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+     },
+     "lat_us": {
+      "v": 25.9,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s"
+     },
+     "path": "host_staging"
+    }
+   },
+   {
+    "src": 2,
+    "dst": 1,
+    "barlink_bar1": {
+     "gbs": {
+      "v": 6.574,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.6 us"
+     },
+     "lat_us": {
+      "v": 12.0,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). one-sided posted writes 16 MiB x3 into the destination's BAR1 window (96.0 MiB mapped); latency = median of 200 x 4 kB write+sync, min 11.6 us"
+     },
+     "lat_dev_us": {
+      "v": 6.36,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Schreibzugriffe hintereinander im Stream, ein Synchronize am Ende, Zeit je Schreibzugriff (KEIN Rundlauf)"
+     }
+    },
+    "nccl": {
+     "gbs": {
+      "v": 6.462,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_us": {
+      "v": 43.0,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4 kB, one launch + one synchronize per measurement (contains the start/synchronisation floor, no wire latency). NCCL chose: transport not readable from the NCCL log. rate = bytes received / receiver wall time, 4 x 64 MiB send/recv, median of 5; latency = 4 kB ping-pong round trip / 2 (delivery incl. the receiver's turn-around), median of 200"
+     },
+     "lat_dev_us": {
+      "v": 36.47,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s",
+      "note": "4-kB-Ping-Pong, 200 Runden hintereinander im Stream, ein Synchronize am Ende, Rundlauf / 2"
+     },
+     "transport": "nccl send/recv (transport not readable from the NCCL log)"
+    },
+    "host_staging": {
+     "gbs": {
+      "v": 6.16,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "pipelined: 8 MiB chunks, two pinned buffers, D2H and H2D overlapped, median of 7"
+     },
+     "gbs_serial": {
+      "v": 4.41,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "GB/s",
+      "note": "serial: whole copy D2H, then whole copy H2D (sum of the two single times)"
+     },
+     "lat_us": {
+      "v": 25.3,
+      "src": "gemessen",
+      "at": 1791316941.7129169,
+      "probe": "card_probe-20ae5edfc9b2.json",
+      "unit": "\u00b5s"
+     },
+     "path": "host_staging"
+    }
+   }
+  ]
+ },
+ "formats": [
+  {
+   "key": "bf16",
+   "unit": "TFLOPS",
+   "label": "bf16"
+  },
+  {
+   "key": "fp8_native",
+   "unit": "TFLOPS",
+   "label": "fp8 (native, _scaled_mm)"
+  },
+  {
+   "key": "fp8_marlin",
+   "unit": "TFLOPS",
+   "label": "fp8 Marlin (weights only)"
+  },
+  {
+   "key": "fp8_w8a16",
+   "unit": "TFLOPS",
+   "label": "fp8 W8A16 (Dequant)"
+  },
+  {
+   "key": "int8",
+   "unit": "TOPS",
+   "label": "int8 W8A8"
+  },
+  {
+   "key": "nvfp4_w4a8",
+   "unit": "TOPS",
+   "label": "NVFP4 W4A8 (int8 cores)"
+  },
+  {
+   "key": "nvfp4_marlin",
+   "unit": "TFLOPS",
+   "label": "NVFP4 W4A16 (Marlin)"
+  },
+  {
+   "key": "nvfp4_w4a4",
+   "unit": "TFLOPS",
+   "label": "NVFP4 W4A4 (native)"
+  }
+ ],
+ "src_vocab": [
+  "gemessen",
+  "NVML",
+  "Datasheet",
+  "gesch\u00e4tzt",
+  "nicht gemessen"
+ ],
+ "id": "sha256:47f20315a459324585d75a57bd10b6bfc8fdaa52d65a68c06f35464748462243",
+ "created": 1792747845.822453,
+ "_fixture": "planer-n2fix 1023: GET /api/hwprofil of the rig 23.10. 09:2xZ (RTX 5090 ReBAR 32768 MiB BAR1, 2 x RTX 3080 256 MiB, PEX switch, gen4 x16); bar1_free_mib added from nvidia-smi the same morning"
+}

@@ -137,7 +137,7 @@ case "$mode" in
       echo "  tmp=\$(mktemp -d $root/profil/.stage.XXXXXX)"
       echo "  git -C $repo archive $sha python/flliper | tar -x -C \$tmp     # ~80 MiB"
       echo "  git -C $repo archive $sha docker/flliper/profiles_release | tar -x -C \$tmp   # the release profiles of this tree"
-      echo "  echo $sha > \$tmp/REV ; touch \$tmp/STAGED_OK ; mv \$tmp $dst"
+      echo "  echo $sha > \$tmp/REV ; git -C $repo rev-parse --path-format=absolute --git-common-dir > \$tmp/SOURCE_REPO ; touch \$tmp/STAGED_OK ; mv \$tmp $dst"
     fi
     [ "$want_switch" = 1 ] && echo "  ln -sfn releases/$sha $root/profil/current.new && mv -T $root/profil/current.new $root/profil/current"
     echo "  danach: Unit-Zeilen mit  $0 --unit-flags  (der Lead setzt sie, dann systemctl restart rig-dashboard)"
@@ -155,6 +155,11 @@ case "$mode" in
         git -C "$repo" archive "$sha" docker/flliper/profiles_release | tar -x -C "$tmp"
       fi
       echo "$sha" > "$tmp/REV"
+      # planer-n2fix 1023 (B7): the repository this archive came from. The launcher's record identity ("line" term: a measured record counts
+      # only when its boot commit is an ancestor of the tree's HEAD) asks git THERE about the commit in REV (pdflip/form.py _stage_source);
+      # without it every record of a newer boot fell to CONSTANT and the live planner priced the 27B D budgets ~1.6 GiB per card low.
+      # The COMMON git dir, not the worktree it was called from: a desk worktree is removed after its deploy, the object store stays.
+      git -C "$repo" rev-parse --path-format=absolute --git-common-dir > "$tmp/SOURCE_REPO"
       touch "$tmp/STAGED_OK"
       mv "$tmp" "$dst"
       trap - EXIT

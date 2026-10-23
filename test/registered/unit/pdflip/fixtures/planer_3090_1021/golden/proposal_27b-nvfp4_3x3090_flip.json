@@ -33,7 +33,7 @@
   "authoritative",
   "--p-bs",
   "1",
-  "--extra-p=--max-running-requests=2",
+  "--extra-p=--max-running-requests=2 --hicache-mamba-host-mib 225",
   "--pdflip-weights-cpu-backup",
   "off",
   "--spec-form",
@@ -70,7 +70,9 @@
   "--p-chunk-model",
   "/spinning/wt-planer-ncards-1021/test/registered/unit/pdflip/fixtures/planer_3090_1021/profiles/27b-nvfp4.pchunk.json",
   "--p-chunk-mscale",
-  "nvfp4"
+  "nvfp4",
+  "--extra-d",
+  "--hicache-mamba-host-mib 524"
  ],
  "env": {
   "FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG": "64",
@@ -109,6 +111,18 @@
   [
    "--d-tp-objective",
    "maxkv",
+   "vorgeschlagen",
+   true
+  ],
+  [
+   "--extra-d --hicache-mamba-host-mib",
+   "524",
+   "vorgeschlagen",
+   true
+  ],
+  [
+   "--extra-p --hicache-mamba-host-mib",
+   "225",
    "vorgeschlagen",
    true
   ],

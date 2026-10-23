@@ -117,6 +117,14 @@ SHORTCUTS = [
 ]
 
 
+#: planer-n2fix 1023 (B2/B3): where the boot takes a field's value from (the reason texts of the fields; German in planer_ziel_de.json)
+SP_DERIVED_TP = ("the launcher derives it again at boot from the profile's D objective, as in the dry run: the start profile records it as the planner's "
+                 "value and does not pin it (a pin in --extra-d would beat the launcher's derivation)")
+#: (no "; " inside: the German view translates a reason part by part at "; ")
+SP_RECORDED_BUDGET = ("recomputed by the launcher at boot from the live card: the start profile records this value as the planner's value and does not pin it "
+                      "(a pinned budget above the live one is refused, W100)")
+MAMBA_HOST_WHY = "at least max running + 1 slots on every rank of each group (the runtime's floor, planner rule after the user rebuke of 16.10.)"
+
 # ---------------------------------------------------------------------------------------------------------------------------- German (review B2)
 _DE_RULES: Optional[list] = None
 
@@ -411,6 +419,17 @@ class ZielPlaner:
             return any(ZielPlaner._has_measured_node(x) for x in node)
         return False
 
+    def _picked(self, hw: Optional[dict], cards: List[dict]) -> Optional[dict]:
+        """planer-n2fix 1023 (B7): the hardware profile of the chosen cards (all or a subset of the rig's, ``ProfilEditor._hw_cards_pick``); an
+        editor without the pick (an older editor, a test stub) answers by the exact match as before."""
+        if not hw or self.ed is None:
+            return None
+        ents = [{"entry": e} for e in cards]
+        pick = getattr(self.ed, "_hw_cards_pick", None)
+        if pick is not None:
+            return pick(hw, ents)
+        return hw if self.ed._hw_cards_match(hw, ents) else None
+
     def _rates_measured(self, hw: dict) -> bool:
         """True when EVERY card of the hardware profile has measured rates (memory bandwidth / compute: ``mem_gbs``, ``compute``, ``gemm_tflops``).  A profile that
         was only CAPTURED (NVML names and sizes) has none: its figures are catalog values and borrowed rates, not measurements (review A5)."""
@@ -421,16 +440,19 @@ class ZielPlaner:
         hw = self.ed._hardware_profile() if self.ed is not None else None
         if hw is None:
             return False
-        return bool(self.ed._hw_cards_match(hw, [{"entry": e} for e in cards])) and self._rates_measured(hw)
+        picked = self._picked(hw, cards)                  # planer-n2fix 1023 (B7): the chosen cards may be a subset of the rig
+        return picked is not None and self._rates_measured(picked)
 
     def _hw_info(self, cards: List[dict]) -> dict:
         hw = self.ed._hardware_profile() if self.ed is not None else None
-        same = bool(hw) and bool(self.ed._hw_cards_match(hw, [{"entry": e} for e in cards]))
-        if same and self._rates_measured(hw):
+        picked = self._picked(hw, cards)                  # planer-n2fix 1023 (B7): all or a subset of the rig's cards
+        same = picked is not None
+        if same and self._rates_measured(picked):
             return {"quelle": "gemessen", "label": "measured",
                     "text": "These are the cards of this machine: the hardware profile (NVML, measured rates) is used."}
         if same:
-            idx = [c.get("nvml_index") for c in hw.get("cards") or [] if isinstance(c.get("nvml_index"), int) and not isinstance(c.get("nvml_index"), bool)]
+            idx = list((picked.get("subset_of") or {}).get("nvml_index") or [c.get("nvml_index") for c in hw.get("cards") or []
+                                                                                if isinstance(c.get("nvml_index"), int) and not isinstance(c.get("nvml_index"), bool)])
             return {"quelle": "erfasst", "label": "rates estimated",
                     "text": "These are the cards of this machine (NVML names and sizes captured), but their rates (memory bandwidth, compute) were never measured: the planner "
                             "borrows the rates of the nearest measured card. Every figure below is an estimate until the rates are measured (button below; it books a GPU window).",
@@ -787,18 +809,20 @@ class ZielPlaner:
             row("weights", "p_layers", "Prefill split: layers per card (group P, pipeline)", pc.get("layers"), per_card=self._csv(pc.get("layers")), unit="layers",
                 why="solved by the launcher's cut solver from the cards' rates and memory; attention layers per stage: %s" % (pc.get("attn") or "-"), raw="plan.pp_cut.layers")
         tp = D.get("--rank-tp-ratio")
+        # planer-n2fix 1023 (B2): say where the boot gets the value from: the launcher derives it again (recorded in the start profile, not pinned)
+        tp_pin = "; " + SP_DERIVED_TP
         if self._csv(tp):
             row("weights", "d_split", "Decode split: share of the dense weights per card (group D)", per_card=self._csv(tp), source="launcher dry run",
-                why="--rank-tp-ratio: the ratio of the dense (non-expert) weights each card holds; 1,0,0 = rank 0 (host role) holds them all, the experts are spread by the MoE ratio",
+                why="--rank-tp-ratio: the ratio of the dense (non-expert) weights each card holds; 1,0,0 = rank 0 (host role) holds them all, the experts are spread by the MoE ratio" + tp_pin,
                 raw="--rank-tp-ratio")
         else:
             row("weights", "d_split", "Decode split (group D, tensor-parallel)", tp, source="launcher dry run",
-                why="'auto' = the launcher shares every layer across the %d cards by their decode-group memory budgets" % len(cards), raw="--rank-tp-ratio")
+                why="'auto' = the launcher shares every layer across the %d cards by their decode-group memory budgets" % len(cards) + tp_pin, raw="--rank-tp-ratio")
         if has_p:
             row("weights", "p_mem", "Memory budget per card, prefill group", per_card=self._csv(P.get("--rank-gpu-memory-mib")) or ([P.get("--rank-gpu-memory-mib")] if P.get("--rank-gpu-memory-mib") else None),
-                unit="MiB", why="--rank-gpu-memory-mib of group P (what the pipeline stage may use on the card)", raw="--rank-gpu-memory-mib (P)")
+                unit="MiB", why="--rank-gpu-memory-mib of group P (what the pipeline stage may use on the card); " + SP_RECORDED_BUDGET, raw="--rank-gpu-memory-mib (P)")
         row("weights", "d_mem", "Memory budget per card, decode group", per_card=self._csv(D.get("--rank-gpu-memory-mib")) or ([D.get("--rank-gpu-memory-mib")] if D.get("--rank-gpu-memory-mib") else None),
-            unit="MiB", why="--rank-gpu-memory-mib of group D (weights shard + KV pool + state of the tensor-parallel group)", raw="--rank-gpu-memory-mib (D)")
+            unit="MiB", why="--rank-gpu-memory-mib of group D (weights shard + KV pool + state of the tensor-parallel group); " + SP_RECORDED_BUDGET, raw="--rank-gpu-memory-mib (D)")
         # --- KV pool: the EFFECTIVE value is what the launcher applies (a pool flag); the cut solver's pool and our own estimate are derivations only (review A1-A4)
         pp = self._pool_p(layout, res, P, pc)
         if pp:
@@ -820,8 +844,11 @@ class ZielPlaner:
                 if env_all.get(name):
                     row("experts", name, lab, per_card=self._csv(env_all[name]) or None, value=None if self._csv(env_all[name]) else env_all[name], source="launcher dry run", raw=name)
         # --- Host memory
-        row("host", "mamba_host", "Mamba (recurrent state) host memory", D.get("--hicache-mamba-host-mib") or P.get("--hicache-mamba-host-mib"), unit="MiB",
-            source="launcher dry run", why="--hicache-mamba-host-mib: where the recurrent state of parked/evicted seats lives in the host", raw="--hicache-mamba-host-mib")
+        # planer-n2fix 1023 (B3): BOTH groups (they differ: the floor is max running + 1 slots of each group), as the host cache row
+        mh = ", ".join("%s %s MiB" % (g, f["--hicache-mamba-host-mib"]) for g, f in (("P", P), ("D", D)) if f.get("--hicache-mamba-host-mib"))
+        row("host", "mamba_host", "Mamba (recurrent state) host memory", mh or None,
+            source="launcher dry run", why="--hicache-mamba-host-mib: where the recurrent state of parked/evicted seats lives in the host; " + MAMBA_HOST_WHY,
+            raw="--hicache-mamba-host-mib")
         hc = ", ".join("%s %s GiB" % (g, f["--hicache-size"]) for g, f in (("P", P), ("D", D)) if f.get("--hicache-size"))
         row("host", "host_cache", "Host KV cache (L2) per group", hc or None, source="launcher dry run",
             why="--hicache-size of the groups: the host tier that catches the KV of parked seats", raw="--hicache-size")
@@ -833,9 +860,13 @@ class ZielPlaner:
             row("chunk", "x", "X: longest prefill the decode group takes itself", x, unit="tokens", source="planner",
                 why=pv("--x-ceiling-tokens") or "--x-ceiling-tokens: requests up to X tokens are prefilled on D, longer ones go to P", raw="--x-ceiling-tokens")
 
+        # --- planer-n2fix 1023: BAR1 per card and the barlink windows the launcher derives from it (the tightest card decides)
+        self._bar1_rows(row, prop.get("cards") or [], P, D)
+
         groups = []
-        titles = {"seats": "Your inputs", "weights": "Weight split and memory per card", "kv": "KV pool", "experts": "Experts", "host": "Host memory", "chunk": "Chunk and X"}
-        for gid in ("seats", "weights", "kv", "experts", "host", "chunk"):
+        titles = {"seats": "Your inputs", "weights": "Weight split and memory per card", "kv": "KV pool", "experts": "Experts", "host": "Host memory", "chunk": "Chunk and X",
+                  "transport": "Transport (barlink BAR1)"}
+        for gid in ("seats", "weights", "kv", "experts", "host", "chunk", "transport"):
             zs = [r for r in rows if r["gruppe"] == gid]
             if zs:
                 groups.append({"id": gid, "titel": titles[gid], "zeilen": zs})
@@ -843,6 +874,32 @@ class ZielPlaner:
                      "rate": (prop.get("cards") or [{}] * (i + 1))[i].get("tflops_src")} for i in range(len(prop.get("cards") or []))]
         return {"felder": groups, "defaults": {"seats": goals.get("seats"), "tokens": goals.get("kv_tokens")}, "goals": goals, "karten": cardinfo,
                 "verdikt": self._verdict(vd, prop), "hinweise": [str(x) for x in (prop.get("notes") or []) + (res.get("notes") or []) if x]}
+
+    @staticmethod
+    def _bar1_rows(row, cards: List[dict], P: dict, D: dict) -> None:
+        """planer-n2fix 1023: what the page knows of each card's BAR1 (NVML total, and the free part when the hardware profile captured it) and
+        the ``--barlink-bar1-window-mib`` of each group as the launcher derived them in the dry run (``pdflip/bar1_windows.plan``: the windows of
+        both groups must fit the TIGHTEST card's free BAR1 minus the 32 MiB runtime reserve).  On the rig of 23.10. (5090 with ReBAR 32768 MiB,
+        3080 256 MiB) the 3080 decides; until 22.10. the 256-MiB 5090 with 15 MiB baseline use did, which is why boot 3 of 23.10. ran explicit
+        windows 24,PP_0=80 / 16,TP_0=32,DCP_0=32.  The start profile does not pin them: the launcher derives them at boot from the live BAR1."""
+        per = []
+        for c in cards:
+            tot, free = c.get("bar1_total_mib"), c.get("bar1_free_mib")
+            if tot in (None, ""):
+                per.append("?")
+            elif free not in (None, "") and int(free) < int(tot):
+                per.append("%s (free %s)" % (tot, free))
+            else:
+                per.append(str(tot))
+        if any(x != "?" for x in per):
+            row("transport", "bar1", "BAR1 aperture per card", per_card=per if len(per) >= 2 else None, value=None if len(per) >= 2 else per[0], unit="MiB",
+                source="hardware profile (NVML)", why="nvmlDeviceGetBAR1MemoryInfo: the PCIe aperture peers write the barlink windows into; the free part is a "
+                "snapshot (baseline use of other processes, e.g. a display)", raw="bar1_total_mib")
+        win = "; ".join("%s %s" % (g, f["--barlink-bar1-window-mib"]) for g, f in (("P", P), ("D", D)) if f.get("--barlink-bar1-window-mib"))
+        if win:
+            row("transport", "bar1_windows", "barlink BAR1 windows per group (MiB)", win, source="launcher dry run",
+                why="--barlink-bar1-window-mib: derived by the launcher from the tightest card's free BAR1 minus the 32 MiB reserve; "
+                "the start profile does not pin them, the launcher derives them again at boot from the live BAR1", raw="--barlink-bar1-window-mib")
 
     def _flag_row(self, rows, group, flag, label, res, P, D, pv) -> None:
         v = D.get(flag) or P.get(flag)

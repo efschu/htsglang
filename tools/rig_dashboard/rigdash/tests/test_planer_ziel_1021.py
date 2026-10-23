@@ -329,7 +329,9 @@ class Summary(unittest.TestCase):
         self.assertEqual(f["d_mem"]["je_karte"], ["19792"] * 3)
         self.assertEqual(f["chunk_p"]["wert"], "2048")
         self.assertEqual(f["x"]["wert"], "12288")
-        self.assertEqual(f["mamba_host"]["wert"], "100")
+        # planer-n2fix 1023 (B3): the row names BOTH groups (their floors differ); this recorded answer predates the planner's floor rule (both at the
+        # launcher's constant 100), the live derivation is pinned by test_planer_n2fix_1023
+        self.assertEqual(f["mamba_host"]["wert"], "P 100 MiB, D 100 MiB")
         self.assertTrue(f["d_pool"]["schaetzung"])
         self.assertNotIn("experts", [g["id"] for g in out["felder"]])
         self.assertEqual(out["defaults"], {"seats": 6, "tokens": 262144})
@@ -340,7 +342,7 @@ class Summary(unittest.TestCase):
         self.assertIn("experts", [g["id"] for g in out["felder"]])
         self.assertEqual(f["--pp-cut-expert-lru-rows"]["je_karte"], ["32", "32", "32"])
         self.assertTrue(f["--rank-moe-ratio"]["je_karte"])
-        self.assertEqual(f["mamba_host"]["wert"], "900")
+        self.assertEqual(f["mamba_host"]["wert"], "P 600 MiB, D 900 MiB")            # the NF profile's own values (both above the floor: kept)
         self.assertIn("host", f["expert_total"]["warum"])
 
     def test_dual_has_no_x_and_solo_has_no_prefill_group(self):

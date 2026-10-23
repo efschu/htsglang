@@ -284,12 +284,38 @@ def _facts(raw: Mapping, specs) -> Dict[str, object]:
             "instr": _pairs(raw["instr"])}
 
 
-def import_env(path: str, specs: Optional[Mapping[str, Mapping]] = None, runner=None) -> Dict[str, object]:
+#: where the image keeps the release profiles and the data files they name next to themselves (Dockerfile.flliper:
+#: ``COPY tools/profiles/ /opt/htsglang/profiles/``; make_flat_ctx.sh F0-G ships the ``$(dirname "${BASH_SOURCE[0]}")/<x>.json`` data files there)
+IMAGE_PROFILES_DIR = "/opt/htsglang/profiles/"
+
+
+def _image_relocator(path: str, image_dir: str):
+    """planer-n2fix 1023 (B4): a profile that names a data file NEXT TO ITSELF (``$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/x.json``,
+    27b-nvfp4 ``PROFILE_P_CHUNK_MODEL_NVFP4``) resolves to the directory it was SOURCED from -- on the rig the staged host copy
+    ``/opt/rigdash/kartenplan/profil/current/docker/flliper/profiles_release/``, which no container has: a start profile carrying it was
+    refused at the entrypoint (REQUIRED_PATHS -> refuse MODEL) and its ``--p-chunk-model`` pointed nowhere.  This maps that directory (logical
+    and resolved spelling) to the image's profile directory, where the same file lies."""
+    dst = image_dir if image_dir.endswith("/") else image_dir + "/"
+    srcs = sorted({os.path.dirname(os.path.abspath(path)) + "/", os.path.dirname(os.path.realpath(path)) + "/"}, key=len, reverse=True)
+
+    def fn(v: str) -> str:
+        for src in srcs:
+            if src != dst and src in v:
+                v = v.replace(src, dst)
+        return v
+    return fn
+
+
+def import_env(path: str, specs: Optional[Mapping[str, Mapping]] = None, runner=None, image_dir: Optional[str] = None) -> Dict[str, object]:
     """``.env`` -> ``flliper.server/1``.  ``instruments1`` holds only what differs under
-    ``HTSGLANG_INSTRUMENTS=1`` (the three nf*.env put instrument env into ``--env-p/-d``)."""
+    ``HTSGLANG_INSTRUMENTS=1`` (the three nf*.env put instrument env into ``--env-p/-d``).  ``image_dir`` (B4): the directory the
+    profile lives in INSIDE the image (:data:`IMAGE_PROFILES_DIR`); paths into the profile's own directory are written as image paths."""
     r0 = dump_env(path, "0", runner)
     r1 = dump_env(path, "1", runner)
     f0, f1 = _walk_strings(_facts(r0, specs), _to_placeholders), _walk_strings(_facts(r1, specs), _to_placeholders)
+    if image_dir:
+        reloc = _image_relocator(path, image_dir)
+        f0, f1 = _walk_strings(f0, reloc), _walk_strings(f1, reloc)
     var0 = {v["name"]: v for v in f0["vars"]}
     doc: Dict[str, object] = {
         "schema": SCHEMA,

@@ -7,7 +7,8 @@
     "pci_bus_id": "0000:02:00.0",
     "reserved_bytes": 0,
     "cc_major": 8,
-    "cc_minor": 6
+    "cc_minor": 6,
+    "pcie_cur_width": 4
   },
   {
     "index": 1,
@@ -17,7 +18,8 @@
     "pci_bus_id": "0000:01:00.0",
     "reserved_bytes": 0,
     "cc_major": 12,
-    "cc_minor": 0
+    "cc_minor": 0,
+    "pcie_cur_width": 8
   },
   {
     "index": 2,
@@ -27,6 +29,7 @@
     "pci_bus_id": "0000:03:00.0",
     "reserved_bytes": 0,
     "cc_major": 8,
-    "cc_minor": 6
+    "cc_minor": 6,
+    "pcie_cur_width": 8
   }
 ]

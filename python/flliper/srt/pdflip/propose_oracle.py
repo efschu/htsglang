@@ -91,7 +91,8 @@ def _int_or_none(x: Any) -> Optional[int]:
 def replay_row(index: int, *, uuid: str, name: str, total_mib: int, cc: Optional[Sequence[int]] = None,
                pci_bus_id: str = "", reserved_mib: int = 0, bar1_total_mib: Optional[int] = None,
                pcie_max_gen: Optional[int] = None, pcie_max_width: Optional[int] = None,
-               mem_bus_width_bits: Optional[int] = None, mem_clock_max_mhz: Optional[int] = None) -> Dict[str, Any]:
+               mem_bus_width_bits: Optional[int] = None, mem_clock_max_mhz: Optional[int] = None,
+               bar1_free_mib: Optional[int] = None, pcie_cur_width: Optional[int] = None) -> Dict[str, Any]:
     """One replay row in the exact field set of ``nvml_devices_1378.json`` (+ the optional properties when known).
 
     ``total_mib`` is MiB as NVML reports it (``total_bytes = total_mib << 20``, the 5090 fixture row is 32607 MiB);
@@ -108,8 +109,12 @@ def replay_row(index: int, *, uuid: str, name: str, total_mib: int, cc: Optional
         row["cc_major"], row["cc_minor"] = int(cc[0]), int(cc[1])
     if bar1_total_mib is not None:
         row["bar1_total_bytes"] = int(bar1_total_mib) * MIB
+    if bar1_free_mib is not None:
+        # momentary (registry DeviceInfo.bar1_free_bytes), not an identity field
+        row["bar1_free_bytes"] = int(bar1_free_mib) * MIB
     for k, v in (("pcie_max_gen", pcie_max_gen), ("pcie_max_width", pcie_max_width),
-                 ("mem_bus_width_bits", mem_bus_width_bits), ("mem_clock_max_mhz", mem_clock_max_mhz)):
+                 ("mem_bus_width_bits", mem_bus_width_bits), ("mem_clock_max_mhz", mem_clock_max_mhz),
+                 ("pcie_cur_width", pcie_cur_width)):        # planer-n2fix 1023: the trained width (launcher.pcie_lanes on a replay)
         if v is not None:
             row[k] = int(v)
     return row
@@ -136,8 +141,10 @@ def replay_from_hardware_profile(profile: Mapping[str, Any]) -> List[Dict[str, A
             int(c["nvml_index"]), uuid=str(c["uuid"]), name=str(c["name"]), total_mib=int(total),
             cc=c.get("cc"), pci_bus_id=str(c.get("pci_bus_id") or ""),
             bar1_total_mib=_int_or_none(_node_v(c.get("bar1_total_mib"))),
+            bar1_free_mib=_int_or_none(_node_v(c.get("bar1_free_mib"))),
             pcie_max_gen=_int_or_none(_node_v(pcie.get("max_gen"))),
-            pcie_max_width=_int_or_none(_node_v(pcie.get("max_width")))))
+            pcie_max_width=_int_or_none(_node_v(pcie.get("max_width"))),
+            pcie_cur_width=_int_or_none(_node_v(pcie.get("cur_width")))))
     rows.sort(key=lambda r: r["index"])
     if [r["index"] for r in rows] != list(range(len(rows))):
         raise ValueError("hardware profile NVML indices are not 0..N-1: %s" % [r["index"] for r in rows])

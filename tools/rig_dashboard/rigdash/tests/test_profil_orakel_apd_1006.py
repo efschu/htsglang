@@ -223,14 +223,27 @@ class DryRunWithOracle(unittest.TestCase):
         self.assertEqual(req["inventory"].get("hardware", {}).get("schema"), "flliper.hardware/1")
         self.assertNotIn("cards", req["inventory"])
         self.assertTrue(any("real UUIDs" in n for n in d["notes"]))
-        # two other cards: synthetic
+        # planer-n2fix 1023 (B7): two OF THE RIG'S cards are a subset of the hardware profile -- their real identity, renumbered 0..1 (until 23.10.
+        # they went as synthetic catalog cards: BAR1 / PCIe from the datasheet, census HW-BORROWED, budgets 1.5 GiB low on the 27B duo)
         orc2 = FakeOracle(_doc([], outcome="geht"))
         ed2 = editor(self.tmp + "_y", oracle=orc2, hardware=lambda: {"ok": True, "profile": hw}) if os.makedirs(self.tmp + "_y") is None else None
         try:
-            ed2.dry_run(ed2.load("release", "demo")["doc"], RIG[:2])
+            d2 = ed2.dry_run(ed2.load("release", "demo")["doc"], RIG[:2])
         finally:
             shutil.rmtree(self.tmp + "_y", ignore_errors=True)
-        self.assertIn("cards", orc2.calls[0][1]["inventory"])
+        inv2 = orc2.calls[0][1]["inventory"]
+        self.assertNotIn("cards", inv2)
+        self.assertEqual([c["uuid"] for c in inv2["hardware"]["cards"]], [hw["cards"][0]["uuid"], hw["cards"][1]["uuid"]])
+        self.assertEqual([c["nvml_index"] for c in inv2["hardware"]["cards"]], [0, 1])
+        self.assertTrue(any("2 of the rig's 3 cards" in n for n in d2["notes"]), d2["notes"])
+        # a card the rig does not have: synthetic
+        orc3 = FakeOracle(_doc([], outcome="geht"))
+        ed3 = editor(self.tmp + "_z", oracle=orc3, hardware=lambda: {"ok": True, "profile": hw}) if os.makedirs(self.tmp + "_z") is None else None
+        try:
+            ed3.dry_run(ed3.load("release", "demo")["doc"], [RIG[1], {"card": "rtx3090-24", "pcie": {"gen": 4, "lanes": 16}}])
+        finally:
+            shutil.rmtree(self.tmp + "_z", ignore_errors=True)
+        self.assertIn("cards", orc3.calls[0][1]["inventory"])
 
 
 def _rows(n):
@@ -239,13 +252,22 @@ def _rows(n):
     return sorted(rows, key=lambda r: r["index"])[:n]
 
 
+#: planer-n2fix 1023: the TRAINED PCIe width of each reference-rig card (the PP-CUT crossing table ``MEASURED_GBPS_BY_LANES`` is keyed by it):
+#: "lanes per ordinal [8, 4, 8]" (5090, 3080 nvml0, 3080 nvml2) in the reference rig's boots (e.g. boot_weg2_dkr27bbar1drei10212330 front.log).
+#: Until 23.10. the dry run read the LIVE box's link of the same NVML index instead; since the rig rebuild (22.10.: every card x16 behind the PEX
+#: switch) that turned these reference-rig runs HW-UNCALIBRATED (ok_with_force instead of geht) -- a property of the box, not of the profile.
+REF_LANES = {"GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 8, "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 4,
+             "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 8}
+
+
 def _hw_profile(rows):
-    """A minimal ``flliper.hardware/1`` of replay rows (what ``replay_from_hardware_profile`` reads)."""
+    """A minimal ``flliper.hardware/1`` of replay rows (what ``replay_from_hardware_profile`` reads), with the reference rig's trained widths."""
     cards = []
     for r in rows:
         cards.append({"nvml_index": r["index"], "uuid": r["uuid"], "name": r["name"], "pci_bus_id": r["pci_bus_id"],
                       "cc": [r["cc_major"], r["cc_minor"]], "vram_total_mib": {"v": r["total_bytes"] >> 20, "src": "NVML"},
-                      "bar1_total_mib": {"v": None, "src": "not measured"}, "pcie": {"max_gen": {"v": None}, "max_width": {"v": None}}})
+                      "bar1_total_mib": {"v": None, "src": "not measured"},
+                      "pcie": {"max_gen": {"v": None}, "max_width": {"v": None}, "cur_width": {"v": REF_LANES.get(r["uuid"]), "src": "reference rig"}}})
     return {"schema": "flliper.hardware/1", "cards": cards}
 
 

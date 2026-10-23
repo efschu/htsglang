@@ -638,7 +638,9 @@ class ProfilEditor:
             hit = self._rel_cache.get(name)
             if hit and hit[0] == mt:
                 return json.loads(json.dumps(hit[1]))
-        doc = pj.import_env(path, self.specs())
+        # planer-n2fix 1023 (B4): a data file next to the profile is named by its IMAGE path (the start profile boots in the container)
+        img = getattr(pj, "IMAGE_PROFILES_DIR", None)          # an older planner tree has neither the constant nor the parameter
+        doc = pj.import_env(path, self.specs(), image_dir=img) if img else pj.import_env(path, self.specs())
         pj.freeze_profile_values(doc, self.specs())
         with self._lock:
             self._rel_cache[name] = (mt, doc)
@@ -1025,15 +1027,45 @@ class ProfilEditor:
         return []
 
     @staticmethod
-    def _hw_cards_match(hw: dict, cards: List[dict]) -> bool:
-        """Sind die gewählten Karten genau die NVML-Karten dieses Rigs (gleiche Namen, gleiche Größen, gleiche Zahl)?"""
+    def _hw_cards_pick(hw: dict, cards: List[dict]) -> Optional[dict]:
+        """planer-n2fix 1023 (B7): das Hardwareprofil der gewählten Karten, wenn jede gewählte Karte eine NVML-Karte dieses Rigs ist (gleicher
+        Name, gleiche Größe; die Auswahl darf eine TEILMENGE sein), sonst ``None``.
+
+        Bis 22.10. galt nur "genau alle Karten des Rigs": 5090 + 3080 aus dem Rig 5090 + 2 x 3080 lief auf synthetischen Catalog-Karten
+        (synthetische UUID, Datenblatt-BAR1 256 MiB statt 32768, PCIe gen5 statt gen4), der Census kannte die UUIDs nicht (HW-BORROWED) und der
+        Trockenlauf preiste den Ruhe-Rest mit der Konstante statt mit der Messung -- die Budgets lagen 1,5 GiB je Karte unter dem Boot
+        (deskq/done/27b-nvfp4-flip-5090-3080-1023.md B7).  Gewählt wird je Name/Größe die Karte mit dem kleinsten NVML-Index (die Reihenfolge,
+        in der der Container die Karten sieht); die NVML-Indizes werden auf 0..k-1 umnummeriert wie im Container mit genau diesen Karten."""
+        def mib(c):
+            v = c.get("vram_total_mib")
+            return int(v.get("v") if isinstance(v, dict) else v)
+
         try:
-            have = sorted((str(c["name"]), int((c["vram_total_mib"] or {}).get("v") if isinstance(c["vram_total_mib"], dict) else c["vram_total_mib"]))
-                          for c in hw.get("cards") or [])
-            want = sorted((str(c["entry"]["nvml_name"]), int(c["entry"]["usable_mib"])) for c in cards)
-        except (KeyError, TypeError, ValueError):
-            return False
-        return bool(have) and have == want
+            have = sorted((c for c in hw.get("cards") or []), key=lambda c: int(c.get("nvml_index", 0)))
+            want: Dict[tuple, int] = {}
+            for c in cards:
+                k = (str(c["entry"]["nvml_name"]), int(c["entry"]["usable_mib"]))
+                want[k] = want.get(k, 0) + 1
+            picked = []
+            for c in have:
+                k = (str(c["name"]), mib(c))
+                if want.get(k, 0) > 0:
+                    want[k] -= 1
+                    picked.append(c)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if not picked or any(v > 0 for v in want.values()):
+            return None
+        out = dict(hw)
+        out["cards"] = [dict(c, nvml_index=i) for i, c in enumerate(json.loads(json.dumps(picked)))]
+        if len(picked) != len(have):
+            out["subset_of"] = {"cards": len(have), "nvml_index": [int(c.get("nvml_index", 0)) for c in picked]}
+        return out
+
+    @classmethod
+    def _hw_cards_match(cls, hw: dict, cards: List[dict]) -> bool:
+        """Sind die gewählten Karten NVML-Karten dieses Rigs (alle oder eine Teilmenge, gleiche Namen und Größen)?  Siehe ``_hw_cards_pick``."""
+        return cls._hw_cards_pick(hw, cards) is not None
 
     def _hardware_profile(self) -> Optional[dict]:
         if self.hardware is None:
@@ -1049,9 +1081,13 @@ class ProfilEditor:
         """Das Inventar der Oracle-Frage: die NVML-Karten dieses Rigs (echte UUIDs), wenn die gewählten Karten genau sie sind, sonst
         synthetische Karten aus dem Catalog (Datasheet, synthetische UUID: der Launcher kennt solche UUIDs nicht, z. B. im Census)."""
         hw = self._hardware_profile()
-        if hw is not None and self._hw_cards_match(hw, cards):
-            notes.append("The selected cards are the NVML cards of this rig (hardware profile): the dry run runs with their real UUIDs.")
-            return {"hardware": hw}
+        picked = self._hw_cards_pick(hw, cards) if hw is not None else None
+        if picked is not None:
+            sub = picked.get("subset_of")
+            notes.append("The selected cards are the NVML cards of this rig (hardware profile): the dry run runs with their real UUIDs."
+                         + (" They are %d of the rig's %d cards (NVML %s), renumbered 0..%d as a container with only these cards sees them."
+                            % (len(picked["cards"]), sub["cards"], ",".join(str(i) for i in sub["nvml_index"]), len(picked["cards"]) - 1) if sub else ""))
+            return {"hardware": picked}
         notes.append("Synthetic cards from the catalog (datasheet, synthetic UUID): what the launcher binds to card UUIDs (census) does not know them.")
         return {"cards": [{"entry": c["entry"], "link": c["link"]} for c in cards]}
 
@@ -1307,12 +1343,73 @@ class ProfilEditor:
         toks = ProfilEditor._argv_tokens((launch or {}).get("argv") or [])
         return any(t == flag and toks[i + 1] == value for i, t in enumerate(toks[:-1]))
 
-    def _startprofil(self, base: dict, proposal: dict, basis_name: str) -> tuple:
+    #: planer-n2fix 1023 (B1): the profile variables that name the cards.  They come from the chosen card list (the proposal's ``cards``, launcher
+    #: order), never from the basis profile: the 27B release profile names 3 cards (5090 + 2 x 3080), a start profile for 2 cards that kept them
+    #: would refuse at the entrypoint's GPU gate (HW-COUNT) or claim a calibration inventory it was not derived for.
+    CARD_VARS = ("PROFILE_CARD_COUNT", "PROFILE_GPUS", "PROFILE_INVENTORY")
+    #: planer-n2fix 1023 (B2): the launcher-derived values of the dry run (``verdict.plan.group_flags``) the page shows -- the D weight split and the
+    #: per-card VRAM budgets -- are RECORDED in the start profile as the planner's values (``meta.planner``), never pinned in ``--extra-*``:
+    #: * a word in ``--extra-p/-d`` stands BEHIND the launcher's computed flags and wins (argparse: last occurrence) -- a pin would silently beat the
+    #:   launcher's own derivation at boot (the class of memory ``argv-doppelung-arm-schlaegt-planer``; the 27B duo boot of 23.10. ran without them
+    #:   on purpose and checked the launcher argv against the page: 58,25 matched);
+    #: * the split is what the launcher derives from the profile's D objective (decode-bs1: the measured rate ratio of the cards), the same
+    #:   computation at boot as in the dry run;
+    #: * the budgets are recomputed at boot from the live card (D after P's sleep: measured dormant rest; P: what other processes hold), and a
+    #:   pinned budget above the live one is refused by W100 (``launcher._refuse_if_extra_raises_budget``).  User rule
+    #:   ``planner-alleinzustaendigkeit-vram``: no frozen VRAM number in a profile.
+    PLAN_RECORDS = (("D", "--rank-tp-ratio"), ("P", "--rank-gpu-memory-mib"), ("D", "--rank-gpu-memory-mib"))
+
+    @staticmethod
+    def card_vars(cards: List[dict]) -> Dict[str, str]:
+        """``PROFILE_CARD_COUNT`` / ``PROFILE_GPUS`` / ``PROFILE_INVENTORY`` of a card list in launcher order (``propose``'s ``cards``: NVML name and
+        calibration class per card): ``PROFILE_GPUS`` = ``<NVML name>=<count>`` per name in order of first appearance (the entrypoint's format),
+        ``PROFILE_INVENTORY`` = the classes in card order (``card_identity.parse_inventory``)."""
+        order: List[str] = []
+        count: Dict[str, int] = {}
+        for c in cards:
+            nm = str(c.get("name") or "")
+            if nm not in count:
+                order.append(nm)
+                count[nm] = 0
+            count[nm] += 1
+        return {"PROFILE_CARD_COUNT": str(len(cards)), "PROFILE_GPUS": ";".join("%s=%d" % (nm, count[nm]) for nm in order),
+                "PROFILE_INVENTORY": ",".join(str(c.get("class") or "") for c in cards)}
+
+    def _plan_values(self, base: Optional[dict], proposal: dict, verdict: dict, form: str) -> tuple:
+        """``(pins, records, notes)`` for the start profile (B1/B2): ``pins`` = ``{profile key: value}`` that go into the document (the card
+        variables), ``records`` = ``{profile key: value}`` that only go to ``meta.planner`` (see ``PLAN_RECORDS``).  The single card has no pdflip launcher (no entrypoint
+        GPU gate, no group flags): nothing."""
+        pins: Dict[str, str] = {}
+        records: Dict[str, str] = {}
+        notes: List[str] = []
+        if form == "single":
+            return pins, records, notes
+        bvars = {v["name"]: str(v.get("value", "")) for v in (base or {}).get("vars") or [] if "name" in v and "value" in v}
+        cards = proposal.get("cards") or []
+        if cards:
+            for k, val in self.card_vars(cards).items():
+                if bvars.get(k) != val:
+                    pins["var:" + k] = val
+        gf = ((verdict or {}).get("plan") or {}).get("group_flags") or {}
+        for g, flag in self.PLAN_RECORDS:
+            val = (gf.get(g) or {}).get(flag)
+            if val not in (None, ""):
+                records["extra:%s:%s" % (g, flag)] = str(val)
+        if records:
+            notes.append("Launcher values of the dry run (%s) are recorded as the planner's values, not pinned: the launcher derives them again at boot "
+                         "(the split from the profile's D objective, the budgets from the live cards; a pin in --extra-* would beat that derivation, a pinned "
+                         "budget above the live one is refused, W100)"
+                         % "; ".join("%s %s %s" % (k.split(":", 2)[1], k.split(":", 2)[2], v) for k, v in records.items()))
+        return pins, records, notes
+
+    def _startprofil(self, base: dict, proposal: dict, basis_name: str, plan: Optional[tuple] = None) -> tuple:
         """Das Startprofil ``flliper.server/1``: das Basisprofil mit den Werten, die der Vorschlag ändert (Herkunft ``planer``).  Gibt
-        ``(doc, keys, nicht_uebernommen)``: ``keys`` = Label -> Profilschlüssel der geänderten Zeilen."""
+        ``(doc, keys, nicht_uebernommen)``: ``keys`` = Label -> Profilschlüssel der geänderten Zeilen.  ``plan`` = ``_plan_values`` (B1/B2): die
+        Kartenvariablen und Layout-Pins kommen als Werte des Planers dazu, die Budgets nur nach ``meta.planner``."""
         pj, _ref = self.mods()
         edits, keys, skipped = [], {}, []
         planner_only: Dict[str, str] = {}
+        pins, records, plan_notes = plan or ({}, {}, [])
         for w in proposal.get("values") or []:
             if not w.get("changed"):
                 continue
@@ -1329,6 +1426,8 @@ class ProfilEditor:
                     edits.append({"key": key, "op": "delete"})
             else:
                 edits.append({"key": key, "op": "set", "value": str(w["value"])})
+        done = {e["key"] for e in edits}
+        edits += [{"key": k, "op": "set", "value": v} for k, v in pins.items() if k not in done]     # B1/B2: card variables, layout pins
         new = pj.apply_edits(base, edits, self.specs())
         meta = new.setdefault("meta", {"origins": {}, "planner": {}, "notes": []})
         for e in edits:                                  # ein Wert des Planers ist nicht "vom Nutzer": Herkunft planer
@@ -1336,6 +1435,8 @@ class ProfilEditor:
             if e["op"] == "set":
                 meta.setdefault("planner", {})[e["key"]] = e["value"]
         meta.setdefault("planner", {}).update(planner_only)
+        meta["planner"].update(records)                  # B2: the dry run's split and budgets as the planner's values, never a row (see PLAN_RECORDS)
+        meta.setdefault("notes", []).extend(plan_notes)
         new["name"] = ("%s-proposal" % basis_name)[:64]
         return new, keys, skipped
 
@@ -1448,7 +1549,7 @@ class ProfilEditor:
         v = res["proposal"]
         if single:
             doc = self._single_base(name, paths["model_path"])
-        new, keys, skipped = self._startprofil(doc, v, name)
+        new, keys, skipped = self._startprofil(doc, v, name, self._plan_values(doc, v, res.get("verdict") or {}, form))
         problems = self.verify_render(new, pj.render_env(new))
         new["meta"]["proposal"] = {"schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"], "goals": v["goals"], "basis": [kind, name], "basis_sha256": bsha,
                                     "outcome": res["verdict"].get("outcome"), "argv_sha256": res["verdict"].get("argv_sha256")}

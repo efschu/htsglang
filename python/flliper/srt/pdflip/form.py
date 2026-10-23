@@ -2546,19 +2546,59 @@ _BOOT_LOG_RE = tolerant_compile(
 )
 
 
-@lru_cache(maxsize=16)
-def _repo_head(repo: str) -> Optional[str]:
-    """The commit the tree ``repo`` has checked out; None = git unreadable."""
+#: planer-n2fix 1023 (B7): a git-ARCHIVE stage of the tree (rigdash
+#: ``deploy/stage_profil_modules.sh``: the planner's dry-run tree under
+#: /opt/rigdash/kartenplan/profil/releases/<sha>) is no checkout, so the
+#: ``line`` term could not read HEAD and priced every record measured on a newer
+#: tip as CONSTANT -- the live planner's 27B D budgets on 5090 + 3080 came out
+#: 1566 / 1640 MiB under the boot's (dormant_other 3196 / 2700 constant against
+#: the 1630 / 1060 record). The stage names its commit (``REV``) and the
+#: repository it was archived from (``SOURCE_REPO``); git is then asked THERE,
+#: about exactly that commit. A tree with neither stays unresolvable, loudly.
+STAGE_REV_FILE = "REV"
+STAGE_SOURCE_FILE = "SOURCE_REPO"
+
+
+def _git(repo: str, *args: str) -> Optional[str]:
     import subprocess
 
     try:
-        r = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+        r = subprocess.run(["git", "-C", repo, *args],
                            capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
         return None
-    return r.stdout.strip() or None
+    return r.stdout
+
+
+def _stage_source(repo: str) -> Optional[Tuple[str, str]]:
+    """``(source repository, commit)`` of a git-archive stage ``repo``: its
+    ``REV`` and ``SOURCE_REPO`` files; None when either is missing or empty."""
+    try:
+        with open(os.path.join(repo, STAGE_REV_FILE), encoding="utf-8") as fh:
+            rev = fh.read().strip()
+        with open(os.path.join(repo, STAGE_SOURCE_FILE), encoding="utf-8") as fh:
+            src = fh.read().strip()
+    except OSError:
+        return None
+    return (src, rev) if rev and src else None
+
+
+@lru_cache(maxsize=16)
+def _repo_head(repo: str) -> Optional[str]:
+    """The commit the tree ``repo`` has checked out (for a git-archive stage:
+    the commit its ``REV`` names, resolved in its ``SOURCE_REPO``); None = git
+    unreadable."""
+    out = _git(repo, "rev-parse", "HEAD")
+    if out is None:
+        st = _stage_source(repo) if repo else None
+        if st is None:
+            return None
+        out = _git(st[0], "rev-parse", "--verify", "-q", st[1] + "^{commit}")
+        if out is None:
+            return None
+    return out.strip() or None
 
 
 @lru_cache(maxsize=16)
@@ -2567,17 +2607,14 @@ def _ancestor_index(repo: str, head: str) -> Optional[Dict[str, Tuple[str, ...]]
     git call per (repo, head) -- 27B line_identity measured 0.12 s against
     3.74 s for one ``merge-base --is-ancestor`` per boot tag (the front's
     sleep-leg gate sits inside the first flip). None = git unreadable."""
-    import subprocess
-
-    try:
-        r = subprocess.run(["git", "-C", repo, "rev-list", head],
-                           capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if r.returncode != 0:
+    out = _git(repo, "rev-list", head)
+    if out is None:
+        st = _stage_source(repo) if repo else None     # a git-archive stage: its source repository holds the history
+        out = _git(st[0], "rev-list", head) if st is not None else None
+    if out is None:
         return None
     idx: Dict[str, List[str]] = {}
-    for sha in r.stdout.split():
+    for sha in out.split():
         idx.setdefault(sha[:7], []).append(sha)
     return {k: tuple(v) for k, v in idx.items()}
 
@@ -2737,7 +2774,8 @@ class CalibrationIdentity:
             return None
         heads = ", ".join(h[:10] for h in self.line_heads) or "none"
         return (f"RECORD-IDENTITY UNRESOLVABLE: tree {self.repo} has no readable git HEAD "
-                f"(no .git?) -- the line term proves only boots on the declared heads "
+                f"(no .git, and no {STAGE_REV_FILE} + {STAGE_SOURCE_FILE} stamp of a git-archive stage) -- the "
+                f"line term proves only boots on the declared heads "
                 f"({heads}); every record measured on a newer commit falls to CONSTANT. "
                 f"Run on a git checkout of the tree.")
 

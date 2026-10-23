@@ -379,6 +379,8 @@ def _read_pynvml() -> Tuple[List[dict], Optional[str]]:
                     "total_mib": int(mem.total // (1024 * 1024)) if mem else 0,
                     "cc": [int(cc[0]), int(cc[1])] if cc else None,
                     "bar1_total_mib": int(bar1.bar1Total // (1024 * 1024)) if bar1 else None,
+                    # momentary: BAR1 left after the baseline use of other processes (e.g. a display seat)
+                    "bar1_free_mib": int(bar1.bar1Free // (1024 * 1024)) if bar1 else None,
                     "pcie_max_gen": _try(pynvml.nvmlDeviceGetMaxPcieLinkGeneration, h),
                     "pcie_max_width": _try(pynvml.nvmlDeviceGetMaxPcieLinkWidth, h),
                     "pcie_cur_gen": _try(pynvml.nvmlDeviceGetCurrPcieLinkGeneration, h),
@@ -435,6 +437,7 @@ def _read_smi() -> Tuple[List[dict], Optional[str]]:
                 "cc": [int(cc[0]), int(cc[1])] if len(cc) == 2 and all(c.isdigit() for c in cc) else None,
                 # nvidia-smi --query-gpu has no BAR1 total and no bus width
                 "bar1_total_mib": None,
+                "bar1_free_mib": None,
                 "pcie_max_gen": int(f(p[5])) if f(p[5]) is not None else None,
                 "pcie_max_width": int(f(p[6])) if f(p[6]) is not None else None,
                 "pcie_cur_gen": int(f(p[7])) if f(p[7]) is not None else None,
@@ -821,6 +824,9 @@ def build(
             "l2_mib": val("l2_mib", "MiB", "device property (torch L2_cache_size) is read by the measuring arm"),
             "vram_total_mib": _nv(r.get("total_mib") or None, "MiB", "memory size"),
             "bar1_total_mib": _nv(r.get("bar1_total_mib"), "MiB", "BAR1 size (the nvidia-smi fallback does not know it)"),
+            "bar1_free_mib": _nv(r.get("bar1_free_mib"), "MiB", "BAR1 free (the nvidia-smi fallback does not know it)",
+                                 "Momentary snapshot: BAR1 total minus the baseline use of other processes "
+                                 "(e.g. a display seat); the BAR1 windows of a launch are planned against it"),
             "pcie": {
                 "max_gen": _nv(r.get("pcie_max_gen"), None, "PCIe-Generation (Maximum)"),
                 "max_width": _nv(r.get("pcie_max_width"), None, "PCIe-Breite (Maximum)"),

@@ -435,6 +435,31 @@ def mamba_slots_d(seats: int) -> int:
     return max(1, int(round(D_MAMBA_SLOTS_REF * int(seats) / float(D_MAMBA_SEATS_REF))))
 
 
+#: planer-n2fix 1023 (B3): what the launcher puts into ``--hicache-mamba-host-mib`` when nothing else names it -- the constant of
+#: ``launcher.common_flags`` (#1430: ``FLLIPER_PDFLIP_MAMBA_ANCHOR_MIB``, default "100" = two 27B slots).  Pinned against the launcher source by
+#: test_planer_n2fix_1023.
+LAUNCHER_MAMBA_ANCHOR_MIB = 100
+
+
+def mamba_staging_slots(max_running: int) -> int:
+    """The fewest host anchor (staging) slots a group runs with on the arena form: one ANCHOR-BYPASS row per running request plus one -- the
+    runtime's own law ``memory_pool_host.mamba_anchor_slot_floor_staging`` (16.10., user rebuke ``mamba-host-mib-300-zu-klein``), restated here
+    because this module is stdlib only (pinned equal by test_planer_n2fix_1023).  0 = the running count is unknown."""
+    m = int(max_running or 0)
+    return m + 1 if m > 0 else 0
+
+
+def mamba_host_mib(max_running: int, slot_mib_full: float) -> int:
+    """``--hicache-mamba-host-mib`` that buys :func:`mamba_staging_slots` slots on EVERY rank of a group: the MiB budget is rank-invariant, the
+    slot count it buys is ``MiB // per_slot`` of the rank and the group takes the MIN (``sync_fixed_hicache_size``), so the budget is priced at
+    the largest per-rank slot -- bounded by one slot of the whole model (every linear layer, every head: ``slot_mib_full``).  Rounded UP to whole
+    MiB; 0 when either term is unknown."""
+    slots = mamba_staging_slots(max_running)
+    if slots <= 0 or not slot_mib_full or slot_mib_full <= 0:
+        return 0
+    return int(math.ceil(slots * float(slot_mib_full)))
+
+
 # ---------------------------------------------------------------------------
 # K4/K2 (MoE): the Form A decode layout
 # ---------------------------------------------------------------------------

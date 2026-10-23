@@ -86,7 +86,7 @@ def cards_from_hardware(hardware: Any) -> List[Dict[str, Any]]:
             bf16 = (c.get("compute") or {}).get("bf16") or {}
             d = {"nvml_index": int(c["nvml_index"]), "uuid": str(c["uuid"]), "name": str(c["name"]),
                  "total_mib": int(_nv(c["vram_total_mib"])), "cc": list(c["cc"]) if c.get("cc") else None,
-                 "bar1_total_mib": _nv(c.get("bar1_total_mib")), "pcie_max_gen": _nv(pcie.get("max_gen")),
+                 "bar1_total_mib": _nv(c.get("bar1_total_mib")), "bar1_free_mib": _nv(c.get("bar1_free_mib")), "pcie_max_gen": _nv(pcie.get("max_gen")),
                  "pcie_max_width": _nv(pcie.get("max_width"))}
             if bf16.get("v") is not None:
                 d["tflops"], d["tflops_src"] = float(bf16["v"]), str(bf16.get("src", ""))
@@ -108,6 +108,9 @@ def cards_from_hardware(hardware: Any) -> List[Dict[str, Any]]:
                     d["total_mib"] = int(d["total_bytes"]) >> 20
                 if d.get("nvml_index") is None:
                     d["nvml_index"] = d.get("index", i)
+                for mib_key, b_key in (("bar1_total_mib", "bar1_total_bytes"), ("bar1_free_mib", "bar1_free_bytes")):   # planer-n2fix 1023
+                    if d.get(mib_key) is None and d.get(b_key) is not None:
+                        d[mib_key] = int(d[b_key]) >> 20
                 out.append(d)
     if not out:
         raise ProposeError("hardware holds no card")
@@ -524,6 +527,69 @@ def _vision_victim_section(la: Any, form: str, fp: Any, model: Mapping[str, Any]
         avail, asrc = VV.available_dense_mib(model, stage0)
     return VV.section(form=form, vision=vision, place=place, is_moe=is_moe, dual=(form == "dual"), tower_bytes=tower, tower_src=tower_src,
                       available_mib=avail, available_src=asrc)
+
+
+#: planer-n2fix 1023 (B3): the flag of the mamba host anchor pool (a group-string word: the launcher's own value comes first in the group argv,
+#: ``--extra-*`` after it wins, as in the NF release profiles)
+MAMBA_HOST_FLAG = "--hicache-mamba-host-mib"
+
+
+def _extra_last(la: LaunchArgv, g: str, flag: str) -> Optional[str]:
+    """The value of the LAST ``flag`` word in the ``--extra-g`` string (argparse: the last occurrence wins; the NF profile names it twice)."""
+    found = LaunchArgv._rx(flag).findall(la.gtext("extra", g) or "")
+    return found[-1] if found else None
+
+
+def _extra_set_all(la: LaunchArgv, g: str, flag: str, value: str) -> None:
+    """Every ``flag`` word of the ``--extra-g`` string gets ``value`` (appended when there is none)."""
+    text = la.gtext("extra", g)
+    if text and LaunchArgv._rx(flag).search(text):
+        la.set_gtext("extra", g, LaunchArgv._rx(flag).sub(lambda m: m.group(0)[: m.start(1) - m.start(0)] + str(value), text))
+    else:
+        la.extra_set(g, flag, value)
+
+
+def _mamba_host_section(la: LaunchArgv, rec: "_Rec", *, form: str, same_inv: bool, slot_mib_full: float, seats: int, seats_p: int,
+                        live_cls: Sequence[str]) -> None:
+    """B3 (planer-n2fix 1023): ``--hicache-mamba-host-mib`` of each launched group from the code's floor instead of the launcher constant.
+
+    The launcher passes ``R.LAUNCHER_MAMBA_ANCHOR_MIB`` (100 MiB, #1430) to both groups unless something names the flag.  On the 27B that buys two
+    slots per rank against the runtime's floor of max_running + 1 (``memory_pool_host.mamba_anchor_slot_floor_staging``): measured on every 27B
+    boot (1022_015348: ``MAMBA-ANCHOR-FLOOR RAISED ... bought 2 host anchor slots, the floor is 7`` on D, ``is 3`` on P).  The user rebuke of 16.10.
+    (``mamba-host-mib-300-zu-klein``) is the rule: compute the value from the floor (slots x per slot), never take a constant below it.  The planner
+    therefore names a value whenever the one the launcher would use buys fewer slots than the floor; a profile value that already buys them (NF:
+    P 600 / D 900) stays untouched.  The profile's own inventory is carried as it is (A1: the proposal for the profile's inventory IS the profile;
+    the reference goldens pin that): there the launcher's constant stays and the runtime raises it to the floor at boot -- the root fix is the
+    launcher's own default (``launcher.common_flags``), an open point of planer-n2fix 1023."""
+    if same_inv or not slot_mib_full or slot_mib_full <= 0:
+        return
+    env_default = la.env.get("FLLIPER_PDFLIP_MAMBA_ANCHOR_MIB")
+    for g in (("d",) if form == "tp" else ("p", "d")):
+        if g == "p":
+            src = la.extra_get("p", "--max-running-requests") or la.get_flag("--p-bs")
+            mrr = int(src) if src and str(src).isdigit() else int(seats_p)
+        else:
+            src = la.extra_get("d", "--max-running-requests") or la.get_flag("--d-bs")
+            mrr = int(src) if src and str(src).isdigit() else int(seats)
+        need = R.mamba_host_mib(mrr, slot_mib_full)
+        if need <= 0:
+            continue
+        old = _extra_last(la, g, MAMBA_HOST_FLAG)
+        basis = old if old is not None else (env_default or str(R.LAUNCHER_MAMBA_ANCHOR_MIB))
+        try:
+            have = int(float(basis))
+        except (TypeError, ValueError):
+            have = 0
+        if have >= need:
+            continue
+        _extra_set_all(la, g, MAMBA_HOST_FLAG, str(need))
+        slots = R.mamba_staging_slots(mrr)
+        rec.add("--extra-%s %s" % (g, MAMBA_HOST_FLAG), group=g, old=old, new=str(need), state=R.PROPOSED,
+                source="Rule: staging floor of the arena form for the cards [%s]: (max running %d + 1) = %d slots x %.2f MiB (one mamba slot of the whole model)"
+                       % (",".join(live_cls), mrr, slots, slot_mib_full),
+                reason="the host anchor pool must hold max running + 1 slots on every rank (runtime floor, user rebuke 16.10.: computed from the floor, never a "
+                       "constant below it); %s %s MiB buys fewer and the runtime would raise it at boot (MAMBA-ANCHOR-FLOOR RAISED)"
+                       % ("the profile's" if old is not None else "the launcher's default", basis), policy="mamba_host")
 
 
 def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: Optional[Mapping[str, Any]] = None, *,
@@ -1153,6 +1219,10 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
                              kv_tokens=kv_tokens, kv_dtype=kv_dtype, rate=rate, rate_src=rate_src, layers=layers, attn=attn, posts=sb["posts"], d_slots=asm.d_mamba_slots,
                              carried=carried, inv_txt=inv_txt, get=_get, set_=_set, slot_label=slot_label)
 
+    # --- planer-n2fix 1023 (B3): the mamba host anchor (staging) pool per group, derived from the code's floor ----------------------------
+    _mamba_host_section(la, rec, form=form, same_inv=same_inv, slot_mib_full=fp.linear_layers * mamba_slot, seats=seats, seats_p=seats_p,
+                        live_cls=live_cls)
+
     # --- VISION-WEIGHTS AP4: the transient tower on displaced weights (only with --pdflip-vision-place weights) -----------------------
     vision_sec = _vision_victim_section(la, form, fp, model, is_moe, effective_cut(), frp, dual)
     if vision_sec.get("aktiv") and vision_sec.get("verdict", {}).get("stage") == "nein":
@@ -1167,7 +1237,9 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
     return {
         "schema": SCHEMA, "form": form, "n": n,
         "cards": [{"ordinal": c["ordinal"], "nvml_index": c.get("nvml_index"), "uuid": c.get("uuid"), "name": c.get("name"),
-                   "class": c["class"], "arch": c["arch"], "total_mib": c["total_mib"], "tflops": rate[i], "tflops_src": rate_src[i]}
+                   "class": c["class"], "arch": c["arch"], "total_mib": c["total_mib"], "tflops": rate[i], "tflops_src": rate_src[i],
+                   # planer-n2fix 1023: BAR1 per card for the page's transport rows (None = the source did not state it)
+                   "bar1_total_mib": c.get("bar1_total_mib"), "bar1_free_mib": c.get("bar1_free_mib")}
                   for i, c in enumerate(cards)],
         "inventory": {"live": list(live_cls), "profil": list(binv) if binv else None, "same_as_profile": bool(same_inv)},
         "argv": list(la.t), "env": dict(la.env), "basis": b["name"],

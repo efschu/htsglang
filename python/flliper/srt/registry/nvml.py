@@ -92,6 +92,19 @@ class DeviceInfo:
     cc_minor: Optional[int] = None
     #: nvmlDeviceGetBAR1MemoryInfo().bar1Total
     bar1_total_bytes: Optional[int] = None
+    #: nvmlDeviceGetBAR1MemoryInfo().bar1Free -- a MOMENTARY value (the BAR1 left
+    #: after the baseline use of other processes, e.g. a display seat), read live
+    #: next to ``bar1_total_bytes``. Deliberately NOT in :data:`IDENTITY_FIELDS`:
+    #: identity / fingerprints of a card must not change with what happens to be
+    #: mapped right now. ``None`` = NVML did not answer / a recording without it.
+    bar1_free_bytes: Optional[int] = None
+    #: planer-n2fix 1023: nvmlDeviceGetCurrPcieLinkWidth -- the width the link
+    #: TRAINED to (the PP-CUT crossing price is keyed by it,
+    #: launcher.pcie_lanes). Momentary like ``bar1_free_bytes``, not identity.
+    #: A recording carries it as ``pcie_cur_width`` so a replayed dry run prices
+    #: the RECORDED links, never the live box's (the planner's dry runs read the
+    #: box's own cards by NVML index until 23.10.).
+    pcie_cur_width: Optional[int] = None
     #: nvmlDeviceGetMaxPcieLinkGeneration / nvmlDeviceGetMaxPcieLinkWidth
     #: (the link the slot+card can train to, not the momentary one).
     pcie_max_gen: Optional[int] = None
@@ -372,6 +385,9 @@ def _replay_devices() -> "list[DeviceInfo] | None":
             # HW-GENERIC 1002: a recording without a property replays it as
             # None (unknown), exactly like an NVML that did not answer.
             **{k: (None if r.get(k) is None else int(r[k])) for k in IDENTITY_FIELDS},
+            # momentary, not an identity field: read separately (absent = None)
+            bar1_free_bytes=(None if r.get("bar1_free_bytes") is None else int(r["bar1_free_bytes"])),
+            pcie_cur_width=(None if r.get("pcie_cur_width") is None else int(r["pcie_cur_width"])),
         )
         for r in rows
     ]
@@ -414,6 +430,34 @@ def _identity_fields(pynvml, handle) -> dict:
     return out
 
 
+def _bar1_free_bytes(pynvml, handle) -> Optional[int]:
+    """nvmlDeviceGetBAR1MemoryInfo().bar1Free, or ``None`` when NVML did not
+    answer. Momentary (see :attr:`DeviceInfo.bar1_free_bytes`), hence not part
+    of :func:`_identity_fields`."""
+    try:
+        bar1 = pynvml.nvmlDeviceGetBAR1MemoryInfo(handle)
+        free = getattr(bar1, "bar1Free", None)
+        return None if free is None else int(free)
+    except Exception:  # noqa: BLE001 - unanswered = None, by design
+        return None
+
+
+def _pcie_cur_width(pynvml, handle) -> Optional[int]:
+    """nvmlDeviceGetCurrPcieLinkWidth, or ``None`` when NVML did not answer
+    (momentary, see :attr:`DeviceInfo.pcie_cur_width`)."""
+    try:
+        return int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))
+    except Exception:  # noqa: BLE001 - unanswered = None, by design
+        return None
+
+
+def replay_armed() -> bool:
+    """True when :data:`ENV_NVML_REPLAY` names a recording: the cards of this
+    process are RECORDED ones, and a live NVML query by index would read the
+    box's own cards instead (a different card, or none)."""
+    return bool(os.environ.get(ENV_NVML_REPLAY, ""))
+
+
 def list_devices() -> list[DeviceInfo]:
     """Every physical GPU, in NVML index order.
 
@@ -442,6 +486,8 @@ def list_devices() -> list[DeviceInfo]:
                     reserved_bytes=reserved_bytes,
                     pci_bus_id=_decode(pynvml.nvmlDeviceGetPciInfo(handle).busId),
                     **_identity_fields(pynvml, handle),
+                    bar1_free_bytes=_bar1_free_bytes(pynvml, handle),
+                    pcie_cur_width=_pcie_cur_width(pynvml, handle),
                 )
             )
         return devices

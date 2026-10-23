@@ -5886,10 +5886,18 @@ class Card:
     #: without ``cc`` never passes ``resolve_cards`` (arch gate, HW-ARCH).
     cc: Optional[Tuple[int, int]] = None
     bar1_total_mib: Optional[int] = None
+    #: BAR1 FREE before the launch (nvmlDeviceGetBAR1MemoryInfo().bar1Free, MiB):
+    #: a momentary value -- the baseline use of a display seat / sibling process
+    #: is already out of it. ``None`` = NVML did not report it (replay without
+    #: it): the BAR1 windows are then judged against ``bar1_total_mib``.
+    bar1_free_mib: Optional[int] = None
     pcie_max_gen: Optional[int] = None
     pcie_max_width: Optional[int] = None
     mem_bus_width_bits: Optional[int] = None
     mem_clock_max_mhz: Optional[int] = None
+    #: planer-n2fix 1023: the trained PCIe link width (NVML current), see
+    #: registry.nvml.DeviceInfo.pcie_cur_width; read by pcie_lanes() on a replay
+    pcie_cur_width: Optional[int] = None
 
 
 @dataclass
@@ -6059,10 +6067,13 @@ def selected_nvml_cards() -> List[Card]:
              cc=getattr(d, "compute_capability", None),
              bar1_total_mib=(None if getattr(d, "bar1_total_bytes", None) is None
                              else int(d.bar1_total_bytes) // (1 << 20)),
+             bar1_free_mib=(None if getattr(d, "bar1_free_bytes", None) is None
+                            else int(d.bar1_free_bytes) // (1 << 20)),
              pcie_max_gen=getattr(d, "pcie_max_gen", None),
              pcie_max_width=getattr(d, "pcie_max_width", None),
              mem_bus_width_bits=getattr(d, "mem_bus_width_bits", None),
-             mem_clock_max_mhz=getattr(d, "mem_clock_max_mhz", None))
+             mem_clock_max_mhz=getattr(d, "mem_clock_max_mhz", None),
+             pcie_cur_width=getattr(d, "pcie_cur_width", None))
         for d in nvml_registry.list_devices()
     ]
     return select_cards(cards, _CARD_SELECTION)
@@ -6276,19 +6287,38 @@ def apply_bar1_windows(ns, cards: Sequence["Card"], log=None) -> Optional[str]:
     """HW-P1c 1003 (BAR1-WINDOW): the group windows for THIS card count and the
     MEASURED BAR1 of the cards (pdflip/bar1_windows.py). Only the untouched
     defaults (and the dual default) are replaced; an operator's explicit
-    window is kept. N = 3 on 256 MiB BARs: the shipped windows, no line."""
+    window is kept. N = 3 on 256 MiB BARs: the shipped windows, no line.
+
+    B6 (23.10.): the aperture of a card is the BAR1 that is FREE before the
+    launch (``Card.bar1_free_mib``), not the total, and each mapping costs
+    ``bar1_windows.OVERHEAD_MIB``. The proven count keeps its early return
+    byte for byte ONLY while every card whose free BAR1 is known fits the
+    shipped windows by that constraint; a card that does not (a display seat
+    holding BAR1) sends the launch through the planner like any other N."""
     n = len(cards)
-    if n in _topo.PROVEN_CARD_COUNTS:
-        return None   # the proven layout is not re-judged: the shipped windows stand byte for byte
     dual = bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False))
     p_cur = str(getattr(ns, "p_barlink_bar1_window_mib", P_BARLINK_BAR1_WINDOW_MIB))
     d_cur = str(getattr(ns, "d_barlink_bar1_window_mib", D_BARLINK_BAR1_WINDOW_MIB))
     p_default = p_cur in (P_BARLINK_BAR1_WINDOW_MIB, DUAL_P_BARLINK_BAR1_WINDOW_MIB)
     d_default = d_cur == D_BARLINK_BAR1_WINDOW_MIB
-    pl = bar1_windows_mod.plan(
-        n, [getattr(c, "bar1_total_mib", None) for c in cards], dual=dual,
-        p_base=p_cur if not p_default else (DUAL_P_BARLINK_BAR1_WINDOW_MIB if dual else None),
-        d_base=d_cur if not d_default else None)
+    p_base = p_cur if not p_default else (DUAL_P_BARLINK_BAR1_WINDOW_MIB if dual else None)
+    d_base = d_cur if not d_default else None
+    totals = [getattr(c, "bar1_total_mib", None) for c in cards]
+    frees = [getattr(c, "bar1_free_mib", None) for c in cards]
+    free_forced = False
+    if n in _topo.PROVEN_CARD_COUNTS:
+        # only the cards whose free BAR1 is known are judged here (the rest stays unexamined, as before)
+        known_free = [f is not None for f in frees]
+        if not any(known_free):
+            return None   # the proven layout is not re-judged: the shipped windows stand byte for byte
+        chk = bar1_windows_mod.plan(
+            n, [t if k else None for t, k in zip(totals, known_free)], dual=dual,
+            p_base=p_base, d_base=d_base,
+            bar1_free_mib=[f if k else None for f, k in zip(frees, known_free)])
+        if chk.ok and chk.scale >= 1.0:
+            return None
+        free_forced = True
+    pl = bar1_windows_mod.plan(n, totals, dual=dual, p_base=p_base, d_base=d_base, bar1_free_mib=frees)
     if not pl.ok:
         raise PdFlipLaunchRefused(f"BAR1-WINDOW: {pl.why}")
     changed = (pl.p != p_cur and p_default) or (pl.d != d_cur and d_default)
@@ -6296,7 +6326,7 @@ def apply_bar1_windows(ns, cards: Sequence["Card"], log=None) -> Optional[str]:
         ns.p_barlink_bar1_window_mib = pl.p
     if d_default:
         ns.d_barlink_bar1_window_mib = pl.d
-    if changed or pl.usable_mib is None and n != _topo.PROVEN_CARD_COUNTS[0]:
+    if changed or free_forced or pl.usable_mib is None and n != _topo.PROVEN_CARD_COUNTS[0]:
         line = pl.line()
         if log is not None:
             log(line)
@@ -13584,6 +13614,32 @@ def rank_state_dir_for(spec: GroupSpec) -> str:
     return rank_state_mod.rank_state_dir_for_log(spec.log)
 
 
+def group_rank_count(argv: Sequence[str]) -> int:
+    """The rank count of a group, from the argv the launcher built for it:
+    ``--tp-size`` x ``--pp-size`` (last occurrence wins, as in the server).
+
+    27B NVFP4 duo 23.10.: the W7/W10 canonical gate was called with a literal
+    3 (the reference rig's card count); on a 2-card launch P is TP1 x PP2 and
+    D is TP2, so a clean group was refused as "group reports 1x2 ranks,
+    launcher expects 3" (boot dkr27bnvfp4duobar1duo10230518)."""
+    from flliper.srt.pdflip import carrier_census as _cc
+    tp = _cc.tp_size_of(argv, default=1) or 1
+    pp = 1
+    items = list(argv)
+    for i, a in enumerate(items):
+        v = None
+        if a == "--pp-size" and i + 1 < len(items):
+            v = items[i + 1]
+        elif a.startswith("--pp-size="):
+            v = a.split("=", 1)[1]
+        if v is not None:
+            try:
+                pp = int(v)
+            except ValueError:
+                pass
+    return tp * pp
+
+
 def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
                          kv_owner_ranks: Sequence[int] = ()) -> None:
     """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
@@ -15924,15 +15980,28 @@ def budgets_from_dc(
     # VERDICT-ONLY: it says so by name and returns the budgets byte-identical.
     # (User decision 2026-09-09, consequences 3 and 4.)
     if not any(f.actuates for f in floors.values()):
+        # planer-n2fix 1023 (B7): the user reserve was NOT zero on the 27B duo
+        # boot (1800,1400) -- it is CONTAINED in the card's booked awake rest
+        # (VRAM-GRUNDGESETZ 29.09., pdflip/budget_rest.py: the measured rest
+        # replaces floor transient, reserve and overshoot; see _reserve_eff
+        # above), so the corridor pass sees 0. Say which of the two it is per
+        # card, and name the launcher's own flag (--user-reserve-mib; the
+        # --rank-user-reserve-mib of the old text is the server's per-rank flag).
+        _res_txt = "; ".join(
+            f"nvml{c.nvml_index} {int((user_reserve_by_card or {}).get(c.uuid, 0))} MiB"
+            + (f" contained in the booked awake rest {int(booked[i])} MiB"
+               if booked[i] is not None and int((user_reserve_by_card or {}).get(c.uuid, 0)) else "")
+            for i, c in enumerate(cards))
         log(
             f"PDFLIP-BUDGET corridor-constrained group={group} pass={label} "
             f"{corridor_budget.UNMEASURED_FLOOR_NAME}: no card's corridor floor "
-            f"is priced (every source is UNMEASURED-FALLBACK and every user "
-            f"reserve is 0), so the corridor pass is VERDICT-ONLY on this boot "
-            f"and every budget stands byte-identical "
-            f"({','.join(str(b) for b in out)} MiB). Measure the awake group's "
-            f"transient (scripts/vram_ledger/probe_activation.py ingest) or "
-            f"pass --rank-user-reserve-mib to make it actuate."
+            f"is priced (every source is UNMEASURED-FALLBACK and no user reserve "
+            f"is charged beside it: user reserve {_res_txt}), so the corridor "
+            f"pass is VERDICT-ONLY on this boot and every budget stands "
+            f"byte-identical ({','.join(str(b) for b in out)} MiB). Measure the "
+            f"awake group's transient (scripts/vram_ledger/probe_activation.py "
+            f"ingest) or pass --user-reserve-mib on a card without a booked rest "
+            f"to make it actuate."
         )
         for cf in floors.values():
             log(cf.line)
@@ -18960,6 +19029,16 @@ def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
     today's NVML enumeration and this launcher already refuses to hardcode
     that kind of fact (``order_cards``).
     """
+    # planer-n2fix 1023: on a REPLAYED inventory (the planner's dry runs, desk
+    # runs) the cards are recorded ones -- a live query by NVML index read the
+    # BOX's card of that index instead (since 22.10. every card here trains x16
+    # behind the PEX switch: the reference-rig dry runs RealOracle/RealForms
+    # turned HW-UNCALIBRATED, and a foreign inventory was priced with this
+    # box's links). The recording's trained width wins, else its maximum (the
+    # slot width a catalog card is requested with), else unknown.
+    if nvml_registry.replay_armed():
+        return [(c.pcie_cur_width if getattr(c, "pcie_cur_width", None) is not None
+                 else getattr(c, "pcie_max_width", None)) for c in cards]
     out: List[Optional[int]] = []
     try:
         import pynvml
@@ -28459,7 +28538,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "this arm runs under prints neither marker. P's own health check "
             "already confirmed it booted clean to READY.")
     else:
-        canonical_state_gate(spec_p, 3, log)
+        canonical_state_gate(spec_p, group_rank_count(spec_p.argv), log)
 
     # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
     # This is the one sleep on this box that is NOT interleaved: group D does
@@ -28562,7 +28641,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "never builds either (enable_hierarchical_cache is False) -- no "
             "canonical-page/GDN-blob emitter to grade, same as group P above.")
     else:
-        canonical_state_gate(spec_d, 3, log,
+        canonical_state_gate(spec_d, group_rank_count(spec_d.argv), log,
                              kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
         # VRAM-Vertrag M2 (display only): P's blocks again, now carrying its
         # first sleep leg -- the per-PID source of the plan's asleep.P

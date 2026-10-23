@@ -71,7 +71,9 @@
   "/spinning/wt-planer-ncards-1021/test/registered/unit/pdflip/fixtures/planer_3090_1021/profiles/27b-nvfp4.pchunk.json",
   "--p-chunk-mscale",
   "nvfp4",
-  "--d-only"
+  "--d-only",
+  "--extra-d",
+  "--hicache-mamba-host-mib 524"
  ],
  "env": {
   "FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG": "64",
@@ -116,6 +118,12 @@
   [
    "--d-tp-objective",
    "maxkv",
+   "vorgeschlagen",
+   true
+  ],
+  [
+   "--extra-d --hicache-mamba-host-mib",
+   "524",
    "vorgeschlagen",
    true
   ],

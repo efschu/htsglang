@@ -128,6 +128,18 @@
 "The decode group runs up to %d overflow waves (Form A standard: %d).": "Die Decode-Gruppe fährt bis zu {0} Überlaufwellen (Form-A-Standard: {1}).",
 "The overflow waves are not priced, so the figure is a lower bound.": "Die Überlaufwellen sind nicht bepreist, die Zahl ist also eine Untergrenze.",
 "The cost per missed expert row is the unmeasured seed; the first boot is the measurement.": "Die Kosten je verfehlter Expertenzeile sind die ungemessene Saat; der erste Boot ist die Messung.",
-"No lock: the layout can be started.": "Keine Sperre: das Layout ist startbar."
+"No lock: the layout can be started.": "Keine Sperre: das Layout ist startbar.",
+"the launcher derives it again at boot from the profile's D objective, as in the dry run: the start profile records it as the planner's value and does not pin it (a pin in --extra-d would beat the launcher's derivation)": "der Launcher leitet sie beim Boot erneut aus dem D-Ziel des Profils ab, wie im Trockenlauf: das Startprofil vermerkt sie als Wert des Planers und pinnt sie nicht (ein Pin in --extra-d schlüge die Ableitung des Launchers)",
+"recomputed by the launcher at boot from the live card: the start profile records this value as the planner's value and does not pin it (a pinned budget above the live one is refused, W100)": "vom Launcher beim Boot aus der laufenden Karte neu gerechnet: das Startprofil vermerkt diesen Wert als Wert des Planers und pinnt ihn nicht (ein gepinntes Budget über dem laufenden wird verweigert, W100)",
+"--rank-tp-ratio: the ratio of the dense (non-expert) weights each card holds": "--rank-tp-ratio: Verhältnis der dichten (Nicht-Experten-)Gewichte je Karte",
+"1,0,0 = rank 0 (host role) holds them all, the experts are spread by the MoE ratio": "1,0,0 = Rang 0 (Host-Rolle) hält sie alle, die Experten verteilen sich nach dem MoE-Verhältnis",
+"at least max running + 1 slots on every rank of each group (the runtime's floor, planner rule after the user rebuke of 16.10.)": "mindestens max_running + 1 Slots auf jedem Rang jeder Gruppe (Untergrenze der Laufzeit, Planer-Regel nach der Nutzerrüge vom 16.10.)",
+"Transport (barlink BAR1)": "Transport (barlink BAR1)",
+"BAR1 aperture per card": "BAR1-Fenster je Karte",
+"hardware profile (NVML)": "Hardwareprofil (NVML)",
+"nvmlDeviceGetBAR1MemoryInfo: the PCIe aperture peers write the barlink windows into; the free part is a snapshot (baseline use of other processes, e.g. a display)": "nvmlDeviceGetBAR1MemoryInfo: das PCIe-Fenster, in das die Partner die barlink-Fenster schreiben; der freie Teil ist eine Momentaufnahme (Grundbelegung anderer Prozesse, z. B. einer Anzeige)",
+"barlink BAR1 windows per group (MiB)": "barlink-BAR1-Fenster je Gruppe (MiB)",
+"--barlink-bar1-window-mib: derived by the launcher from the tightest card's free BAR1 minus the 32 MiB reserve": "--barlink-bar1-window-mib: vom Launcher aus dem freien BAR1 der engsten Karte abzüglich 32 MiB Reserve abgeleitet",
+"the start profile does not pin them, the launcher derives them again at boot from the live BAR1": "das Startprofil pinnt sie nicht, der Launcher leitet sie beim Boot erneut aus dem laufenden BAR1 ab"
 }
 }
