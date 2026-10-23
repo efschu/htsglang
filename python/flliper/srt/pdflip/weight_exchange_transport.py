@@ -728,6 +728,27 @@ class DeviceOps:
     def ipc_close_handle(self, ptr: int) -> None:
         raise NotImplementedError
 
+    # -- batched copy issue (BAR1 collector) ---------------------------------
+    def batch_copier(self, device: int):
+        """``(copier, "")`` or ``(None, why)``: a verified
+        :class:`CudartBatchCopier` for ``device``. Only the cudart adapter has
+        one; every other ops object names the absence instead of raising."""
+        return None, f"ops {self.name} has no batch copier"
+
+
+def get_batch_copier(ops, device: int):
+    """:meth:`DeviceOps.batch_copier` for ANY ops object, never raising: an
+    object without the method (a desk fake) or one whose method throws gets
+    ``(None, why)`` with the reason named."""
+    fn = getattr(ops, "batch_copier", None)
+    if not callable(fn):
+        return None, f"ops {getattr(ops, 'name', type(ops).__name__)} has no batch copier"
+    try:
+        copier, why = fn(int(device))
+    except Exception as exc:  # noqa: BLE001 -- the answer is a reason, not a raise
+        return None, f"batch_copier raised {type(exc).__name__}: {exc}"
+    return copier, why
+
 
 def find_libcudart(venv: str = "") -> str:
     """The runtime this rig actually ships, cu13 first.
@@ -768,6 +789,78 @@ class _IpcHandle(ctypes.Structure):
     # c_ubyte, NEVER c_char.  See the module docstring: a c_char array has
     # STRING semantics and truncates the handle at its first NUL.
     _fields_ = [("reserved", ctypes.c_ubyte * CUDA_IPC_HANDLE_SIZE)]
+
+
+# -- CUDA 12.8+/13 batched-copy structs (driver_types.h), mirrored for ctypes.
+#
+# Layout is pinned AGAINST THE REAL HEADER by
+# test_pdflip_bar1_collect_batch_copier_1023.py (gcc prints sizeof/offsetof of
+# every field of every struct below; the test compares them with ctypes). A
+# mistake here would not fail: the runtime would read garbage pointers/pitches
+# and copy weights to the wrong place. The runtime canary in
+# :meth:`CudartDeviceOps.batch_copier` is the second line of defence.
+#
+# cu13 numbers: sizeof(cudaMemLocation)=8, cudaMemcpyAttributes=24,
+# cudaMemcpy3DOperand=40 (type @0, union @8, 32 bytes), cudaExtent=24,
+# cudaMemcpy3DBatchOp=112 (src @0, dst @40, extent @80, srcAccessOrder @104,
+# flags @108).
+
+#: cudaMemcpySrcAccessOrderStream / cudaMemcpyOperandTypePointer
+CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM = 1
+CUDA_MEMCPY_OPERAND_TYPE_POINTER = 1
+#: first runtime with cudaMemcpyBatchAsync / cudaMemcpy3DBatchAsync (they take
+#: an extra ``size_t *failIdx`` before the stream below 13000)
+CUDART_BATCH_MIN_VERSION = 12080
+CUDART_BATCH_NO_FAILIDX_VERSION = 13000
+
+
+class _CuMemLocation(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class _CuMemcpyAttributes(ctypes.Structure):
+    _fields_ = [("srcAccessOrder", ctypes.c_int),
+                ("srcLocHint", _CuMemLocation),
+                ("dstLocHint", _CuMemLocation),
+                ("flags", ctypes.c_uint)]
+
+
+class _CuExtent(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_size_t), ("height", ctypes.c_size_t),
+                ("depth", ctypes.c_size_t)]
+
+
+class _CuOffset3D(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_size_t), ("y", ctypes.c_size_t),
+                ("z", ctypes.c_size_t)]
+
+
+class _CuMemcpy3DOperandPtr(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p),
+                ("rowLength", ctypes.c_size_t),
+                ("layerHeight", ctypes.c_size_t),
+                ("locHint", _CuMemLocation)]
+
+
+class _CuMemcpy3DOperandArray(ctypes.Structure):
+    _fields_ = [("array", ctypes.c_void_p), ("offset", _CuOffset3D)]
+
+
+class _CuMemcpy3DOperandOp(ctypes.Union):
+    _fields_ = [("ptr", _CuMemcpy3DOperandPtr),
+                ("array", _CuMemcpy3DOperandArray)]
+
+
+class _CuMemcpy3DOperand(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("op", _CuMemcpy3DOperandOp)]
+
+
+class _CuMemcpy3DBatchOp(ctypes.Structure):
+    _fields_ = [("src", _CuMemcpy3DOperand),
+                ("dst", _CuMemcpy3DOperand),
+                ("extent", _CuExtent),
+                ("srcAccessOrder", ctypes.c_int),
+                ("flags", ctypes.c_uint)]
 
 
 def dst_pointer_probe(ops):
@@ -1009,6 +1102,67 @@ class CudartDeviceOps(DeviceOps):
 
         return lane_sm_copy.copier_for(int(device))
 
+    # -- batched copy issue (BAR1 collector) ---------------------------------
+    def _memcpy_sync(self, dst: int, src: int, nbytes: int) -> None:
+        """Blocking ``cudaMemcpy`` (kind Default) -- canary scratch up/download."""
+        fn = self.lib.cudaMemcpy
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                       ctypes.c_int]
+        self._check(fn(ctypes.c_void_p(dst), ctypes.c_void_p(src), nbytes,
+                       CUDA_MEMCPY_DEFAULT), "cudaMemcpy")
+
+    def batch_copier(self, device: int):
+        """``(copier, "")`` or ``(None, why)``; never raises.
+
+        Cached PER PROCESS, keyed by (runtime library, device) -- not on this
+        instance: the wake leg builds a fresh ``CudartDeviceOps`` for every
+        tag's collect (``_pdflip_xchg_device_ops``), so an instance cache
+        re-ran the canary on every tag (review barlink-lanes2-1023). A copier
+        is handed out ONLY after :func:`_batch_canary` copied a non-uniform
+        pattern through it on ``device`` and every byte matched. Refusals:
+        runtime older than 12.8, a missing symbol, a failed canary, any
+        exception -- all named. A verdict is cached (copier, version/symbol
+        refusal, byte mismatch); a canary that RAISED (an allocation or
+        launch failure, possibly transient mid-flip) is not, the next tag
+        asks again."""
+        device = int(device)
+        key = (str(self.path), device)
+        with _BATCH_COPIERS_LOCK:
+            if key in _BATCH_COPIERS:
+                return _BATCH_COPIERS[key]
+            try:
+                ans = self._build_batch_copier(device)
+            except Exception as exc:  # noqa: BLE001 -- a reason, never a raise
+                ans = (None, f"cudart batch copier refused: unexpected "
+                             f"{type(exc).__name__}: {exc}")
+            if ans[0] is not None or not _batch_refusal_transient(ans[1]):
+                _BATCH_COPIERS[key] = ans
+            return ans
+
+    def _build_batch_copier(self, device: int):
+        ver = ctypes.c_int(0)
+        fn = self.lib.cudaRuntimeGetVersion
+        fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._check(fn(ctypes.byref(ver)), "cudaRuntimeGetVersion")
+        ver = int(ver.value)
+        if ver < CUDART_BATCH_MIN_VERSION:
+            return None, (f"cudart batch copier refused: runtime {ver} < "
+                          f"{CUDART_BATCH_MIN_VERSION} has no "
+                          f"cudaMemcpyBatchAsync (libcudart={self.path})")
+        for sym in ("cudaMemcpyBatchAsync", "cudaMemcpy3DBatchAsync"):
+            if not hasattr(self.lib_held, sym):
+                return None, (f"cudart batch copier refused: symbol {sym} "
+                              f"missing from {self.path} (runtime {ver})")
+        copier = CudartBatchCopier(self, ver)
+        why = _batch_canary(self, copier, device)
+        if why:
+            return None, (f"cudart batch copier refused: canary failed on "
+                          f"device {device} (runtime {ver}): {why}")
+        # the canary's own calls are not lane traffic
+        copier.calls = 0
+        copier.copies = 0
+        return copier, ""
+
     # -- host pinning -----------------------------------------------------
     def host_register(self, ptr: int, nbytes: int, flags: int) -> None:
         self._check(self.lib.cudaHostRegister(ctypes.c_void_p(ptr), nbytes, flags),
@@ -1057,6 +1211,279 @@ class CudartDeviceOps(DeviceOps):
     def ipc_close_handle(self, ptr: int) -> None:
         self._check(self.lib.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr)),
                     "cudaIpcCloseMemHandle")
+
+
+class PreparedBatch:
+    """The ctypes arrays of ONE batch, built once by
+    :meth:`CudartBatchCopier.prepare` and replayed by ``issue``. Holds the
+    arrays alive (the runtime reads them at issue time). ``n_flat`` /
+    ``n_2d`` are the row counts of the two parts, ``calls`` the runtime calls
+    one ``issue`` makes (0..2)."""
+
+    __slots__ = ("n_flat", "n_2d", "dsts", "srcs", "sizes", "attrs",
+                 "attrs_idxs", "ops3d")
+
+    def __init__(self):
+        self.n_flat = 0
+        self.n_2d = 0
+        self.dsts = self.srcs = self.sizes = None
+        self.attrs = self.attrs_idxs = None
+        self.ops3d = None
+
+    @property
+    def calls(self) -> int:
+        return (1 if self.n_flat else 0) + (1 if self.n_2d else 0)
+
+    @property
+    def copies(self) -> int:
+        return self.n_flat + self.n_2d
+
+
+class CudartBatchCopier:
+    """N device-to-device copies as ONE runtime call per part
+    (``cudaMemcpyBatchAsync`` for the flat part, ``cudaMemcpy3DBatchAsync``
+    for the strided-2D part), bound through ``ctypes.PyDLL`` -- the GIL stays
+    held across the call, the same reasoning as ``CudartDeviceOps.lib_held``
+    (the call only queues work for device memory and returns).
+
+    ROW SHAPE (plain 7-tuples, all rows alike)::
+
+        (kind, dst, src, nbytes_or_width, dpitch, spitch, rows)
+
+        FLAT       (FLAT,      dst, src, nbytes, 0,      0,      0)
+        STRIDED2D  (STRIDED2D, dst, src, width,  dpitch, spitch, rows)
+
+    ``dst``/``src`` are device addresses (int), sizes in bytes. ``nbytes`` and
+    ``width``/``rows`` must be > 0 (the 3D extent forbids 0; a 0-byte piece is
+    the caller's to drop), ``dpitch``/``spitch`` >= ``width``. Within one
+    batch the copies are NOT ordered and must not depend on each other (API
+    contract). Row order inside each part is preserved in the arrays.
+
+    ``prepare`` builds the arrays once; ``issue(prepared, stream)`` is then at
+    most two calls with no per-piece Python work. ``stream`` must be a created,
+    nonzero stream handle of the CURRENT thread's device (the legacy NULL
+    stream is refused by the API; here by name).
+
+    Do not construct directly: ask :meth:`CudartDeviceOps.batch_copier`, which
+    hands one out only after the layout canary passed.
+    """
+
+    def __init__(self, ops, version: int):
+        self.ops = ops
+        self.version = int(version)
+        self.fail_idx_form = self.version < CUDART_BATCH_NO_FAILIDX_VERSION
+        held = ops.lib_held
+        # AttributeError on a missing symbol is the caller's (batch_copier's)
+        # refusal, by name.
+        self._flat_fn = held.cudaMemcpyBatchAsync
+        self._3d_fn = held.cudaMemcpy3DBatchAsync
+        pv = ctypes.POINTER(ctypes.c_void_p)
+        ps = ctypes.POINTER(ctypes.c_size_t)
+        flat_args = [pv, pv, ps, ctypes.c_size_t,
+                     ctypes.POINTER(_CuMemcpyAttributes), ps, ctypes.c_size_t]
+        d3_args = [ctypes.c_size_t, ctypes.POINTER(_CuMemcpy3DBatchOp)]
+        if self.fail_idx_form:
+            flat_args.append(ps)
+            d3_args.append(ps)
+        d3_args.append(ctypes.c_ulonglong)
+        flat_args.append(ctypes.c_void_p)
+        d3_args.append(ctypes.c_void_p)
+        self._flat_fn.argtypes = flat_args
+        self._flat_fn.restype = ctypes.c_int
+        self._3d_fn.argtypes = d3_args
+        self._3d_fn.restype = ctypes.c_int
+        self._lock = threading.Lock()
+        #: runtime calls / copies issued through this copier (lane-time line)
+        self.calls = 0
+        self.copies = 0
+
+    # -- build ------------------------------------------------------------
+    def prepare(self, rows) -> PreparedBatch:
+        flat = []
+        d2 = []
+        for i, row in enumerate(rows):
+            if len(row) != 7:
+                raise ValueError(
+                    f"batch row {i} has {len(row)} fields, want "
+                    f"(kind, dst, src, nbytes_or_width, dpitch, spitch, rows)")
+            kind, dst, src, n, dpitch, spitch, nrows = row
+            if kind == FLAT:
+                if n <= 0:
+                    raise ValueError(f"batch row {i}: FLAT nbytes={n} must be > 0")
+                flat.append((int(dst), int(src), int(n)))
+            elif kind == STRIDED2D:
+                if n <= 0 or nrows <= 0:
+                    raise ValueError(
+                        f"batch row {i}: STRIDED2D width={n} rows={nrows} "
+                        f"must be > 0 (the 3D extent forbids 0)")
+                if dpitch < n or spitch < n:
+                    raise ValueError(
+                        f"batch row {i}: STRIDED2D dpitch={dpitch} spitch={spitch} "
+                        f"must be >= width={n}")
+                d2.append((int(dst), int(src), int(n), int(dpitch),
+                           int(spitch), int(nrows)))
+            else:
+                raise ValueError(
+                    f"batch row {i}: kind {kind!r} is neither {FLAT} nor "
+                    f"{STRIDED2D}; ZEROFILL and the rest are not copies")
+        pb = PreparedBatch()
+        if flat:
+            n = len(flat)
+            pb.n_flat = n
+            pb.dsts = (ctypes.c_void_p * n)(*[r[0] for r in flat])
+            pb.srcs = (ctypes.c_void_p * n)(*[r[1] for r in flat])
+            pb.sizes = (ctypes.c_size_t * n)(*[r[2] for r in flat])
+            attrs = _CuMemcpyAttributes()
+            attrs.srcAccessOrder = CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM
+            pb.attrs = attrs
+            pb.attrs_idxs = (ctypes.c_size_t * 1)(0)
+        if d2:
+            n = len(d2)
+            pb.n_2d = n
+            ops3d = (_CuMemcpy3DBatchOp * n)()
+            for k, (dst, src, width, dpitch, spitch, nrows) in enumerate(d2):
+                op = ops3d[k]
+                op.src.type = CUDA_MEMCPY_OPERAND_TYPE_POINTER
+                op.src.op.ptr.ptr = src
+                op.src.op.ptr.rowLength = spitch
+                op.src.op.ptr.layerHeight = 0
+                op.dst.type = CUDA_MEMCPY_OPERAND_TYPE_POINTER
+                op.dst.op.ptr.ptr = dst
+                op.dst.op.ptr.rowLength = dpitch
+                op.dst.op.ptr.layerHeight = 0
+                op.extent.width = width
+                op.extent.height = nrows
+                op.extent.depth = 1
+                op.srcAccessOrder = CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM
+                op.flags = 0
+            pb.ops3d = ops3d
+        return pb
+
+    # -- issue ------------------------------------------------------------
+    def issue(self, prepared: PreparedBatch, stream: int) -> None:
+        if not stream:
+            raise ValueError(
+                "CudartBatchCopier.issue: stream is 0 (the legacy NULL stream); "
+                "cudaMemcpyBatchAsync / cudaMemcpy3DBatchAsync refuse it -- "
+                "pass a created, nonzero stream")
+        sh = ctypes.c_void_p(int(stream))
+        ncalls = 0
+        if prepared.n_flat:
+            args = [prepared.dsts, prepared.srcs, prepared.sizes,
+                    prepared.n_flat, prepared.attrs, prepared.attrs_idxs, 1]
+            if self.fail_idx_form:
+                args.append(ctypes.c_size_t(0))
+            args.append(sh)
+            self.ops._check(self._flat_fn(*args), "cudaMemcpyBatchAsync")
+            ncalls += 1
+        if prepared.n_2d:
+            args = [prepared.n_2d, prepared.ops3d]
+            if self.fail_idx_form:
+                args.append(ctypes.c_size_t(0))
+            args.append(0)
+            args.append(sh)
+            self.ops._check(self._3d_fn(*args), "cudaMemcpy3DBatchAsync")
+            ncalls += 1
+        if ncalls:
+            with self._lock:
+                self.calls += ncalls
+                self.copies += prepared.copies
+
+
+#: (runtime library path, device) -> (copier or None, why): one canary per
+#: process and card (CudartDeviceOps.batch_copier).
+_BATCH_COPIERS: dict = {}
+_BATCH_COPIERS_LOCK = threading.Lock()
+
+
+def _batch_refusal_transient(why: str) -> bool:
+    """A refusal that says nothing about the runtime: the canary itself could
+    not run (cudaMalloc/stream/copy raised) or something unexpected raised."""
+    w = str(why or "")
+    return "(stage=alloc)" in w or "(stage=setup)" in w or "refused: unexpected" in w
+
+
+def reset_batch_copier_cache() -> None:
+    """Tests only: forget every cached verdict."""
+    with _BATCH_COPIERS_LOCK:
+        _BATCH_COPIERS.clear()
+
+
+def _canary_pattern(n: int) -> bytes:
+    """Non-uniform, non-periodic-at-small-scale bytes: an offset or pitch error
+    of even one byte changes every compared byte."""
+    return bytes(((i * 131) ^ (i >> 8) * 7 ^ 0x5A) & 0xFF for i in range(n))
+
+
+CANARY_BYTES = 64 * 1024
+CANARY_FILL = 0xEE
+#: (dst_off, src_off, nbytes) -- distinct, unaligned, non-overlapping dst
+CANARY_FLAT = ((3, 5, 777), (4099, 9001, 1234), (20001, 30011, 4093),
+               (50001, 60007, 31))
+#: (dst_off, src_off, width, dpitch, spitch, rows): dpitch != spitch != width
+CANARY_2D = ((32771, 40013, 211, 300, 517, 7),)
+
+
+def _batch_canary(ops, copier: CudartBatchCopier, device: int) -> str:
+    """Run ONE prepared batch (4 flat rows + 1 strided row, see CANARY_*) on
+    a fresh stream between two device scratch buffers and compare every byte
+    with what Python says it must be. ``""`` = verified, else the reason.
+
+    This is what keeps a ctypes layout mistake from silently corrupting the
+    weights on the metal: the test file pins the layout against the header, the
+    canary pins the RUNTIME's behaviour on this device."""
+    a = b = 0
+    stream = 0
+    stage = "setup"
+    try:
+        src_host = _canary_pattern(CANARY_BYTES)
+        want = bytearray([CANARY_FILL]) * CANARY_BYTES
+        for dst, src, n in CANARY_FLAT:
+            want[dst:dst + n] = src_host[src:src + n]
+        for dst, src, width, dpitch, spitch, rows in CANARY_2D:
+            for r in range(rows):
+                want[dst + r * dpitch:dst + r * dpitch + width] = \
+                    src_host[src + r * spitch:src + r * spitch + width]
+        stage = "alloc"
+        a = ops.raw_malloc(device, CANARY_BYTES)
+        b = ops.raw_malloc(device, CANARY_BYTES)
+        up = ctypes.create_string_buffer(src_host, CANARY_BYTES)
+        ops._memcpy_sync(a, ctypes.addressof(up), CANARY_BYTES)
+        fill = ctypes.create_string_buffer(bytes([CANARY_FILL]) * CANARY_BYTES,
+                                           CANARY_BYTES)
+        ops._memcpy_sync(b, ctypes.addressof(fill), CANARY_BYTES)
+        rows = [(FLAT, b + d, a + s, n, 0, 0, 0) for d, s, n in CANARY_FLAT]
+        rows += [(STRIDED2D, b + d, a + s, w, dp, sp, r)
+                 for d, s, w, dp, sp, r in CANARY_2D]
+        stage = "prepare"
+        prepared = copier.prepare(rows)
+        stage = "alloc"
+        stream = ops.create_stream(device)
+        stage = "batch"
+        copier.issue(prepared, stream)
+        ops.synchronize(stream)
+        down = ctypes.create_string_buffer(CANARY_BYTES)
+        ops._memcpy_sync(ctypes.addressof(down), b, CANARY_BYTES)
+        got = down.raw
+        if got != bytes(want):
+            first = next(i for i in range(CANARY_BYTES) if got[i] != want[i])
+            bad = sum(1 for i in range(CANARY_BYTES) if got[i] != want[i])
+            return (f"canary byte mismatch: {bad} of {CANARY_BYTES} bytes "
+                    f"differ, first at offset {first} (got {got[first]:#04x} "
+                    f"want {want[first]:#04x})")
+        return ""
+    except Exception as exc:  # noqa: BLE001 -- named, then the copier is refused
+        # stage=alloc (scratch, upload, stream) says nothing about the batch
+        # API and is not cached; stage=batch/prepare is a verdict
+        return f"canary raised {type(exc).__name__}: {exc} (stage={stage})"
+    finally:
+        for fn, arg in ((ops.destroy_stream, stream), (ops.raw_free, b),
+                        (ops.raw_free, a)):
+            if arg:
+                try:
+                    fn(arg)
+                except Exception:  # noqa: BLE001 -- cleanup must not mask the verdict
+                    pass
 
 
 # ---------------------------------------------------------------------------

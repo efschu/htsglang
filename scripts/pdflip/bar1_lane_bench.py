@@ -245,6 +245,16 @@ def build_parser():
                          "'off' sets it to 0 so a slow lane stays measurable; "
                          "'prod' leaves production's value, a refused lane "
                          "shows as a REFUSED cell with the named reason")
+    ap.add_argument("--piece-mix", choices=sorted(PIECE_MIXES), default="bench",
+                    help="descriptor mix of a tag: 'bench' = 25 big pieces per "
+                         "640 MiB (the 23.10. cells), 'layer' = ~200 pieces "
+                         "shaped like a 27B NVFP4 layer (the collector-issue "
+                         "class)")
+    ap.add_argument("--gil-threads", type=int, default=0,
+                    help="pure-Python busy threads per worker while the lanes "
+                         "run -- the GIL competition of a rank's main thread "
+                         "and second collect (barlink-lanes2-1023: the collector "
+                         "issue spikes of the 17 CPU-class tags); 0 = none")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VAL",
                     help="extra environment for the workers (production switches)")
     ap.add_argument("--out", default="", help="JSON artifact path")
@@ -323,6 +333,8 @@ def parse_args(argv=None):
         ap.error("--tags >= 1 and --warmup-tags >= 0")
     if a.readback_probe < 0:
         ap.error("--readback-probe >= 0")
+    if not 0 <= a.gil_threads <= 8:
+        ap.error("--gil-threads: 0..8")
     if a.src_card == a.dst_card:
         ap.error("--src-card and --dst-card must differ")
     envx = {}
@@ -443,8 +455,35 @@ TEMPLATES = (
 )
 
 
+#: barlink-lanes2-1023: a 27B NVFP4 layer as the collector sees it (piece
+#: sizes from the PDFLIP-SEQ cf/collect lines of boot 10230932: norms 10240,
+#: k_norm 512, scalars 4/8, conv1d 11264, gate_up 31129600, its scale 1679360,
+#: down_proj 13434880 strided, in_proj_qkvz 21626880 strided, a 1536-B strided
+#: scale) -- ~22 pieces per ~71 MB, so a 640-MiB tag carries ~200 pieces like
+#: production's 176-355, where the BENCH mix carries 25.
+TEMPLATES_LAYER = (
+    ("FLAT", 10240), ("FLAT", 512), ("FLAT", 4), ("FLAT", 4),
+    ("FLAT", 11264), ("FLAT", 11264), ("FLAT", 31129600), ("FLAT", 1679360),
+    ("FLAT", 4), ("FLAT", 8), ("2D", 5120, 2624), ("FLAT", 839680),
+    ("FLAT", 4), ("2D", 10560, 2048), ("2D", 96, 16), ("FLAT", 132),
+    ("FLAT", 2560), ("FLAT", 2560), ("2D", 2560, 1024), ("FLAT", 4),
+    ("FLAT", 4), ("FLAT", 8),
+)
+PIECE_MIXES = {"bench": TEMPLATES, "layer": TEMPLATES_LAYER}
+
+
 def _align(x, a=4096):
     return (int(x) + a - 1) // a * a
+
+
+def gil_burner(stop, slice_n=2000):
+    """Pure-Python work until ``stop``: holds the GIL in interpreter slices like
+    a rank's main thread (resume loop, named_parameters walks) does."""
+    x = 0
+    while not stop.is_set():
+        for i in range(slice_n):
+            x ^= i
+    return x
 
 
 def plan_descs(tag_bytes, templates=TEMPLATES):
@@ -619,6 +658,15 @@ def lane_stats(deps, cols, tag_bytes):
                 if isinstance(d.get("lane_time", {}).get(key), float)]
         if vals:
             fields[key] = dist(vals)
+    # barlink-lanes2-1023: the collector's side of the same tags (issue_ms is
+    # the batched-copy A/B's number; collect_batch says which path ran)
+    col_fields = {}
+    for key in ("total_ms", "credit_ms", "issue_ms", "prep_ms"):
+        vals = [c["lane_time"][key] for c in cols
+                if isinstance(c.get("lane_time", {}).get(key), float)]
+        if vals:
+            col_fields[key] = dist(vals)
+    col_last = (cols[-1].get("lane_time") if cols else None) or {}
     last = (deps[-1].get("lane_time") if deps else None) or {}
     errs = [d["err"] for d in deps if d.get("err")] + \
            [c["err"] for c in cols if c.get("err")]
@@ -634,6 +682,9 @@ def lane_stats(deps, cols, tag_bytes):
         "batch_ms": dist(batch),
         "sync_dur_ms": dist([x for d in deps for x in d.get("sync_ms", [])]),
         "lane_time": fields,
+        "collect_lane_time": col_fields,
+        "collect_batch": col_last.get("collect_batch"),
+        "collect_batch_why": col_last.get("why") if col_last.get("collect_batch") == "OFF" else None,
         "mode": last.get("mode"),
         "write_order": last.get("write_order"),
         "errors": errs,
@@ -728,6 +779,11 @@ def summary_rows(cells):
                          "batch_p50": st["batch_ms"]["p50"],
                          "batch_max": st["batch_ms"]["max"],
                          "rb_p50": p50, "rb_max": mx, "rb_gt5": gt,
+                         "col_issue_p50": ((st.get("collect_lane_time") or {}).get("issue_ms")
+                                           or {}).get("p50"),
+                         "col_issue_max": ((st.get("collect_lane_time") or {}).get("issue_ms")
+                                           or {}).get("max"),
+                         "col_batch": st.get("collect_batch"),
                          "correct": st["correct"], "note": ""})
         if c["direction"] == "both":
             rows.append({**base, "direction": "both:sum",
@@ -745,7 +801,7 @@ def _f(x, w, p=2):
 def format_summary(rows):
     head = (f"{'direction':<10} {'slot':>5} {'wo':>3} {'GB/s':>7} "
             f"{'batch p50':>10} {'batch max':>10} {'rb p50':>8} {'rb max':>8} "
-            f"{'rb>5ms':>6}  correct")
+            f"{'rb>5ms':>6} {'col iss p50':>11} {'col iss max':>11} {'c-batch':>7}  correct")
     out = [head, "-" * len(head)]
     for r in rows:
         slot = (str(r["slot_mib"]) if r.get("slot_mib") else str(r["slot"]))
@@ -758,7 +814,9 @@ def format_summary(rows):
             f"{_f(r['gbs'], 7)} {_f(r['batch_p50'], 10, 3)} "
             f"{_f(r['batch_max'], 10, 3)} {_f(r['rb_p50'], 8, 3)} "
             f"{_f(r['rb_max'], 8, 3)} "
-            f"{(str(r['rb_gt5']) if r['rb_gt5'] is not None else '-'):>6}  {tail}")
+            f"{(str(r['rb_gt5']) if r['rb_gt5'] is not None else '-'):>6} "
+            f"{_f(r.get('col_issue_p50'), 11, 1)} {_f(r.get('col_issue_max'), 11, 1)} "
+            f"{str(r.get('col_batch') or '-'):>7}  {tail}")
     return "\n".join(out)
 
 
@@ -956,7 +1014,7 @@ def slot_value_mib(slot, big_bar):
 
 def lane_vram_mib(a, ring):
     """Per-card VRAM of the lane cells (excluding the CUDA context), MiB."""
-    specs = plan_descs(a.tag_mib << 20)
+    specs = plan_descs(a.tag_mib << 20, PIECE_MIXES[getattr(a, "piece_mix", "bench")])
     sf, df, _ = footprints(specs)
     both = ("both" in a.directions) or (("fwd" in a.directions) and ("rev" in a.directions))
     arenas = sf + df if both else max(sf, df)
@@ -1262,7 +1320,7 @@ def _lane_worker(spec, res, barrier):
     barrier.wait(BARRIER_S)
 
     tag_bytes = spec["tag_mib"] << 20
-    specs = plan_descs(tag_bytes)
+    specs = plan_descs(tag_bytes, PIECE_MIXES[spec.get("piece_mix", "bench")])
     sf, df, _pay = footprints(specs)
     arenas = {}
     for lk in lane_keys:
@@ -1311,6 +1369,13 @@ def _lane_worker(spec, res, barrier):
                     "verify": None})
         tls.lines = None
 
+    # barlink-lanes2-1023: optional GIL competition (--gil-threads)
+    gil_stop = threading.Event()
+    gil_ths = [threading.Thread(target=gil_burner, args=(gil_stop,), daemon=True)
+               for _ in range(int(spec.get("gil_threads", 0) or 0))]
+    for th in gil_ths:
+        th.start()
+    res["gil_threads"] = len(gil_ths)
     for di, direction in enumerate(spec["directions"]):
         lks = LANE_OF_DIR[direction]
         for ti in range(warm_n + spec["tags"]):
@@ -1339,6 +1404,10 @@ def _lane_worker(spec, res, barrier):
                     seed = 5 + ti * 13 + li * 101 + di * 1009 + spec["cfg"] * 7919
                     r["verify"] = check_dst(arenas[r["lane"]], specs, seed)
             runs.extend(out)
+
+    gil_stop.set()
+    for th in gil_ths:
+        th.join(5)
 
     # -- the readback probe cell -------------------------------------------
     res["probes"] = {}
@@ -1715,7 +1784,8 @@ def run_lane_configs(a, infos, nv, art, ring):
                           "slot": slot, "directions": cfg["directions"],
                           "lane_keys": lanes_for(cfg["directions"]),
                           "tag_mib": a.tag_mib, "tags": a.tags,
-                          "warmup": a.warmup_tags, "probe_n": a.readback_probe})
+                          "warmup": a.warmup_tags, "probe_n": a.readback_probe,
+                          "gil_threads": a.gil_threads, "piece_mix": a.piece_mix})
         print(f"# config {ci + 1}/{len(cfgs)}: slot={slot} write-order={wo} "
               f"directions={cfg['directions']} ...", flush=True)
         snap_before = {c: nvml_snapshot(nv, c) for c in (a.src_card, a.dst_card)}
@@ -1860,7 +1930,7 @@ def print_plan(a):
               f"src card {a.src_card}, dst card {a.dst_card}")
         for c in cells:
             print(f"#   {c.direction:<5} slot={c.slot:<5} write-order={c.write_order}")
-        specs = plan_descs(a.tag_mib << 20)
+        specs = plan_descs(a.tag_mib << 20, PIECE_MIXES[getattr(a, "piece_mix", "bench")])
         sf, df, pay = footprints(specs)
         k2 = sum(1 for s in specs if s["kind"] == "STRIDED2D")
         print(f"# tag = {pay >> 20} MiB payload in {len(specs)} descs "
