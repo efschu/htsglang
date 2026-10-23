@@ -521,6 +521,32 @@ def floor_rows(configured: int, page_size: int) -> int:
     return max(page, (int(configured) // CAP_FLOOR_DIV // page) * page)
 
 
+def flip_trim_thresholds(rates_text: str, configured: int, page_size: int, line_mib: float) -> str:
+    """27B int4ar 23.10. (D TP2 2x3080, boot ..._a45112428e_1023_140032): the trim threshold the flip arm writes
+    when the profile names none -- per rank ``ceil(line + floor_rows(configured) x rate)``, i.e. the driver free a
+    card needs for the vote to fund at least the floor chunk above the corridor line. Under it the trim hands the
+    fully free segments of the allocator cache back to the driver before the extend (``maybe_trim``), so the vote
+    reads what the card really has. A rank without a rate (``0``) gets ``0`` = never trims.
+
+    Why the flip arm needs it: the vote funds from DRIVER free alone (a4f4b8fec1), so without a trim the cache that
+    decode and extend leave behind is never returned and the vote starves. Metal: the int4ar profile (derived from
+    the duo profile, which never carried the INT8 ``27b.env`` line ``--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1200,
+    1100,800``) ran 0 trims; D TP1 sat at 40-170 MiB driver free from 14:11Z on, reserved 18.4 GiB against 17.2 GiB
+    allocated (~1.2 GiB idle cache), the vote was 1 row and the floor raised it to 256 -- or to 128-135 at 40 MiB."""
+    vals = [x.strip() for x in str(rates_text or "").split(",") if x.strip()]
+    if not vals:
+        return ""
+    rows = floor_rows(configured, page_size)
+    out = []
+    for v in vals:
+        try:
+            r = float(v)
+        except ValueError:
+            r = 0.0
+        out.append("0" if r <= 0 else str(int(math.ceil(float(line_mib) + rows * r))))
+    return ",".join(out)
+
+
 def floored_width(cap: int, post_mib: float, rate: float, configured: int, page_size: int) -> int:
     """``max(cap, min(floor_rows, floor(post / rate)))``, page aligned: the vote
     with its floor. A pure function of the card reading, the priced rate and

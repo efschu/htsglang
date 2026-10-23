@@ -20377,7 +20377,49 @@ def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
     _rtext = _d_extend_cap_rate_env(ns, log, label, capped=False)
     if _rtext:
         _d_extend_cap_floor_env(ns, log, label)
+        _d_extend_flip_trim_env(ns, log, label, _rtext)
     return _rtext
+
+
+#: 27B int4ar 23.10.: the line of the flip arm's trim threshold
+EXTEND_TRIM_FLIP_MARKER = "EXTEND-TRIM-FLIP"
+EXTEND_TRIM_ENV = "FLLIPER_PDFLIP_EXTEND_TRIM_MIB"
+
+
+def _d_extend_flip_trim_env(ns, log, label: str, rtext: str) -> Optional[str]:
+    """27B int4ar 23.10. (D TP2 2x3080, boot dkr27bint4arbar1int4ar10231400 a45112428e, D.log _1023_140032): wherever
+    the flip arm armed the vote (Q-694 rate + Q-710 floor), arm the rc12e trim too -- a value named in --env-d wins.
+
+    The vote funds the chunk from DRIVER free alone (a4f4b8fec1). The 27B launcher never wrote the trim itself (only
+    the NF #145 ledger path does, :func:`d_extend_trim_env`); the INT8 profile carried it by hand
+    (``27b.env``: ``--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1200,1100,800``), the duo profile and the int4ar profile
+    derived from it did not. Metal without it: 0 trims, D TP1 at 40-170 MiB driver free from 14:11Z on (near-OOM under
+    the corridor rule), reserved 18.4 GiB vs 17.2 GiB allocated, every vote 1 row, the Q-710 floor raised it to 256
+    (128-135 at 40 MiB free) -- 21003 D tokens in 137 extends, ~426 tok/s wall.
+
+    Threshold per rank = ``ceil(stated corridor law + floor_rows(CHUNKED_PREFILL_TOKENS) x rate)``
+    (:func:`extend_trim.flip_trim_thresholds`): the driver free at which the vote funds at least the floor chunk
+    above the line; under it the extend first hands the fully free cache segments back. No reserve, no new term: the
+    law, the floor chunk and the rate are the ones the vote itself uses. Dual layout / P0 / Next Flash never reach
+    this (they never reach :func:`_d_extend_flip_rate_env`'s armed branch)."""
+    from flliper.srt.pdflip import extend_trim as _et
+
+    line = float(corridor_guard.corridor_law_mib())
+    value = _et.flip_trim_thresholds(rtext, CHUNKED_PREFILL_TOKENS, 1, line)
+    if not value:
+        return None
+    _env_d = getattr(ns, "env_d", "") or ""
+    _have = parse_group_env(_env_d)
+    # a value other than our own came from the user (a second solve pass sees its own write)
+    _given = EXTEND_TRIM_ENV in _have and str(_have.get(EXTEND_TRIM_ENV, "")).strip() != value
+    if not _given:
+        ns.env_d = set_group_env(_env_d, EXTEND_TRIM_ENV, value)
+    _now = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_TRIM_ENV, "")).strip()
+    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_TRIM_FLIP_MARKER} {EXTEND_TRIM_ENV}={_now}"
+        f"{' (aus --env-d gesetzt, unveraendert)' if _given else ''} (je Rang ceil(Korridor-Gesetz {line:.0f} + "
+        f"Bodenchunk {_et.floor_rows(CHUNKED_PREFILL_TOKENS, 1)} x Rate); darunter gibt D vor dem Extend die ganz "
+        f"freien Cache-Segmente an den Treiber zurueck, damit die Breitenabstimmung den echten Kartenstand liest)")
+    return _now
 
 
 #: Q-710: the arming variable of the chunk-cap floor (the vote never crawls)
