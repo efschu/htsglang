@@ -141,6 +141,19 @@ def _fi_lse_to_merge_domain(lse):
     """FlashInfer base-2 LSE -> the natural-log domain of the DCP merges."""
     if not isinstance(lse, torch.Tensor) or not _fi_lse_ln2_on():
         return lse
+    if not _FI_LSE_LN2_CACHE.get("noted"):
+        # NF rc36 (23.10.): one INFO line per process on the FIRST conversion.
+        # NF's full attention under Form-A DCP normally runs through QSA
+        # (natural LSE, never converted here); this line is the only log
+        # evidence that a FlashInfer LSE actually reached an uneven-DCP merge
+        # on this rank. Python-side only (at CUDA-graph capture it fires once
+        # during capture), no tensor read, no collective.
+        _FI_LSE_LN2_CACHE["noted"] = True
+        logger.info(
+            "DCP-FI-LSE-LN2 armed: first FlashInfer base-2 LSE converted to "
+            "the natural-log domain at an uneven-DCP merge (shape=%s)",
+            tuple(lse.shape),
+        )
     return lse * _LN2
 
 
