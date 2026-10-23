@@ -13592,6 +13592,32 @@ def core_cwd_for(group_log: str, tree: str, log: Log) -> str:
     return d
 
 
+def group_rank_count(argv: Sequence[str]) -> int:
+    """The rank count of a group, from the argv the launcher built for it:
+    ``--tp-size`` x ``--pp-size`` (last occurrence wins, as in the server).
+
+    27B NVFP4 duo 23.10.: the W7/W10 canonical gate was called with a literal
+    3 (the reference rig's card count); on a 2-card launch P is TP1 x PP2 and
+    D is TP2, so a clean group was refused as "group reports 1x2 ranks,
+    launcher expects 3" (boot dkr27bnvfp4duobar1duo10230518)."""
+    from flliper.srt.pdflip import carrier_census as _cc
+    tp = _cc.tp_size_of(argv, default=1) or 1
+    pp = 1
+    items = list(argv)
+    for i, a in enumerate(items):
+        v = None
+        if a == "--pp-size" and i + 1 < len(items):
+            v = items[i + 1]
+        elif a.startswith("--pp-size="):
+            v = a.split("=", 1)[1]
+        if v is not None:
+            try:
+                pp = int(v)
+            except ValueError:
+                pass
+    return tp * pp
+
+
 def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
                          kv_owner_ranks: Sequence[int] = ()) -> None:
     """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
@@ -28463,7 +28489,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "this arm runs under prints neither marker. P's own health check "
             "already confirmed it booted clean to READY.")
     else:
-        canonical_state_gate(spec_p, 3, log)
+        canonical_state_gate(spec_p, group_rank_count(spec_p.argv), log)
 
     # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
     # This is the one sleep on this box that is NOT interleaved: group D does
@@ -28566,7 +28592,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "never builds either (enable_hierarchical_cache is False) -- no "
             "canonical-page/GDN-blob emitter to grade, same as group P above.")
     else:
-        canonical_state_gate(spec_d, 3, log,
+        canonical_state_gate(spec_d, group_rank_count(spec_d.argv), log,
                              kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
         # VRAM-Vertrag M2 (display only): P's blocks again, now carrying its
         # first sleep leg -- the per-PID source of the plan's asleep.P
