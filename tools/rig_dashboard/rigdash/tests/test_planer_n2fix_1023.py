@@ -7,17 +7,17 @@ with three findings; each one is pinned here on REAL launcher dry runs (the orac
       were converted.  Cause: ``ProfilEditor._startprofil`` applied the proposal's argv values only; the card variables are no argv value and nothing derived
       them.  Now ``ProfilEditor.card_vars`` derives all three from the proposal's card list (launcher order) for every N and card mix.
 * B2  the fields named ``--rank-tp-ratio`` 58,25 and per-phase ``--rank-gpu-memory-mib``, the start profile carried neither.  Cause: those are LAUNCHER outputs of
-      the dry run (``verdict.plan.group_flags``), and the start profile was built from the stage-A proposal only.  Now the layout value (the D weight split) is
-      pinned in ``--extra-d``; the per-card budgets are recorded as the planner's value (``meta.planner``) and NOT pinned: the launcher recomputes them at boot
-      from the live card and W100 refuses any pinned budget above the live one (dry 27784 / 27800 vs live 27792 on the rig's 5090) -- user rule
-      ``planner-alleinzustaendigkeit-vram``.  The fields say which of the two a value is.
+      the dry run (``verdict.plan.group_flags``), and the start profile was built from the stage-A proposal only.  Now all three are RECORDED in the start
+      profile (``meta.planner``) and never pinned: a word in ``--extra-*`` would beat the launcher's own derivation at boot (memory argv-doppelung), and W100
+      refuses any pinned budget above the live one -- user rule ``planner-alleinzustaendigkeit-vram``.  The fields say so.
 * B3  ``--hicache-mamba-host-mib`` 100: the launcher constant (``launcher.common_flags``, #1430), not derived; on the 27B it buys 2 slots per rank against the
       runtime floor of max running + 1 (every 27B boot logs ``MAMBA-ANCHOR-FLOOR RAISED``).  Now stage A (``propose._mamba_host_section``) names
       ceil((max running + 1) x one mamba slot of the whole model) per group when the launcher's value buys fewer (27B: P 225 / D 524 MiB).
 
 Cases: 5090 + 3080 20 GB (n=2, mixed, the hardware profile of the rig with its measured card library), 2 / 3 / 7 x RTX 3090 (catalog cards).  For each: the vars
-match the card list, every positional value of the start profile has n entries, the fields equal the start profile (pinned) or its ``meta.planner`` (recorded),
-and a SECOND launcher dry run of the start profile itself ships the same layout (weight split, mamba pools) and has no entrypoint HW-COUNT.
+match the card list, every positional value of the start profile has n entries, the fields equal the start profile's ``meta.planner`` (recorded), and a SECOND
+launcher dry run of the start profile itself ships the same layout (weight split, mamba pools) and has no entrypoint HW-COUNT.  B4 (image paths), B7 (a subset of
+the rig on its real cards; a git-archive stage resolves the record identity) and the BAR1 rows are pinned below as well.
 """
 
 import copy
@@ -207,6 +207,16 @@ class HwPick(unittest.TestCase):
         self.assertTrue(P.ProfilEditor._hw_cards_match(hw, self._entries("5090")))
         self.assertFalse(P.ProfilEditor._hw_cards_match(hw, self._entries("3090")))
 
+    def test_the_pair_and_index_parts_follow_the_renumbering(self):
+        hw = _rig_hw()
+        got = P.ProfilEditor._hw_cards_pick(hw, self._entries("3080", "3080"))
+        pairs = {(lk["src"], lk["dst"]) for lk in got["links"]}
+        self.assertEqual(pairs, {(0, 1), (1, 0)})                                  # old 1->2 / 2->1, nothing that touched the 5090
+        self.assertEqual(len(got["links"]), len([lk for lk in hw["links"] if {lk["src"], lk["dst"]} == {1, 2}]))
+        self.assertEqual(sorted(got["unmeasured"]), ["0", "1"])
+        self.assertNotIn("inventory_sig", got)
+        self.assertIn("inventory_sig", hw)                                          # the input is untouched
+
     def test_the_replay_takes_the_picked_cards(self):
         from flliper.srt.pdflip import propose_oracle as O
         got = P.ProfilEditor._hw_cards_pick(_rig_hw(), self._entries("5090", "3080"))
@@ -247,6 +257,18 @@ class StageLineIdentity(unittest.TestCase):
         self.assertTrue(F.is_line_ancestor(self.tmp, "85a95da48b"))             # the A2 deploy is an ancestor of this branch
         self.assertFalse(F.is_line_ancestor(self.tmp, "f6de5974db"))            # a 27B-line commit is not
 
+    def test_the_stamp_wins_over_an_enclosing_work_tree(self):
+        from flliper.srt.pdflip import form as F
+        inner = tempfile.mkdtemp(prefix="n2fix_stage_in_repo_", dir=os.path.join(REPO_ROOT, "test"))     # a stage dir INSIDE a git work tree
+        try:
+            with open(os.path.join(inner, "REV"), "w") as fh:
+                fh.write("85a95da48b\n")
+            with open(os.path.join(inner, "SOURCE_REPO"), "w") as fh:
+                fh.write(self.git_dir + "\n")
+            self.assertTrue(F._repo_head(inner).startswith("85a95da48b"))               # not the enclosing checkout's HEAD
+        finally:
+            shutil.rmtree(inner, ignore_errors=True)
+
     def test_a_stage_without_its_source_stays_unresolvable_by_name(self):
         from flliper.srt.pdflip import form as F
         self._stage(self.head[:10], None)
@@ -257,10 +279,22 @@ class StageLineIdentity(unittest.TestCase):
         self.assertIn("RECORD-IDENTITY UNRESOLVABLE", line)
         self.assertIn("REV + SOURCE_REPO", line)
 
-    def test_the_stage_script_writes_the_common_git_dir(self):
-        with open(os.path.join(HERE, "..", "deploy", "stage_profil_modules.sh"), encoding="utf-8") as fh:
-            src = fh.read()
-        self.assertIn('rev-parse --path-format=absolute --git-common-dir > "$tmp/SOURCE_REPO"', src)
+    def test_the_stage_script_writes_the_stamp_and_the_launcher_reads_it(self):
+        """Runs the real stage script into a scratch root (git archive of HEAD, ~80 MiB): REV + SOURCE_REPO (the COMMON git dir) are written,
+        and the stage's own form module resolves the line from them."""
+        import subprocess
+        r = subprocess.run(["bash", os.path.join(HERE, "..", "deploy", "stage_profil_modules.sh"), "--apply", "--root", self.tmp, "HEAD"],
+                           capture_output=True, text=True, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        cur = os.path.join(self.tmp, "profil", "current")
+        with open(os.path.join(cur, "SOURCE_REPO")) as fh:
+            self.assertEqual(fh.read().strip(), self.git_dir)
+        with open(os.path.join(cur, "REV")) as fh:
+            rev = fh.read().strip()
+        self.assertTrue(self.head.startswith(rev))
+        self.assertFalse(os.path.exists(os.path.join(cur, ".git")))                  # an archive, no checkout
+        from flliper.srt.pdflip import form as F
+        self.assertEqual(F._repo_head(os.path.realpath(cur)), self.head)
 
 
 class ImagePaths(unittest.TestCase):
@@ -281,6 +315,29 @@ class ImagePaths(unittest.TestCase):
             self.assertEqual(fn("/spinning/llm_stuff/x/config.json"), "/spinning/llm_stuff/x/config.json")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_relocator_is_anchored(self):
+        from flliper.srt.pdflip import profile_json as PJ
+        fn = PJ._image_relocator("/a/rel/x.env", PJ.IMAGE_PROFILES_DIR)
+        self.assertEqual(fn("/a/rel/f.json"), "/opt/htsglang/profiles/f.json")
+        self.assertEqual(fn("--m=/a/rel/f.json,/a/rel/g.json"), "--m=/opt/htsglang/profiles/f.json,/opt/htsglang/profiles/g.json")
+        self.assertEqual(fn("/b/a/rel/f.json"), "/b/a/rel/f.json")                   # the directory inside another path is not touched
+        self.assertEqual(fn("/a/rel2/f.json"), "/a/rel2/f.json")
+
+    @unittest.skipUnless(HAS_LAUNCHER, "no pdflip launcher in this tree")
+    def test_the_oracle_resolves_the_image_path_in_its_own_tree(self):
+        from flliper.srt.pdflip import propose_oracle as O
+        self.assertEqual(O.tree_release_dir(), RELEASE_DIR)
+        tmp = tempfile.mkdtemp(prefix="n2fix_li_")
+        try:
+            env = os.path.join(tmp, "x.env")
+            with open(env, "w") as fh:
+                fh.write('PROFILE_NAME=x\nPROFILE_ARGS=(--p-chunk-model %s)\n' % IMAGE_PCHUNK)
+            li = O.profile_launch_input(env)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(li.argv, ["--p-chunk-model", os.path.join(RELEASE_DIR, "27b-nvfp4.pchunk.json")])
+        self.assertEqual(li.unresolved_paths, [])
 
     def test_the_release_import_names_the_image_path(self):
         tmp = tempfile.mkdtemp(prefix="n2fix_imp_")

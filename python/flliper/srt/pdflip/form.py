@@ -2590,14 +2590,15 @@ def _repo_head(repo: str) -> Optional[str]:
     """The commit the tree ``repo`` has checked out (for a git-archive stage:
     the commit its ``REV`` names, resolved in its ``SOURCE_REPO``); None = git
     unreadable."""
-    out = _git(repo, "rev-parse", "HEAD")
-    if out is None:
-        st = _stage_source(repo) if repo else None
-        if st is None:
-            return None
+    # the stamp first: a stage dir that happens to lie inside another work tree
+    # would otherwise answer with THAT tree's HEAD (read-through 1023)
+    st = _stage_source(repo) if repo else None
+    if st is not None:
         out = _git(st[0], "rev-parse", "--verify", "-q", st[1] + "^{commit}")
-        if out is None:
-            return None
+    else:
+        out = _git(repo, "rev-parse", "HEAD")
+    if out is None:
+        return None
     return out.strip() or None
 
 
@@ -2607,10 +2608,8 @@ def _ancestor_index(repo: str, head: str) -> Optional[Dict[str, Tuple[str, ...]]
     git call per (repo, head) -- 27B line_identity measured 0.12 s against
     3.74 s for one ``merge-base --is-ancestor`` per boot tag (the front's
     sleep-leg gate sits inside the first flip). None = git unreadable."""
-    out = _git(repo, "rev-list", head)
-    if out is None:
-        st = _stage_source(repo) if repo else None     # a git-archive stage: its source repository holds the history
-        out = _git(st[0], "rev-list", head) if st is not None else None
+    st = _stage_source(repo) if repo else None         # a git-archive stage: its source repository holds the history
+    out = _git(st[0], "rev-list", head) if st is not None else _git(repo, "rev-list", head)
     if out is None:
         return None
     idx: Dict[str, List[str]] = {}

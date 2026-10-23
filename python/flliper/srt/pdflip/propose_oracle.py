@@ -732,6 +732,22 @@ DEFAULT_ASSET_DIRS = ("/spinning/gpu-arb/weg2/census", "/spinning/gpu-arb/weg2",
 _IMAGE_PROFILES = "/opt/htsglang/profiles/"
 
 
+def tree_release_dir() -> Optional[str]:
+    """planer-n2fix 1023 (B4): the release profiles of the tree THIS module runs from (``<tree>/docker/flliper/profiles_release``; the
+    planner's staged tree carries them, stage_profil_modules.sh).  A start profile names a data file next to the profile by its image path
+    ``/opt/htsglang/profiles/<file>``; resolving it here first means the oracle reads the file of its own tree, not a copy elsewhere on the
+    box that may have drifted.  None when the tree has no such directory."""
+    root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
+    d = os.path.join(root, "docker", "flliper", "profiles_release")
+    return d if os.path.isdir(d) else None
+
+
+def default_asset_dirs() -> Tuple[str, ...]:
+    """:data:`DEFAULT_ASSET_DIRS` with :func:`tree_release_dir` in front (when the tree has one)."""
+    d = tree_release_dir()
+    return ((d,) if d else ()) + tuple(DEFAULT_ASSET_DIRS)
+
+
 class LaunchInput:
     """The launcher side of a release profile: ``argv`` (PROFILE_ARGS, placeholders and image paths resolved),
     ``env`` (what the entrypoint exports before the launcher starts: the file's top-level exports + ``profile_form_env``;
@@ -809,6 +825,8 @@ def profile_launch_input(env_path: str, *, instruments: str = "0", tag: str = OR
         return v
 
     miss: List[str] = []
+    if asset_dirs is DEFAULT_ASSET_DIRS:                 # the default: this tree's own release dir first (B4)
+        asset_dirs = default_asset_dirs()
     argv = [_resolve_token(sub(t), asset_dirs, miss) for t in raw["arrays"].get("PROFILE_ARGS", [])]
     env: Dict[str, str] = {}
     for k, v in raw["exports"]:

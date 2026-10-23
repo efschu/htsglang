@@ -140,6 +140,8 @@
 "nvmlDeviceGetBAR1MemoryInfo: the PCIe aperture peers write the barlink windows into; the free part is a snapshot (baseline use of other processes, e.g. a display)": "nvmlDeviceGetBAR1MemoryInfo: das PCIe-Fenster, in das die Partner die barlink-Fenster schreiben; der freie Teil ist eine Momentaufnahme (Grundbelegung anderer Prozesse, z. B. einer Anzeige)",
 "barlink BAR1 windows per group (MiB)": "barlink-BAR1-Fenster je Gruppe (MiB)",
 "--barlink-bar1-window-mib: derived by the launcher from the tightest card's free BAR1 minus the 32 MiB reserve": "--barlink-bar1-window-mib: vom Launcher aus dem freien BAR1 der engsten Karte abzüglich 32 MiB Reserve abgeleitet",
-"the start profile does not pin them, the launcher derives them again at boot from the live BAR1": "das Startprofil pinnt sie nicht, der Launcher leitet sie beim Boot erneut aus dem laufenden BAR1 ab"
+"the start profile does not pin them, the launcher derives them again at boot from the live BAR1": "das Startprofil pinnt sie nicht, der Launcher leitet sie beim Boot erneut aus dem laufenden BAR1 ab",
+"The selected cards are the NVML cards of this rig (hardware profile): the dry run runs with their real UUIDs.": "Die gewählten Karten sind die NVML-Karten dieses Rigs (Hardwareprofil): der Trockenlauf läuft mit ihren echten UUIDs.",
+"They are %d of the rig's %d cards (NVML %s), renumbered 0..%d as a container with only these cards sees them.": "Es sind {0} der {1} Karten des Rigs (NVML {2}), neu nummeriert 0..{3}, wie ein Container mit nur diesen Karten sie sieht."
 }
 }

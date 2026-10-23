@@ -45,7 +45,7 @@ carve-out"). This module keeps THAT arithmetic and makes its inputs variable:
   baseline BAR1. A card whose BAR1 NVML did not report cannot be checked: the
   reference windows stand, named UNCHECKED (the runtime gate
   ``Bar1WindowRefused`` still stands behind it). The reference rig (3 x 256 MiB
-  BAR, free unknown or >= 255): 208 + 14 = 222 <= 223, the shipped windows.
+  BAR, free unknown or >= 254): 208 + 14 = 222 <= 254 - 32, the shipped windows.
 
 ``MIN_WINDOW_MIB`` and the factor are ESTIMATES (S): the measured anchors are
 the reference rig's N = 3 / 256 MiB figures above and :data:`OVERHEAD_MIB`;

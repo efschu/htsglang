@@ -1056,10 +1056,25 @@ class ProfilEditor:
             return None
         if not picked or any(v > 0 for v in want.values()):
             return None
-        out = dict(hw)
-        out["cards"] = [dict(c, nvml_index=i) for i, c in enumerate(json.loads(json.dumps(picked)))]
+        out = json.loads(json.dumps(hw))
+        old = [int(c.get("nvml_index", 0)) for c in picked]
+        new_of = {o: i for i, o in enumerate(old)}
+        cards_out = []
+        for i, c in enumerate(json.loads(json.dumps(picked))):
+            c["nvml_index"] = i
+            if "ord" in c:
+                c["ord"] = i
+            cards_out.append(c)
+        out["cards"] = cards_out
         if len(picked) != len(have):
-            out["subset_of"] = {"cards": len(have), "nvml_index": [int(c.get("nvml_index", 0)) for c in picked]}
+            out["subset_of"] = {"cards": len(have), "nvml_index": old}
+            # the per-pair and per-index parts of the profile follow the same renumbering (read-through 1023: a renumbered card list
+            # next to links in the old indices would hand a later reader the wrong pair); the inventory signature of the whole rig is dropped
+            out["links"] = [dict(lk, src=new_of[lk["src"]], dst=new_of[lk["dst"]]) for lk in out.get("links") or []
+                            if isinstance(lk, dict) and lk.get("src") in new_of and lk.get("dst") in new_of]
+            if isinstance(out.get("unmeasured"), dict):
+                out["unmeasured"] = {str(new_of[int(k)]): v for k, v in out["unmeasured"].items() if str(k).isdigit() and int(k) in new_of}
+            out.pop("inventory_sig", None)
         return out
 
     @classmethod
@@ -1094,7 +1109,12 @@ class ProfilEditor:
     @staticmethod
     def _inventar_key(inv: dict) -> list:
         if inv.get("hardware"):
-            return [["nvml", str(c.get("uuid")), str(c.get("name")), c.get("vram_total_mib"), c.get("cc")] for c in inv["hardware"].get("cards") or []]
+            def v(node):
+                return node.get("v") if isinstance(node, dict) else node
+            # planer-n2fix 1023: BAR1 (total and the momentary free part) and the PCIe widths change the verdict (BAR1 windows, PP-CUT pricing)
+            return [["nvml", str(c.get("uuid")), str(c.get("name")), c.get("vram_total_mib"), c.get("cc"), v(c.get("bar1_total_mib")),
+                     v(c.get("bar1_free_mib")), v((c.get("pcie") or {}).get("max_width")), v((c.get("pcie") or {}).get("cur_width"))]
+                    for c in inv["hardware"].get("cards") or []]
         return [["catalog", str(c["entry"].get("id")), (c.get("link") or {}).get("effective"), (c.get("link") or {}).get("bar1_mib")]
                 for c in inv.get("cards") or []]
 

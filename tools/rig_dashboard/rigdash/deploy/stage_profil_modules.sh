@@ -159,7 +159,8 @@ case "$mode" in
       # only when its boot commit is an ancestor of the tree's HEAD) asks git THERE about the commit in REV (pdflip/form.py _stage_source);
       # without it every record of a newer boot fell to CONSTANT and the live planner priced the 27B D budgets ~1.6 GiB per card low.
       # The COMMON git dir, not the worktree it was called from: a desk worktree is removed after its deploy, the object store stays.
-      git -C "$repo" rev-parse --path-format=absolute --git-common-dir > "$tmp/SOURCE_REPO"
+      # (a failing git call leaves the stamp out -- the launcher then names the tree unresolvable -- instead of aborting the stage)
+      if src_git=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then echo "$src_git" > "$tmp/SOURCE_REPO"; fi
       touch "$tmp/STAGED_OK"
       mv "$tmp" "$dst"
       trap - EXIT

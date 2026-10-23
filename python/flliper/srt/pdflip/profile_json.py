@@ -298,10 +298,13 @@ def _image_relocator(path: str, image_dir: str):
     dst = image_dir if image_dir.endswith("/") else image_dir + "/"
     srcs = sorted({os.path.dirname(os.path.abspath(path)) + "/", os.path.dirname(os.path.realpath(path)) + "/"}, key=len, reverse=True)
 
+    import re as _re
+    # anchored: the directory starts the value or follows a separator of an argv word / list (=, comma, colon, space, quote)
+    rxs = [_re.compile(r"(^|[=,: '\"])" + _re.escape(src)) for src in srcs if src != dst]
+
     def fn(v: str) -> str:
-        for src in srcs:
-            if src != dst and src in v:
-                v = v.replace(src, dst)
+        for rx in rxs:
+            v = rx.sub(lambda m: m.group(1) + dst, v)
         return v
     return fn
 
