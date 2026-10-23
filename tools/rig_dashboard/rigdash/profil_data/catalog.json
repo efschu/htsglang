@@ -29280,7 +29280,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/managers/scheduler_components/invariant_checker.py",
       "row_note": 1862,
-      "zeile": 2192
+      "zeile": 2232
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -36050,7 +36050,7 @@
    "id": "FLLIPER_DFLASH_SLOT_TRACE",
    "kind": "env",
    "lesestellen": [
-    "speculative/dflash_worker_v2.py:3983"
+    "speculative/dflash_worker_v2.py:4032"
    ],
    "level": "expert",
    "name": "FLLIPER_DFLASH_SLOT_TRACE",
@@ -36059,7 +36059,7 @@
    "source": {
     "file": "speculative/dflash_worker_v2.py",
     "kind": "os.environ",
-    "line": 3983,
+    "line": 4032,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -36147,7 +36147,7 @@
    "kind": "env",
    "lesestellen": [
     "uneven_perf.py:3492",
-    "speculative/dflash_solo_pool.py:336"
+    "speculative/dflash_solo_pool.py:342"
    ],
    "level": "expert",
    "name": "FLLIPER_DFLASH_SOLO_POOL_FACTOR",
@@ -43150,7 +43150,7 @@
    "kind": "env",
    "lesestellen": [
     "mem_cache/hicache_storage.py:3800",
-    "mem_cache/pool_host/arena_pool.py:1228",
+    "mem_cache/pool_host/arena_pool.py:1266",
     "pdflip/launcher.py:27590"
    ],
    "level": "expert",
@@ -43184,7 +43184,7 @@
    "kind": "env",
    "lesestellen": [
     "server_args.py:9069",
-    "mem_cache/pool_host/arena_pool.py:1204",
+    "mem_cache/pool_host/arena_pool.py:1242",
     "mem_cache/pool_host/mha.py:1463",
     "pdflip/launcher.py:14140"
    ],
@@ -43218,7 +43218,7 @@
    "id": "FLLIPER_HICACHE_ARENA_KV_PAGE_BYTES",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1231"
+    "mem_cache/pool_host/arena_pool.py:1269"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_KV_PAGE_BYTES",
@@ -43227,7 +43227,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1231,
+    "line": 1269,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43250,7 +43250,7 @@
    "id": "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1196"
+    "mem_cache/pool_host/arena_pool.py:1234"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA",
@@ -43259,7 +43259,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1196,
+    "line": 1234,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43319,7 +43319,7 @@
    "kind": "env",
    "lesestellen": [
     "mem_cache/pool_host/arena_mamba_pool.py:307",
-    "mem_cache/pool_host/arena_pool.py:1590"
+    "mem_cache/pool_host/arena_pool.py:1628"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_PREPIN",
@@ -43416,7 +43416,7 @@
    "kind": "env",
    "lesestellen": [
     "server_args.py:9071",
-    "mem_cache/pool_host/arena_pool.py:1338"
+    "mem_cache/pool_host/arena_pool.py:1376"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_STAGING_GB",
@@ -44468,7 +44468,7 @@
    "id": "FLLIPER_HICACHE_LOAD_ASYNC_INDEX",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1262"
+    "mem_cache/pool_host/arena_pool.py:1300"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_LOAD_ASYNC_INDEX",
@@ -44477,7 +44477,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1262,
+    "line": 1300,
     "tree": "27b"
    },
    "status": "explained",
@@ -54783,7 +54783,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:993"
+    "mem_cache/pool_host/arena_pool.py:1031"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD",
@@ -54792,7 +54792,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 993,
+    "line": 1031,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -54815,8 +54815,8 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_BLOCK",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1134",
-    "mem_cache/pool_host/arena_pool.py:2049"
+    "mem_cache/pool_host/arena_pool.py:1172",
+    "mem_cache/pool_host/arena_pool.py:2087"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_BLOCK",
@@ -54825,7 +54825,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1134,
+    "line": 1172,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -54848,7 +54848,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1022"
+    "mem_cache/pool_host/arena_pool.py:1060"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE",
@@ -54857,7 +54857,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1022,
+    "line": 1060,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -54880,7 +54880,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_TIMING",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1117"
+    "mem_cache/pool_host/arena_pool.py:1155"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_TIMING",
@@ -54889,7 +54889,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1117,
+    "line": 1155,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -54976,7 +54976,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_STAGE_VIEW",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1151"
+    "mem_cache/pool_host/arena_pool.py:1189"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_STAGE_VIEW",
@@ -54985,7 +54985,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1151,
+    "line": 1189,
     "tree": "27b"
    },
    "status": "harvested",
@@ -72772,7 +72772,7 @@
    "id": "FLLIPER_PDFLIP_PREPARE_PARTS",
    "kind": "env",
    "lesestellen": [
-    "managers/schedule_batch.py:3238"
+    "managers/schedule_batch.py:3252"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREPARE_PARTS",
@@ -72781,7 +72781,7 @@
    "source": {
     "file": "managers/schedule_batch.py",
     "kind": "os.environ",
-    "line": 3238,
+    "line": 3252,
     "tree": "27b"
    },
    "status": "harvested",
@@ -84796,7 +84796,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/managers/scheduler_components/invariant_checker.py",
       "row_note": 1366,
-      "zeile": 1509
+      "zeile": 1545
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -93087,11 +93087,11 @@
   },
   "unexplained": 693
  },
- "tree_rev": "27b=da2c96617c+nf=c8c38d2a64",
+ "tree_rev": "27b=b036b48c02+nf=c8c38d2a64",
  "trees": {
   "27b": {
    "entries": 2917,
-   "rev": "da2c96617c"
+   "rev": "b036b48c02"
   },
   "nf": {
    "entries": 2717,
