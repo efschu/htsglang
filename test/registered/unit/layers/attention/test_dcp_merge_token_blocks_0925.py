@@ -490,6 +490,9 @@ class TestFinalMergeBlocks(CustomTestCase):
         lse_cur = torch.randn(9, 3, generator=g)
         o_pre = torch.randn(9, 3, 8, generator=g)
         lse_pre = torch.randn(9, 3, generator=g)
+        # B10 (23.10.): lse_cur is FlashInfer's BASE-2 LSE; the merge moves it
+        # into the natural-log domain (x ln 2) before this expression.
+        lse_cur_raw, lse_cur = lse_cur, lse_cur * 0.6931471805599453
         final_lse = torch.logaddexp(lse_cur.float(), lse_pre.float())
         sc_cur = torch.nan_to_num(torch.exp(lse_cur - final_lse), nan=0.0, posinf=0.0, neginf=0.0).unsqueeze(-1)
         sc_pre = torch.nan_to_num(torch.exp(lse_pre - final_lse), nan=0.0, posinf=0.0, neginf=0.0).unsqueeze(-1)
@@ -500,7 +503,7 @@ class TestFinalMergeBlocks(CustomTestCase):
 
         got = fb.FlashInferAttnBackend._dcp_extend_final_merge(
             mock.Mock(_dcp_merge_block_tokens=0), torch.zeros(9, 24, dtype=torch.bfloat16),
-            _L, o_cur, lse_cur, o_pre, lse_pre)
+            _L, o_cur, lse_cur_raw, o_pre, lse_pre)
         self.assertTrue(torch.equal(got, old))
 
 
