@@ -3957,7 +3957,10 @@ class HiCacheFile(HiCacheStorage):
             listed = idx.has(list(stems))
         except Exception:  # noqa: BLE001 -- cannot re-read: void (the next pass stats again)
             listed = [False] * len(stems)
-        bad = [int(s_) for s_, ok in zip(np.asarray(slots, dtype=np.int64).tolist(), listed) if not ok]
+        _slots_l = np.asarray(slots, dtype=np.int64).tolist()
+        if not all(listed) and self._l3wb_publish_heal_on():
+            listed = self._l3wb_publish_heal(idx, list(stems), list(listed))
+        bad = [int(s_) for s_, ok in zip(_slots_l, listed) if not ok]
         if not bad:
             return 0
         _b = np.asarray(bad, dtype=np.int64)
@@ -3967,10 +3970,82 @@ class HiCacheFile(HiCacheStorage):
             sec[0][_b] = -1
         n = getattr(HiCacheFile, "_a5n1_voided", 0) + len(bad)
         HiCacheFile._a5n1_voided = n
-        logger.info("S109-A5-N1 L3WB-PUBLISH-RACE voided=%d (total %d): the L3 LRU took the file between the pass's "
-                    "stat/commit and its publish -- not recorded as copied; the next pass copies it again",
-                    len(bad), n)
+        if self._l3wb_publish_log_ok("race"):
+            logger.info("S109-A5-N1 L3WB-PUBLISH-RACE voided=%d (total %d): the L3 LRU took the file between the "
+                        "pass's stat/commit and its publish -- not recorded as copied; the next pass copies it again",
+                        len(bad), n)
         return len(bad)
+
+    @staticmethod
+    def _l3wb_publish_heal_on() -> bool:
+        """WAKEEXT-1023 (A5-N1 false positive): ``FLLIPER_PDFLIP_L3WB_PUBLISH_HEAL`` -- default ON, "0" = the
+        re-read voids every stem the index does not list (the 20.10. form)."""
+        return os.environ.get("FLLIPER_PDFLIP_L3WB_PUBLISH_HEAL", "1").strip() not in ("0", "false", "")
+
+    def _l3wb_publish_heal(self, idx, stems: list, listed: list) -> list:
+        """WAKEEXT-1023: tell the index LAG from the LRU unlink before :meth:`_l3wb_publish` voids.
+
+        Metal (27B AutoRound rc35i4ar, boot 1023_140032): P PP0 logged ``L3WB-PUBLISH-RACE`` 13867 times, D TP0
+        4992 -- and the L3 LRU took NO file in that boot (no ``L3-EVICT-FILE`` line in P or D, every journal apply
+        ``-0 files``, cap 150 GB against 35 GB on disk). The re-read missed for another reason: since S36 both groups'
+        write-behind threads walk the SAME shared arena; the sibling's ``pageio.write_pages`` renames the final file
+        in C, and its Python ``commit`` (the ``#1459`` add) follows only after its whole chunk returned. This pass's
+        write in that window gets status 2 (file complete), adopts it (``adopt_foreign`` indexes nothing), publishes,
+        re-reads -- and the stem is not listed YET. The void then wrote -1 into the SHARED record, possibly over the
+        sibling's own publish of the same generation.
+
+        Linearizable against the LRU (``os.remove`` -> ``idx.remove`` -> ``on_evict``): first ADD the missing stems,
+        then stat them (``_stat_stems``, which asks the index and strikes a listed stem whose file is gone from the
+        index and the evictor). A stem whose file is on disk after the add stays listed and published: an unlink
+        after this stat removes it from the index and voids the record through ``on_evict`` after this publish. A
+        stem whose file is gone is struck and voided exactly as before. Returns the new ``listed``."""
+        miss = [st for st, ok in zip(stems, listed) if not ok]
+        if not miss:
+            return listed
+        try:
+            idx.add(miss)
+            present = self._stat_stems(miss)
+        except Exception:  # noqa: BLE001 -- cannot verify: void as before (the next pass stats again)
+            return listed
+        healed = 0
+        out = []
+        for st, ok in zip(stems, listed):
+            if not ok and st in present:
+                ok = True
+                healed += 1
+            out.append(ok)
+        if healed:
+            n = getattr(HiCacheFile, "_a5n1_healed", 0) + healed
+            HiCacheFile._a5n1_healed = n
+            if self._l3wb_publish_log_ok("heal"):
+                logger.info("S109-A5-N1 L3WB-INDEX-LAG healed=%d (total %d, voided total %d): the file is on disk "
+                            "(the sibling group's write-behind completed it and had not yet listed it in #1459) -- "
+                            "listed now and kept as copied, no void (WAKEEXT-1023)",
+                            healed, n, int(getattr(HiCacheFile, "_a5n1_voided", 0)))
+        return out
+
+    #: WAKEEXT-1023: per kind ("race" / "heal") at most this many lines per window; the window's first line after
+    #: a suppression names how many were suppressed. The counters in the lines stay exact.
+    _A5N1_LOG_WINDOW_S = 10.0
+    _A5N1_LOG_PER_WINDOW = 8
+
+    def _l3wb_publish_log_ok(self, kind: str) -> bool:
+        st = HiCacheFile.__dict__.get("_a5n1_logwin")
+        if st is None:
+            st = {}
+            HiCacheFile._a5n1_logwin = st
+        now = time.monotonic()
+        t0, n, sup = st.get(kind, (0.0, 0, 0))
+        if now - t0 >= self._A5N1_LOG_WINDOW_S:
+            if sup:
+                logger.info("S109-A5-N1 L3WB-PUBLISH log window kind=%s suppressed=%d (counters in the lines are "
+                            "totals)", kind, sup)
+            t0, n, sup = now, 0, 0
+        if n < self._A5N1_LOG_PER_WINDOW:
+            st[kind] = (t0, n + 1, sup)
+            return True
+        st[kind] = (t0, n, sup + 1)
+        return False
 
     def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None,
                              cont: bool = False, slice_s: Optional[float] = None) -> dict:

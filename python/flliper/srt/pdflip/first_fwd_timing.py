@@ -122,6 +122,89 @@ def gil_mode(env=None) -> str:
     return v if v in ("held", "all") else "off"
 
 
+THREADS_ENV = "FLLIPER_PDFLIP_FIRST_FWD_THREADS"
+
+
+def threads_on(env=None) -> bool:
+    """WAKEEXT-1023: per-thread CPU of this process over each timed forward's window (default ON)."""
+    env = os.environ if env is None else env
+    return str(env.get(THREADS_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _proc_task_dir() -> str:
+    return "/proc/self/task"
+
+
+def thread_cpu_snapshot(task_dir: Optional[str] = None) -> Dict[int, tuple]:
+    """``{native tid: (name, cpu_ns)}`` of every thread of this process -- ``schedstat`` (ns on the CPU), else
+    ``stat`` utime+stime ticks. Python threads are named by ``threading``; native ones by ``comm``."""
+    task_dir = task_dir or _proc_task_dir()
+    names: Dict[int, str] = {}
+    try:
+        for t in threading.enumerate():
+            nid = getattr(t, "native_id", None)
+            if nid is not None:
+                names[int(nid)] = t.name
+    except Exception:  # noqa: BLE001
+        pass
+    out: Dict[int, tuple] = {}
+    try:
+        tids = os.listdir(task_dir)
+    except OSError:
+        return out
+    hz = None
+    for tid_s in tids:
+        try:
+            tid = int(tid_s)
+        except ValueError:
+            continue
+        ns = None
+        try:
+            with open(os.path.join(task_dir, tid_s, "schedstat")) as f:
+                ns = int(f.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            try:
+                with open(os.path.join(task_dir, tid_s, "stat")) as f:
+                    fields = f.read().rsplit(")", 1)[1].split()
+                if hz is None:
+                    hz = float(os.sysconf("SC_CLK_TCK") or 100)
+                ns = int((int(fields[11]) + int(fields[12])) * 1e9 / hz)
+            except (OSError, ValueError, IndexError):
+                ns = None
+        if ns is None:
+            continue
+        name = names.get(tid)
+        if name is None:
+            try:
+                with open(os.path.join(task_dir, tid_s, "comm")) as f:
+                    name = "native:" + f.read().strip()
+            except OSError:
+                name = "native:?"
+        out[tid] = (name, ns)
+    return out
+
+
+def thread_cpu_delta(before: Dict[int, tuple], after: Dict[int, tuple], wall_s: float,
+                     own_tid: Optional[int] = None, top: int = 5) -> str:
+    """``cpu[wall_ms= sched_ms= others_ms= top=name:ms,...]`` -- the CPU each thread burned over the window
+    (a thread that started inside it counts from 0); ``sched`` is the calling (scheduler) thread."""
+    per: Dict[str, float] = {}
+    sched_ms = 0.0
+    for tid, (name, ns1) in after.items():
+        ns0 = before.get(tid, (name, 0))[1] if tid in before else 0
+        ms = max(0, ns1 - ns0) / 1e6
+        if own_tid is not None and tid == own_tid:
+            sched_ms += ms
+            continue
+        if ms <= 0.0:
+            continue
+        per[name] = per.get(name, 0.0) + ms
+    tops = sorted(per.items(), key=lambda kv: -kv[1])[:top]
+    return ("cpu[wall_ms=%.0f sched_ms=%.0f others_ms=%.0f top=%s]"
+            % (wall_s * 1000.0, sched_ms, sum(per.values()),
+               ",".join("%s:%.0f" % (n.replace(" ", "_")[:40], v) for n, v in tops) or "-"))
+
+
 class _Sampler:
     """L15-FWD-INST GIL sampler: a daemon thread wakes every ``period_s`` and
     reads the scheduler thread's innermost frame. Its own lateness beyond the
@@ -197,6 +280,13 @@ def on_set_consumer(index) -> None:
             if S.sampler is not None:
                 S.cur["gil"] = S.sampler.stop()
                 S.sampler = None
+            _c0 = S.cur.pop("cpu0", None)
+            if _c0 is not None:
+                try:
+                    S.cur["cpu"] = thread_cpu_delta(_c0[1], thread_cpu_snapshot(), time.perf_counter() - _c0[0],
+                                                    own_tid=_c0[2])
+                except Exception:  # noqa: BLE001
+                    pass
             S.pending.append(S.cur)
             S.cur = None
             del S.pending[:-MAX_PENDING]
@@ -208,6 +298,11 @@ def on_set_consumer(index) -> None:
                      "layers": {}, "load": S.load, "host": {},
                      "held": int(S.held_wake == S.wake)}
             S.load = None
+            if threads_on():
+                try:  # WAKEEXT-1023: which threads of this process burn CPU while this forward launches
+                    S.cur["cpu0"] = (time.perf_counter(), thread_cpu_snapshot(), threading.get_native_id())
+                except Exception:  # noqa: BLE001
+                    pass
             mode = gil_mode()
             if S.fwd == 1 and (mode == "all" or (mode == "held" and S.cur["held"])):
                 try:
@@ -349,7 +444,7 @@ def summarize(rec) -> Optional[str]:
     hot = [g for l, g in hg.items() if l % 4 != 3]
     host_prof = " host[full_attn sum=%.1f other sum=%.1f mean=%.2f] held=%d%s" % (
         sum(hfa), sum(hot), (sum(hot) / len(hot)) if hot else 0.0, int(rec.get("held", 0)),
-        (" " + rec["gil"]) if rec.get("gil") else "")
+        (" " + rec["gil"]) if rec.get("gil") else "") + ((" " + rec["cpu"]) if rec.get("cpu") else "")
     prof = "gap_sum_ms=%.1f full_attn(L%%4==3)[n=%d sum=%.1f mean=%.2f] other[n=%d sum=%.1f mean=%.2f] gap_top=%s" % (
         sum(gaps.values()), len(fa), sum(fa), (sum(fa) / len(fa)) if fa else 0.0,
         len(ot), sum(ot), (sum(ot) / len(ot)) if ot else 0.0,

@@ -598,6 +598,19 @@ def _any_scheduler_process_alive() -> bool:
         return True
     return False
 
+def _pdflip_rescan_deferred(updater) -> None:
+    """WAKEEXT-1023: the async store rescan's thread waits (bounded) until the wake's first forwards are launched
+    (``pdflip.wake_cpu_defer``), then walks. The journal apply is pure Python (89-619 ms on the 27B AutoRound boots,
+    growing with the journal) and ran beside the first hand-back extend's launch on the owner rank only."""
+    try:
+        from flliper.srt.pdflip import wake_cpu_defer as _wcd
+
+        _wcd.wait("store_rescan")
+    except Exception:  # noqa: BLE001 -- the deferral is never a gate
+        pass
+    updater._pdflip_rescan_store_index_sync()
+
+
 class PdFlipLegLedger:
     """Per-rank record of COMPLETED epoch-scoped flip legs (#1285)."""
 
@@ -4662,7 +4675,14 @@ class SchedulerWeightUpdaterManager:
             self._pdflip_rescan_store_index_sync()
             return
         self._pdflip_join_store_rescan("wake (previous rescan)")
-        th = threading.Thread(target=self._pdflip_rescan_store_index_sync,
+        try:  # WAKEEXT-1023: armed AFTER the join (whose release would undo a fresh arm)
+            from flliper.srt.pdflip import wake_cpu_defer as _wcd
+
+            _wcd.arm(has_work=bool(getattr(self, "_pdflip_wake_defer_work", True)))
+            self._pdflip_wake_defer_work = True
+        except Exception:  # noqa: BLE001 -- the deferral is never a gate
+            pass
+        th = threading.Thread(target=_pdflip_rescan_deferred, args=(self,),
                               name="pdflip-store-rescan", daemon=True)
         self.pdflip_store_rescan_thread = th
         th.start()
@@ -4673,6 +4693,12 @@ class SchedulerWeightUpdaterManager:
         th = self.pdflip_store_rescan_thread
         if th is None:
             return
+        try:  # WAKEEXT-1023: a deferred rescan starts NOW -- a join never waits for the deferral's bound
+            from flliper.srt.pdflip import wake_cpu_defer as _wcd
+
+            _wcd.release("join:%s" % where)
+        except Exception:  # noqa: BLE001
+            pass
         t0 = time.perf_counter()
         th.join()
         self.pdflip_store_rescan_thread = None
@@ -11242,6 +11268,10 @@ class SchedulerWeightUpdaterManager:
                 _iw = getattr(scheduler, "_pdflip_intake_watch", None)
                 if _iw is not None:
                     _iw.reset()
+                # WAKEEXT-1023: the async rescan (journal apply, owner rank only) starts after this wake's
+                # first forwards are launched -- armed (in _pdflip_rescan_store_index, after its join of the
+                # previous rescan) only when the wake holds parked or queued work
+                self._pdflip_wake_defer_work = bool(_rw_work)
                 _sub_t0 = time.perf_counter()
                 self._pdflip_rescan_store_index()
                 _pdflip_sub_t("rescan", _sub_t0)
