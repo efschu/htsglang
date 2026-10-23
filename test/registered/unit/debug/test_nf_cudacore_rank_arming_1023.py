@@ -1,5 +1,6 @@
-"""NF #162 (23.10.): every scheduler rank arms the CUDA coredump itself and the CUDA driver names, on the rank's own
-log line, whether a GPU exception there writes a dump -- where, and with which flags.
+"""NF #162 (23.10.): every scheduler rank is spawned with the CUDA coredump armed (skip_abort included), proves it on
+its own log lines (RANK-ENV from libc getenv, DRIVER from the CUDA driver itself), and the launch_server crash path
+waits for a dump that is still being written.
 
 Background: the import-time injection (debug_utils/cuda_coredump.py) runs once in the top-level process and prints
 "Injecting CUDA coredump env vars" only there, so the rc32 boot log showed it for launch_server alone; the ranks'
