@@ -208,3 +208,144 @@ def split_pieces(pieces, element: int):
         for j in range(nbytes // element):
             kern.append((element, int(dp) + j * element, int(sp) + j * element, int(ss)))
     return kern, rest
+
+
+# --- #179 (23.10.2026): the run stage goes in chunks of one extend chunk ------
+#
+# Boot 10231552 (27B int4ar, D = TP2 on 2x RTX 3080), 16:41:26Z, TP0 and TP1:
+# 'PDFLIP-ARENA-WRITE run mode failed (OutOfMemoryError ... Tried to allocate
+# 882.00 MiB ... 765.75 MiB is free)'. The run stage was ONE (pages, 2 * run)
+# tensor for the whole write: 2 * run = 32 KiB per page on that D rank (16
+# attention layers x 1 KiB cell, K and V, page = 1 token), and the write was the
+# write-through of a finished request's tail node (pdflip-20-65, cache_len 97792,
+# 64k decode tokens never written per chunk) -- 882 MiB / 32 KiB = ~28.2k pages in
+# one call. Nothing books a transient that grows with the decode length (up to
+# context / dcp x 32 KiB = 4 GiB at 262k), and a reserve for it is forbidden
+# (keine-korridor-reserve-nie). So the stage is CAPPED BY MECHANISM: it holds at
+# most the KV one extend chunk puts on the card (``chunked_prefill_size`` tokens
+# = the per-chunk publish's own stage), and a longer write runs that stage
+# several times on the same stream. The kernel's items, element and block quota
+# per page are unchanged, so the transfer is the same; a chunk adds 2L gather
+# copies + one kernel launch.
+
+def stage_chunk_pages(chunk_tokens, page_tokens: int, pages: int) -> int:
+    """Pages per stage fill: ``ceil(chunk_tokens / page_tokens)`` capped at the
+    write's own ``pages`` (a short write keeps its exact stage), at least 1.
+    ``chunk_tokens`` <= 0 or None (no chunked prefill: the extend itself holds
+    the whole prompt's KV at once) leaves the write in one fill -- the caller
+    names that case in its log line."""
+    pages = max(0, int(pages))
+    if pages == 0:
+        return 0
+    try:
+        ct = int(chunk_tokens) if chunk_tokens is not None else 0
+    except (TypeError, ValueError):
+        ct = 0
+    if ct <= 0:
+        return pages
+    pt = max(1, int(page_tokens or 1))
+    return max(1, min(pages, -(-ct // pt)))
+
+
+def stage_chunks(pages: int, chunk_pages: int):
+    """``[(start, stop), ...]`` page ranges of the stage fills, in order."""
+    pages, chunk_pages = int(pages), int(chunk_pages)
+    if pages <= 0:
+        return []
+    if chunk_pages <= 0:
+        raise ValueError(f"stage chunk of {chunk_pages} pages")
+    return [(s, min(pages, s + chunk_pages)) for s in range(0, pages, chunk_pages)]
+
+
+def run_stage_bytes(chunk_pages: int, run_bytes: int) -> int:
+    """The named transient of one run write: ``chunk_pages x 2 x run`` bytes."""
+    return int(chunk_pages) * 2 * int(run_bytes)
+
+
+def is_oom(exc: BaseException) -> bool:
+    """A card-memory refusal of the stage (torch OutOfMemoryError, or the
+    kernel's 'CUDA error: out of memory'): THIS write goes the cell way, the run
+    mode stays -- the card was full at that moment, the run path is not broken.
+    Anything else (a kernel/JIT failure) keeps the old one-way fallback."""
+    if type(exc).__name__ == "OutOfMemoryError":
+        return True
+    # the CUDA runtime's own wording only (cudaErrorMemoryAllocation as torch
+    # reports it) -- not any text that happens to say "out of memory" (a JIT /
+    # compiler failure keeps the one-way switch)
+    return "CUDA error: out of memory" in str(exc)
+
+
+class WriteClock:
+    """#179: what an arena write costs, per mode, from CUDA events on the write's
+    own stream (no sync: a pair is read once its stop event has completed).
+    ``mark()`` returns a start token, ``stop(tok, mode, nbytes)`` queues the
+    pair, ``drain()`` folds completed pairs into ``totals`` {mode: [n, ms,
+    bytes]}. ``event_factory`` is injectable for the desk tests. An instrument:
+    it never raises into the write."""
+
+    MAX_OPEN = 256
+
+    def __init__(self, event_factory=None):
+        self._mk = event_factory
+        self._open = []
+        self.totals = {}
+
+    def _event(self):
+        if self._mk is not None:
+            return self._mk()
+        import torch
+
+        return torch.cuda.Event(enable_timing=True)
+
+    def mark(self):
+        """A recorded start event, or None (an instrument never fails the write)."""
+        try:
+            ev = self._event()
+            ev.record()
+            return ev
+        except Exception:  # noqa: BLE001
+            return None
+
+    def stop(self, start, mode: str, nbytes: int) -> None:
+        if start is None:
+            return
+        try:
+            ev = self._event()
+            ev.record()
+        except Exception:  # noqa: BLE001
+            return
+        self._open.append((start, ev, str(mode), int(nbytes)))
+        if len(self._open) > self.MAX_OPEN:
+            # an instrument never grows without bound: the oldest pair is dropped, named in the totals
+            self._open.pop(0)
+            self.totals.setdefault("dropped", [0, 0.0, 0])[0] += 1
+        self.drain()
+
+    def drain(self) -> None:
+        keep = []
+        for start, ev, mode, nbytes in self._open:
+            try:
+                if not ev.query():
+                    keep.append((start, ev, mode, nbytes))
+                    continue
+                ms = float(start.elapsed_time(ev))
+            except Exception:  # noqa: BLE001 -- an unreadable pair is dropped, counted
+                self.totals.setdefault("dropped", [0, 0.0, 0])[0] += 1
+                continue
+            t = self.totals.setdefault(mode, [0, 0.0, 0])
+            t[0] += 1
+            t[1] += ms
+            t[2] += nbytes
+        self._open = keep
+
+    def summary(self) -> str:
+        """``run=n/ms/MiB/GBps cell=...`` over the completed writes so far."""
+        parts = []
+        for mode in sorted(self.totals):
+            n, ms, nbytes = self.totals[mode]
+            if mode == "dropped":
+                parts.append(f"dropped={n}")
+                continue
+            gbps = (nbytes / (ms * 1e6)) if ms > 0 else 0.0
+            parts.append(f"{mode}={n}w/{ms:.1f}ms/{nbytes / (1 << 20):.1f}MiB/{gbps:.2f}GBps")
+        return " ".join(parts) if parts else "none"
