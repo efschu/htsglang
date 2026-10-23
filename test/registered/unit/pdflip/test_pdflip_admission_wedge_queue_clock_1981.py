@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""deskq 1988 (b) / report 1981: ADMISSION-WEDGE false alarm. Behind FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK (default off,
-dual layout only) the age is min(D's last-first-token age, age of the non-empty queue) and a new alarm window clears
+"""deskq 1988 (b) / report 1981: ADMISSION-WEDGE false alarm. Behind FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK (default on since
+27b-flipverdict-1023, dual layout only) the age is min(D's last-first-token age, age of the non-empty queue) and a new alarm window clears
 the recovery channel's stale last_outcome. A real stand (queued, 0 running, nothing for long) still alarms.
 
 DANGER DIRECTIONS: switch off or flip form -> pre-fix verdict, nothing written onto the scheduler; armed -> the
@@ -144,7 +144,14 @@ class FlipUnchanged1988(CustomTestCase):
             self.assertIsNotNone(ch.last_outcome)
             self.assertNotIn("QUEUE-CLOCK", detail)
 
-    def test_env_unset_is_off(self):
+    def test_env_unset_is_off_without_the_dual_layout(self):
         e = {k: v for k, v in os.environ.items() if k not in (QC, DUAL)}
         with mock.patch.dict(os.environ, e, clear=True):
             self.assertFalse(IC._wedge_queue_clock_armed())
+
+    def test_env_unset_is_on_in_the_dual_layout(self):
+        # 27b-flipverdict-1023: default ON (user order 14.10.), still bound to the dual layout
+        e = {k: v for k, v in os.environ.items() if k != QC}
+        e[DUAL] = "1"
+        with mock.patch.dict(os.environ, e, clear=True):
+            self.assertTrue(IC._wedge_queue_clock_armed())

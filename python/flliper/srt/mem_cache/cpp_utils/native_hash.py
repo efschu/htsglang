@@ -56,6 +56,39 @@ def _load_native_hash_module() -> Any:
         return m
 
 
+def prewarm_native_hash(site: str) -> bool:
+    """Load (on a cache miss: build) the hash extension at hicache init, before READY.
+
+    27b-flipverdict-1023 B: until now the first page hash of the process loaded
+    it -- on group D that is the first request's store probe/prefetch, in the
+    scheduler's own threads. With a warm cache volume that costs 0.02-0.14 s
+    (boot 15, 23.10.: ``ready in 0.06 s (source staged=unchanged)``), but after
+    a change of ``hash_binding.cpp`` it is a ninja build of 4-7 s in front of the
+    first user request (y6o 01.10., queue_ms=6338). Called from both census
+    sites (``init_hicache``, ``hiradix_init``). Never raises: a failure is logged
+    and the first hash retries the load exactly as before.
+    """
+    t0 = time.monotonic()
+    try:
+        _load_native_hash_module()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "HICACHE-HASH-PREWARM site=%s FAILED (%r) after %.2f s -- the first page "
+            "hash retries the load",
+            site,
+            exc,
+            time.monotonic() - t0,
+        )
+        return False
+    logger.info(
+        "HICACHE-HASH-PREWARM site=%s ready in %.2f s (before READY: no request "
+        "loads or builds the hash extension)",
+        site,
+        time.monotonic() - t0,
+    )
+    return True
+
+
 def _reload_from_copy(module: Any) -> Any:
     path = getattr(module, "__file__", None)
     if not path or not os.path.exists(path):
