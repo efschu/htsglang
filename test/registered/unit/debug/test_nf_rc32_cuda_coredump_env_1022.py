@@ -77,7 +77,7 @@ class TheProfileSwitchArmsEveryRank(unittest.TestCase):
         self.assertEqual(p.get("CUDA_ENABLE_COREDUMP_ON_EXCEPTION"), "1")
         self.assertEqual(p.get("CUDA_COREDUMP_GENERATION_FLAGS"),
                          "skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,"
-                         "skip_local_memory,skip_constbank_memory")
+                         "skip_local_memory,skip_constbank_memory,skip_abort")
         self.assertEqual(p.get("CUDA_COREDUMP_FILE"), self.dump_dir + "/cuda_coredump_%h.%p.%t")
 
     def test_the_dump_directory_exists_on_the_evidence_path(self):
@@ -159,7 +159,7 @@ class EverySchedulerRankGetsThemThroughTheSpawnHop(unittest.TestCase):
             "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
             "CUDA_COREDUMP_SHOW_PROGRESS": "1",
             "CUDA_COREDUMP_GENERATION_FLAGS": "skip_nonrelocated_elf_images,skip_global_memory,"
-                                              "skip_shared_memory,skip_local_memory,skip_constbank_memory",
+                                              "skip_shared_memory,skip_local_memory,skip_constbank_memory,skip_abort",
             "CUDA_COREDUMP_FILE": self.dump_dir + "/cuda_coredump_%h.%p.%t",
         }
         self.assertEqual(self.res["parent"], want)

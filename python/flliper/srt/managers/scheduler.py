@@ -24311,6 +24311,17 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # NF #162 (23.10.): the CUDA coredump witness of THIS rank. Its settings are
+    # the env it was spawned with (the driver latches them at the first CUDA
+    # init, already during this process's unpickling import of flliper -- see
+    # debug_utils/cuda_coredump.py); the two log lines below prove them.
+    from flliper.srt.debug_utils import cuda_coredump as _cudacore
+
+    _cudacore_label = "%s TP%s PP%s" % (
+        (os.environ.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper() or "-",
+        tp_rank,
+        pp_rank,
+    )
     _pdflip_arm_dc_snapshot_history()  # #1452
     # EXIT WITNESS (NF 20.10. 14:18:29Z, D TP0 OOM-killed in silence): the
     # cgroup oom_kill baseline, read before this rank can have died, so the
@@ -24347,6 +24358,7 @@ def run_scheduler_process(
         pp_rank,
         dp_rank,
     )
+    _cudacore.log_rank_env(_cudacore_label, logger)  # NF #162: one line per rank
     # NUMPY-THP-SERVE (27B z30y11): no numpy MADV_HUGEPAGE in a rank process --
     # a 2 MiB first touch compacts synchronously and migrates the shared arena
     # under every rank (see gguf_numpy_hugepage.numpy_hugepage_off_for_serving).
@@ -24437,6 +24449,10 @@ def run_scheduler_process(
             dp_rank,
         )
 
+        # NF #162: CUDA is up -- the driver itself names whether a GPU exception
+        # in this rank writes a dump, the expanded file and the flags.
+        _cudacore.driver_report(_cudacore_label, logger)
+
         # VRAM-Vertrag M2: the scheduler (paused tags, the runners' pools) is
         # what the rank's VRAM actual attributes against from here on; bound
         # before boot_complete so that mark is the first complete one.
@@ -24505,6 +24521,17 @@ def run_scheduler_process(
     except Exception as scheduler_exc:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # NF #162: a CUDA error -> this rank's device VA map (page-controller
+        # tensors with their mapped spans + torch segments) next to the CUDA
+        # coredump, so the fault VA of the Xid line / cuda-gdb gets an owner.
+        # Host-only, bounded, never raises.
+        if "CUDA error" in (traceback or "") or "AcceleratorError" in (traceback or ""):
+            try:
+                from flliper.srt.debug_utils import va_witness as _va_witness
+
+                _va_witness.write_va_map(scheduler, _cudacore_label, "cuda_error", log=logger)
+            except Exception:  # noqa: BLE001 - a witness never masks the death
+                pass
         # DASHBOARD-AUS-IPC A14: the stop as a record in this rank's rankstats
         # file, written HERE -- before the #1223 hold and before the SIGQUIT
         # below end the group; the front publishes it as `rank_stop`.
