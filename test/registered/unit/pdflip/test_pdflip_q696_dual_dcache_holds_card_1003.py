@@ -374,6 +374,11 @@ class TestBFrontCardStall:
 # ------------------------------------------------------------------------------- C
 
 class TestCWedgeClass:
+    @pytest.fixture(autouse=True)
+    def _pre_fix_wedge_verdict(self, monkeypatch):
+        # 27b-qclock-1023: this file pins the PRE-FIX verdict (a first poll on a long-stale first-token stamp alarms); the armed queue clock is covered by test_pdflip_wedge_qclock_1023.py
+        monkeypatch.setenv("FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK", "0")
+
     def _stage_files(self, tmp, tag, paths):
         for r, pth in enumerate(paths):
             with open(os.path.join(tmp, "st%d" % r), "w") as fh:

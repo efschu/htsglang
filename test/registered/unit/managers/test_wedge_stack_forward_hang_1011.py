@@ -135,6 +135,12 @@ class WriteSchedulerStackTest(CustomTestCase):
 
 
 class PollerStackTest(CustomTestCase):
+    def setUp(self):
+        # 27b-qclock-1023: this file pins the PRE-FIX verdict (a first poll on a long-stale first-token stamp alarms); the armed queue clock is covered by test_pdflip_wedge_qclock_1023.py
+        p = mock.patch.dict(os.environ, {"FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK": "0"})
+        p.start()
+        self.addCleanup(p.stop)
+
     def _poller(self, s):
         # no recovery driver traffic: the post/settle machinery is not under test here
         return make_admission_wedge_poller(s)

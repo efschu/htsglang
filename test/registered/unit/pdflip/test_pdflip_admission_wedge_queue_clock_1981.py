@@ -133,25 +133,30 @@ class WedgeClockArmed1981(CustomTestCase):
 
 
 class FlipUnchanged1988(CustomTestCase):
-    def test_switch_on_without_the_dual_layout_is_the_old_verdict(self):
+    def test_switch_on_without_the_dual_layout_is_armed_too(self):
+        # 27b-qclock-1023: the clock is no longer bound to the dual layout (boot 17:35:55Z ran pp=2 without it)
         with _env(True, dual=False):
             s = _Sched(last_token=0.0, queued=1)
-            ch = get_recovery_channel(s)
-            ch.last_outcome = object()
             alarm, detail = IC.check_admission_wedge_once(s, now=100.0)
-            self.assertTrue(alarm, detail)
-            self.assertFalse(hasattr(s, "_wedge_queue_since"))
-            self.assertIsNotNone(ch.last_outcome)
-            self.assertNotIn("QUEUE-CLOCK", detail)
+            self.assertFalse(alarm, detail)
+            self.assertEqual(s._wedge_queue_since, 100.0)
+            self.assertIn("QUEUE-CLOCK", detail)
 
-    def test_env_unset_is_off_without_the_dual_layout(self):
-        e = {k: v for k, v in os.environ.items() if k not in (QC, DUAL)}
-        with mock.patch.dict(os.environ, e, clear=True):
-            self.assertFalse(IC._wedge_queue_clock_armed())
+    def test_switch_off_is_the_old_verdict_in_any_form(self):
+        for dual in (True, False):
+            with _env(False, dual=dual):
+                s = _Sched(last_token=0.0, queued=1)
+                ch = get_recovery_channel(s)
+                ch.last_outcome = object()
+                alarm, detail = IC.check_admission_wedge_once(s, now=100.0)
+                self.assertTrue(alarm, detail)
+                self.assertFalse(hasattr(s, "_wedge_queue_since"))
+                self.assertIsNotNone(ch.last_outcome)   # the off path leaves the previous window's outcome alone
 
-    def test_env_unset_is_on_in_the_dual_layout(self):
-        # 27b-flipverdict-1023: default ON (user order 14.10.), still bound to the dual layout
-        e = {k: v for k, v in os.environ.items() if k != QC}
-        e[DUAL] = "1"
-        with mock.patch.dict(os.environ, e, clear=True):
-            self.assertTrue(IC._wedge_queue_clock_armed())
+    def test_env_unset_is_on_in_every_form(self):
+        for dual in ("1", "0", None):
+            e = {k: v for k, v in os.environ.items() if k not in (QC, DUAL)}
+            if dual is not None:
+                e[DUAL] = dual
+            with mock.patch.dict(os.environ, e, clear=True):
+                self.assertTrue(IC._wedge_queue_clock_armed())

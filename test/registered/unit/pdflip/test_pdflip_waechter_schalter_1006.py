@@ -76,8 +76,11 @@ class _Clean(unittest.TestCase):
     def setUp(self):
         self._saved = {k: os.environ.pop(k, None) for k in _ALL}
         os.environ["FLLIPER_WEDGE_STATUS_DISABLE"] = "1"
+        # 27b-qclock-1023: this file pins the PRE-FIX verdict (a first poll on a long-stale first-token stamp alarms); the armed queue clock is covered by test_pdflip_wedge_qclock_1023.py
+        os.environ["FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK"] = "0"
 
     def tearDown(self):
+        os.environ.pop("FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK", None)
         for k in _ALL:
             os.environ.pop(k, None)
         for k, v in self._saved.items():
