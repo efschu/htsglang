@@ -118,10 +118,12 @@ def _tree_cache():
 def _adder(available):
     rb = MagicMock()
     rb.reqs = []
+    tc, alloc = _tree_cache(), _Alloc(available)
+    tc.token_to_kv_pool_allocator = alloc  # the #679 grant reads the pool through the tree (fundable_extend_tokens)
     return PrefillAdder(
         page_size=1,
-        tree_cache=_tree_cache(),
-        token_to_kv_pool_allocator=_Alloc(available),
+        tree_cache=tc,
+        token_to_kv_pool_allocator=alloc,
         running_batch=rb,
         new_token_ratio=1.0,
         rem_input_tokens=10**9,
@@ -304,6 +306,59 @@ class ChunkGeometryRankAgreeTest(unittest.TestCase):
                     self.assertIn("EXTEND-LEN SPLIT", str(out[r]))
                 else:
                     self.assertIsNone(out[r])
+
+
+class ChunkGeometryReviewB1B3Test(unittest.TestCase):
+    """Review 23.10. (Opus) of da864a4347: B1 (MIN <= 0 -> the #679 grant is the group's too), B2 (the riegel compares
+    the START as well), B3 (MIN below a grain parks every rank alike)."""
+
+    setUp = ChunkGeometryRankAgreeTest.setUp
+
+    def test_b1_min_zero_unequal_fundable_both_park(self):
+        """TP1's pool is exhausted (rem_total 0 -> group MIN 0), TP0's is not: both enter the grant branch, where
+        ``fundable_extend_tokens`` reads each rank's OWN pool. Without B1 TP0 extends 4096 while TP1 parks (red: the
+        riegel's split); with B1 the grant is the group's MIN (0) and both park."""
+        group, out = _run([TP0_AVAILABLE, 0])
+        fails = {r: v[1] for r, v in out.items() if v[0] == "raise"}
+        self.assertEqual(fails, {}, f"tp0={group.logs[0]} tp1={group.logs[1]} -- {fails}")
+        self.assertEqual((out[0][1], out[1][1]), (0, 0))
+        self.assertEqual(group.logs[0], group.logs[1])
+
+    def test_b1_both_pools_exhausted_unchanged(self):
+        _group, out = _run([0, 0])
+        self.assertEqual({v[0] for v in out.values()}, {"ok"})
+        self.assertEqual((out[0][1], out[1][1]), (0, 0))
+
+    def test_b3_min_below_a_grain_parks_every_rank(self):
+        """Grain 64 (a QSA pool): TP1 funds 30 rows, below the next grain boundary -> K11 parks it; TP0 funds 4096.
+        On the group MIN both park (no forward with two token counts)."""
+        with patch.object(PrefillAdder, "_pdflip_chunk_grain", lambda self: 64):
+            group, out = _run([TP0_AVAILABLE, 30])
+        fails = {r: v[1] for r, v in out.items() if v[0] == "raise"}
+        self.assertEqual(fails, {}, f"tp0={group.logs[0]} tp1={group.logs[1]} -- {fails}")
+        self.assertEqual((out[0][1], out[1][1]), (0, 0))
+
+    def test_b2_same_length_different_start_is_a_named_stop(self):
+        """Equal lengths at different starts = different token positions in one all_reduce: EXTEND-LEN SPLIT."""
+        a = SimpleNamespace(rid="r", extend_range=Range(10, 4106))
+        b = SimpleNamespace(rid="r", extend_range=Range(74, 4170))
+        group = _TPGroup(n=2)
+        out = {}
+
+        def run(r, req):
+            try:
+                out[r] = ra.extend_set_riegel([req], None, 1, gather=lambda p: group.gather(r, "s", p), tp_rank=r)
+            except Exception as exc:  # noqa: BLE001
+                out[r] = exc
+
+        ts = [threading.Thread(target=run, args=(r, q), daemon=True) for r, q in enumerate((a, b))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        for r in (0, 1):
+            self.assertIsInstance(out[r], ra.RankAgreeSplit)
+            self.assertIn("EXTEND-LEN SPLIT", str(out[r]))
 
 
 if __name__ == "__main__":

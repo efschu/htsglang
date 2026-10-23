@@ -2787,6 +2787,12 @@ class PrefillAdder:
                 grant = chunk_tokens_the_pool_can_fund(
                     fundable, self.page_size, self.rem_chunk_tokens
                 )
+                # CHUNKGEOM B1 (SOLL R11): `fundable` carries THIS rank's deliverable evictable, so on unequal pools the
+                # small rank parks (grant 0) while the large one extends `grant` rows -- the split the riegel would stop
+                # by name in exactly the D-load case. Every rank entered this branch on the same group MIN above, so the
+                # second gather pairs on every rank; the grant is the group's MIN too.
+                if _ra_chunk_min is not None:
+                    grant = int(_ra_chunk_min(req.rid, int(grant)))
                 self._note_cap_blind_chunk(req, fundable, grant)
                 if grant <= 0:
                     req.set_extend_range(

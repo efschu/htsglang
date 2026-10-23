@@ -51,8 +51,10 @@ THE RULE.
    DCP group), and the forward's per-token all_reduces ran with two different token counts -> hang to the watchdog.
    Now every rank gathers ``("chunk", rid, its budget)`` right there and the chunk is sized on the group's MIN -- no
    rank is made to extend past its own pool, every rank cuts at the same length.
-5. The riegel carries every admitted request's extent ``(start, length)``: a length that still differs (a rank-local
-   cut behind the agreed budget) is a named stop before PW-R / the queue removal / prepare_for_extend
+   When that MIN is <= 0 the #679 grant (``fundable_extend_tokens``: this rank's deliverable evictable) is gathered
+   the same way (B1, review 23.10.), so the park-or-extend verdict is the group's as well.
+5. The riegel carries every admitted request's extent ``(start, length)``: an extent that still differs (a rank-local
+   cut behind the agreed budget, or a different start) is a named stop before PW-R / the queue removal / prepare_for_extend
    (``EXTEND-LEN SPLIT``), never a forward with two token counts.
 
 Every collective here is the same kind (``all_gather_object`` on the TP cpu group, under the blocked-recv stamp), so a
@@ -245,14 +247,15 @@ def extend_set_riegel(admitted: Sequence[Any], hol_head: Optional[str], gate_cal
             "collectives (PW-R's group MIN, the DCP prefix check, the forward) would differ per rank; stopping by "
             "name instead (raenge-nie-uneins, SOLL R11)."
         )
+    # CHUNKGEOM B2: the whole extent (start AND length) -- equal lengths at different starts would put different token
+    # positions into the same all_reduce (silent corruption, worse than a hang)
     exts = [tuple(v[4]) if len(v) > 4 and v[4] is not None else None for v in got]
-    lens = [None if e is None else tuple(None if x is None else x[1] for x in e) for e in exts]
-    if any(ln is not None for ln in lens) and any(ln != lens[0] for ln in lens):
+    if any(e is not None for e in exts) and any(e != exts[0] for e in exts):
         raise RankAgreeSplit(
             f"{MARK} EXTEND-LEN SPLIT tp={tp_rank} rids={list(sets[0])} extents(start,len)={[list(e or ()) for e in exts]}: "
-            "the ranks admitted the same requests at different chunk lengths -- the forward's per-token collectives "
-            "would run with different token counts (a hang to the watchdog); stopping by name instead "
-            "(raenge-nie-uneins, SOLL R11)."
+            "the ranks admitted the same requests at different extents (chunk length or start) -- the forward's "
+            "per-token collectives would run with different token counts (a hang to the watchdog) or different token "
+            "positions (silent corruption); stopping by name instead (raenge-nie-uneins, SOLL R11)."
         )
 
 
