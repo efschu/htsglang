@@ -127,7 +127,9 @@ class TestProbeLoop(CustomTestCase):
             t[0] += 0.050 if len(calls) == 2 else 0.00002
             return b"\x00" * 16
 
-        lat, ones = bl.run_readback_probe(read_once, 8, 5.0, clock=clock)
+        # confirm=1 = the 23.10. form; the default (READBACK-CONFIRM, 2) reads
+        # on after a single stall -- test_pdflip_bar1_lanes3x80_1023.py
+        lat, ones = bl.run_readback_probe(read_once, 8, 5.0, clock=clock, confirm=1)
         self.assertEqual(len(calls), 2)
         self.assertEqual(len(lat), 2)
         self.assertGreater(lat[1], 5.0)
