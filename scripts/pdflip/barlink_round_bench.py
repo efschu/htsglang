@@ -282,18 +282,118 @@ def calibration_verdict(rows: list, fit, contended: list) -> str:
 # the measurement
 # ---------------------------------------------------------------------------
 
-def _timed(fn, seconds: float, at_least: int = 3) -> list:
-    """Per-iteration milliseconds over at least ``seconds`` of wall clock."""
+# ---------------------------------------------------------------------------
+# LOCKSTEP (barlink-race-1023). Every rank must issue the SAME sequence of
+# collectives -- the transport pairs the k-th collective of every rank, it has
+# no other notion of "the same call". A loop that ends on a rank-LOCAL clock
+# breaks that: each rank sets its deadline when IT enters the loop and tests it
+# after each call, so two ranks whose host clocks see the calls at different
+# offsets can end after different call counts. The rank that runs one call
+# longer then pairs its last call with the peer's FIRST call of the next loop:
+# a different payload, a correct transport, a wrong sum in every element, and
+# status 0 -- the 23.10. 10:50Z specimen (pair 0,2, card 2 under a foreign
+# load: "1 of 216 timed calls wrong (call, n_bad) [(215, 6291456)] status=0",
+# 6291456 = every float of the 24 MiB message, the LAST call of the loop, and a
+# traceback on the OTHER rank, whose next call found no peer). A foreign load
+# widens exactly that host-side skew; it never touched the data.
+#
+# The stop decision is therefore AGREED: after every call (outside the timed
+# span) the ranks all-reduce MAX over "I want to stop" on the gloo group, so
+# the first rank whose deadline passed -- or that saw a wrong result -- ends
+# the loop for everyone at the same call. After the loop the call counts are
+# gathered and compared: unequal counts are refused as an SPMD DIVERGENCE of
+# the bench, never reported as a transport result. Same lesson, same cure as
+# scripts/dual_layout/bar1_two_groups.py (63909e080a, 30.09.: "a time trigger
+# fires on different rounds per rank and misaligns the collective sequence").
+#
+# WHAT IT COSTS THE MEASUREMENT: one gloo round trip between two bar1 calls,
+# outside the timed span. Each timed call already starts from a
+# torch.cuda.synchronize(), so per-call times are unchanged; what the loop no
+# longer exercises is two ranks' hosts drifting apart over many back-to-back
+# calls -- the serving path (graph replay) does that, this bench does not, and
+# a back-to-back transport race would need its own harness.
+# ---------------------------------------------------------------------------
+
+class LocalLockstep:
+    """World 1 (and the desk tests' single-rank cases): nothing to agree."""
+
+    rank = 0
+    world = 1
+
+    def stop(self, local_stop: bool) -> bool:
+        return bool(local_stop)
+
+    def gather(self, values: list) -> list:
+        return [list(values)]
+
+
+class GlooLockstep:
+    """The agreement over a CPU process group. ``stop`` is one 4-byte gloo
+    all_reduce(MAX) per loop iteration, OUTSIDE the timed span."""
+
+    def __init__(self, pg, rank: int, world: int):
+        self.pg = pg
+        self.rank = int(rank)
+        self.world = int(world)
+
+    def stop(self, local_stop: bool) -> bool:
+        import torch
+        import torch.distributed as dist
+
+        t = torch.tensor([1 if local_stop else 0], dtype=torch.int32)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=self.pg)
+        return bool(int(t.item()))
+
+    def gather(self, values: list) -> list:
+        import torch
+        import torch.distributed as dist
+
+        t = torch.tensor([int(v) for v in values], dtype=torch.int64)
+        out = [torch.zeros_like(t) for _ in range(self.world)]
+        dist.all_gather(out, t, group=self.pg)
+        return [[int(x) for x in o.tolist()] for o in out]
+
+
+def require_equal_counts(lockstep, calls: int, where: str) -> None:
+    """Refuse a loop whose ranks issued different numbers of collectives.
+
+    The guard behind the agreement: if a future edit makes the stop decision
+    rank-local again, this names it as what it is instead of letting the
+    mispaired call surface as a WRONG transport result.
+    """
+    counts = [row[0] for row in lockstep.gather([calls])]
+    if len(set(counts)) > 1:
+        raise SystemExit(
+            f"SPMD DIVERGENCE: {where} -- the ranks issued different numbers "
+            f"of collectives in this loop (calls per rank {counts}). The "
+            f"transport pairs the k-th call of every rank; from the first "
+            f"surplus call on, results mix different calls' payloads. This is "
+            f"a BENCH defect, not a transport result.")
+
+
+def _timed(fn, seconds: float, *, lockstep, at_least: int = 3,
+           where: str = "") -> list:
+    """Per-iteration milliseconds over at least ``seconds`` of wall clock.
+
+    The stop decision is agreed across the ranks (``lockstep``), see LOCKSTEP
+    above -- ``fn`` is a collective, and a rank-local stop would leave one
+    rank's last call without a partner (NCCL/gloo: a hang or a mispaired
+    call; bar1: a wrong sum).
+    """
     import torch
 
     samples = []
     deadline = time.perf_counter() + seconds
-    while time.perf_counter() < deadline or len(samples) < at_least:
+    while True:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         fn()
         torch.cuda.synchronize()
         samples.append((time.perf_counter() - t0) * 1e3)
+        local = (time.perf_counter() >= deadline and len(samples) >= at_least)
+        if lockstep.stop(local):
+            break
+    require_equal_counts(lockstep, len(samples), where or "timed loop")
     return samples
 
 
@@ -312,7 +412,8 @@ def reduced_result(comm, probe):
     return probe if out is None else out
 
 
-def verify_all_reduce(comm, buf, world: int, where: str, want=None):
+def verify_all_reduce(comm, buf, world: int, where: str, want=None,
+                      lockstep=None):
     """One all_reduce of ``buf``, checked. Returns the reduced tensor.
 
     Runs on a CLONE, so the caller's buffer is reusable whichever contract
@@ -322,6 +423,10 @@ def verify_all_reduce(comm, buf, world: int, where: str, want=None):
 
     ``want`` is the expected tensor (a :func:`round_payload` pair); ``None``
     keeps the old scalar ``sum(1..world)`` for a constant ``rank + 1`` fill.
+
+    ``lockstep`` (barlink-race-1023): when given, the verdict is agreed before
+    anyone raises, so every rank stops at this call and the report names the
+    rank -- instead of one rank exiting and its peer dying in the next call.
     """
     probe = reduced_result(comm, buf.clone())
     import torch
@@ -331,13 +436,20 @@ def verify_all_reduce(comm, buf, world: int, where: str, want=None):
         ok = bool(torch.all(probe == want).item())
     else:
         ok = bool(torch.equal(probe, want))
+    any_bad = (not ok) if lockstep is None else lockstep.stop(not ok)
+    if any_bad and ok:
+        raise SystemExit(
+            f"WRONG RESULT: {where} -- on a PEER rank; rank {lockstep.rank}/"
+            f"{lockstep.world} computed this call correctly and stops with it.")
     if not ok:
         bad = (probe != want)
         nbad = int(bad.sum().item())
         first = int(bad.nonzero()[0].item()) if nbad else -1
         st = transport_status(comm) if hasattr(comm, "transport") else ""
+        who = (f"rank {lockstep.rank}/{lockstep.world}: "
+               if lockstep is not None else "")
         raise SystemExit(
-            f"WRONG RESULT: {where} -- {nbad} of {probe.numel()} values wrong "
+            f"WRONG RESULT: {where} -- {who}{nbad} of {probe.numel()} values wrong "
             f"(first at element {first}), got {probe.min().item()}.."
             f"{probe.max().item()} {st}. A decomposition that returns the wrong "
             f"sum is not a slow case."
@@ -389,17 +501,64 @@ def gather_payload(n: int, rank: int, k: int, device):
         torch.float32)
 
 
-def _timed_verified(comm, pairs: list, seconds: float, where: str,
-                    at_least: int = 3) -> list:
+def decode_wrong(res, want, world: int) -> str:
+    """What a wrong all_reduce result IS, read off the round term.
+
+    With ``x[r, k, i] = (r + 1) + 8 * ((7 i + 3 k) mod 61)`` a result in which
+    every peer contributed call ``k'`` instead of ``k`` is exactly
+    ``pat_k + (world - 1) * pat_k' + R(R+1)/2``. ``k'`` is recovered from
+    element 0 (3 is invertible mod 61, inverse 41) and then checked on EVERY
+    element. Returns a sentence; it is information, NOT a verdict: a transport
+    that delivered a peer's whole previous call would decode the same way.
+    The verdict comes from the call counts (``require_equal_counts``).
+    """
+    import torch
+
+    w = int(world)
+    if w < 2:
+        return "world 1: no peer contribution to decode"
+    base = float(w * (w + 1) // 2)
+    pat_k = (want.double() - base) / w
+    m0 = (float(res.reshape(-1)[0].double().item()) - float(pat_k.reshape(-1)[0].item())
+          - base) / ((w - 1) * 8.0)
+    if not (m0 == int(m0) and 0 <= int(m0) <= 60):
+        return "matches no uniform pairing of whole calls (element 0 decodes to no k')"
+    kp = (int(m0) * 41) % 61
+    k = (int(round(float(pat_k.reshape(-1)[0].item()) / 8.0)) * 41) % 61
+    i = torch.arange(res.numel(), device=res.device, dtype=torch.int64)
+    pat_kp = ((7 * i + 3 * kp) % 61).to(torch.float64) * 8.0
+    hyp = pat_k.reshape(-1) + (w - 1) * pat_kp + base
+    if bool(torch.equal(hyp, res.reshape(-1).double())):
+        d = (kp - k) % 61
+        d = d - 61 if d > 30 else d
+        return (f"every element equals own call k plus the peers' call "
+                f"k{d:+d} (mod 61): a WHOLE call of the peers paired with this "
+                f"rank's call")
+    nbad = int((hyp != res.reshape(-1).double()).sum().item())
+    return (f"not a uniform whole-call pairing ({nbad} of {res.numel()} elements "
+            f"differ from the best hypothesis k'={kp} mod 61)")
+
+
+def _timed_verified(comm, pairs: list, seconds: float, where: str, *,
+                    lockstep, at_least: int = 3) -> list:
     """Like :func:`_timed`, rotating over round-termed ``(payload, want)``
-    pairs, and every single result checked after its clock stopped."""
+    pairs, and every single result checked after its clock stopped.
+
+    A wrong result ends the loop for EVERY rank at the same call (it is
+    folded into the agreed stop), then the call counts are compared, then
+    every rank raises with the per-rank picture. Before 23.10. the rank that
+    saw the wrong result exited alone and the other one died in its next call,
+    so the report came from one rank, without a rank number, next to an
+    unrelated traceback.
+    """
     import torch
 
     samples = []
     wrong = []
+    first_diag = ""
     deadline = time.perf_counter() + seconds
     j = 0
-    while time.perf_counter() < deadline or len(samples) < at_least:
+    while True:
         buf, want = pairs[j % len(pairs)]
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -409,17 +568,39 @@ def _timed_verified(comm, pairs: list, seconds: float, where: str,
         res = buf if out is None else out
         if not bool(torch.equal(res, want)):
             wrong.append((j, int((res != want).sum().item())))
+            first_bad = (res, want)
         j += 1
+        local = bool(wrong) or (time.perf_counter() >= deadline
+                                and len(samples) >= at_least)
+        if lockstep.stop(local):
+            break
     if wrong:
+        # AFTER the agreement, and guarded: a diagnostic that raised on one
+        # rank before the stop would leave the peer blocked in it.
+        try:
+            first_diag = decode_wrong(first_bad[0], first_bad[1], lockstep.world)
+        except Exception as e:  # noqa: BLE001 -- information, never the error
+            first_diag = f"decode failed ({type(e).__name__})"
+    require_equal_counts(lockstep, j, where)
+    per_rank = lockstep.gather([len(wrong)])
+    if any(row[0] for row in per_rank):
+        mine = (f"{len(wrong)} of {j} timed calls wrong (call, n_bad) "
+                f"{wrong[:8]}" if wrong else f"0 of {j} calls wrong")
         raise SystemExit(
-            f"WRONG RESULT: {where} -- {len(wrong)} of {j} timed calls wrong "
-            f"(call, n_bad) {wrong[:8]} {transport_status(comm)}. A "
-            f"decomposition that returns the wrong sum is not a slow case.")
+            f"WRONG RESULT: {where} -- rank {lockstep.rank}/{lockstep.world}: "
+            f"{mine} {transport_status(comm)}; wrong calls per rank "
+            f"{[row[0] for row in per_rank]}. Call counts AGREE across the "
+            f"ranks ({j}): the collective sequence was in lockstep, so this is "
+            f"NOT a bench count divergence -- treat it as a TRANSPORT-class "
+            f"wrong result."
+            + (f" Decode of the first wrong call: {first_diag}." if first_diag
+               else "")
+            + " A decomposition that returns the wrong sum is not a slow case.")
     return samples
 
 
 def check_other_ops(comm, n: int, rank: int, world: int, dev, kctr: list,
-                    where: str, log) -> None:
+                    where: str, log, lockstep=None) -> None:
     """all_gather, broadcast and all_to_all_single with the round term.
 
     Same transport, same window -- the a2a kernel carries all three, and a
@@ -427,6 +608,19 @@ def check_other_ops(comm, n: int, rank: int, world: int, dev, kctr: list,
     Raises SystemExit on any wrong element.
     """
     import torch
+
+    def _fail_agreed(ok: bool, text: str) -> None:
+        # barlink-race-1023: agree before raising, so the peer does not die in
+        # its next call while this rank exits with the only report.
+        if lockstep is None:
+            if not ok:
+                raise SystemExit(text)
+            return
+        if lockstep.stop(not ok):
+            raise SystemExit(
+                f"{text} [rank {lockstep.rank}/{lockstep.world}]" if not ok else
+                f"WRONG RESULT: {where} -- on a PEER rank in check_other_ops; "
+                f"rank {lockstep.rank}/{lockstep.world} was correct here.")
 
     tr = comm.transport
     shard = max(4, n // world // 4 * 4)
@@ -437,9 +631,10 @@ def check_other_ops(comm, n: int, rank: int, world: int, dev, kctr: list,
     got = comm.all_gather(mine, dim=0)
     want = torch.cat([gather_payload(shard, r, k, dev) for r in range(world)])
     path = "bar1" if tr.handles("all_gather", shard * 4) else "host"
-    if not torch.equal(got, want):
-        raise SystemExit(f"WRONG RESULT: {where} all_gather ({path}) -- "
-                         f"{int((got != want).sum())} of {want.numel()} wrong")
+    ok = bool(torch.equal(got, want))
+    _fail_agreed(ok, f"WRONG RESULT: {where} all_gather ({path}) -- "
+                     f"{0 if ok else int((got != want).sum())} of "
+                     f"{want.numel()} wrong")
     # broadcast from every source
     for src in range(world):
         k = kctr[0]
@@ -448,9 +643,10 @@ def check_other_ops(comm, n: int, rank: int, world: int, dev, kctr: list,
             shard, dtype=torch.float32, device=dev)
         got = comm.broadcast(t, src)
         want = gather_payload(shard, src, k, dev)
-        if not torch.equal(got, want):
-            raise SystemExit(f"WRONG RESULT: {where} broadcast src={src} -- "
-                             f"{int((got != want).sum())} of {shard} wrong")
+        ok = bool(torch.equal(got, want))
+        _fail_agreed(ok, f"WRONG RESULT: {where} broadcast src={src} -- "
+                         f"{0 if ok else int((got != want).sum())} of "
+                         f"{shard} wrong")
     # all_to_all_single, even split
     k = kctr[0]
     kctr[0] += 1
@@ -461,9 +657,10 @@ def check_other_ops(comm, n: int, rank: int, world: int, dev, kctr: list,
     comm.all_to_all_single(out, inp)
     want = torch.cat([gather_payload(blk, s * world + rank, k, dev)
                       for s in range(world)])
-    if not torch.equal(out, want):
-        raise SystemExit(f"WRONG RESULT: {where} all_to_all_single -- "
-                         f"{int((out != want).sum())} of {want.numel()} wrong")
+    ok = bool(torch.equal(out, want))
+    _fail_agreed(ok, f"WRONG RESULT: {where} all_to_all_single -- "
+                     f"{0 if ok else int((out != want).sum())} of "
+                     f"{want.numel()} wrong")
     log(f"#   {where}: all_gather({path}, {shard * 4} B shard), broadcast x{world}, "
         f"all_to_all_single ({blk * 4} B blocks) CORRECT")
 
@@ -512,6 +709,9 @@ def run_rank(a) -> int:
 
     sizes = [m << 20 for m in a.messages]
     ref = None
+    # LOCKSTEP: every timed loop below ends on an AGREED call, never on a
+    # rank-local clock (barlink-race-1023).
+    ls = GlooLockstep(gloo_pg, rank, world)
     kctr = [0]          # the round term's call counter, global over the run
 
     for wmib in a.windows:
@@ -542,7 +742,7 @@ def run_rank(a) -> int:
                 buf, want = round_payload(n, rank, world, kctr[0], dev)
                 kctr[0] += 1
                 verify_all_reduce(comm, buf, world, f"{where}, call {c}",
-                                  want=want)
+                                  want=want, lockstep=ls)
             ok = True
 
             # -- timing on ROTATING round-termed payloads; every timed result
@@ -552,19 +752,22 @@ def run_rank(a) -> int:
             for _ in range(3):
                 pairs.append(round_payload(n, rank, world, kctr[0], dev))
                 kctr[0] += 1
-            _timed_verified(comm, pairs, a.warmup, f"{where} (warmup)")
-            bar1 = _timed_verified(comm, pairs, a.secs, f"{where} (timed)")
+            _timed_verified(comm, pairs, a.warmup, f"{where} (warmup)",
+                            lockstep=ls)
+            bar1 = _timed_verified(comm, pairs, a.secs, f"{where} (timed)",
+                                   lockstep=ls)
             buf = pairs[0][0]
             if a.other_ops:
-                check_other_ops(comm, n, rank, world, dev, kctr, where, log)
+                check_other_ops(comm, n, rank, world, dev, kctr, where, log,
+                                lockstep=ls)
 
             nccl = []
             if a.nccl:
                 nwork = buf.clone()
                 _timed(lambda: dist.all_reduce(nwork, group=nccl_pg),
-                       a.warmup)
+                       a.warmup, lockstep=ls, where=f"{where} nccl warmup")
                 nccl = _timed(lambda: dist.all_reduce(nwork, group=nccl_pg),
-                              a.secs)
+                              a.secs, lockstep=ls, where=f"{where} nccl")
 
             row = {
                 "window_mib": wmib,
@@ -598,9 +801,11 @@ def run_rank(a) -> int:
     if a.gloo_rung:
         nbytes = max(sizes)
         host = torch.zeros(nbytes // 4, dtype=torch.float32)
-        _timed(lambda: dist.all_reduce(host, group=gloo_pg), a.warmup)
+        _timed(lambda: dist.all_reduce(host, group=gloo_pg), a.warmup,
+               lockstep=ls, where="gloo rung warmup")
         ms = statistics.median(
-            _timed(lambda: dist.all_reduce(host, group=gloo_pg), a.secs)
+            _timed(lambda: dist.all_reduce(host, group=gloo_pg), a.secs,
+                   lockstep=ls, where="gloo rung")
         )
         next_rung = nbytes / (ms / 1e3) / 1e9
         log(f"# host-staged gloo rung: {ms:.1f} ms for {nbytes} B "
