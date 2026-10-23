@@ -213,6 +213,126 @@ def export_static_state_host(model: Any) -> dict:
     return dict(buffers=bufs, pinned=pinned, block=block)
 
 
+# -- (b2) the DRAFT runner's static state ------------------------------------------
+#: 27b-korrekt-1023 (boots dkr27bint4arbar1int4ar10231552 / ...ab ctx 10231704 / ...abratio
+#: 10231709): the sleep stashed the buffers of the TARGET model alone
+#: (``weight_updater``: ``export_static_state_host(self.tp_worker.model_runner.model)``), while
+#: the coverage (W84) books every registered buffer under an exchanged tag as restored by
+#: that stash. The drafter's buffers -- for the DFlash2 draft exactly one, the RoPE
+#: ``cos_sin_cache`` (``PDFLIP-XCHG-COVER tag=weights_draft buffers=1 buffers_mib=128.0``)
+#: -- live in ``weights_draft``, which the exchange carries parameter by parameter only, so
+#: after every wake the draft read undefined cos/sin. Latent while
+#: ``reserve_rope_cache_for_long_sequences`` re-allocates the cache after load (context
+#: 262144 -> reserve 262528 > 262144 rows: a NEW, untagged buffer); visible as soon as the
+#: reserve stays under the boot-time length (``--context-length 131072`` -> reserve 131456):
+#: D accept_len 1.03 from the first wake on, 28-token prompts included, and degenerate /
+#: foreign tokens in long sampled answers. Unset = on; 0/false/no/off = the target-only
+#: stash (A/B only; the W84 coverage then names the draft buffers as uncovered).
+ENV_DRAFT_STATIC = "FLLIPER_PDFLIP_DRAFT_STATIC_STATE"
+#: the last draft export's numbers, for the PDFLIP-DRAFT-STATIC-EXPORT line
+LAST_DRAFT_EXPORT: Dict[str, Any] = {}
+
+
+def draft_static_state_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    return str(e.get(ENV_DRAFT_STATIC, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+class _NamedBuffers:
+    """The ``named_buffers()`` face of a filtered buffer list, so the draft stash goes
+    through the SAME exporter as the target's (one writer of the stash format)."""
+
+    def __init__(self, named):
+        self._named = list(named)
+
+    def named_buffers(self):
+        return iter(self._named)
+
+
+def _storage_key(t: Any):
+    try:
+        st = t.untyped_storage()
+        return int(st.data_ptr()), int(st.nbytes())
+    except Exception:  # noqa: BLE001 -- meta / exotic tensors have no storage key
+        return None
+
+
+def draft_static_buffers(draft_model: Any, target_model: Any = None) -> List[Tuple[str, Any]]:
+    """The drafter's registered buffers the sleep must carry: every ``named_buffers()``
+    entry of ``draft_model`` that holds bytes (no META -- a solo shadow's draft) and
+    whose storage the TARGET does not also reach (that one is the target stash's)."""
+    if draft_model is None or draft_model is target_model:
+        return []
+    shared = set()
+    if target_model is not None:
+        for _n, t in list(target_model.named_parameters()) + list(target_model.named_buffers()):
+            if t is None or getattr(t, "device", None) is None or t.device.type == "meta":
+                continue
+            k = _storage_key(t)
+            if k is not None:
+                shared.add(k)
+    out: List[Tuple[str, Any]] = []
+    for name, buf in draft_model.named_buffers():
+        if buf is None or buf.device.type == "meta":
+            continue
+        k = _storage_key(buf)
+        if k is not None and k in shared:
+            continue
+        out.append((name, buf))
+    return out
+
+
+def export_draft_static_state(draft_model: Any, target_model: Any = None, *, host: bool = True,
+                              env=None) -> Optional[dict]:
+    """The drafter's stash, or ``None`` (switch off, no drafter, nothing to carry).
+
+    ``host``: the pinned host form (:func:`export_static_state_host`, what the target
+    stash uses under ``FLLIPER_PDFLIP_GROUP``); otherwise a device clone, the target's
+    ``_export_static_state`` form. :data:`LAST_DRAFT_EXPORT` carries the numbers."""
+    import time as _time
+
+    LAST_DRAFT_EXPORT.clear()
+    if not draft_static_state_on(env):
+        return None
+    named = draft_static_buffers(draft_model, target_model)
+    if not named:
+        return None
+    t0 = _time.perf_counter()
+    if host:
+        saved = dict(LAST_EXPORT)
+        stash = export_static_state_host(_NamedBuffers(named))
+        mode = LAST_EXPORT.get("mode", "?")
+        LAST_EXPORT.clear()
+        LAST_EXPORT.update(saved)  # the target's PDFLIP-STATIC-EXPORT numbers stay its own
+    else:
+        stash = dict(buffers=[(n, b.detach().clone()) for n, b in named])
+        mode = "device-clone"
+    LAST_DRAFT_EXPORT.update(
+        n=len(named), bytes=sum(_nbytes(b) for _n, b in named),
+        ms=(_time.perf_counter() - t0) * 1000.0, mode=mode,
+        names=[n for n, _b in named],
+    )
+    return stash
+
+
+def import_draft_static_state(draft_model: Any, stash: Optional[dict]) -> int:
+    """Copy the stash back into the drafter's buffers, in place (the wake's half).
+    Returns the number of buffers written; a name the drafter no longer has raises
+    (a silent skip would be the defect this exists to close)."""
+    if not stash or draft_model is None:
+        return 0
+    import torch
+
+    non_blocking = bool(stash.get("pinned", False))
+    own = dict(draft_model.named_buffers())
+    n = 0
+    with torch.inference_mode():
+        for name, tensor in stash["buffers"]:
+            own[name].copy_(tensor, non_blocking=non_blocking)
+            n += 1
+    return n
+
+
 # -- (c) the holder report -------------------------------------------------------------
 
 
