@@ -2207,6 +2207,8 @@ class LRUFileEvictor:
             cap = int(os.environ.get("FLLIPER_HICACHE_L3_EVICT_FILE_LOG", "64") or 0)
             if cap <= 0 or n > cap:
                 return
+            if not self._evict_file_window_admits(cap):
+                return
             age = -1.0 if mtime is None else max(0.0, time.time() - float(mtime))
             comp = "kv"
             for tag in (".qsa_indexer", ".mamba", ".draft"):
@@ -2218,6 +2220,37 @@ class LRUFileEvictor:
                         self.__dict__.get("_evict_why", "?"), self.__dict__.get("_evict_run_id", 0), n, cap)
         except Exception:  # noqa: BLE001 - an instrument never stops an eviction
             pass
+
+    def _evict_file_window_admits(self, cap: int) -> bool:
+        """STOREREAD-1023: the per-run cap of the L3-EVICT-FILE lines did not hold on boot 15 of the 27B duo line
+        (``..._1023_114625``, P PP0): the background evictor's batches end after ONE victim whenever a thread waits
+        for the index lock (D-HEALTH 10.10.), so its runs were 1-8 files long and every file got its line -- 408438
+        lines from 11:50:51 to 12:13:19Z, 2-4.4k per second, each formatted and written on a thread of the rank
+        process that also runs the scheduler and the L3 reads (one GIL). The journal's ``E`` line names every evicted
+        file anyway. Now also at most ``cap`` lines per ``FLLIPER_HICACHE_L3_EVICT_FILE_LOG_WINDOW_S`` (default 10 s,
+        0 = per run only, as before); the suppressed count is named once per window."""
+        try:
+            win = float(os.environ.get("FLLIPER_HICACHE_L3_EVICT_FILE_LOG_WINDOW_S", "10") or 0)
+        except ValueError:
+            win = 10.0
+        if win <= 0:
+            return True
+        now = time.monotonic()
+        t0 = self.__dict__.get("_evict_file_win_t0")
+        if t0 is None or now - t0 >= win:
+            sup = self.__dict__.get("_evict_file_win_sup", 0)
+            if sup:
+                logger.info("L3-EVICT-FILE WINDOW suppressed=%d in the last %.1f s (at most %d lines per %.0f s; "
+                            "the journal's E lines name every evicted file -- FLLIPER_HICACHE_L3_EVICT_FILE_LOG_WINDOW_S)",
+                            sup, now - t0, int(cap), win)
+            self._evict_file_win_t0 = now
+            self._evict_file_win_n = 0
+            self._evict_file_win_sup = 0
+        if self.__dict__.get("_evict_file_win_n", 0) >= int(cap):
+            self._evict_file_win_sup = self.__dict__.get("_evict_file_win_sup", 0) + 1
+            return False
+        self._evict_file_win_n = self.__dict__.get("_evict_file_win_n", 0) + 1
+        return True
 
     def _evict_while(self, should_continue, why: str = "cap") -> int:
         """Evict oldest non-pending entries while ``should_continue(reclaimed)``.

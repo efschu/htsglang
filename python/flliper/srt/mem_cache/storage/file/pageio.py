@@ -54,6 +54,24 @@ class PageIO:
             ctypes.POINTER(ctypes.c_int8),
         ]
 
+        # STOREREAD-1023: the whole batch on C threads in one call (see pageio.c)
+        self._has_read_mt = hasattr(lib, "hicache_read_pages_mt")
+        if self._has_read_mt:
+            lib.hicache_read_pages_mt.restype = ctypes.c_int64
+            lib.hicache_read_pages_mt.argtypes = [
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_char_p),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int8),
+                ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int64),
+            ]
+
         # S36 (18.10.): KV-DURCHLAUF reads out of held fds, O_DIRECT writes
         self._has_fds = hasattr(lib, "hicache_read_fds")
         if self._has_fds:
@@ -192,6 +210,83 @@ class PageIO:
         self._lib.hicache_stat_sizes(n, c_paths, sizes)
         return list(sizes)
 
+    @property
+    def has_read_mt(self) -> bool:
+        return bool(self._has_read_mt)
+
+    def read_pages_mt(
+        self,
+        paths: Sequence[str],
+        expect_total: Sequence[int],
+        extents: Sequence[Sequence[tuple[int, int]]],
+        out_ptrs: Sequence[int],
+        touch: bool,
+        threads: int,
+        progress=None,
+        poll_s: float = 0.1,
+    ) -> list[int]:
+        """STOREREAD-1023: ``read_pages`` for the whole batch on ``threads`` C
+        threads in ONE ctypes call (one GIL release, one re-acquire).
+
+        ``progress`` (optional, a no-arg callable) is the S23 witness: while
+        the C call runs on a helper thread, the caller calls it at most every
+        ``poll_s`` and only when the C page counter moved since the last call
+        -- a read that stops moving stops reporting, exactly like the pool
+        path's per-sub-call report. Status per page as ``read_pages``.
+        """
+        n = len(paths)
+        if n == 0:
+            return []
+        if not self._has_read_mt:
+            raise RuntimeError("pageio helper without hicache_read_pages_mt (stale build)")
+        c_paths = (ctypes.c_char_p * n)(*[os.fsencode(p) for p in paths])
+        c_total = (ctypes.c_int64 * n)(*[int(t) for t in expect_total])
+        n_ext = (ctypes.c_int64 * n)(*[len(e) for e in extents])
+        flat_off = [int(o) for e in extents for o, _ in e]
+        flat_len = [int(l) for e in extents for _, l in e]
+        m = max(1, len(flat_off))
+        c_off = (ctypes.c_int64 * m)(*flat_off)
+        c_len = (ctypes.c_int64 * m)(*flat_len)
+        c_out = (ctypes.c_void_p * n)(*[int(p) for p in out_ptrs])
+        status = (ctypes.c_int8 * n)()
+        done = ctypes.c_int64(0)
+        k = max(1, min(64, int(threads)))
+
+        def _call():
+            self._lib.hicache_read_pages_mt(
+                n, c_paths, c_total, n_ext, c_off, c_len, c_out, 1 if touch else 0, status, k,
+                ctypes.byref(done),
+            )
+
+        if progress is None:
+            _call()
+            return list(status)
+        err: list = []
+
+        def _run():
+            try:
+                _call()
+            except BaseException as e:  # noqa: BLE001 - re-raised in the caller
+                err.append(e)
+
+        t = threading.Thread(target=_run, name="pageio-read-mt", daemon=True)
+        t.start()
+        last = -1
+        while True:
+            t.join(max(0.001, float(poll_s)))
+            cur = int(done.value)
+            if cur != last:
+                last = cur
+                try:
+                    progress()
+                except Exception:  # noqa: BLE001 - a witness never breaks a read
+                    pass
+            if not t.is_alive():
+                break
+        if err:
+            raise err[0]
+        return list(status)
+
     def read_pages(
         self,
         paths: Sequence[str],
@@ -253,7 +348,7 @@ def load() -> Optional[PageIO]:
             if not os.path.exists(so):
                 tmp = f"{so}.{os.getpid()}.tmp"
                 subprocess.run(
-                    ["gcc", "-O2", "-shared", "-fPIC", "-o", tmp, _SRC],
+                    ["gcc", "-O2", "-shared", "-fPIC", "-pthread", "-o", tmp, _SRC],
                     check=True,
                     capture_output=True,
                     timeout=120,
