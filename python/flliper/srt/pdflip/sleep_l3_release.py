@@ -91,6 +91,7 @@ import time
 import zlib
 from typing import Any, Callable, Dict, List, Optional
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -356,7 +357,7 @@ def apply(tree: Any, pool: Any, cands: List[tuple], agreed_veto: torch.Tensor,
     dev = [c for c in map(_cand, cands) if c[2] == KIND_DEVICE]
     hon = sorted((c for c in map(_cand, cands) if c[2] == KIND_HOST_ONLY), key=lambda c: -_depth(c[0]))
     for node, sl, _k, _sub in dev:
-        if any(int(agreed_veto[s]) for s in sl):
+        if _any_set(agreed_veto, sl):
             continue
         aux = bool(_aux_kinds(tree, node))
         tree._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
@@ -373,7 +374,7 @@ def apply(tree: Any, pool: Any, cands: List[tuple], agreed_veto: torch.Tensor,
                 _r12.record_spill(tree, node)   # the workers released the same node themselves; a noop there
         released.extend(sl)
     for node, sl, _k, sub in hon:
-        if any(int(agreed_veto[s]) for s in sub):
+        if _any_set(agreed_veto, sub):
             continue
         if not tree._is_host_leaf(node):
             # cannot happen when the veto saw the same tree (every descendant is a released candidate, deeper
@@ -393,6 +394,15 @@ def apply(tree: Any, pool: Any, cands: List[tuple], agreed_veto: torch.Tensor,
 FIX_ROUNDS = 16
 
 
+def _any_set(vec: torch.Tensor, slots) -> bool:
+    """``any(int(vec[s]) for s in slots)`` as one index read (FLIPTIME-1023: S86 released 85780 slots in 4.6 s at
+    14:21:55Z, a Python ``int(vec[s])`` per slot in ``apply`` and ``_mixed_block``). Same indexing rules (negative
+    indices wrap, an out-of-range slot raises IndexError as before)."""
+    if not slots:
+        return False
+    return bool((vec[torch.as_tensor(slots, dtype=torch.int64)] != 0).any())
+
+
 def _mixed_block(cands: List[tuple], agreed: torch.Tensor) -> torch.Tensor:
     """S86c: this rank's slots that the agreed set cannot release here -- the agreed slots of a candidate node that
     also holds a vetoed slot (the node is kept whole, so its agreed slots stay referenced). S86e: a host-only
@@ -404,9 +414,10 @@ def _mixed_block(cands: List[tuple], agreed: torch.Tensor) -> torch.Tensor:
             _node, sl, _kind, sub = _cand(c)
             if not sl:
                 continue
-            flags = [int(agreed[s]) for s in sl]
-            sub_vetoed = any(int(agreed[s]) for s in sub)
-            if (any(flags) and not all(flags)) or (sub_vetoed and not all(flags)):
+            f = agreed[torch.as_tensor(sl, dtype=torch.int64)] != 0   # FLIPTIME-1023: one index read per node
+            any_f, all_f = bool(f.any()), bool(f.all())
+            sub_vetoed = _any_set(agreed, sub)
+            if (any_f and not all_f) or (sub_vetoed and not all_f):
                 out[torch.tensor(sl, dtype=torch.int64)] = 1
     except Exception:  # noqa: BLE001
         logger.warning("%s mixed-node scan raised: every slot kept", MARK, exc_info=True)
@@ -432,15 +443,35 @@ def _residual_after(tree: Any, pool: Any, agreed: torch.Tensor) -> int:
         hv = node.component_data[BASE_COMPONENT_TYPE].host_value
         if hv is None or int(hv.numel()) == 0:
             continue
-        for s in _slots(pool, hv):
-            if not int(agreed[s]):
-                left.add(int(s))
+        sl = _slots(pool, hv)
+        if sl:
+            # FLIPTIME-1023: one index read per node instead of one ``int(agreed[s])`` per slot
+            t = torch.as_tensor(sl, dtype=torch.int64)
+            left.update(t[agreed[t] == 0].tolist())
     return len(left)
 
 
-def _digest(slots: List[int]) -> int:
-    arr = torch.tensor(sorted(set(int(s) for s in slots)), dtype=torch.int64).numpy().tobytes()
+def _digest(slots) -> int:
+    """crc32 of the sorted, de-duplicated slot ids as int64 bytes. FLIPTIME-1023: one ``np.unique`` instead of
+    ``sorted(set(...))`` over Python ints (317 ms for the 720896-slot agreed set on the boot) -- byte-identical
+    input to the crc, so the digest value is the one the previous form computed (list, tensor or array)."""
+    if isinstance(slots, torch.Tensor):
+        a = slots.detach().to(device="cpu", dtype=torch.int64).reshape(-1).numpy()
+    else:
+        a = np.asarray(list(slots) if not isinstance(slots, np.ndarray) else slots, dtype=np.int64).reshape(-1)
+    if a.shape[0] > 1 and not bool(np.all(a[1:] > a[:-1])):
+        a = np.unique(a)          # strictly increasing already (``torch.nonzero``): no sort needed
+    arr = np.ascontiguousarray(a, dtype=np.int64).tobytes()
     return int(zlib.crc32(arr)) & 0x7FFFFFFF
+
+
+def _vec(reduced) -> torch.Tensor:
+    """FLIPTIME-1023: the reduced veto vector as an int64 tensor. The tree's ``hicache_group_max`` answers a tensor with a
+    tensor (no list round trip of the 720896 slots); a reducer that answers a list (a cache without HiCache collectives,
+    the tests' rank threads) is converted as before."""
+    if isinstance(reduced, torch.Tensor):
+        return reduced.detach().to(dtype=torch.int64).reshape(-1)
+    return torch.tensor([int(v) for v in reduced], dtype=torch.int64)
 
 
 def run(tree: Any, group_max: Optional[Callable[..., List[int]]] = None, pool: Any = None) -> Dict[str, Any]:
@@ -495,7 +526,8 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
         except Exception:  # noqa: BLE001 - fail closed and keep posting: the peers wait at the next collective
             logger.warning("%s veto raised: every slot kept", MARK, exc_info=True)
             veto, cands, why = torch.ones(n_slots, dtype=torch.int64), [], {"error": 1}
-    agreed = torch.tensor(group_max(veto.tolist(), label="s86_sleep_l3_release/veto"), dtype=torch.int64)
+    # FLIPTIME-1023: the veto vector goes to the reduce as a tensor (no 720896-element list round trip)
+    agreed = _vec(group_max(veto, label="s86_sleep_l3_release/veto"))
     # S86c (rc23 D 11:05:06Z, W86 DIVERGED released 431..433): the node structure is RANK-LOCAL -- TP0 (share-0 host)
     # holds other nodes than the token owners (ARENA-REF-HOLDERS tree=259 vs 433; kept aux_host_only:24 vs 8) and
     # splits are rank-local. A node holding an agreed slot AND a vetoed one is kept whole on its rank while a peer
@@ -506,8 +538,7 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
     rounds = 0
     while True:
         rounds += 1
-        nxt = torch.tensor(group_max(torch.maximum(agreed, _mixed_block(cands, agreed)).tolist(),
-                                     label="s86_sleep_l3_release/veto_fix"), dtype=torch.int64)
+        nxt = _vec(group_max(torch.maximum(agreed, _mixed_block(cands, agreed)), label="s86_sleep_l3_release/veto_fix"))
         if torch.equal(nxt, agreed):
             break
         agreed = nxt
@@ -528,7 +559,7 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
         # and the RESIDUAL: agreed slots this rank holds but did not let go (0 on every rank). A rank that holds a
         # slot nobody else holds (TP0's tree is not the workers') releases a different COUNT, which is no divergence.
         res = _residual_after(tree, pool, agreed)
-        dig = _digest(torch.nonzero(agreed == 0).reshape(-1).tolist())
+        dig = _digest(torch.nonzero(agreed == 0).reshape(-1))
     except Exception:  # noqa: BLE001
         cnt, res, dig, err = len(released), 0, 0, 1
     mx = group_max([cnt, -cnt, dig, -dig, err, res], label="s86_sleep_l3_release/digest")

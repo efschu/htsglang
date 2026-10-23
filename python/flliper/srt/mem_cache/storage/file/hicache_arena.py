@@ -585,6 +585,10 @@ def stem_keys_lo(stems: Sequence[str]):
     return out
 
 
+#: arena.c ``STEM_CAP``: bytes of the stem field in a slot header (NUL-terminated inside it)
+STEM_CAP = 192
+
+
 class ShmArena:
     """One arena file: `slots` slots of `slot_bytes` each.
 
@@ -899,6 +903,18 @@ class ShmArena:
         ref = u32.reshape(self.slots, hb // 4)[:, 1]
         return [int(ref[int(s)]) if 0 <= int(s) < self.slots else 0 for s in slots]
 
+    def slot_refs_np(self):
+        """FLIPTIME-1023: the reader references of EVERY slot as an int64 array (the strided header read of ``slot_refs``,
+        no per-slot list). The S83 VICTIM-CENSUS at the flush asked ``slot_refs(range(slots))`` -- 720896 Python ints and a
+        per-slot generator: ``#1470 FLUSH-PUBLISH issued=0 unbacked_left=1 waited_ms=1343 / 1753`` (boot 1023_140032, D TP0
+        14:21:50Z / 14:32:57Z) were that instrument, not a publish."""
+        import numpy as np
+        out = (ctypes.c_int64 * 6)()
+        self._lib.arena_layout(self.slots, self.slot_bytes, out)
+        hb, hope = int(out[0]), int(out[3])
+        u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hope)
+        return u32.reshape(self.slots, hb // 4)[:, 1].astype(np.int64)
+
     def slot_states(self, slots) -> list[int]:
         """A2: the header state of these slots (0 free, 1 claimed, 2 complete,
         3 evicting, 4 quarantine, 5 reaping) -- one strided header read, for
@@ -1197,6 +1213,64 @@ class ShmArena:
         """The store stem recorded in the slot header (any rank may evict it)."""
         raw = self._lib.arena_slot_stem(self._base, int(slot))
         return (raw or b"").decode("utf-8", "replace")
+
+    # FLIPTIME-1023 (boot ..._a45112428e_1023_140032, D TP0): the S109-A7 quiesce census asked ``slot_stem`` once per
+    # COMPLETE slot -- one ctypes call plus a decode, then one encode per stem for the #1459 index -- on the
+    # scheduler thread, twice per D>P flip (the /flush_cache quiesce and the release flush). Measured on the boot:
+    # PDFLIP-SLEEP-SUB TP0 sweep 6 -> 116 -> 411 -> 961 -> 2161 ms while the KV arena grew 1k -> 30k -> 94k -> 193k ->
+    # 260k COMPLETE slots (FLUSH-PUBLISH waited_ms 0-237 of it), the D>P flip 1.6 s -> 6.4 s. The two forms below hand
+    # the same header bytes over as addresses and arrays: no Python call per slot.
+    def _stem_geometry(self):
+        """``(headers_off, header_bytes, stem_off)`` of this mapping: the first two from the arena header the C code
+        reads (``ArenaHeader.header_bytes`` / ``.headers_off``), the stem offset probed through ``arena_slot_stem``
+        itself (its address for slot 0), so no struct layout is restated here. Cached per instance."""
+        geo = getattr(self, "_stem_geo", None)
+        if geo is not None:
+            return geo
+        import numpy as np
+
+        head = np.frombuffer(self._mm, dtype=np.uint64, count=8)
+        header_bytes, headers_off = int(head[3]), int(head[6])
+        proto = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64)
+        fn = proto(ctypes.cast(self._lib.arena_slot_stem, ctypes.c_void_p).value)
+        addr = int(fn(self._base, 0) or 0)
+        stem_off = addr - int(self._base.value) - headers_off
+        if header_bytes <= 0 or not (0 <= stem_off <= header_bytes - STEM_CAP):
+            raise RuntimeError(f"{self.path}: stem geometry unreadable (header_bytes={header_bytes} "
+                               f"headers_off={headers_off} stem_off={stem_off})")
+        geo = self._stem_geo = (headers_off, header_bytes, stem_off)
+        return geo
+
+    def slot_stem_ptrs(self, slots):
+        """FLIPTIME-1023: ``(ptrs, nonempty)`` for ``slots`` -- ``ptrs`` the uint64 addresses of each slot header's
+        NUL-terminated stem inside this mapping (a ready ``char **`` for ``L3Index.has_ptrs`` /
+        ``ArenaView.find_states_ptrs``, valid while the mapping is), ``nonempty`` False where the slot is out of range
+        or its stem is empty (``slot_stem`` would return ""). The same header bytes ``slot_stem`` reads, as arrays."""
+        import numpy as np
+
+        s = np.ascontiguousarray(np.asarray(slots, dtype=np.int64)).reshape(-1)
+        headers_off, header_bytes, stem_off = self._stem_geometry()
+        ok = (s >= 0) & (s < self.slots)
+        rel = (np.where(ok, s, 0).astype(np.uint64) * np.uint64(header_bytes)
+               + np.uint64(headers_off + stem_off))
+        first = np.frombuffer(self._mm, dtype=np.uint8)[rel.astype(np.int64)] if s.shape[0] else np.zeros(0, np.uint8)
+        ptrs = np.ascontiguousarray(rel + np.uint64(int(self._base.value)), dtype=np.uint64)
+        return ptrs, ok & (first != 0)
+
+    def slot_states_np(self, slots):
+        """FLIPTIME-1023: ``slot_states`` as an int64 array (-1 out of range), one strided read, no per-slot list."""
+        import numpy as np
+
+        s = np.asarray(slots, dtype=np.int64).reshape(-1)
+        out = (ctypes.c_int64 * 6)()
+        self._lib.arena_layout(self.slots, self.slot_bytes, out)
+        hb, hope = int(out[0]), int(out[3])
+        u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hope)
+        st = u32.reshape(self.slots, hb // 4)[:, 0]
+        ok = (s >= 0) & (s < self.slots)
+        res = np.full(s.shape, -1, dtype=np.int64)
+        res[ok] = st[s[ok]].astype(np.int64)
+        return res
 
     def slot_ptr(self, slot: int) -> int:
         """Address of slot data inside the mapping (for a C read straight into the slot)."""

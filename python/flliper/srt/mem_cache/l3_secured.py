@@ -42,6 +42,58 @@ ATTACH_RETRY_S = 1.0
 _LOCK = threading.Lock()
 #: requested slots kept per arena at most (a rank without the write-behind never drains its set)
 URGENT_MAX = 65536
+#: FLIPTIME-1023: the stem lookups of ``secured`` / ``unsecured_keys_lo`` as arrays (``_listed_mask``); "0" = the
+#: per-slot ``slot_stem`` + ``l3_listed`` form as before (A/B switch, default ON)
+STEM_PTRS_ENV = "FLLIPER_L3SEC_STEM_PTRS"
+#: FLIPTIME-1023: lookups that fell back to the per-slot form although the switch is on (an arena or backend without
+#: the array form, or the array form raised) -- counted, the first ones named
+FAST_STATS = {"fast": 0, "fallback": 0}
+
+
+def stem_ptrs_on() -> bool:
+    return (os.environ.get(STEM_PTRS_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _listed_mask(arena: Any, backend: Any, slots) -> Optional[np.ndarray]:
+    """FLIPTIME-1023 (boot ..._a45112428e_1023_140032): ``slot_stem(s) non-empty AND l3_listed(stem)`` per slot,
+    without a Python call per slot. The S109-A7 quiesce census ran the per-slot form over every COMPLETE slot of the
+    KV arena on the scheduler thread (D TP0 / P PP0), twice per flip: PDFLIP-SLEEP-SUB sweep 6 -> 2161 ms as the
+    arena filled 1k -> 260k COMPLETE slots, the D>P flip 1.6 -> 6.4 s (9.9 s at 14:21Z). Here the slot headers' stem
+    addresses go to the same #1459 C lookup (``L3Index.has_ptrs``) as one ``char **`` -- the same bytes, the same
+    index, the same fail-closed answers (no index = nothing listed, an empty stem = not listed). None = this
+    arena/backend has no array form (or the switch is off): the caller keeps the per-slot form."""
+    if not stem_ptrs_on():
+        return None
+    ptrs_fn = getattr(arena, "slot_stem_ptrs", None)
+    has_fn = getattr(backend, "l3_listed_ptrs", None) if backend is not None else None
+    # the array form answers for ``l3_listed`` only where it IS that method's twin (the same ``_l3idx``): an ``l3_listed``
+    # replaced on the instance or in a subclass keeps its own per-slot form
+    _ll = getattr(backend, "l3_listed", None) if backend is not None else None
+    if not getattr(getattr(_ll, "__func__", _ll), "_l3sec_ptrs_twin", False):
+        has_fn = None
+    if not callable(ptrs_fn) or not callable(has_fn):
+        FAST_STATS["fallback"] += 1
+        return None
+    try:
+        s = np.ascontiguousarray(np.asarray(slots, dtype=np.int64)).reshape(-1)
+        if not s.shape[0]:
+            return np.zeros(0, dtype=bool)
+        ptrs, nonempty = ptrs_fn(s)
+        ptrs = np.ascontiguousarray(ptrs, dtype=np.uint64)   # kept alive by this frame across the C call
+        import ctypes
+
+        has = has_fn(ptrs.ctypes.data_as(ctypes.POINTER(ctypes.c_char_p)), int(s.shape[0]))
+        if has is None:                     # the index has no pointer form: the per-slot form answers
+            FAST_STATS["fallback"] += 1
+            return None
+        out = np.asarray(nonempty, dtype=bool) & (np.asarray(has).reshape(-1) != 0)
+        FAST_STATS["fast"] += 1
+        return out
+    except Exception as exc:  # noqa: BLE001 -- the per-slot form answers instead (named once in a while)
+        FAST_STATS["fallback"] += 1
+        if FAST_STATS["fallback"] <= 8 or FAST_STATS["fallback"] % 256 == 0:
+            logger.warning("FLIPTIME-1023 L3SEC-STEM-PTRS fallback n=%d: %r", FAST_STATS["fallback"], exc)
+        return None
 
 
 def _path(arena: Any) -> Optional[str]:
@@ -184,7 +236,9 @@ def secured(arena: Any, slots, backend: Any = None, evicting_ok: bool = False) -
         return out
     try:
         gens = np.asarray(arena.slot_gens_np(s), dtype=np.int64)
-        states = np.asarray(arena.slot_states([int(x) for x in s.tolist()]), dtype=np.int64)
+        _st_np = getattr(arena, "slot_states_np", None) if stem_ptrs_on() else None
+        states = (np.asarray(_st_np(s), dtype=np.int64) if callable(_st_np)
+                  else np.asarray(arena.slot_states([int(x) for x in s.tolist()]), dtype=np.int64))
         sec_gen = sec[0]
         ok = (s >= 0) & (s < sec_gen.shape[0])
         idx = np.where(ok, s, 0)
@@ -193,9 +247,13 @@ def secured(arena: Any, slots, backend: Any = None, evicting_ok: bool = False) -
         listed = getattr(backend, "l3_listed", None) if backend is not None else None
         cand = np.nonzero(out)[0]
         if callable(listed) and cand.shape[0]:
-            stems = [arena.slot_stem(int(x)) or "" for x in s[cand].tolist()]
-            has = listed(stems)
-            out[cand] = np.asarray([bool(st) and bool(h) for st, h in zip(stems, has)], dtype=bool)
+            fast = _listed_mask(arena, backend, s[cand])
+            if fast is not None:
+                out[cand] = fast
+            else:
+                stems = [arena.slot_stem(int(x)) or "" for x in s[cand].tolist()]
+                has = listed(stems)
+                out[cand] = np.asarray([bool(st) and bool(h) for st, h in zip(stems, has)], dtype=bool)
     except Exception as exc:  # noqa: BLE001 -- fail closed
         logger.warning("S109b L3-SECURED read failed: %r", exc)
         return np.zeros(s.shape, dtype=bool)
@@ -352,9 +410,13 @@ def unsecured_keys_lo(arena: Any, backend: Any = None, keys: bool = True):
     cand = np.nonzero(mine)[0]
     listed = getattr(backend, "l3_listed", None) if backend is not None else None
     if callable(listed) and cand.shape[0]:
-        stems = [arena.slot_stem(int(x)) or "" for x in slots[cand].tolist()]
-        has = listed(stems)
-        mine[cand] = np.asarray([bool(st) and bool(h) for st, h in zip(stems, has)], dtype=bool)
+        fast = _listed_mask(arena, backend, slots[cand])
+        if fast is not None:
+            mine[cand] = fast
+        else:
+            stems = [arena.slot_stem(int(x)) or "" for x in slots[cand].tolist()]
+            has = listed(stems)
+            mine[cand] = np.asarray([bool(st) and bool(h) for st, h in zip(stems, has)], dtype=bool)
     un = ~mine
     if un.any():
         request(arena, slots[un])

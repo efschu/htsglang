@@ -2424,6 +2424,12 @@ class Envs:
     # to prefill is carried into the collected set's sum. Off = collect only
     # while D decodes (the sum of an arriving burst on an idle D is unpriced).
     FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY = EnvBool(True)
+    # FLIPTIME-1023 (SOLL R2, user 23.10. ~14:40Z: "unsere regeln sind eigentlich eindeutig"): a kurz request D was granted
+    # (D_NOW) prefills on D to its end BEFORE D quiesces for a D->P flip -- a flip verdict (R8/R4/R3/R6/R5) taken while such
+    # a grant is open (granted, started or not, no first content yet) waits; once the kurz decodes, R4 decides again.
+    # Boot 1023_140032 14:21:46Z: pdflip-20-119 (u=293, D_NOW 45,018) "unstarted" at the R8 FLIP_P, PARK-IMMEDIATE parked it,
+    # its decode stood 49 s. 0 = the verdict as before (A/B only).
+    FLLIPER_PDFLIP_R2_KURZ_GRANT_HOLD = EnvBool(True)
     # S49 D-EXTEND-BEACON (SOLL v2 R6, user 18.10. ~21:15Z "Nur echt laufend zählt"): every rank of group D records
     # in a mmap ring (<arena>/d_extend/D-pid<pid>.bin) the rids whose FIRST extend after their arrival began; the
     # front's R6 counts a granted D prefill into the set's S only once D really computes it (granted-but-not-started
