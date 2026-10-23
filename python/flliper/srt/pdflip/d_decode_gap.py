@@ -29,6 +29,12 @@ CAUSES (the dominant one is ``cause=``, every one present is listed in ``notes=`
                          the pure extends (draft/result/recv/schedule of the next batch);
 * ``lend_return``     -- S78: D-TRANSIENT-LEND gave lent expert rows back in the gap (rows OFF, sync, unmap);
 * ``lend``            -- S78: D-TRANSIENT-LEND lent rows in the gap (map + ON) -- rc17 p50 ~300 ms per lend;
+* ``store_probe``     -- FLIPTIME-1023: store presence probes (``HiCacheFile.batch_exists_v2``: #1439 ARENA-PRESENT,
+                         #1472 READ-TRACE, on the prefetch thread or the scheduler's) burned at least half of the rest
+                         as thread CPU -- the scheduler thread waits for the GIL behind them; ``probe=n:keys:wall:cpu``.
+                         Boot 1023_144422 14:49:12-36Z: 34 gaps of 450-580 ms ``cause=other`` with ``rest`` 400-500 ms
+                         -- D re-probed two refused hand-backs (keys=118709 / 107619, readable=0) every round
+                         (``D-ADMIT-AFTER-REFUSALS refusals=37 waited_s=20.1 gates={lifetime:37}``); no span named it.
 * ``other``           -- none of these: the rest of the gap (``other_ms`` = gap minus the extends' wall).
 * ``idle``            -- S106: no request of the round that opened the gap is in the round that closed it (the
                          earlier decodes finished, a new request opened the next stream): nothing was paused --
@@ -65,6 +71,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Dict, Optional
 
@@ -78,7 +85,32 @@ _ATTR = "_pdflip_d_decode_gap"
 NOTE_CAUSES = ("skipfirst_hold", "f3_decode_first", "seat", "wake_read", "lend_return", "lend")
 #: S106: the notes whose own wall is measured (``note_ms``); they name the gap only when that wall dominates it
 TIMED_CAUSES = ("lend_return", "lend")
-CAUSES = ("flip", "idle", "mixed_prefill", "d_prefill") + NOTE_CAUSES + ("other",)
+CAUSES = ("flip", "idle", "mixed_prefill", "d_prefill") + NOTE_CAUSES + ("store_probe", "other",)
+
+#: FLIPTIME-1023: store presence probes since the last decode round, from ANY thread of this process
+#: (``n``, ``keys``, wall ms, thread-CPU ms) -- filled by :func:`note_probe`, taken by the tracker per round
+_PROBE_LOCK = threading.Lock()
+_PROBE = [0, 0, 0.0, 0.0]
+
+
+def note_probe(keys: int, wall_ms: float, cpu_ms: float) -> None:
+    """FLIPTIME-1023: one store presence probe (``batch_exists_v2``) -- its keys, wall and the CPU of the thread that ran
+    it. Any thread; a few adds under a lock; never raises."""
+    try:
+        with _PROBE_LOCK:
+            _PROBE[0] += 1
+            _PROBE[1] += int(keys)
+            _PROBE[2] += max(0.0, float(wall_ms))
+            _PROBE[3] += max(0.0, float(cpu_ms))
+    except Exception:  # noqa: BLE001 -- an instrument never breaks a probe
+        pass
+
+
+def _take_probe() -> tuple:
+    with _PROBE_LOCK:
+        out = tuple(_PROBE)
+        _PROBE[0], _PROBE[1], _PROBE[2], _PROBE[3] = 0, 0, 0.0, 0.0
+    return out
 
 
 def _env_float(name: str, default: float) -> float:
@@ -193,18 +225,22 @@ class Tracker:
             cause = "d_prefill"
         else:
             cause = next((c for c in NOTE_CAUSES if _names(c)), "d_prefill" if self.ext_n else "other")
+        probe = _take_probe()
+        if cause == "other" and probe[0] and probe[3] >= 0.5 * other_ms:
+            cause = "store_probe"   # FLIPTIME-1023: the probes' thread CPU is at least half of the unnamed rest
         host_ms = None if run_ms is None else max(0.0, gap_ms - self.ext_ms - run_ms)
         rec = {"gap_ms": gap_ms, "cause": cause, "rows": self.last_rows, "d_prefill_ms": self.ext_ms,
                "extends": self.ext_n, "prefill_tokens": self.ext_tokens, "notes": notes, "other_ms": other_ms,
                "flip": flip, "mixed_tokens": mixed, "run_ms": run_ms, "host_ms": host_ms,
                "lend_ms": notes_ms.get("lend"), "return_ms": notes_ms.get("lend_return"),
-               "spans": dict(self.spans)}
+               "spans": dict(self.spans), "probe": probe}
         self.gaps += 1
         self.census[cause][0] += 1
         self.census[cause][1] += gap_ms
         return rec
 
     def _reset_between(self) -> None:
+        _take_probe()   # FLIPTIME-1023: the probes belong to the gap since the last decode round only
         self.ext_open = None
         self.ext_ms = 0.0
         self.ext_n = 0
@@ -297,6 +333,14 @@ def format_spans(rec: dict) -> str:
     return ",".join(parts)
 
 
+def format_probe(rec: dict) -> str:
+    """FLIPTIME-1023: ``n:keys:wall_ms:cpu_ms`` of the store presence probes in the gap, ``-`` without one."""
+    pr = rec.get("probe") or (0, 0, 0.0, 0.0)
+    if not pr[0]:
+        return "-"
+    return "%d:%d:%.0f:%.0f" % (int(pr[0]), int(pr[1]), float(pr[2]), float(pr[3]))
+
+
 def _batch_rids(batch) -> Optional[frozenset]:
     """S106: the requests a decode-advancing batch advances (decode: all; MIXED-D: the folded decodes)."""
     try:
@@ -346,8 +390,9 @@ def on_batch(sched, batch, now: Optional[float] = None) -> None:
             logger.info(
                 "%s gap_ms=%.0f cause=%s rows=%d d_prefill_ms=%.0f extends=%d prefill_tokens=%d other_ms=%.0f "
                 "mixed_tokens=%d run_ms=%s host_ms=%s "
-                "notes=%s lend_ms=%s return_ms=%s spans=%s (start-to-start between two decode-advancing batches; "
-                "D group, rank-local; spans = host ms per function in the gap, match nested in admit)",
+                "notes=%s lend_ms=%s return_ms=%s spans=%s probe=%s (start-to-start between two decode-advancing batches; "
+                "D group, rank-local; spans = host ms per function in the gap, match nested in admit; probe = store "
+                "presence probes in the gap n:keys:wall_ms:thread_cpu_ms, any thread)",
                 MARK, rec["gap_ms"], rec["cause"], rec["rows"], rec["d_prefill_ms"], rec["extends"],
                 rec["prefill_tokens"], rec["other_ms"], rec["mixed_tokens"],
                 "-" if rec["run_ms"] is None else "%.0f" % rec["run_ms"],
@@ -355,7 +400,7 @@ def on_batch(sched, batch, now: Optional[float] = None) -> None:
                 ",".join("%s:%d" % kv for kv in sorted(rec["notes"].items())) or "-",
                 "-" if rec["lend_ms"] is None else "%.0f" % rec["lend_ms"],
                 "-" if rec["return_ms"] is None else "%.0f" % rec["return_ms"],
-                format_spans(rec))
+                format_spans(rec), format_probe(rec))
         cen = tr.census_due(now)
         if cen is not None:
             logger.info(

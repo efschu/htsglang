@@ -312,3 +312,53 @@ def test_s83_victim_census_other_only_is_the_same_count_as_before(tmp_path):
     hh[:300] = held.numpy()
     want = int(((refs > 0) & (hh == 0)).sum())
     assert oo[0] == oo[1] == str(want) and want > 0, (oo, want)
+
+
+# --- D-DECODE-GAP: the store presence probes get a name (boot 1023_144422 14:49:12-36Z) -------------------------------
+
+
+def test_decode_gap_names_store_probes_that_ate_the_rest(monkeypatch, caplog):
+    """34 gaps of 450-580 ms ``cause=other`` with ``rest`` 400-500 ms: D re-probed two refused hand-backs (keys=118709 /
+    107619) every round. The probe's thread CPU now rides the gap (``probe=n:keys:wall:cpu``) and names it
+    ``store_probe`` when it is at least half of the unnamed rest; a probe-free gap stays ``other``."""
+    import logging
+    from types import SimpleNamespace
+
+    from flliper.srt.pdflip import d_decode_gap as G
+
+    class _Mode:
+        def is_decode(self):
+            return True
+
+        def is_extend(self):
+            return False
+
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
+    for e in (G.ENV, G.ENV_MS, G.ENV_CENSUS_S):
+        monkeypatch.delenv(e, raising=False)
+    dec = SimpleNamespace(forward_mode=_Mode(), batch_size=lambda: 2)
+    sched = SimpleNamespace(tp_rank=0, _pdflip_wake_seq=1)
+    with caplog.at_level(logging.INFO, logger=G.__name__):
+        G.on_batch(sched, dec, now=100.0)
+        G.note_probe(118709, 230.0, 215.0)
+        G.note_probe(107619, 210.0, 200.0)
+        G.on_batch(sched, dec, now=100.5)                     # 500 ms gap, ~415 ms of probe CPU
+        G.on_batch(sched, dec, now=101.0)                     # 500 ms gap, no probe
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith(G.MARK + " gap_ms")]
+    assert len(lines) == 2, lines
+    assert "cause=store_probe" in lines[0] and "probe=2:226328:440:415" in lines[0], lines[0]
+    assert "cause=other" in lines[1] and "probe=-" in lines[1], lines[1]
+
+
+def test_batch_exists_v2_reports_its_probe_to_the_gap_instrument(monkeypatch):
+    from flliper.srt.mem_cache import hicache_storage as hs
+    from flliper.srt.pdflip import d_decode_gap as G
+
+    got = []
+    monkeypatch.setattr(G, "note_probe", lambda k, w, c: got.append((k, w, c)))
+    assert getattr(hs.HiCacheFile.batch_exists_v2, "__wrapped__", None) is not None
+    fake = types.SimpleNamespace(_canonical_probe_mismatch=lambda: "stand-in")
+    hs.HiCacheFile._probe_mismatch_count = 10 ** 6 + 1   # keep the refusal's log quiet
+    res = hs.HiCacheFile.batch_exists_v2(fake, ["a", "b", "c"])
+    assert got and got[0][0] == 3 and got[0][1] >= 0.0 and got[0][2] >= 0.0
+    assert int(getattr(res, "kv_hit_pages", 0) or 0) == 0
