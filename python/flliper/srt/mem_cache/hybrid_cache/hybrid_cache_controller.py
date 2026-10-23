@@ -134,6 +134,48 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+#: PPAUSE-LOAD-FENCE counter (lines printed)
+_LOAD_FENCE_N = [0]
+
+
+def _load_fence_event(stream):
+    """A timing event recorded on ``stream`` (PPAUSE-LOAD-FENCE), or None where events cannot be made."""
+    try:
+        ev = device_module.Event(enable_timing=True)
+        ev.record(stream)
+        return ev
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the load
+        return None
+
+
+def _load_fence_harvest(ctrl) -> None:
+    """PPAUSE-LOAD-FENCE (27B rc35i4ar 23.10., PP1 'PDFLIP-START-LOADING tokens=29184 ... kv_issue_ms=2190' while
+    PP0 loads the same arena slots in 12 ms): print the fence probes of earlier loads whose end event completed --
+    ``query()`` only, never ``synchronize()``. ``fence_wait_ms`` = device time the load stream stood at
+    ``load_stream.wait_stream(forward/spill)``; ``l0_host_ms`` / ``guard_host_ms`` = the scheduler thread's wall of
+    layer 0 and of the #1424 arena guard's index min/max inside it. A guard ms close to the fence wait names the
+    host block: the guard's ``int(device_indices.min())`` waits for everything the fence put in front of it."""
+    q = getattr(ctrl, "_pdflip_load_fence_pending", None)
+    while q:
+        e0, e1, n_tok, l0_ms, guard_ms = q[0]
+        try:
+            if not e1.query():
+                return
+            wait_ms = float(e0.elapsed_time(e1))
+        except Exception:  # noqa: BLE001
+            q.pop(0)
+            continue
+        q.pop(0)
+        _LOAD_FENCE_N[0] += 1
+        n = _LOAD_FENCE_N[0]
+        if wait_ms >= 50.0 or guard_ms >= 50.0 or n <= 16 or (n & (n - 1)) == 0:
+            logger.info(
+                "PDFLIP-LOAD-FENCE tokens=%d fence_wait_ms=%.1f l0_host_ms=%.1f guard_host_ms=%.1f (n=%d): device time "
+                "the load stream waited at the forward/spill fence, against the scheduler thread's layer-0 and arena-guard "
+                "wall (FLLIPER_PDFLIP_LOAD_FENCE_PROBE)",
+                n_tok, wait_ms, l0_ms, guard_ms, n,
+            )
+
 
 #: QSA-PAIR (S99): marks an operation queued by :func:`put_backup_ahead`.
 BACKUP_AHEAD_ATTR = "_qsa_pair_ahead"
@@ -1065,6 +1107,10 @@ class HybridCacheController(BaseHiCacheController):
         if not consume_gate(self, "load_queue", "load"):
             return -1
         _sl_t0 = time.perf_counter()  # 19.09. Task #3: the wake's start_loading, sectioned
+        # PPAUSE-LOAD-FENCE: the fence probes of earlier loads whose events have completed (query only)
+        _lfp = bool(envs.FLLIPER_PDFLIP_LOAD_FENCE_PROBE.get())
+        if _lfp:
+            _load_fence_harvest(self)
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
@@ -1093,12 +1139,16 @@ class HybridCacheController(BaseHiCacheController):
         _dup_layers = 0
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            # PPAUSE-LOAD-FENCE: device time the load stream waits at the fence below (events, never a sync)
+            _lf_e0 = _load_fence_event(self.load_stream) if _lfp else None
             # upstream #36738 (see HiCacheController.start_loading): the H2D
             # (KV + Mamba pool_transfers + draft rows) into reclaimed device
             # rows waits for the forward(s) in flight -- this override is the
             # load path the 27B/NF hybrid UnifiedRadixCache actually runs.
             for fence_stream in self._load_fence_streams():
                 self.load_stream.wait_stream(fence_stream)
+            _lf_e1 = _load_fence_event(self.load_stream) if _lfp else None
+            _sl_l0 = 0.0
             _fft.on_load(self.load_stream, "begin")   # DP-NACHLAUF PDFLIP-FIRST-FWD-TIMING
             for i in range(self.mem_pool_host.transfer_layer_domain):
                 _sl_a = time.perf_counter()
@@ -1111,6 +1161,8 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=load_transfers,
                 )
                 _sl_kv_ms += (time.perf_counter() - _sl_a) * 1000.0
+                if i == 0:
+                    _sl_l0 = (time.perf_counter() - _sl_a) * 1000.0
                 _dup_layers += _mld.copy_dups(self.mem_pool_host, _dups, i)
                 if (
                     self.draft_tier_armed("load")
@@ -1154,6 +1206,14 @@ class HybridCacheController(BaseHiCacheController):
         _sl_t3 = time.perf_counter()
         _n_tok = int(host_indices.numel()) if hasattr(host_indices, "numel") else -1
         _comp = getattr(self.mem_pool_host, "_pdflip_load_ms", None)
+        if _lfp and isinstance(_comp, dict):
+            # PPAUSE-LOAD-FENCE: host ms of layer 0 (where the arena guard's index sync sits)
+            _comp["kv.l0"] = _sl_l0
+            if _lf_e0 is not None and _lf_e1 is not None:
+                _q = self.__dict__.setdefault("_pdflip_load_fence_pending", [])
+                _q.append((_lf_e0, _lf_e1, int(host_indices.numel()) if hasattr(host_indices, "numel") else -1,
+                           float(_sl_l0), float(_comp.get("kv.guard", 0.0))))
+                del _q[:-64]
         _comp_txt = ",".join(f"{k}={v:.0f}" for k, v in sorted((_comp or {}).items()))
         if isinstance(_comp, dict):
             _comp.clear()

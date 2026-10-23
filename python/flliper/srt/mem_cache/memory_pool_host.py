@@ -2611,6 +2611,11 @@ class HostPoolGroup:
                 io_backend,
             )
             _acc["kv"] = _acc.get("kv", 0.0) + (time.perf_counter() - _t) * 1000.0
+            # PPAUSE-LOAD-FENCE: the arena guard's index-sync wall inside 'kv' (FLLIPER_PDFLIP_LOAD_FENCE_PROBE)
+            _g = getattr(anchor.host_pool, "_pdflip_guard_ms", None)
+            if _g:
+                _acc["kv.guard"] = _acc.get("kv.guard", 0.0) + float(_g)
+                anchor.host_pool._pdflip_guard_ms = 0.0
 
         # 2. Extra pool transfers
         for transfer in pool_transfers or []:

@@ -1613,6 +1613,20 @@ class Envs:
     # 'not done' and on) -- instead of a reap that mixes two rids' numbers and a later gloo abort with no
     # name. Off: the 3-slot form.
     FLLIPER_PDFLIP_PREFETCH_RID_NET = EnvBool(True)
+    # PPAUSE-FRAME-FIRST (27B rc35i4ar 23.10., boot ..._1023_144422 PP1 14:48:32-53 'CHAIN-RECV blocked 20660 ms'):
+    # a follower with nothing to run took the INDEFINITE chain park even when the frame of a forward PP0 had
+    # already launched was about to arrive (PP0 sends the proxy after its commit; the gate looked before).
+    # PP0's next chain came only after its S82 park on a 20.8 s store read -- pdflip-1-3's PP1 half lost 20.5 s.
+    # Seconds the idle follower polls the counters for 'chain posted' OR 'frame posted' (chain always first,
+    # SOLL R11: the follower executes PP0's row, it decides nothing) before it falls back to the blocking park.
+    # 0 = the old immediate blocking park.
+    FLLIPER_PP_FOLLOWER_FRAME_WAIT_S = EnvFloat(30.0)
+    # PPAUSE-LOAD-FENCE (27B rc35i4ar 23.10., PP1 'PDFLIP-START-LOADING ... kv_issue_ms=2190' on a first chunk while
+    # the same slot range loads in 12 ms on PP0): the instrument of the arena load's host block. 'kv.guard' (host ms of
+    # the #1424 guard's device-index min/max sync), 'kv.l0' (host ms of layer 0) in START-LOADING components_ms, and
+    # 'PDFLIP-LOAD-FENCE fence_wait_ms' (device ms the load stream waited at the forward/spill fence, CUDA events,
+    # harvested by query() -- never a synchronize). Off: no events, no timing.
+    FLLIPER_PDFLIP_LOAD_FENCE_PROBE = EnvBool(True)
     # WAKE-READ-SEAT-GATE (NF arena fix 14.10.): the #248f gate held hold reads
     # up to the whole KV arena (6466 of 6485 pages pinned, 231 CAPACITY-WAIT in
     # one boot) -- D's own retain/park backup and its L3 fills found no slot.
