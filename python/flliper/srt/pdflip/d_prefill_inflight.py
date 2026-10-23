@@ -50,6 +50,18 @@ class DPrefillInflight:
         ledger is ``carried``, not a decode -- ``Front._dc_decoding``)."""
         return rid in self._rows
 
+    def open_rids(self, *, now: float, live: Container[str],
+                  idle: Optional[Callable[[str], bool]] = None) -> list:
+        """FLIPTIME-1023 (SOLL R2): the rids of the LIVING open rows (the liveness rule of :meth:`pending_tokens`: a row in
+        leg 2 lives while D holds the rid, one that never got there ``GRANT_TTL_S``), started or not, minus ``idle``
+        ones (parked, held below a lane floor). Read only: dead rows are left for :meth:`pending_tokens` to drop."""
+        out = []
+        for rid, row in list(self._rows.items()):
+            alive = rid in live if row.in_leg2 else now - row.t_grant < GRANT_TTL_S
+            if alive and not (idle is not None and idle(rid)):
+                out.append(rid)
+        return out
+
     def pending_tokens(self, *, now: float, live: Container[str],
                        idle: Optional[Callable[[str], bool]] = None,
                        started: Optional[Callable[[str, float], bool]] = None,

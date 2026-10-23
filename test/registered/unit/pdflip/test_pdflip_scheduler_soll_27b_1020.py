@@ -165,3 +165,79 @@ def test_r6k_a_running_kurz_d_prefill_is_not_rerouted_and_not_in_s():
         assert f._decode_collect(_time.time()) == "hold"         # g waits its T_halb (R4), no flip by k
         assert f.counters["set_reroute_p"] == 0
         assert f.counters["r6k_kurz_stays_on_d"] >= 1
+
+
+def _r2_scene(now, *, started=False):
+    """Boot 1023_140032 14:21:46Z (27B AutoRound, X=4096, halbX=2048, T_halb=4,5 s): pdflip-20-118 (gross, u=23969) waits
+    3,9 s in the set; on D only pdflip-20-119 (kurz, u=293, D_NOW 45,018), granted and not begun -- no decode on D."""
+    from test_pdflip_arrival_seat_rule_0929 import _front, _pending
+
+    f = _front(running=["k"], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = 4096
+    f.t_awake = now - 60.0
+    g = _pending("g", 23969, now - 3.9)
+    f.queue = [g]
+    f._d_pf_book().grant(rid="k", tokens=293, now=now - 1.44)
+    f._d_pf_book().enter_leg2(rid="k")
+    f.groups["D"].outstanding["k"] = now - 1.4
+    f._r6k_mark_kurz("k")
+    f._d_ext_reading = (lambda: {}) if not started else None
+    if started:
+        import time as _t
+
+        from flliper.srt.pdflip import d_extend_beacon as dxb
+
+        f._d_ext_reading = lambda: {dxb.rid_key("k"): (_t.time_ns(), 293)}
+    return f
+
+
+def test_r2_a_d_granted_kurz_finishes_on_d_before_the_flip_then_r4_decides():
+    """SOLL R2 (user 23.10. ~14:40Z: "unsere regeln sind eigentlich eindeutig" -- a kurz request is prefilled on D at once and
+    without wait, and there is never a flip for it; R6k is not needed for the case) + R4/R8. Defect (boot 1023_140032
+    14:21:46,456Z): R8 "no decode on D" decided FLIP_P while the D-granted kurz 20-119 had not begun; PARK-IMMEDIATE parked
+    it and its decode stood 49 s. SOLL: the D-granted kurz prefills on D to its end before D quiesces; then it DECODES, and
+    the big member waits the rest of its T_halb (R4)."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    for decider in (True, False):
+        with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(decider):
+            now = _time.time()
+            # the defect, reproduced with the hold switched off: R8 flips over the granted kurz
+            with envs.FLLIPER_PDFLIP_R2_KURZ_GRANT_HOLD.override(False):
+                f = _r2_scene(now)
+                assert not f._dc_decoding()                       # the R8 premise: a granted kurz is no decode
+                assert f._decode_collect(now) == "P", decider
+            for started in (False, True):                         # granted-not-begun (20-119) and running alike
+                f = _r2_scene(now, started=started)
+                assert f._decode_collect(now) == "hold", (decider, started)
+                assert f.counters["r2_kurz_grant_hold"] == 1 and f.counters["set_flip_p"] == 0
+                # the kurz prefill ended on D (first content): it DECODES now -> R4, the big member waits its T_halb
+                f._d_pf_book().done(rid="k")
+                assert f._dc_decoding()
+                assert f._decode_collect(now + 0.1) == "hold"     # waited 4.0 s < 4.5 s: R4 COLLECT
+                assert f.counters["r2_kurz_grant_hold_done"] == 0  # no flip verdict was held this time: R4 itself waits
+                assert f._decode_collect(now + 0.7) == "P"        # T_halb over (4.6 s): R4 flips
+                assert f.counters["set_flip_p"] == 1
+
+
+def test_r2_a_parked_kurz_does_not_hold_the_flip():
+    """The hold covers only kurz requests D is prefilling now: a kurz D parked (or holds for RESUME-VIA-P) is not
+    prefilling -- R8 decides as before."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f = _r2_scene(now)
+        f._d_parked["k"] = now - 0.5
+        assert f._r2_kurz_grants_open(now) == []
+        assert f._decode_collect(now) == "P"

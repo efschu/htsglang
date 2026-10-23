@@ -227,6 +227,11 @@ def test_r6k_kurz_running_and_a_big_set_flip_without_the_kurz_it_stays_on_d(monk
     tp.mkdir()
     now, f = _r6k_front(monkeypatch, tp, member_u=9875, klass="kurz", waited=4.6)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        # FLIPTIME-1023 SOLL R2 (user 23.10. ~14:40Z): the D-granted kurz prefills on D to its END before D quiesces --
+        # the flip verdict waits at the verdict (before: committed, and the park's R6k hold waited at most T_halb)
+        assert f._decode_collect(now) == "hold"
+        assert _r6k_lines(caplog, "R2-KURZ-BEFORE-FLIP outcome=hold")
+        f._d_pf_book().done(rid="pdflip-12-275")                      # its first content: the kurz prefill ended on D
         assert f._decode_collect(now) == "P"                          # T_halb over: the big set flips
     sv = _r6k_lines(caplog, "PDFLIP SET-VERDICT")
     assert sv and all("verdict=REROUTE_P" not in m for m in sv), sv
@@ -278,6 +283,10 @@ def test_r6k_halb_and_kurz_running_r6_moves_only_the_halb(monkeypatch, caplog, t
     add_running(f, now, tmp_path, "pdflip-12-276", rest_start=900, ext_len=900, ended=False, klass="kurz", key=37870)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
         assert f._dc_carried_running() == 3952      # NF-RC30-R6STALE: the halb's unlaunched 6000-2048, the kurz not at all
+        # FLIPTIME-1023 SOLL R2 (user 23.10.): the running kurz prefills on D to its end before D quiesces for the flip
+        assert f._decode_collect(now) == "hold"
+        assert _r6k_lines(caplog, "R2-KURZ-BEFORE-FLIP outcome=hold rids=pdflip-12-276")
+        f._d_pf_book().done(rid="pdflip-12-276")      # its first content: the kurz prefill ended on D
         assert f._decode_collect(now) == "P"
     red = _r6k_lines(caplog, "R6-REDIRECT")
     assert red and "pdflip-12-275" in red[0] and "pdflip-12-276" not in red[0], red

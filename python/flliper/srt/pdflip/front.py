@@ -14318,6 +14318,106 @@ class Front:
             return False
         return True
 
+    #: FLIPTIME-1023 (SOLL R2): a hold that stands longer than this many T_halb is named (instrument only, no decision clock)
+    R2_KURZ_HOLD_NAME_X_THALB = 2.0
+
+    def _r2_kurz_grants_open(self, now: Optional[float] = None) -> List[str]:
+        """SOLL R2 (user 23.10. ~14:40Z, verbatim "unsere regeln sind eigentlich eindeutig"; R2 "u < halbX: sofort auf D
+        prefillen ... Nie ein Flip für einen kurzen Request"): the kurz requests D was GRANTED (D_NOW, the X-SUM-PRICE book
+        ``_d_pf``) whose D prefill is not over (no first content yet) -- started or not. A parked / lane-held row is not
+        prefilling and does not count (the book's own idle rule). Class = the one the request went to D with
+        (``_r6k_note_class``); a row with no class known does not count (named ``r2_kurz_class_unknown``)."""
+        if not envs.FLLIPER_PDFLIP_R2_KURZ_GRANT_HOLD.get():
+            return []
+        book = self.__dict__.get("_d_pf")
+        if book is None or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+            return []
+        if not (self.awake == "D" and self.state == "serving"):
+            return []
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        if D is None:
+            return []
+        running = set(self._flip_ledger(D))
+        ls = self.__dict__.get("_lane_state_obj")
+        floor = int(getattr(ls, "lane_floor", 0) or 0) if ls is not None else 0
+
+        def _idle(rid: str) -> bool:
+            if rid in D.outstanding and rid not in running:
+                return True                      # parked / RESUME-VIA-P: D does not prefill it now
+            return bool(floor > 0 and ls.lane_for(rid) < floor)
+
+        classes = self.__dict__.get("_r6k_class") or {}
+        out = []
+        reading: Optional[Dict[int, Any]] = None
+        for rid in book.open_rids(now=time.time() if now is None else float(now), live=D.outstanding, idle=_idle):
+            got = classes.get(rid)
+            if got is None:
+                self.counters["r2_kurz_class_unknown"] += 1
+                continue
+            if got[0] != phase_policy.CLASS_KURZ:
+                continue
+            if _dxb.enabled():
+                # review K1 (SOLL R6k, exact numbers): D's exact rest >= the halfX the kurz class stood on proves u >= halfX
+                # -- not kurz, R6 applies to it; it holds no flip
+                if reading is None:
+                    reading = self._d_ext_reading_full() or {}
+                row = getattr(book, "_rows", {}).get(rid)
+                e = _dxb._entry(reading, rid) if reading else None
+                if (e is not None and row is not None and e[0] >= int(float(row.t_grant) * 1e9) and e[1] > 0
+                        and Front._r6k_contradicted(self, rid, int(e[1]), got)):
+                    continue
+            out.append(str(rid))
+        return out
+
+    def _r2_kurz_grant_hold(self, sv: "phase_policy.SetVerdict", now: float) -> "phase_policy.SetVerdict":
+        """SOLL R2 (user 23.10.; with R4/R8): a FLIP verdict (FLIP_P / PARK_NO_SEAT / REROUTE_P) taken while a kurz D grant is
+        open waits -- COLLECT, the D-granted kurz requests prefill on D to their end before D quiesces for the D->P flip.
+        Then the set is decided again on D's state: the kurz requests now DECODE, so a big member waits the rest of its
+        T_halb (R4); with no decode on D, R8 decides at once. Root of boot 1023_140032 14:21:46,456Z: R8 "no decode on D"
+        (``_dc_decoding``: a granted kurz still prefilling is ``carried``, not a decode -- NODECODE 1015) gave FLIP_P while
+        pdflip-20-119 (u=293, D_NOW 45,018) was granted and unstarted; the park's R6k hold (``_r6k_finish_hold``) sees only
+        kurz prefills the D-EXTEND-BEACON proves RUNNING, so PARK-IMMEDIATE parked it and its decode stood 49 s.
+        No time bound decides here (the book's own row liveness ends a grant D never takes); a hold longer than
+        ``R2_KURZ_HOLD_NAME_X_THALB`` x T_halb is named once."""
+        if sv.verdict not in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
+            return sv
+        rids = Front._r2_kurz_grants_open(self, now)
+        st = self.__dict__.get("_r2_kurz_hold")
+        if st is not None and st.get("epoch") != self.epoch:
+            st = None
+        if not rids:
+            if st is not None and not st.get("closed"):
+                st["closed"] = True
+                self.counters["r2_kurz_grant_hold_done"] += 1
+                logger.info("PDFLIP R2-KURZ-BEFORE-FLIP outcome=done wait_ms=%d rids=%s epoch=%d -- the D-granted kurz "
+                            "request(s) finished their prefill on D; the set is decided again on D's state (SOLL R2, R4/R8): "
+                            "%s %s", int(round((now - st["t0"]) * 1000)), ",".join(st["rids"]), self.epoch, sv.verdict, sv.why)
+            return sv
+        if st is None or st.get("closed"):
+            st = {"epoch": self.epoch, "t0": now, "rids": list(rids)}
+            self.__dict__["_r2_kurz_hold"] = st
+            self.counters["r2_kurz_grant_hold"] += 1
+            logger.info("PDFLIP R2-KURZ-BEFORE-FLIP outcome=hold rids=%s epoch=%d -- a flip verdict (%s: %s) waits: the kurz "
+                        "request(s) D was granted prefill on D to their end before D quiesces (SOLL R2 \"sofort auf D ... nie "
+                        "ein Flip für einen kurzen Request\"; user 23.10.)", ",".join(rids), self.epoch, sv.verdict, sv.why)
+        else:
+            new = [r for r in rids if r not in st["rids"]]
+            if new:
+                st["rids"].extend(new)
+            t_half = float(Front._set_cfg()[1])
+            if (not st.get("long_named") and t_half > 0
+                    and now - st["t0"] > Front.R2_KURZ_HOLD_NAME_X_THALB * t_half):
+                st["long_named"] = True
+                self.counters["r2_kurz_grant_hold_long"] += 1
+                logger.warning("PDFLIP R2-KURZ-BEFORE-FLIP outcome=long wait_ms=%d rids=%s epoch=%d -- kurz grants keep D "
+                               "prefilling past %.1f x T_halb; the flip still waits (SOLL R2), named for the monitor",
+                               int(round((now - st["t0"]) * 1000)), ",".join(rids), self.epoch,
+                               Front.R2_KURZ_HOLD_NAME_X_THALB)
+        return phase_policy.SetVerdict(
+            phase_policy.V_COLLECT,
+            "R2 kurz D grant(s) %s finish on D first (was %s: %s)" % (",".join(rids[:4]), sv.verdict, sv.why),
+            sv.left_s, sv.s_tokens, sv.half_x)
+
     def _r6_redirect(self, why: str) -> List[str]:
         """S56 (SOLL R6 "auch ein laufender D prefill wird dann geflippt"): a REROUTE_P verdict MOVES the running D
         prefills its S counted -- PARK-HANDBACK closes each leg (D aborts it), P's batch takes it. Before S56 the
@@ -15443,6 +15543,7 @@ class Front:
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
             sv = Front._set_xsum_hold(self, sv, x_tok, running, decoding=decoding)
         sv = Front._r6_commit_hold(self, sv)  # review A1: no final verdict while a counted prefill's next chunk is COMMITTED
+        sv = Front._r2_kurz_grant_hold(self, sv, now)  # FLIPTIME-1023 SOLL R2: D-granted kurz requests finish on D first
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
@@ -15945,6 +16046,7 @@ class Front:
                                       d_prefill_running_uncached=_run, new_since_last=0,
                                       class_x_tokens=x_cls)
         sv = Front._r6_commit_hold(self, sv)  # review A1
+        sv = Front._r2_kurz_grant_hold(self, sv, now)  # FLIPTIME-1023 SOLL R2
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1
@@ -17022,6 +17124,16 @@ class Front:
                                    bool(getattr(head, "d_eligible", False)))
                 if Front._set_flip_justified(self, now):
                     return True, True, None
+            return False, not self.admit_d, None
+        _r2_open = Front._r2_kurz_grants_open(self, now)
+        if _r2_open:
+            # FLIPTIME-1023 SOLL R2: no D->P flip for a P-bound entry while a D-granted kurz request still prefills on D
+            self.counters["r2_kurz_grant_hold_pbound"] += 1
+            if self.__dict__.get("_r2_pbound_last") != (self.epoch, tuple(_r2_open)):
+                self.__dict__["_r2_pbound_last"] = (self.epoch, tuple(_r2_open))
+                logger.info("PDFLIP R2-KURZ-BEFORE-FLIP outcome=hold site=arrival-seat rids=%s epoch=%d -- the P-bound "
+                            "entry %s waits: D-granted kurz request(s) prefill on D to their end first (SOLL R2)",
+                            ",".join(_r2_open), self.epoch, cands[0].rid)
             return False, not self.admit_d, None
         if envs.FLLIPER_PDFLIP_PBOUND_FLIP_NOW.get():
             return self._asr_pbound_flip_now(cands, x_tok, now)
