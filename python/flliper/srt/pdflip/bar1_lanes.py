@@ -43,6 +43,7 @@ import logging
 import mmap
 import contextlib
 import os
+import select
 import socket
 import struct
 import threading
@@ -360,6 +361,10 @@ class FileCredits:
         return take_flag(self.d, kind, self.seq, g, timeout_s, liveness=self.liveness,
                          on_slow=self.on_slow, on_tick=self.on_tick)
 
+    def ready(self, kind: str, g: int) -> bool:
+        """Is credit (kind, g) already there? Never blocks, never consumes."""
+        return os.path.exists(_flag_path(self.d, kind, self.seq, g))
+
 
 class SocketCredits:
     """One 5-byte frame per credit on the lane's open connection; a plan
@@ -411,6 +416,14 @@ class SocketCredits:
                 return None          # peer closed
             buf += chunk
         return buf
+
+    def ready(self, kind: str, g: int) -> bool:
+        """Has the next frame (credits arrive in order) started to arrive?
+        Never blocks, never consumes."""
+        try:
+            return bool(select.select([self.sock], [], [], 0)[0])
+        except (OSError, ValueError, TypeError):
+            return False
 
     def recv(self, kind: str, g: int, timeout_s: float):
         head = self._read(_FRAME.size + 4, timeout_s)
@@ -516,6 +529,80 @@ def collect_copiers(ops, env: Optional[_Map[str, str]] = None):
     if held:
         return ops.memcpy_async_held, ops.memcpy2d_async_held, "held"
     return ops.memcpy_async, ops.memcpy2d_async, "released"
+
+
+# -- the collector's copy-out in ONE runtime call per batch (barlink-lanes2-1023) --
+#
+# Boot dkr27bnvfp4duorebarbar1duo10230932: 17 of the 49 BAR1 tags under 10 GB/s
+# were collector CPU -- tags of 176-355 pieces, issue_ms 0.01-0.25 ms per piece
+# with spikes under GIL competition (p1 5-weights_7 issue 84 ms, p0
+# 5-weights_1 52 ms). The copy-out is device-to-device on one card (own BAR1
+# window -> own tensors), so a batch of N pieces is ONE cudaMemcpyBatchAsync
+# (flat pieces) plus ONE cudaMemcpy3DBatchAsync (strided pieces), CUDA >= 12.8
+# -- the call vLLM's swap_blocks and our own kvcacheio staged_write_back
+# already make. The arrays are built for the whole tag in the preplan, before
+# the first credit, so the loop between two credits is one call. The ops hand
+# the copier out only after a canary batch on the device read back byte-exact
+# (weight_exchange_transport.CudartBatchCopier); anything else -- switch off,
+# no preplan, a desk fake, an old runtime, a failed canary, a stream 0, a
+# failing call -- is the per-piece path, named on the lane-time line.
+ENV_COLLECT_BATCH = "FLLIPER_PDFLIP_BAR1_COLLECT_BATCH"
+
+
+def collect_batch_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_COLLECT_BATCH, env)
+
+
+def collect_batch_copier(ops, device: int, env: Optional[_Map[str, str]] = None):
+    """(copier or None, why) for one collect tag."""
+    if not collect_batch_on(env):
+        return None, f"{ENV_COLLECT_BATCH}=0"
+    from flliper.srt.pdflip import weight_exchange_transport as tp
+    copier, why = tp.get_batch_copier(ops, device)   # never raises; desk fakes named
+    if copier is None:
+        return None, str(why or "batch copier unavailable")
+    return copier, ""
+
+
+def prewarm_collect_batch(lanes, ops_factory=None, log=None) -> str:
+    """Run the batch copier's canary at BOOT (the lane setup thread) instead of
+    inside the first flip's first collect: a rank with a receiving BAR1 lane
+    asks the cudart ops once; the verdict is cached per process
+    (weight_exchange_transport.CudartDeviceOps.batch_copier). Returns the
+    line it logged ("" when there was nothing to do). Never raises."""
+    log = log or logger.info
+    try:
+        if not collect_batch_on() or not collect_preplan_on() or not getattr(lanes, "recv", None):
+            return ""
+        from flliper.srt.pdflip import weight_exchange_transport as tp
+        ops = (ops_factory or tp.CudartDeviceOps)()
+        dev = lanes._ordinal()
+        t0 = time.perf_counter()
+        copier, why = tp.get_batch_copier(ops, dev)
+        line = (f"PDFLIP-BAR1 collect-batch canary device={dev} "
+                + ("OK" if copier is not None else f"REFUSED why={_compact(why, 240)}")
+                + f" ms={(time.perf_counter() - t0) * 1000:.1f} lanes={sorted(lanes.recv)}")
+    except Exception as exc:  # noqa: BLE001 -- the first collect asks again
+        line = f"PDFLIP-BAR1 collect-batch canary n/a ({type(exc).__name__}: {exc})"
+    log(line)
+    return line
+
+
+def batch_rows(row, sbase: int) -> list:
+    """One preplan row (``_collect_plan``) as the copier's rows
+    ``(kind, dst, src, nbytes_or_width, dpitch, spitch, rows)``: FLAT ->
+    (FLAT, dst, slot+off, nbytes, 0, 0, 0); strided -> the per-piece call's
+    ``memcpy2d(dst, dpitch=a, src, spitch=b, width=b, height=c)``. A 0-byte
+    piece is dropped (a no-op per piece; the batch API forbids 0 extents)."""
+    from flliper.srt.pdflip import weight_exchange_transport as tp
+    out = []
+    for kind, dst, soff, a, b, c in row:
+        if kind == tp.FLAT:
+            if int(a) > 0:
+                out.append((kind, int(dst), int(sbase) + int(soff), int(a), 0, 0, 0))
+        elif int(b) > 0 and int(c) > 0:
+            out.append((kind, int(dst), int(sbase) + int(soff), int(b), int(a), int(b), int(c)))
+    return out
 
 
 def parallel_copy_on() -> bool:
@@ -704,6 +791,63 @@ def readback_scratch(ops, device: int) -> int:
             p = int(ops.raw_malloc(int(device), 4096))
             _RB_SCRATCH[int(device)] = p
         return p
+
+
+# -- WAKE-RUNAHEAD-DEPOSITOR (barlink-lanes2-1023): the depositor says it waits ---
+#
+# Boot dkr27bnvfp4duorebarbar1duo10230932: 25 of the 49 BAR1 tags under 10 GB/s
+# were a START OFFSET -- the depositor's ring was full within a few ms and it
+# waited for free(0) because its collector had not begun the tag (depositor
+# span 70-270 ms longer than the whole collect; P PP0 p1 8-weights_4: 271 of
+# 295 ms). The collector begins a tag only after its wake loop has resumed it,
+# and that loop's run-ahead bound waits for an OLDER collect
+# (pdflip/wake_runahead.py). So the depositor tells the waker, per tag, that
+# its bytes are waiting: a flag ``ffwait.<seq>.0`` in the lane's flag dir,
+# posted right before a first-free wait that would block and removed when the
+# wait ends. The waker's bound wait reads it for the NEXT tag
+# (``Bar1Lanes.depositor_waiting``). Same switch as the wake side; off = no
+# flag, no stat.
+ENV_RUNAHEAD_DEPOSITOR = "FLLIPER_PDFLIP_WAKE_RUNAHEAD_DEPOSITOR"
+FFWAIT = "ffwait"
+
+
+def first_free_flag_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_RUNAHEAD_DEPOSITOR, env)
+
+
+def _credit_ready(cred, kind: str, g: int) -> bool:
+    fn = getattr(cred, "ready", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn(kind, g))
+    except Exception:  # noqa: BLE001 -- unknown = not ready: the flag goes up
+        return False
+
+
+@contextlib.contextmanager
+def first_free_wait(cred, d: str, seq, g: int, lane_key: str, rank: int, kind: str = "free"):
+    """Around the depositor's wait for the FIRST credit of a tag that only a
+    running collector can send (``free`` g, or -- file credits, a tag of <=
+    ring batches, no trailing frees -- ``done``): the ``ffwait`` flag stands
+    while the wait lasts, only when the credit is not already there. Yields
+    whether it was posted."""
+    posted = False
+    if first_free_flag_on() and not _credit_ready(cred, kind, g):
+        try:
+            post_flag(d, FFWAIT, seq, 0, {"since": time.time(), "lane": str(lane_key),
+                                          "rank": int(rank), "free": int(g)})
+            posted = True
+        except OSError:
+            posted = False
+    try:
+        yield posted
+    finally:
+        if posted:
+            try:
+                os.unlink(_flag_path(d, FFWAIT, seq, 0))
+            except OSError:
+                pass
 
 
 def _compact(why: str, n: int = 120) -> str:
@@ -1010,6 +1154,18 @@ class Bar1Lanes:
     def flags(self, lane_key: str, role: str) -> str:
         dst_group = self.group if role == "dst" else other_group(self.group)
         return flag_dir(self.boot_nonce, lane_key, dst_group, self.root)
+
+    def depositor_waiting(self, seq) -> bool:
+        """WAKE-RUNAHEAD-DEPOSITOR: does a depositor of tag instance ``seq``
+        ("<flip>-<tag>") already wait for its first free on a lane this rank
+        collects (one stat per receiving lane)?"""
+        for lane_key in list(self.recv):
+            try:
+                if os.path.exists(_flag_path(self.flags(lane_key, "dst"), FFWAIT, seq, 0)):
+                    return True
+            except Exception:  # noqa: BLE001 -- a probe, never a failure
+                continue
+        return False
 
     # -- #22: credit-wait flags and the cycle reader --------------------
     def credit_dir(self) -> str:
@@ -1849,6 +2005,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         except Exception as exc:  # noqa: BLE001 -- named in the lane-time line
             wo_fn, wo_why = None, f"readback scratch: {type(exc).__name__}: {exc}"
     wo_n = 0
+    ffwait_n = 0      # WAKE-RUNAHEAD-DEPOSITOR: first-free waits announced to the waker
     # FLIPCYCLE H4: fast-receiver-first on this card's one D2H engine
     _gate = None
     _gate_ms = 0.0
@@ -1880,9 +2037,20 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     pre = None
     pre_why = ""
     prep_s = 0.0
+    bcp, bwhy, bprep, bcalls = None, "", None, 0
+    if role == "dst" and not collect_preplan_on():
+        bwhy = f"{ENV_COLLECT_PREPLAN}=0 (the batch is built by the preplan)"
+    elif role == "dst":
+        bcp, bwhy = collect_batch_copier(ops, device)
     if role == "dst" and collect_preplan_on():
         tp0 = time.perf_counter()
         pre, pre_why = _collect_plan(batches, descs, _nw, probe, probed, lane_key, tp)
+        if bcp is not None:
+            try:
+                bprep = [bcp.prepare(batch_rows(pre[g], base + ring_slot(g, ring) * slot_bytes))
+                         if pre[g] else None for g in range(len(pre))]
+            except Exception as exc:  # noqa: BLE001 -- the per-piece path, named
+                bprep, bwhy = None, f"prepare {type(exc).__name__}: {exc}"
         prep_s = time.perf_counter() - tp0
     plan = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
               str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
@@ -2029,8 +2197,13 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 if g >= ring:
                     tw = time.perf_counter()
                     try:
-                        got_free = _recv_marked(cred, "free", g - ring, budget_s, d, seq, lane_key,
-                                                lanes.rank, "free", on_tick=tick, own_state=tick_state)
+                        with (first_free_wait(cred, d, seq, 0, lane_key, lanes.rank)
+                              if g == ring else contextlib.nullcontext()) as _ffp:
+                            got_free = _recv_marked(cred, "free", g - ring, budget_s, d, seq,
+                                                    lane_key, lanes.rank, "free", on_tick=tick,
+                                                    own_state=tick_state)
+                        if _ffp:
+                            ffwait_n += 1
                     except _CycleSpill:
                         clk.credit += time.perf_counter() - tw
                         return _spill_rest(g, g - ring, plan_sent=True,
@@ -2092,11 +2265,24 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 wo_fn(int(device))
                 wo_n += 1
             if pre is not None:
-                for kind, dst, soff, a, b, c in pre[g]:
-                    if kind == tp.FLAT:
-                        out_cp(dst, sbase + soff, a, stream)
-                    else:
-                        out_cp2d(dst, a, sbase + soff, b, b, c, stream)
+                _batched = False
+                if bprep is not None and not stream:
+                    bprep, bwhy = None, "stream 0 (the batch API refuses the legacy NULL stream)"
+                if bprep is not None and bprep[g] is not None:
+                    try:
+                        bcp.issue(bprep[g], stream)
+                        bcalls += int(getattr(bprep[g], "calls", 1))
+                        _batched = True
+                    except Exception as exc:  # noqa: BLE001 -- re-issued per piece below
+                        # copies are idempotent (same bytes, same places): a
+                        # partly enqueued batch is simply issued again
+                        bprep, bwhy = None, f"issue {type(exc).__name__}: {exc}"
+                if not _batched:
+                    for kind, dst, soff, a, b, c in pre[g]:
+                        if kind == tp.FLAT:
+                            out_cp(dst, sbase + soff, a, stream)
+                        else:
+                            out_cp2d(dst, a, sbase + soff, b, b, c, stream)
                 clk.issue += time.perf_counter() - ti
                 if pre_why and g == len(pre) - 1:
                     # the refused piece's batch: everything before it is out,
@@ -2151,8 +2337,13 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 for g in range(max(0, nb - ring), nb):
                     tf = time.perf_counter()
                     try:
-                        got_free = _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
-                                                lanes.rank, "trailing-free", on_tick=tick, own_state=tick_state)
+                        with (first_free_wait(cred, d, seq, 0, lane_key, lanes.rank)
+                              if g == 0 else contextlib.nullcontext()) as _ffp:
+                            got_free = _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
+                                                    lanes.rank, "trailing-free", on_tick=tick,
+                                                    own_state=tick_state)
+                        if _ffp:
+                            ffwait_n += 1
                     except _CycleSpill:
                         # every byte is in the ring already: the backlog only waits
                         return _spill_rest(nb, g, plan_sent=True)
@@ -2162,8 +2353,12 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     if g == 0:      # a tag of <= ring batches: free(0) comes back here
                         clk.first_free += time.perf_counter() - tf
             try:
-                got_done = _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
-                                        lanes.rank, "done", on_tick=tick, own_state=tick_state)
+                with (first_free_wait(cred, d, seq, 0, lane_key, lanes.rank, kind="done")
+                      if (via != "sock" and nb <= ring) else contextlib.nullcontext()) as _ffp:
+                    got_done = _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
+                                            lanes.rank, "done", on_tick=tick, own_state=tick_state)
+                if _ffp:
+                    ffwait_n += 1
             except _CycleSpill:
                 return _spill_rest(nb, nb, plan_sent=True)
             if got_done is None:
@@ -2192,7 +2387,11 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
         f"lag={lag} prep_ms={prep_s * 1000:.0f}"
         + (f" issue_gil={gil_mode}" if gil_mode else "")
-        + f" sync_query={'held' if sync_q else 'off'} sync_skipped={clk.sync_skipped}/{clk.syncs}")
+        + f" sync_query={'held' if sync_q else 'off'} sync_skipped={clk.sync_skipped}/{clk.syncs}"
+        + (f" ffwait={ffwait_n if first_free_flag_on() else 'off'}" if role == "src" else "")
+        + ((f" collect_batch=on calls={bcalls}" if (bcp is not None and not bwhy)
+            else f" collect_batch=OFF calls={bcalls} why={_compact(bwhy)}")
+           if role == "dst" else ""))
     if _gate is not None and _gate_ms > 0:
         log(f"PDFLIP-FLIPCYCLE stage=legs_engine lane={lane_key} seq={seq} top={_gate.top} "
             f"ms={_gate_ms:.0f} floor_ms=0 (H4: this slower-receiver lane yielded the D2H "

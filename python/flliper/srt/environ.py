@@ -658,6 +658,15 @@ class Envs:
     # Same collects in flight, same resumes and credit waits, no VRAM. Per
     # group (the waking group reads it); off until metal.
     FLLIPER_PDFLIP_WAKE_RUNAHEAD_ANY = EnvBool(False)
+    # WAKE_RUNAHEAD_DEPOSITOR (barlink-lanes2-1023, pdflip/wake_runahead.py): the
+    # run-ahead bound also ends when the NEXT tag's BAR1 depositor already
+    # waits for its first free (its ring is full, the bytes are on the wire),
+    # while at most bound+1 collects are unfinished -- at most ONE collect
+    # beyond the bound, each resume still behind its VRAM credit wait, one
+    # extra collect worker. Boot 10230932: 25 of 49 slow tags were this start
+    # offset (P PP0 p1 8-weights_4: 354 ms in the bound, 271 ms credit wait on
+    # the depositor). Default on (user order: new features on); 0 = the bound.
+    FLLIPER_PDFLIP_WAKE_RUNAHEAD_DEPOSITOR = EnvBool(True)
     # CREDIT_LIVE_STAGING: the waker's credit check subtracts only the peer's
     # stagings that are booked but not yet allocated; an allocated staging is
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,

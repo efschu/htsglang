@@ -1309,7 +1309,13 @@ class SchedulerWeightUpdaterManager:
             self._pdflip_bar1 = reg
             import threading
 
-            t = threading.Thread(target=reg.setup, args=(lanes,),
+            def _setup_then_canary(reg=reg, lanes=lanes):
+                reg.setup(lanes)
+                # barlink-lanes2-1023: the collect-batch canary at boot, not
+                # inside the first flip's first collect
+                b1.prewarm_collect_batch(reg, log=logger.info)
+
+            t = threading.Thread(target=_setup_then_canary,
                                  name="pdflip-bar1-setup", daemon=True)
             self._pdflip_bar1_thread = t
             t.start()
@@ -6362,6 +6368,18 @@ class SchedulerWeightUpdaterManager:
                     ev.set()
         except Exception:  # noqa: BLE001 -- stubs without the fields
             pass
+
+    def _pdflip_runahead_depositor_probe(self, next_tag):
+        """WAKE-RUNAHEAD-DEPOSITOR: a callable for the run-ahead bound -- does
+        the BAR1 depositor of ``next_tag`` (this flip) already wait for its
+        first free on a lane this rank collects? None when the tag instance
+        has no flip index (the desk counters): the bound as before."""
+        b1 = getattr(self, "_pdflip_bar1", None)
+        fi = getattr(self, "_pdflip_flip_index_now", None)
+        if b1 is None or fi is None or int(fi) < 0 or not hasattr(b1, "depositor_waiting"):
+            return None
+        seq = f"{int(fi)}-{next_tag}"
+        return lambda: b1.depositor_waiting(seq)
 
     def _pdflip_wake_collect_one(self, tag) -> None:
         """One tag's collect on the wake side (the exchange carrier), run
@@ -11462,6 +11480,13 @@ class SchedulerWeightUpdaterManager:
 
                 _ra_any = _pdflip_runahead.runahead_any_on()
                 _ra_waited = [0.0, 0]
+                # WAKE-RUNAHEAD-DEPOSITOR (barlink-lanes2-1023): the bound also
+                # ends when the NEXT tag's BAR1 depositor already waits for its
+                # first free -- at most one collect beyond the bound, one extra
+                # worker for it; resumes stay behind their credit waits.
+                _ra_dep = (_pdflip_runahead.runahead_depositor_on()
+                           and getattr(self, "_pdflip_bar1", None) is not None)
+                _ra_stats: dict = {}
                 if _pdflip_wake_overlap_armed():
                     from concurrent.futures import ThreadPoolExecutor as _TPE
                     # 18.09. (xsn367): TWO collects in flight -- the flip's critical chain
@@ -11477,7 +11502,8 @@ class SchedulerWeightUpdaterManager:
                     # workers held PP2's and PP1's tags. The spare worker(s)
                     # change no resume and no VRAM, only who may collect.
                     _wake_worker = _TPE(
-                        max_workers=_n_wake_workers + max(0, _envs_h11.FLLIPER_PDFLIP_WAKE_COLLECT_SPARE.get()),
+                        max_workers=_n_wake_workers + max(0, _envs_h11.FLLIPER_PDFLIP_WAKE_COLLECT_SPARE.get())
+                        + (1 if _ra_dep else 0),
                         thread_name_prefix="pdflip-wake-collect")
                 for _ti, tag in enumerate(weights_tags):
                     # C14: the device bytes this tag needs may only exist once
@@ -11765,8 +11791,16 @@ class SchedulerWeightUpdaterManager:
                             # collect t, nothing further: wait for t-1 here.
                             # WAKE-RUNAHEAD-ANY (pdflip/wake_runahead.py): off = the
                             # FIFO wait for the collect bound+1 places back
+                            _ra_early = None
+                            if _ra_dep and _ti + 1 < len(weights_tags):
+                                try:
+                                    _ra_early = self._pdflip_runahead_depositor_probe(
+                                        weights_tags[_ti + 1])
+                                except Exception:  # noqa: BLE001 -- no probe: the bound as before
+                                    _ra_early = None
                             _ra_waited[0] += _pdflip_runahead.bound_wait(
-                                _wake_futs, _n_wake_workers, _ra_any)
+                                _wake_futs, _n_wake_workers, _ra_any,
+                                early=_ra_early, stats=_ra_stats)
                             _ra_waited[1] += 1
                         else:
                             self._pdflip_bar1_register(tag)
@@ -11852,9 +11886,10 @@ class SchedulerWeightUpdaterManager:
                         _errs.append((_ftag, _fexc))
                 _wake_worker.shutdown(wait=True)
                 logger.info("PDFLIP-WAKE-OVERLAP collects=%d joined_ms=%.0f errors=%d "
-                            "runahead=%s runahead_wait_ms=%.0f",
+                            "runahead=%s runahead_wait_ms=%.0f runahead_depositor=%s",
                             len(_wake_futs), (time.perf_counter() - _t_join) * 1000,
-                            len(_errs), "any" if _ra_any else "fifo", _ra_waited[0] * 1000)
+                            len(_errs), "any" if _ra_any else "fifo", _ra_waited[0] * 1000,
+                            (f"on early={int(_ra_stats.get('early', 0))}" if _ra_dep else "off"))
                 if _errs:
                     raise _errs[0][1]
             # xsn265/266: the collector is the LAST reader of every lane it

@@ -486,3 +486,52 @@ def test_the_script_never_edits_production_lane_code():
     assert "bl.BIG_BAR_MIN = 1" in src
     assert "bl.run_bar1_units(" in src and "lanes.setup(" in src
     assert "def connect_peer" not in src and "def open_window" not in src
+
+
+# -- barlink-lanes2-1023: the collector-issue arms ------------------------------
+
+def test_layer_piece_mix_is_production_shaped():
+    specs = B.plan_descs(640 << 20, B.PIECE_MIXES["layer"])
+    assert sum(s["nbytes"] for s in specs) == 640 << 20
+    assert 150 <= len(specs) <= 260
+    assert sum(1 for s in specs if s["kind"] == "STRIDED2D") >= 20
+    assert B.PIECE_MIXES["bench"] is B.TEMPLATES
+
+
+def test_piece_mix_and_gil_threads_parse_and_plan(capsys):
+    assert B.main(["--plan", "--piece-mix", "layer", "--gil-threads", "2",
+                   "--env", "FLLIPER_PDFLIP_BAR1_COLLECT_BATCH=0"]) == 0
+    out = capsys.readouterr().out
+    assert "205 descs" in out and "FLLIPER_PDFLIP_BAR1_COLLECT_BATCH" in out
+    with pytest.raises(SystemExit):
+        B.main(["--plan", "--gil-threads", "9"])
+
+
+def test_gil_burner_stops():
+    import threading as _th
+    stop = _th.Event()
+    t = _th.Thread(target=B.gil_burner, args=(stop,), daemon=True)
+    t.start()
+    stop.set()
+    t.join(2)
+    assert not t.is_alive()
+
+
+def test_collector_columns_for_the_batch_ab():
+    lt_d = B.parse_lane_time("PDFLIP-BAR1 lane-time lane=p0 phase=bench seq=x units=9 total_ms=40 "
+                             "issue_ms=1 rate_GBs=16.0 write_order=OFF why=FLLIPER_PDFLIP_BAR1_WRITE_ORDER=0 ffwait=0")
+    cols = []
+    for iss, cb in ((30.0, "on"), (10.0, "on")):
+        cols.append({"lane_time": B.parse_lane_time(
+            f"PDFLIP-BAR1 lane-time lane=p0 phase=bench seq=x units=205 total_ms=41 issue_ms={iss:.0f} "
+            f"write_order=OFF why=FLLIPER_PDFLIP_BAR1_WRITE_ORDER=0 prep_ms=3 collect_batch={cb} calls=68"),
+            "verify": {"bad_payload": 0, "bad_padding": 0}})
+    deps = [{"wall_ms": 40.0, "bytes": 640 << 20, "lane_time": lt_d, "batch_ms": [1.0]}] * 2
+    st = B.lane_stats(deps, cols, 640 << 20)
+    assert st["collect_lane_time"]["issue_ms"]["max"] == 30.0
+    assert st["collect_batch"] == "on" and st["collect_batch_why"] is None
+    off = [{"lane_time": B.parse_lane_time(
+        "PDFLIP-BAR1 lane-time lane=p0 issue_ms=55 write_order=readbackx3 "
+        "collect_batch=OFF calls=0 why=cudart_batch_copier_refused:_canary"), "verify": None}]
+    st2 = B.lane_stats(deps[:1], off, 640 << 20)
+    assert st2["collect_batch"] == "OFF" and st2["collect_batch_why"].startswith("cudart_batch")
