@@ -175,7 +175,7 @@
      "evidence": {"file": "/spinning/gpu-arb/docker/entrypoint.sh", "zeile": 328, "anchor": "PROFILE_D_ONLY"}},
     {"id": "K57", "von": "PROFILE_SHM_MIN_GIB", "nach": "SHM", "rel": "requires", "calc": "text", "value": null,
      "satz": "/dev/shm below the profile minimum is refused by name with SHM -- the threshold is exactly this threshold.",
-     "evidence": {"file": "/spinning/gpu-arb/docker/entrypoint.sh", "zeile": 514, "anchor": "PROFILE_SHM_MIN_GIB"}},
+     "evidence": {"file": "/spinning/gpu-arb/docker/entrypoint.sh", "zeile": 514, "anchor": "PROFILE_SHM_MIN_GIB * GIB"}},
     {"id": "K58", "von": "PROFILE_MEMAVAIL_MIN_GIB", "nach": "MEMAVAIL", "rel": "requires", "calc": "text", "value": null,
      "satz": "The MemAvailable minimum of the profile is checked against the actual host value -- below it the start is refused with MEMAVAIL.",
      "evidence": {"file": "/spinning/gpu-arb/docker/entrypoint.sh", "zeile": 525, "anchor": "PROFILE_MEMAVAIL_MIN_GIB"}},

@@ -29,6 +29,7 @@ from rigdash import server as S  # noqa: E402
 
 FIXTURE_TREE = os.path.join(HERE, "fixtures", "kartenplan", "planner_tree", "python")
 REPO_CATALOG = os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json")
+REPO_PY = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", "python"))        # <repo>/python: the source tree of THIS checkout
 with open(REPO_CATALOG, encoding="utf-8") as _f:
     KNOWN = frozenset(json.load(_f)["entries"])          # die Katalognamen: nur fuer sie zeigt der Laufbericht einen Wert
 HIDDEN = redact.HIDDEN_UNKNOWN
@@ -494,10 +495,23 @@ class Redaction(Base):
             self.assertNotIn(probe, out, probe)
             self.assertIn("<redacted>", out, probe)
         self.assertEqual(redact.text_for_issue("W64 PdFlipTpOperatingPointInfeasible: x"), "W64 PdFlipTpOperatingPointInfeasible: x")
-        # die Liste kommt aus dem Quelltext: ein Name, der dort als Klasse steht, bleibt lesbar (Beleg: class PdFlipDKvStageWavesRefused)
-        self.assertIn("PdFlipDKvStageWavesRefused", redact.known_idents())
-        self.assertIn("PdFlipTpOperatingPointInfeasible", redact.known_idents())
-        self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.known_idents())
+        # die Liste kommt aus dem Quelltext: ein Name, der dort als Klasse steht, bleibt lesbar (Beleg: class PdFlipDKvStageWavesRefused).
+        # Der Baum ist hier der DIESES Repos (python/), nicht der, den die Maschine zufaellig hat: ohne den Pin liest known_idents() den ausgerollten
+        # Planer-Baum unter /opt/rigdash/kartenplan/current, und der kennt eine Klasse erst nach dem naechsten Planer-Deploy (gemessen 23.10.: dort fehlt sie).
+        saved = (redact._known_cache, os.environ.get("HWPROFIL_TREE"))
+        try:
+            redact._known_cache = None
+            os.environ["HWPROFIL_TREE"] = REPO_PY
+            self.assertTrue(os.path.isdir(os.path.join(REPO_PY, "flliper", "srt", "pdflip")), REPO_PY)
+            self.assertIn("PdFlipDKvStageWavesRefused", redact.known_idents())
+            self.assertIn("PdFlipTpOperatingPointInfeasible", redact.known_idents())
+            self.assertNotIn("AbcdEfghIjklMnopQrstUvwxYz12Ab", redact.known_idents())
+        finally:
+            redact._known_cache = saved[0]
+            if saved[1] is None:
+                os.environ.pop("HWPROFIL_TREE", None)
+            else:
+                os.environ["HWPROFIL_TREE"] = saved[1]
 
     def test_without_a_source_tree_only_the_builtin_names_stay(self):
         saved = (redact._known_cache, os.environ.get("HWPROFIL_TREE"), os.environ.get("KARTENPLAN_TREE"), redact._tree_candidates)
@@ -553,6 +567,7 @@ class Redaction(Base):
         self.assertGreater(len(names), 2000)
         hits = [n for n in names if redact.secret_name(n)]
         self.assertEqual(hits, ["--admin-api-key", "--api-key", "--ssl-keyfile-password", "FLLIPER_PDFLIP_BOOT_TOKEN",
+                                "FLLIPER_PDFLIP_LBV_ROW_SAME_PASS",    # S48: an on/off switch ("same pass" = same forward pass); the last word ``pass`` trips the name rule -- over-redaction is the safe side
                                 "FLLIPER_PDFLIP_PRESENCE_FETCH_KEY",   # RC5: a switch (the fetch's key form), redacted by the name rule -- over-redaction is the safe side
                                 "FLLIPER_REGISTRY_ADMIN_API_KEY",
                                 "FLLIPER_REGISTRY_API_KEY"])    # catalog order: since the F0-D rename the subsystem prefix sorts before FLLIPER_REGISTRY

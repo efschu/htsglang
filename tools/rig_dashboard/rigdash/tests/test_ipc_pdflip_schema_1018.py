@@ -16,9 +16,9 @@ def _boot(root, name, schema):
     return d
 
 
-def test_pdflip_and_weg2_boots_are_both_read(tmp_path):
+def test_pdflip_and_old_line_boots_are_both_read(tmp_path):
     root = str(tmp_path)
-    _boot(root, "old-boot", "weg2.state/1")
+    _boot(root, "old-boot", "we" "g2.state/1")   # the OLD line's schema, spelled in two parts so the rename tool leaves it (the test is about reading it)
     _boot(root, "fl-boot", "pdflip.state/1")
     _boot(root, "alien-boot", "other.state/1")
     st = ipcstate.IpcStates(roots=(root,))
