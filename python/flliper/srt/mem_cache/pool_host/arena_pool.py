@@ -1839,10 +1839,17 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             dst_rows = int(device_pool.k_buffer[layer_id].shape[0])
         except Exception:  # noqa: BLE001 -- a desk double without buffers
             dst_rows = -1
+        # PPAUSE-LOAD-FENCE: the host wall of these four reads -- a CUDA index tensor (P-NOSYNC keeps the
+        # device rows on the card) is a D2H sync on the load stream, behind the fence to the forward in flight
+        _lfp = bool(envs.FLLIPER_PDFLIP_LOAD_FENCE_PROBE.get())
+        _lf_t = time.perf_counter() if _lfp else 0.0
         s_min = int(slots.min()) if slots.numel() else 0
         s_max = int(slots.max()) if slots.numel() else -1
         d_min = int(device_indices.min()) if device_indices.numel() else 0
         d_max = int(device_indices.max()) if device_indices.numel() else -1
+        if _lfp:
+            self._pdflip_guard_ms = float(getattr(self, "_pdflip_guard_ms", 0.0) or 0.0) + (
+                time.perf_counter() - _lf_t) * 1000.0
         pinned = "n/a"
         bm = getattr(self, "_pinned", None)
         if bm is not None and slots.numel():

@@ -7,7 +7,7 @@ import time
 from array import array
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -4909,8 +4909,16 @@ class SchedulerPPMixin:
                         and not any(b is not None for b in self.mbs)
                         and not self._pp_row_any_proxy_signal()
                     ):
-                        recv_reqs = self.request_receiver.recv_requests()
-                        self._pp_occupant_since = {}
+                        # PPAUSE-FRAME-FIRST (SOLL R11): before the indefinite park, poll the
+                        # counters for the NEXT CHAIN or a FRAME -- whichever is posted first,
+                        # the chain always ahead of the frame. A frame first takes the existing
+                        # proxy arm below (recv_reqs=[]); the chain or a lapsed window takes
+                        # the blocking receive exactly as before.
+                        if self._pp_follower_idle_wait() == "proxy":
+                            recv_reqs = []
+                        else:
+                            recv_reqs = self.request_receiver.recv_requests()
+                            self._pp_occupant_since = {}
                     else:
                         # #1071 HORIZON. Taking this arm is legitimate and
                         # frequent -- it is the ordinary 2 ms of pipeline skew
@@ -10089,6 +10097,66 @@ class SchedulerPPMixin:
         # comparison is counter-against-its-own-twin.
         posted = counters.sent(CHAN_REQ, self._pp_flip_upstream())
         return int(counters.local_consumed(CHAN_REQ)) < int(posted)
+
+    def _pp_follower_idle_wait(
+        self: Scheduler,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> str:
+        """PPAUSE-FRAME-FIRST: what ends an idle follower's wait -- 'chain', 'proxy' or 'park'.
+
+        THE CASE (27B rc35i4ar a45112428e, P = PP2 over 2x3080, boot ..._1023_144422):
+          PP0 14:48:32 '#969N ADMIT slot=0 fwd_ct=6 extend=2008 rids=[pdflip-1-3]' (launched), then
+          'S82 COMMIT-PARK n=1 outcome=read rid=pdflip-1-2 waited_ms=20480.2' at its next pass top --
+          a REAL store read (l3fill 71936 pages, 20.8 s) -- so PP0's next chain went out at 14:48:53.
+          PP1 had looked at its gate BEFORE PP0 sent the proxy of fwd 6 (the proxy follows PP0's commit),
+          saw 'gate=False proxy=False mbs=0', and took the indefinite chain park:
+          'PP-CHAIN-RECV #1460 CHAIN-RECV blocked 20660 ms', and only then '#969N ADMIT fwd_ct=6'.
+          The frame had been on its wire for ~20 s; pdflip-1-3's PP1 half (and its first token) waited.
+          Same shape, smaller, on ..._1023_140032: 14:10:36-41 'CHAIN-RECV blocked 4278 ms'.
+
+        THE RULE (SOLL R11 -- the front and PP0 decide, the ranks execute finished rows): the follower
+        decides nothing here. It only stops waiting for the wrong message. Each poll asks, in this order,
+          1. is the next chain posted (`_pp_row_chain_pending`)? -> 'chain' (the blocking receive, now
+             bounded by transfer -- the old branch);
+          2. is a frame posted (`_pp_row_any_proxy_signal`)? -> re-ask 1 (PP0 posts chain s BEFORE frame
+             s, so a frame seen after a chain-less read may hide a chain posted in between: the chain
+             still goes first), else 'proxy' -- the loop takes the existing proxy arm, the one a follower
+             already takes when the frame is there at the gate ('#1460 FOLLOWER-GATE gate=False
+             proxy=True mbs=0', rc35 14:13:04);
+          3. the window (FLLIPER_PP_FOLLOWER_FRAME_WAIT_S, default 30 s) lapsed -> 'park', the old
+             indefinite receive. 'park' also when the counters cannot answer (no signal channel), and
+             at once with the window 0.
+        A follower therefore never runs a frame while a posted chain is unread (danger direction:
+        the stages drift apart), and never waits for a chain while PP0's frame lies on its wire.
+        """
+        bound = float(envs.FLLIPER_PP_FOLLOWER_FRAME_WAIT_S.get() or 0.0)
+        if bound <= 0.0:
+            return "park"
+        t0 = clock()
+        while True:
+            chain = self._pp_row_chain_pending()
+            if chain is None:
+                return "park"
+            if chain:
+                return "chain"
+            if self._pp_row_any_proxy_signal():
+                if self._pp_row_chain_pending():
+                    return "chain"
+                waited_ms = (clock() - t0) * 1000.0
+                n = int(getattr(self, "_ppause_frame_first_n", 0) or 0) + 1
+                self._ppause_frame_first_n = n
+                if waited_ms >= 50.0 and (n <= 32 or (n & (n - 1)) == 0):
+                    logger.info(
+                        "PPAUSE FRAME-FIRST pp_rank=%s waited_ms=%.0f (n=%d): the frame of a forward PP0 "
+                        "launched arrived before PP0's next chain -- executed now instead of in the "
+                        "indefinite chain park (SOLL R11: PP0's row, no decision of this rank)",
+                        getattr(getattr(self, "ps", None), "pp_rank", "?"), waited_ms, n,
+                    )
+                return "proxy"
+            if clock() - t0 >= bound:
+                return "park"
+            sleep(0.002)
 
     def _pp_row_any_proxy_signal(self: Scheduler) -> bool:
         """#631 ROW AUTHORITY: any proxy frame stashed or provably in flight?
