@@ -6941,7 +6941,9 @@ class SchedulerPPMixin:
             # dispatched list below stays `recv_reqs`.
             _wire_reqs = recv_reqs
             if pdflip_store_told.armed(self) and pdflip_store_told.is_pp0(self):
-                _wire_reqs = pdflip_store_told.pp0_publish(self, recv_reqs)
+                # PPAUSE-PGAP: PP0's whole pass top (told publish incl. the S82 park) is a #PGAP host term
+                with _pov.span("pass_top"):
+                    _wire_reqs = pdflip_store_told.pp0_publish(self, recv_reqs)
                 _pp_seg(self, "in.told_publish")
                 # RO: the rids P can only skip (held/paced) for the front's
                 # dispatch cap -- bookkeeping, nothing on the wire changes.
