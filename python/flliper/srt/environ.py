@@ -3322,7 +3322,11 @@ class Envs:
     # that begins while the box is busy alarms exactly as fast as before. 0 = off (default): the pre-fix verdict,
     # byte for byte, nothing written onto the scheduler. Same name as the 27B branch's switch (deskq 1981); here
     # without the dual-layout gate.
-    FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK = EnvBool(False)
+    # 27b-flipverdict-1023 (boot 16, 23.10.: P alarmed 'NO first token for 103.6s' five seconds after the arrival, the
+    # token clock ran through P's sleep and idle rest; WEDGE-STACK dumps + a corridor-relief post followed): default ON
+    # per the user order of 14.10. (new functions default on). 0 keeps the pre-fix verdict. The 27B line arms it only in
+    # the dual layout (invariant_checker._wedge_queue_clock_armed).
+    FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK = EnvBool(True)
 
     # deskq 52 (user decision 06.10.): switches and thresholds for the watchdogs that STOP the group or the process
     # hard. Every default is today's behaviour byte for byte (switch on, threshold as before); an unset env changes

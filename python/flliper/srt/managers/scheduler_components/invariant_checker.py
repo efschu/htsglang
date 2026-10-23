@@ -1386,7 +1386,8 @@ def _wedge_threshold_order_warning() -> Optional[str]:
 
 
 def _wedge_queue_clock_armed() -> bool:
-    """deskq 1981: FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK on AND the dual layout (default off = pre-fix verdict).
+    """deskq 1981: FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK on AND the dual layout (default on since 27b-flipverdict-1023;
+    0 = the pre-fix verdict).
     Never raises: a bad value reads as off."""
     try:
         return bool(envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.get()) and (

@@ -194,6 +194,11 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
+        # 27b-flipverdict-1023 B: the page-hash extension is loaded here, before
+        # READY, not by the first request's store probe in the scheduler thread.
+        from flliper.srt.mem_cache.cpp_utils.native_hash import prewarm_native_hash
+
+        prewarm_native_hash("init_hicache")
     return cache
 
 

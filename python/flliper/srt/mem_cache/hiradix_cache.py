@@ -214,6 +214,10 @@ class HiRadixCache(RadixCache):
         from flliper.srt.mem_cache.prefetch_budget import log_prefetch_limit
 
         log_prefetch_limit(self.cache_controller, site="hiradix_init")
+        # 27b-flipverdict-1023 B: load the page-hash extension before READY
+        from flliper.srt.mem_cache.cpp_utils.native_hash import prewarm_native_hash
+
+        prewarm_native_hash("hiradix_init")
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
