@@ -29,6 +29,7 @@ from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
+import inspect
 import types
 import unittest
 from unittest import mock
@@ -216,28 +217,31 @@ class TestOneCensusPerSweep(CustomTestCase):
 
 
 class TestARoomChangeChangesTheAnswer(CustomTestCase):
-    def test_a_spill_that_frees_room_mid_sweep_gets_the_claims(self):
-        """The first room question's spill releases room: the memo's refusal and
-        census are void, and the chain is claimed from there (never a stale
-        refusal of a freed room)."""
-        arena = _Arena(slots=64, complete=64, referenced=64)
+    def test_a_spill_that_frees_room_mid_sweep_voids_the_cached_room(self):
+        """Heads big (64 pages, its claim refused: arms the skip), A, B, C (16 pages
+        each), room 0. A's room question reads the census (room 0: refused). B's
+        spill frees 32 slots: B is claimed. C must read the census AGAIN and be
+        claimed -- a cached room of 0 would have refused it (stale refusal)."""
+        arena = _Arena(slots=1000, complete=1000, referenced=1000)
         pool = _Pool(arena)
-        cache, chain = _chain_tree(10)
-        state = {"n": 0}
+        cache, (big, a, b, c) = _heads_tree([64, 16, 16, 16])
+        asked = {"n": 0}
 
         def spill(self, p, n, claimer=None):
-            state["n"] += 1
-            if state["n"] == 1:
+            # only the room question's spill (write_backup's own spill attempts free nothing here)
+            if not any(f.function == "_pdflip_full_arena_refuses" for f in inspect.stack()[1:4]):
+                return 0
+            asked["n"] += 1
+            if asked["n"] == 2:
                 arena.referenced -= 32   # the spill let 32 COMPLETE slots go
                 return 32
             return 0
 
-        stats = _sweep(cache, pool, chain, spill=spill)
-        self.assertGreaterEqual(stats["issued"], len(chain) - 1, "the room the spill freed serves the chain")
-        self.assertLessEqual(stats["refused"], 1, "at most the first claim, before the spill, was refused")
-        self.assertTrue(all(n.backuped or n.write_through_pending_id is not None for n in chain),
-                        "every node of the chain is backed once the room is there")
-        self.assertGreaterEqual(arena.census_reads, 1, "after the room moved, the census is read again")
+        stats = _sweep(cache, pool, [big, a, b, c], spill=spill)
+        self.assertEqual(pool.claims, [big.hash_value[0], b.hash_value[0], c.hash_value[0]])
+        self.assertEqual(arena.census_reads, 2, "A read it; after B's spill C read it again")
+        self.assertEqual(stats["issued"], 2)
+        self.assertEqual(stats["refused"], 2)
 
     def test_a_claim_that_uses_the_room_up_voids_the_cached_room(self):
         """Heads: big (64 pages, refused: arms the skip), A (16 pages, the room is
