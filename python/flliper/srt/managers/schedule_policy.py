@@ -1492,6 +1492,11 @@ class PrefillAdder:
         #: exchange here (`Scheduler._form_a_admission_follow_fn`); None keeps
         #: every gate in `add_one_req` rank-local exactly as before.
         self.form_a_admission_follow = None
+        #: RA (R11, managers/tp_admission_agree.py): on a plain TP group (tp > 1,
+        #: pp 1, no Form A) the scheduler installs the group-MIN gate verdict
+        #: here (`tp_admission_agree.make_agree`); None keeps every gate
+        #: rank-local exactly as before.
+        self.tp_admission_agree = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -3173,6 +3178,10 @@ class PrefillAdder:
         # point inside the lock (`form_a_admission_follow`); everywhere else
         # the first failing gate returns exactly as before.
         _fa_follow = self.form_a_admission_follow
+        # RA (SOLL R11, tp_admission_agree): off a Form A group the same gates
+        # are gathered into ONE group verdict (MIN) at the same point inside
+        # the lock -- never a local early return a peer does not take.
+        _tp_agree = self.tp_admission_agree if _fa_follow is None else None
         # H98d: this rank (the Form A host) found its match below the group
         # depth planted at the top of the pass -- refused through the H105
         # verdict on every rank (OTHER), or the H98 stop without a verdict.
@@ -3227,7 +3236,7 @@ class PrefillAdder:
             _gate_why = "rem_input_no_chunk"
             _gate_nums = dict(input=int(real_input_tokens), rem_input=self.rem_input_tokens)
 
-        if _gate is not None and _fa_follow is None:
+        if _gate is not None and _fa_follow is None and _tp_agree is None:
             return self._refuse(req, _gate, _gate_why or "unlabeled", **_gate_nums)
 
         with self._lock_node(req.last_node):
@@ -3324,6 +3333,22 @@ class PrefillAdder:
                         int(self.rem_total_tokens),
                     )
                 _fa_host_first = False
+            elif _tp_agree is not None:
+                # RA (R11): after every rank-local gate (pre-lock and in-lock)
+                # and BEFORE the load-back -- the one point every rank of the
+                # plain TP group reaches for this rid. MIN: ADMIT only when
+                # every rank's own pool admits; else every rank refuses with
+                # the first refusing rank's code.
+                _ra_code = _tp_agree(
+                    req, _gate, int(total_tokens),
+                    _rem_total if _rem_total is not None else self.rem_total_tokens,
+                )
+                if _ra_code == "ADMIT":
+                    _gate = None
+                else:
+                    if _gate is None:
+                        _gate_why = "tp_group_verdict"
+                    _gate = AddReqResult[_ra_code]
             if _gate is not None:
                 # a None local name with a refusal = the group's decider refused
                 return self._refuse(req, _gate, _gate_why or "h105_group_verdict", **_gate_nums)
