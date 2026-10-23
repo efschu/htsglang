@@ -48,6 +48,8 @@ import socket
 import struct
 import threading
 import time
+import random
+import zlib
 from dataclasses import dataclass, field
 from typing import Mapping as _Map, Optional
 
@@ -462,7 +464,7 @@ class SocketCredits:
     """One 5-byte frame per credit on the lane's open connection; a plan
     frame carries a length-prefixed JSON. Both sides read in order, so the
     kinds are checked, never searched."""
-    KINDS = {"plan": b"P", "full": b"F", "free": b"R", "done": b"D"}
+    KINDS = {"plan": b"P", "full": b"F", "free": b"R", "done": b"D", "sum": b"S"}
 
     def __init__(self, sock, liveness=None):
         self.sock, self.liveness = sock, liveness
@@ -879,10 +881,10 @@ def run_readback_probe(read_once, n: int, stall_ms: float, clock=time.perf_count
         ms = (clock() - t0) * 1000.0
         lat.append(ms)
         one = got is not None and bytes(got) == _ALL_ONES
-        if one:
-            ones += 1
         if ms > stall_ms:
             stalls += 1
+            if one:          # the completion-timeout signature is a STALLED read's data
+                ones += 1
             if stalls >= need or one:
                 break
     return lat, ones
@@ -1687,6 +1689,12 @@ class Bar1Lanes:
                 ring = len(slot_addrs)
                 borrowed = "+".join(r["borrowed"] for r in regions_meta)
         except Exception as exc:  # noqa: BLE001 -- a named refusal, the host lane stays
+            for _fd in ([locals().get("fd")] + list(locals().get("extra_fds") or [])):
+                if isinstance(_fd, int) and _fd >= 0:
+                    try:
+                        os.close(_fd)
+                    except OSError:
+                        pass
             self.refusals[lane_key] = f"window: {type(exc).__name__}: {exc}"
             self.log(f"PDFLIP-BAR1 lane={lane_key} role=dst REFUSED {self.refusals[lane_key]} -> host lane")
             self._mark_no_window(lane_key, self.refusals[lane_key])
@@ -1762,7 +1770,7 @@ class Bar1Lanes:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.settimeout(10.0)
                 s.connect(path)
-                data, fds, _flags, _addr = socket.recv_fds(s, 4096, 4)
+                data, fds, _flags, _addr = socket.recv_fds(s, 4096, 17)  # MULTI-REGION: up to ring 16 + 1
                 meta = json.loads(data.decode())
                 break
             except (OSError, ValueError):
@@ -2149,6 +2157,18 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                 f"{sorted(lanes.turn.get(lane_key) or ())})")
     if preplan is not None:
         preplan["turn_s"] = time.perf_counter() - tt0
+        preplan["recheck"] = "-"
+        if preplan["turn_s"] * 1000.0 >= preplan_recheck_ms():
+            # PREPLAN-RECHECK: the destinations may have changed state while
+            # the turn waited; a refused one rebuilds the plan after the turn,
+            # where the per-piece cut names it exactly as before
+            _rw = preplan_recheck(preplan, batches, descs, no_write or (), lane_key, tp)
+            if _rw:
+                preplan = {"at": "turn", "turn_s": preplan["turn_s"], "recheck": "rebuilt"}
+                preplan = dict(collect_preplan(ops, device, batches, descs, no_write or (), lane_key,
+                                               tp, base, ring, slot_bytes), **preplan)
+            else:
+                preplan["recheck"] = "ok"
     try:
         return _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
                              budget_s, device, log, base, slot_bytes, ring, batches, tp,
@@ -2404,7 +2424,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 c2 = (SocketCredits(chan, liveness) if chan is not None
                       else FileCredits(d, seq, liveness))
                 if not plan_sent:
-                    c2.send("plan", 0, {"batches": plan})
+                    c2.send("plan", 0, _plan_rec)
                 nf = int(next_free)
                 with lane_streams(ops, device, 1) as fst:
                     for x in rest:
@@ -2422,6 +2442,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                                          int(batches[x].total_bytes), fst[0])
                         ops.synchronize(fst[0])
                         c2.send("full", x)
+                    _send_sum(c2)
                     if via == "sock":
                         while nf < nb:
                             if c2.recv("free", nf, budget_s) is None:
@@ -2440,13 +2461,44 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         lanes.backlog_push(lane_key, job)
         return ""
 
+    # LANE-INTEGRITY: the depositor samples its SOURCE before any batch (the
+    # spill path below still has it), announces the record in the plan
+    integ_f = ""
+    want_sum = False
+    _sum_payload = None
+    _sum_state = {"sent": False}
+    if role == "src" and integrity_samples() > 0:
+        try:
+            _ist = streams[0] if streams else 0
+            _irows = []
+            for g_, i_, r_, o_, n_ in integrity_plan(batches, seq, integrity_samples(), tp):
+                pc_ = batches[g_].pieces[i_]
+                d_ = descs[pc_.desc_index]
+                if d_.src_ptr is None:
+                    continue
+                _irows.append([g_, i_, r_, o_, n_, zlib.crc32(_read_dev(
+                    ops, _sample_addr(int(d_.src_ptr), pc_, r_, o_, "src", tp), n_, _ist))])
+            _sum_payload = {"samples": _irows}
+            integ_f = f"sent:{len(_irows)}"
+        except Exception as exc:  # noqa: BLE001 -- unchecked tag, named on the line
+            _sum_payload = None
+            integ_f = f"OFF why={_compact(f'{type(exc).__name__}: {exc}', 60)}"
+    elif role == "src":
+        integ_f = f"OFF why={ENV_INTEGRITY_SAMPLES}=0"
+    _plan_rec = {"batches": plan, **({"sum": True} if _sum_payload is not None else {})}
+
+    def _send_sum(c) -> None:
+        if _sum_payload is not None and not _sum_state["sent"]:
+            _sum_state["sent"] = True
+            c.send("sum", 0, _sum_payload)
+
     try:
         if role == "src":
             _busy = getattr(lanes, "backlog_busy", None)
             if _busy is not None and _busy(lane_key):
                 # the lane's byte stream belongs to the backlog until it drains
                 return _spill_rest(0, 0, plan_sent=False)
-            cred.send("plan", 0, {"batches": plan})
+            cred.send("plan", 0, _plan_rec)
         else:
             tw = time.perf_counter()
             got = cred.recv("plan", 0, budget_s)
@@ -2458,6 +2510,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 return (f"bar1 collect lane={lane_key} seq={seq}: the deposit plan "
                         f"({len(got.get('batches') or [])} batches) differs from this side's cut "
                         f"({len(plan)}) -- the two plans disagree")
+            want_sum = bool(got.get("sum"))
 
         def _finish(g):
             timed_sync(ops, streams[ring_slot(g, ring)], clk, query=sync_q)
@@ -2595,6 +2648,23 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 _finish(g - lag)
         for g in range(max(0, nb - lag), nb):
             _finish(g)
+        if role == "src":
+            _send_sum(cred)
+        _imiss = ""
+        if role == "dst" and want_sum:
+            tw = time.perf_counter()
+            srec = cred.recv("sum", 0, budget_s)
+            clk.credit += time.perf_counter() - tw
+            if srec is None:
+                return (f"bar1 collect lane={lane_key} seq={seq}: the announced integrity "
+                        f"record did not come within {budget_s:.0f} s")
+            n_s, n_v, n_k, _imiss = integrity_verify(srec, batches, descs, _nw, ops,
+                                                     streams[0] if streams else 0, tp)
+            integrity_record(seq, n_s, n_v, n_k, 1 if _imiss else 0)
+            integ_f = (f"MISMATCH verified:{n_v}/{n_s}" if _imiss
+                       else f"verified:{n_v}/{n_s} skipped={n_k}")
+        elif role == "dst":
+            integ_f = "not-announced"
         if role == "dst":
             if via == "file":
                 for g in range(max(0, nb - ring), nb):
@@ -2603,6 +2673,11 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     except FileNotFoundError:
                         pass
             cred.send("done", 0)
+            if _imiss:
+                # the depositor is released (done), the leg stops on the name
+                log(f"PDFLIP-BAR1-INTEGRITY MISMATCH lane={lane_key} seq={seq} {_imiss}")
+                return (f"bar1 INTEGRITY MISMATCH lane={lane_key} seq={seq}: {_imiss} -- the "
+                        f"bytes in this rank's weights differ from the source; refusing the tag")
         else:
             # the collector's done closes the tag: its last copies out of the
             # slots are through before this side's next tag writes them. On a
@@ -2662,7 +2737,9 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
         f"lag={lag} prep_ms={prep_s * 1000:.0f}"
         + (f" prep_at={pp_.get('at', 'turn')} turn_ms={float(pp_.get('turn_s', 0.0)) * 1000:.0f}"
+           f" prep_recheck={pp_.get('recheck', '-')}"
            if role == "dst" else "")
+        + (f" integrity={integ_f}" if integ_f else "")
         + (f" issue_gil={gil_mode}" if gil_mode else "")
         + f" sync_query={'held' if sync_q else 'off'} sync_skipped={clk.sync_skipped}/{clk.syncs}"
         + (f" ffwait={ffwait_n if first_free_flag_on() else 'off'}" if role == "src" else "")
@@ -2677,6 +2754,161 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         log(f"PDFLIP-FLIPCYCLE stage=legs_engine lane={lane_key} seq={seq} top={_gate.top} "
             f"ms={_gate_ms:.0f} floor_ms=0 (H4: this slower-receiver lane yielded the D2H "
             f"engine to the lane into the widest receiver)")
+    return ""
+
+
+# -- LANE-INTEGRITY (27b-lanes3x80-1023, review of 9373c7647c) -----------------
+#
+# The BAR1 payload path carried no content check: credit frames, the 16-B
+# arrival readback per batch and the per-destination pointer probe prove that
+# a batch ARRIVED and WHERE it goes, not WHAT arrived. The 3080 lanes run
+# switch-direct for the first time since 23.10. 21:15Z (ACS 0011), and the same
+# day saw wrong data on the switch path (#174). So every tag is now sampled:
+# the depositor reads ``samples`` chunks of <= 4 KiB of its SOURCE (positions
+# drawn deterministically from the seq over the plan's pieces, the first and
+# the last piece always included; a STRIDED2D chunk lies inside one row) and
+# sends their crc32 after its last batch (credit kind ``sum``, announced in the
+# plan record so a peer without it is not waited for); the collector reads the
+# same chunks from its DESTINATION after its last copy-out synced and compares.
+# A mismatch is a NAMED refusal of the tag (the leg stops on it), never a
+# silent continue. Per flip one ``PDFLIP-BAR1-INTEGRITY`` line (verified /
+# sampled / skipped no-write / mismatch). Cost: 2 x samples synchronous 4-KiB
+# D2H reads per tag. Sampled, not exhaustive: a systematic fault (wrong slot,
+# stale visibility, a dropped batch, a torn region) is caught; a single flipped
+# bit in an unsampled chunk is not. FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES (8,
+# 0 = off).
+ENV_INTEGRITY_SAMPLES = "FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES"
+INTEGRITY_SAMPLES_DEFAULT = 8
+INTEGRITY_CHUNK = 4096
+_INTEG_LOCK = threading.Lock()
+_INTEG: dict = {}      # flip -> [tags, sampled, verified, skipped, mismatch]
+
+
+def integrity_samples(env: Optional[_Map[str, str]] = None) -> int:
+    env = os.environ if env is None else env
+    try:
+        n = int(env.get(ENV_INTEGRITY_SAMPLES, str(INTEGRITY_SAMPLES_DEFAULT)))
+    except ValueError:
+        n = INTEGRITY_SAMPLES_DEFAULT
+    return max(0, min(256, n))
+
+
+def integrity_plan(batches, seq, n: int, tp) -> list:
+    """``[(g, piece index, row, offset, length), ...]`` -- deterministic from
+    ``seq`` and the cut, so both sides could derive it; the depositor sends it."""
+    flat = [(g, i, pc) for g, b in enumerate(batches) for i, pc in enumerate(b.pieces)
+            if int(getattr(pc, "nbytes", 0) or 0) > 0]
+    if not flat or n <= 0:
+        return []
+    rng = random.Random(zlib.crc32(str(seq).encode()))
+    picks = [flat[0], flat[-1]] + [flat[rng.randrange(len(flat))] for _ in range(max(0, n - 2))]
+    out = []
+    for g, i, pc in picks[:max(1, n)]:
+        if pc.kind == tp.FLAT:
+            row, span = 0, int(pc.nbytes)
+        else:
+            row, span = rng.randrange(max(1, int(pc.rows))), int(pc.run_bytes)
+        length = max(1, min(INTEGRITY_CHUNK, span))
+        out.append((g, i, row, rng.randrange(0, span - length + 1), length))
+    return out
+
+
+def _sample_addr(base: int, pc, row: int, off: int, side: str, tp) -> int:
+    if pc.kind == tp.FLAT:
+        return int(base) + int(pc.src_off if side == "src" else pc.dst_off) + int(off)
+    if side == "src":
+        return int(base) + int(pc.src_off) + int(row) * int(pc.spitch) + int(off)
+    return int(base) + int(pc.dst_off) + int(row) * int(pc.dpitch) + int(off)
+
+
+def _read_dev(ops, addr: int, n: int, stream) -> bytes:
+    buf = ctypes.create_string_buffer(int(n))
+    ops.memcpy_async(ctypes.addressof(buf), int(addr), int(n), stream)
+    ops.synchronize(stream)
+    return buf.raw
+
+
+def integrity_verify(srec, batches, descs, no_write, ops, stream, tp):
+    """The collector's side: ``(sampled, verified, skipped, mismatch text)``."""
+    sampled = verified = skipped = 0
+    for row in (srec or {}).get("samples") or []:
+        sampled += 1
+        try:
+            g, i, r, off, n, crc = (int(x) for x in row)
+            pc = batches[g].pieces[i]
+        except (ValueError, TypeError, IndexError):
+            return sampled, verified, skipped, f"sample {row!r} lies outside this side's cut"
+        desc = descs[pc.desc_index]
+        name = str(getattr(desc, "param_name", "?"))
+        tag = str(getattr(desc, "tag", "") or "")
+        if (tag, name) in no_write or name in no_write or desc.dst_ptr is None:
+            skipped += 1
+            continue
+        got = zlib.crc32(_read_dev(ops, _sample_addr(int(desc.dst_ptr), pc, r, off, "dst", tp),
+                                   n, stream))
+        if got != crc:
+            return (sampled, verified, skipped,
+                    f"batch {g} piece {i} {name!r} tag={tag} row={r} off={off} len={n}: "
+                    f"source crc32 {crc:08x} != destination {got:08x}")
+        verified += 1
+    return sampled, verified, skipped, ""
+
+
+def integrity_record(seq, sampled: int, verified: int, skipped: int, mismatch: int) -> None:
+    flip = str(seq).split("-", 1)[0]
+    with _INTEG_LOCK:
+        r = _INTEG.setdefault(flip, [0, 0, 0, 0, 0])
+        for k, v in enumerate((1, sampled, verified, skipped, mismatch)):
+            r[k] += int(v)
+
+
+def integrity_flip_line(flip) -> Optional[str]:
+    """One line per flip for the collecting rank (and removes the entry)."""
+    if flip is None:
+        return None
+    with _INTEG_LOCK:
+        r = _INTEG.pop(str(int(flip)) if str(flip).lstrip("-").isdigit() else str(flip), None)
+    if r is None:
+        return None
+    return (f"PDFLIP-BAR1-INTEGRITY flip={flip} tags={r[0]} sampled={r[1]} verified={r[2]} "
+            f"skipped_no_write={r[3]} mismatch={r[4]} (crc32 of <= {INTEGRITY_CHUNK} B chunks, "
+            f"depositor source vs collector destination; {ENV_INTEGRITY_SAMPLES}="
+            f"{integrity_samples()})")
+
+
+#: PREPLAN-RECHECK (review of 9373c7647c): the preplan probed the destinations
+#: before the lane's turn; after a turn wait longer than this the probes are
+#: asked again (fresh) before the first copy-out -- one pointer query per
+#: destination, ~1 us each. 0 = always.
+ENV_PREPLAN_RECHECK_MS = "FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS"
+
+
+def preplan_recheck_ms(env: Optional[_Map[str, str]] = None) -> float:
+    env = os.environ if env is None else env
+    try:
+        return max(0.0, float(env.get(ENV_PREPLAN_RECHECK_MS, "0")))
+    except ValueError:
+        return 0.0
+
+
+def preplan_recheck(preplan: dict, batches, descs, no_write, lane_key, tp) -> str:
+    """Probe every destination of the hoisted preplan again with a FRESH probed
+    set; '' when all are still mapped device memory, else the refusal text."""
+    probe = preplan.get("probe")
+    if probe is None:
+        return ""
+    fresh: set = set()
+    for batch in batches:
+        for pc in batch.pieces:
+            desc = descs[pc.desc_index]
+            name = str(getattr(desc, "param_name", "?"))
+            tag = str(getattr(desc, "tag", "") or "")
+            if (tag, name) in no_write or name in no_write or desc.dst_ptr is None:
+                continue
+            why = tp.refuse_unmapped_dst(probe, fresh, dst=int(desc.dst_ptr), lane_key=lane_key,
+                                         i=pc.desc_index, name=name, tag=tag)
+            if why:
+                return why
     return ""
 
 

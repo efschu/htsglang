@@ -136,9 +136,18 @@ class TestProbeLoop(CustomTestCase):
         self.assertEqual(ones, 0)
 
     def test_counts_all_ones(self):
+        # 27b-lanes3x80-1023 review: all-ones counts only on STALLED reads (the
+        # completion-timeout signature); fast reads of 0xff window bytes are data
         lat, ones = bl.run_readback_probe(lambda: b"\xff" * 16, 3, 5.0)
-        self.assertEqual(ones, 3)
+        self.assertEqual(ones, 0)
         self.assertEqual(len(lat), 3)
+        t = [0.0]
+
+        def slow():
+            t[0] += 0.040
+            return b"\xff" * 16
+        lat, ones = bl.run_readback_probe(slow, 3, 5.0, clock=lambda: t[0])
+        self.assertEqual((ones, len(lat)), (1, 1))
 
     def test_env_knobs(self):
         self.assertEqual(bl.readback_probe_n({}), bl.READBACK_PROBE_N_DEFAULT)

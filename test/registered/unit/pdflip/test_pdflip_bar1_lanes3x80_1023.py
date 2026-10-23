@@ -405,5 +405,129 @@ class TestPreplanBeforeTurn(CustomTestCase):
         self.assertFalse(bl.preplan_before_turn_on({bl.ENV_COLLECT_PREPLAN: "0"}))
 
 
+def _pair_run(col_ops=None, dep_ops=None, env=None, n=6, lanes_cls=None, budget_s=10.0, seq="17-weights_7"):
+    """Depositor + collector over one contiguous 4-slot window in one process."""
+    bl._RB_SCRATCH.clear()
+    slot, ring = 4096, 4
+    win = bytearray(slot * ring)
+    root = tempfile.mkdtemp(prefix="l3x80i")
+    pairs = ((0, 1),)
+    dep = bl.Bar1Lanes("n3", "P", 0, 0, pairs, log=lambda *_a: None, root=root)
+    col = (lanes_cls or bl.Bar1Lanes)("n3", "D", 1, 0, pairs, log=lambda *_a: None, root=root)
+    col.recv["p0"] = SimpleNamespace(dptr=_addr(win), slot_bytes=slot, ring=ring)
+    dep.peers["p0"] = SimpleNamespace(dev_ptr=_addr(win), slot_bytes=slot, ring=ring)
+    srcs = [bytearray(os.urandom(slot)) for _ in range(n)]
+    dsts = [bytearray(slot) for _ in range(n)]
+    descs = [SimpleNamespace(kind=tp.FLAT, nbytes=slot, src_off=0, dst_off=0,
+                             param_name=f"w{i}", tag="weights_7",
+                             src_ptr=_addr(srcs[i]), dst_ptr=_addr(dsts[i])) for i in range(n)]
+    out, clog, dlog = {}, [], []
+    with mock.patch.dict("os.environ", env or {}):
+        def collect():
+            out["c"] = bl.run_bar1_units(descs, col_ops or _Ops(), lanes=col, lane_key="p0",
+                                         role="dst", seq=seq, phase="collect", budget_s=budget_s,
+                                         log=clog.append, order_key=(17, 6))
+
+        th = threading.Thread(target=collect)
+        th.start()
+        out["d"] = bl.run_bar1_units(descs, dep_ops or _Ops(), lanes=dep, lane_key="p0", role="src",
+                                     seq=seq, phase="deposit", budget_s=budget_s, log=dlog.append)
+        th.join(30)
+    return out, srcs, dsts, clog, dlog
+
+
+class TestLaneIntegrity(CustomTestCase):
+    """LANE-INTEGRITY: sampled crc32 of the depositor's source against the
+    collector's destination, per tag; a mismatch is a named refusal."""
+
+    def test_clean_tag_is_verified_and_counted_per_flip(self):
+        bl._INTEG.clear()
+        out, srcs, dsts, clog, dlog = _pair_run()
+        self.assertEqual(out, {"c": "", "d": ""})
+        cl = [x for x in clog if "lane-time" in x][0]
+        dl = [x for x in dlog if "lane-time" in x][0]
+        self.assertIn("integrity=verified:8/8 skipped=0", cl)
+        self.assertIn("integrity=sent:8", dl)
+        line = bl.integrity_flip_line(17)
+        self.assertIn("flip=17 tags=1 sampled=8 verified=8 skipped_no_write=0 mismatch=0", line)
+        self.assertIsNone(bl.integrity_flip_line(17))          # consumed
+
+    def test_corrupted_copy_out_is_a_named_refusal(self):
+        bl._INTEG.clear()
+
+        class Corrupt(_Ops):
+            def memcpy_async(self, dst, src, nb, stream):
+                ctypes.memmove(dst, src, nb)
+                if nb == 4096 and not getattr(self, "_done", False):
+                    self._done = True                       # first copy-out: one byte flipped
+                    b = (ctypes.c_ubyte * 1).from_address(dst + 100)
+                    b[0] ^= 0x5A
+
+        out, _s, _d, clog, _dl = _pair_run(col_ops=Corrupt())
+        self.assertEqual(out["d"], "")                     # the depositor got its done
+        self.assertIn("INTEGRITY MISMATCH", out["c"])
+        self.assertIn("source crc32", out["c"])
+        self.assertTrue(any("PDFLIP-BAR1-INTEGRITY MISMATCH" in x for x in clog))
+        self.assertIn("mismatch=1", bl.integrity_flip_line(17))
+
+    def test_off_is_named_and_not_waited_for(self):
+        out, srcs, dsts, clog, dlog = _pair_run(env={bl.ENV_INTEGRITY_SAMPLES: "0"})
+        self.assertEqual(out, {"c": "", "d": ""})
+        self.assertTrue(all(bytes(a) == bytes(b) for a, b in zip(srcs, dsts)))
+        self.assertIn("integrity=not-announced", [x for x in clog if "lane-time" in x][0])
+        self.assertIn("integrity=OFF why=", [x for x in dlog if "lane-time" in x][0])
+
+    def test_plan_is_deterministic_and_inside_the_pieces(self):
+        pcs = [SimpleNamespace(kind=tp.FLAT, nbytes=10000, src_off=0, dst_off=0),
+               SimpleNamespace(kind=tp.STRIDED2D, nbytes=6 * 512, rows=6, run_bytes=512,
+                               spitch=4096, dpitch=1024, src_off=0, dst_off=0)]
+        batches = [SimpleNamespace(pieces=pcs)]
+        a = bl.integrity_plan(batches, "9-weights_3", 8, tp)
+        self.assertEqual(a, bl.integrity_plan(batches, "9-weights_3", 8, tp))
+        self.assertEqual(len(a), 8)
+        self.assertEqual(a[0][:2], (0, 0))
+        self.assertEqual(a[1][:2], (0, 1))
+        for g, i, row, off, n in a:
+            pc = pcs[i]
+            span = pc.nbytes if pc.kind == tp.FLAT else pc.run_bytes
+            self.assertLessEqual(off + n, span)
+            self.assertLess(row, getattr(pc, "rows", 1))
+        self.assertEqual(bl.integrity_samples({}), 8)
+        self.assertEqual(bl.integrity_samples({bl.ENV_INTEGRITY_SAMPLES: "0"}), 0)
+
+
+class TestPreplanRecheck(CustomTestCase):
+    """PREPLAN-RECHECK: a destination that stops being mapped device memory
+    while the collector waits for the lane's turn is refused by name."""
+
+    def _run(self, env):
+        state = {"after_turn": False}
+
+        class Lanes(bl.Bar1Lanes):
+            def take_turn(self, lane_key, order_key, timeout_s):
+                time.sleep(0.05)
+                state["after_turn"] = True
+                return True
+
+        class Ops(_Ops):
+            def ptr_attrs(self, a):
+                return (0, 0, -1) if state["after_turn"] else (0, 2, 0)
+
+        return _pair_run(col_ops=Ops(), lanes_cls=Lanes, env=env, budget_s=2.0)
+
+    def test_a_destination_unmapped_during_the_turn_is_refused(self):
+        out, _s, _d, _c, _dl = self._run({})
+        self.assertIn("is not mapped device memory", out["c"])
+
+    def test_without_the_recheck_the_stale_plan_would_run(self):
+        out, _s, _d, clog, _dl = self._run({bl.ENV_PREPLAN_RECHECK_MS: "100000"})
+        self.assertEqual(out["c"], "")
+        self.assertIn("prep_recheck=-", [x for x in clog if "lane-time" in x][0])
+
+    def test_knob(self):
+        self.assertEqual(bl.preplan_recheck_ms({}), 0.0)
+        self.assertEqual(bl.preplan_recheck_ms({bl.ENV_PREPLAN_RECHECK_MS: "x"}), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
