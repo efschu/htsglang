@@ -1735,12 +1735,19 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     from flliper.srt.pdflip import pp_chain_announce as _w2c
 
     if _w2c.pp0_take_announced(scheduler) is None:
-        # P-MINIFWD: a lone final rest waits (bounded, measured) for the read of a
-        # queued request, so this pass's told carries it into the same forward.
-        _minifwd_hold(scheduler, recv_reqs)
-        # S82: a pass whose output receive will block parks HERE for the first of {ack set complete, read
-        # terminable, owed output posted}, so what lands meanwhile is published/admitted in THIS pass.
-        _commit_park(scheduler, recv_reqs)
+        from flliper.srt.managers import pdflip_p_overlap as _pov
+
+        # PPAUSE-PGAP (27B rc35i4ar 14:10:44): the two pass-top waits are a #PGAP host term of their own
+        # ('s82_park'). Before, a 3994 ms park sat in no term of 'host[...]' -- the P-PAUSE line read
+        # 'commit=95 d2h=981' (d2h_wait on PP0 = the downstream output's data, not a D2H of PP0's own) and
+        # the 4.1 s gap had no name.
+        with _pov.span("s82_park"):
+            # P-MINIFWD: a lone final rest waits (bounded, measured) for the read of a
+            # queued request, so this pass's told carries it into the same forward.
+            _minifwd_hold(scheduler, recv_reqs)
+            # S82: a pass whose output receive will block parks HERE for the first of {ack set complete, read
+            # terminable, owed output posted}, so what lands meanwhile is published/admitted in THIS pass.
+            _commit_park(scheduler, recv_reqs)
     paced_on = bool(getattr(scheduler, "_pdflip_told_paced_on", False))
     if paced_on:
         return _vision_at_admit(scheduler, recv_reqs, _pp0_publish_paced(scheduler, recv_reqs))
@@ -1870,6 +1877,59 @@ def _read_open(scheduler, tree, rid: str, held: Dict[str, Any]) -> bool:
     return entry is not None and getattr(entry, "operation", None) is not None
 
 
+#: PPAUSE-REVOKE (27B rc35i4ar 23.10.): counters of the revoked reads the PP0 pass-top waits drained themselves
+_REVOKE_WAIT = {"n": 0, "entry": 0, "poll": 0}
+
+
+def _drain_revokes_for(scheduler, tree, rids, site: str) -> List[str]:
+    """PPAUSE-REVOKE (27B rc35i4ar a45112428e, P log ..._1023_140032, PP0 14:10:36-41): drain the revoke queue
+    before (``site='entry'``) and while (``site='poll'``) a PP0 pass-top wait (S82 COMMIT-PARK, P-MINIFWD-HOLD)
+    looks at the open reads of ``rids``.
+
+    The case. pdflip-15-35 (22520 tokens) had 20224 resident on PP0's device; PP0's store read of the 2294-token
+    tail was answered with nothing ('PDFLIP-CLAIM-SHORT ... pp=0 asked=2294 kv=0 claimed=0') at 14:10:36 -- the
+    probe REVOKED it. A revoked operation is never terminated: its record leaves ``ongoing_prefetch`` only when
+    the scheduler thread drains the revoke queue, once per round (#1400). The S82 park held that very thread at
+    the pass top and polled ``can_terminate_prefetch`` on the record (empty ``hash_value`` is never complete) until
+    the length-priced timeout: 'S82 COMMIT-PARK n=3 outcome=read rid=pdflip-15-35 waited_ms=3994.0', '#1157
+    PREFETCH REAPED ... hit_pages=0 ... elapsed=4.24s budget=4.24s policy=timeout'. The park also withheld PP0's
+    chain: PP1 sat in its chain receive ('#1460 CHAIN-RECV blocked 4278 ms'), so the owed output could not come
+    either -- both 3080s idle, '#PGAP pp_rank=0 fwd=70 gpu_gap_ms=4100.0' with a queue of 2 (P-PAUSE). Same
+    class at 14:08:05-15 (pdflip-11-20 'waited_ms=9672.3', budget 9.86 s, gpu_gap 9648) and 14:22:23-25
+    (pdflip-21-121 'waited_ms=2742.5', claimed=0 by=mamba): 16.4 s of a stalled P in the boot's first 30 min.
+
+    Draining here is exactly what the next round does with the queue, one round early; the tree does it only
+    where that needs no peer (``drain_prefetch_revokes_uncoordinated``: group P, attention group 1) and a tree
+    without the method keeps the unchanged wait. Returns the rids whose open read the drain retired."""
+    ongoing = getattr(tree, "ongoing_prefetch", None)
+    if ongoing is None:
+        return []
+    before = [r for r in rids if r in ongoing]
+    if not before:
+        return []
+    _drain_revokes_while_waiting(tree)
+    gone = [r for r in before if r not in ongoing]
+    if gone:
+        _REVOKE_WAIT["n"] += len(gone)
+        _REVOKE_WAIT[site] = _REVOKE_WAIT.get(site, 0) + len(gone)
+        n = _REVOKE_WAIT["n"]
+        if n <= 32 or (n & (n - 1)) == 0:
+            logger.info(
+                "PPAUSE REVOKE-DRAINED site=%s rids=%s (n=%d entry=%d poll=%d): a pass-top wait found these "
+                "store reads revoked (probe below the threshold) -- drained now instead of polled to the "
+                "timeout; nothing is coming for them",
+                site, [_rt(r) for r in gone], n, _REVOKE_WAIT["entry"], _REVOKE_WAIT["poll"],
+            )
+    return gone
+
+
+def _read_terminable_draining(scheduler, tree, rid: str) -> bool:
+    """``_read_terminable`` for a wait that holds the scheduler thread: a revoke queued meanwhile is drained
+    first (PPAUSE-REVOKE, :func:`_drain_revokes_for`)."""
+    _drain_revokes_for(scheduler, tree, (rid,), "poll")
+    return _read_terminable(tree, rid)
+
+
 def _read_terminable(tree, rid: str) -> bool:
     """P-MINIFWD: would ``check_prefetch_progress(rid)`` terminate now? The
     same predicate without the termination (``can_terminate_prefetch`` is
@@ -1926,6 +1986,8 @@ def _minifwd_hold(scheduler, recv_reqs: List) -> None:
         tree = scheduler.tree_cache
         told_map: Dict[str, int] = scheduler._pdflip_store_told
         queued = [_rid(r) for r in scheduler.waiting_queue]
+        # PPAUSE-REVOKE: a revoked read is not open -- drained before the verdict counts it as one
+        _drain_revokes_for(scheduler, tree, [r for r in queued if r in held], "entry")
         control = any(type(r).__name__ in _mh.CONTROL_KINDS for r in (recv_reqs or ()))
         bound = _mh.wait_bound_s()
         verdict = _mh.decide(
@@ -1938,7 +2000,8 @@ def _minifwd_hold(scheduler, recv_reqs: List) -> None:
         )
         if not verdict.wait:
             return
-        outcome, rid, waited = _mh.wait(verdict.rids, lambda r: _read_terminable(tree, r), bound)
+        outcome, rid, waited = _mh.wait(
+            verdict.rids, lambda r: _read_terminable_draining(scheduler, tree, r), bound)
         _mh.log_hold(_rid(scheduler.chunked_req), verdict, outcome, rid, waited, bound)
     except Exception as exc:  # noqa: BLE001 -- the hold is an optimisation, the pass must run
         logger.warning("P-MINIFWD-HOLD skipped (%s: %s)", type(exc).__name__, exc)
@@ -2038,6 +2101,9 @@ def _commit_park(scheduler, recv_reqs: List) -> None:
                     ack_waits.append(rid)
                 else:
                     decidable_any = True
+        # PPAUSE-REVOKE (27B rc35i4ar 14:10:36-41, pdflip-15-35): a read the probe revoked is not open -- the
+        # revoke queue is drained BEFORE the verdict counts it, else the park polls it to its timeout (4.24 s)
+        _drain_revokes_for(scheduler, tree, [r for r in queued if r in held], "entry")
         open_reads = [r for r in queued if _read_open(scheduler, tree, r, held)]
         if paced_on and ack_waits:
             # a landed read publishes only a read-ahead this pass (its Admit follows a pass later): an
@@ -2069,7 +2135,7 @@ def _commit_park(scheduler, recv_reqs: List) -> None:
         outcome, rid, waited = _cp.wait(
             verdict,
             output_pending=lambda: _s82_output_pending(scheduler),
-            read_done=lambda r: _read_terminable(tree, r),
+            read_done=lambda r: _read_terminable_draining(scheduler, tree, r),
             acks_done=lambda r: _admit_state(r) != "wait",
             harvest=harvest,
             bound_s=bound,

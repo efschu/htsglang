@@ -418,8 +418,15 @@ _PLAN_PARTS = ("anchor", "publish", "rowcheck", "evict_drain")
 #: forward stream. Once the plan no longer waits for the running forward
 #: (P-NOSYNC, memory_pool ``_nosync_mapping_rows``), that wait lands HERE, so
 #: ``launch - fi_plan`` is the launch's own host work.
+#: PPAUSE-PGAP (27B rc35i4ar a45112428e, 23.10.): ``pass_top`` = PP0's told publish at the pass top
+#: (``pdflip_store_told.pp0_publish``), ``s82_park`` = the part of it spent in the S82 COMMIT-PARK /
+#: P-MINIFWD-HOLD waits. Before, a 3994 ms park was in no term: '#PGAP fwd=70 gpu_gap_ms=4100.0
+#: host[... output_commit=95 d2h_wait=981 process=25]' named 1.3 s of a 4.1 s gap. Appended at the END so
+#: every parser reading the old keys reads them unchanged. On PP0 ``d2h_wait`` is the wait for the
+#: DOWNSTREAM output's data (the NCCL receive the commit posted, ``_pp_prep_batch_result`` on the copy
+#: stream), not a device-to-host copy of PP0's own.
 _ORDER = ("plan", "proxy_recv", "launch", "fi_plan", "deferred_publish",
-          "output_commit", "d2h_wait", "process")
+          "output_commit", "d2h_wait", "process", "pass_top", "s82_park")
 #: PDFLIP-G (N5a 1002_114540: launch 426-640 ms ~ gpu_fwd 475-540 ms, card
 #: idle 78-180 ms on every chunk): the parts of ``launch`` -- ForwardBatch.init_new
 #: and the model's _forward_raw; ``rest`` = launch minus both (run_batch's own).
