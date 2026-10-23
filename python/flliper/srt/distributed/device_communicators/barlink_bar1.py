@@ -1074,6 +1074,44 @@ def bar1_window(bdf: str) -> Bar1Window:
     return Bar1Window(bdf=bdf, base=start, size=end - start + 1)
 
 
+def bar1_contiguous_prefix(sg, window) -> tuple:
+    """``(start, length, entries)``: the BAR1 run that maps the buffer FROM ITS
+    FIRST BYTE, in buffer order.
+
+    The sg table the holder returns is in BUFFER order: ``nv_dma_buf_map_pfns``
+    (``nv-dmabuf.c:938-975``) emits handle by handle and, inside a handle, range
+    by range in memArea order. Those ranges come from ``kbusMapFbAperture`` with
+    ``BUS_MAP_FB_FLAGS_ALLOW_DISCONTIG`` (``osapi.c`` ``rm_dma_buf_map_mem_handle``):
+    when no single BAR1 range is free, RM maps the buffer in pieces wherever
+    BAR1 VA is free -- not necessarily ascending.
+
+    The pre-1023 code SORTED the entries by address and took the contiguous run
+    from the lowest one. That glues pieces into one run whose ORDER is not the
+    buffer's: buffer pieces [p0, p1, p2] mapped at BAR1 [X, X+2L, X+L] became
+    "contiguous X..X+3L", so the sender's byte at window offset L landed in p2,
+    i.e. at buffer offset 2L -- silently, and the 64-KiB setup proof at offset 0
+    cannot see it. Here the entries are walked in their own order; the run ends
+    at the first entry that does not continue the previous one in BAR1, and it
+    must START with the first entry (buffer offset 0). An empty table or a first
+    entry outside the window gives length 0 -- the caller refuses.
+    """
+    entries = list(sg)
+    if not entries:
+        return (0, 0, 0)
+    start = int(entries[0].dma_address)
+    if not (window.base <= start < window.end):
+        return (start, 0, 0)
+    length, expected, n = 0, start, 0
+    for e in entries:
+        a, ln = int(e.dma_address), int(e.length)
+        if a != expected or a + ln > window.end:
+            break
+        length += ln
+        expected += ln
+        n += 1
+    return (start, length, n)
+
+
 PAGE_SIZE = 4096
 
 #: Largest group for which the kernel arguments have room.
@@ -3179,30 +3217,27 @@ class BarlinkBar1Transport:
         # Attach happens as THIS card -- it will write later.
         handle_, sg, total = self._holder.hold(foreign_fd, self.bdfs[self.rank])
 
-        hits = [e for e in sg if window.base <= e.dma_address < window.end]
-        if not hits:
+        start, length, n_run = bar1_contiguous_prefix(sg, window)
+        hits = sg[:n_run]
+        if length == 0:
             self._holder.release(handle_)
             raise Bar1Unavailable(
-                f"None of the {len(sg)} sg-addresses of rank {peer} lie "
-                f"within its BAR1 [{window.base:#x}, {window.end:#x}). "
-                f"First address {sg[0].dma_address:#x}. This means either "
+                f"The first of the {len(sg)} sg-addresses of rank {peer} "
+                f"({sg[0].dma_address if sg else 0:#x}) does not lie within its "
+                f"BAR1 [{window.base:#x}, {window.end:#x}). This means either "
                 f"that the IOMMU does not map identically (in which case "
                 f"the offset derived from the sg-table does not hold and "
                 f"the pattern scan would be needed), or that the driver did "
                 f"not map into BAR1 at all. No guessing -- this edge is "
                 f"dropped."
             )
-        hits.sort(key=lambda e: e.dma_address)
-        start = hits[0].dma_address
-        # Contiguous? Only the contiguous beginning can be mapped as one
-        # piece; the rest would be a second window.
-        length = 0
-        expected = start
-        for e in hits:
-            if e.dma_address != expected:
-                break
-            length += e.length
-            expected += e.length
+        if n_run < len(sg):
+            logger.info(
+                "barlink-BAR1: %s region of rank %d is mapped into BAR1 in "
+                "pieces; the buffer-order run from offset 0 covers %d of %d "
+                "sg entries (%d bytes, next entry at %#x).", kind, peer, n_run,
+                len(sg), length, sg[n_run].dma_address,
+            )
         offset = start - window.base
         if length < minimum:
             self._holder.release(handle_)

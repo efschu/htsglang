@@ -1318,7 +1318,7 @@ class Bar1Lanes:
     # -- depositor: connect + map --------------------------------------------
     def connect_peer(self, lane_key: str, timeout_s: Optional[float] = None) -> Optional[PeerWindow]:
         from flliper.srt.distributed.device_communicators.barlink_bar1 import (
-            Holder, bar1_window,
+            Holder, bar1_contiguous_prefix, bar1_window,
         )
         path = socket_path(self.boot_nonce, lane_key, other_group(self.group), self.root)
         if timeout_s is None:
@@ -1366,17 +1366,12 @@ class Bar1Lanes:
             peer_bdf = str(meta["bdf"])
             window = bar1_window(peer_bdf)
             handle_, sg, _total = self._holder.hold(fd, self.bdf())
-            hits = sorted([e for e in sg if window.base <= e.dma_address < window.end],
-                          key=lambda e: e.dma_address)
-            if not hits:
-                raise RuntimeError(f"none of {len(sg)} sg entries inside the peer's BAR1")
-            start = hits[0].dma_address
-            length, expected = 0, start
-            for e in hits:
-                if e.dma_address != expected:
-                    break
-                length += e.length
-                expected += e.length
+            # Buffer-order run from offset 0, NOT the address-sorted run: with
+            # ALLOW_DISCONTIG BAR1 pieces need not ascend, and sorting would map
+            # window offset X to some other buffer offset (barlink-visibility-1023).
+            start, length, _n_run = bar1_contiguous_prefix(sg, window)
+            if length == 0:
+                raise RuntimeError(f"first of {len(sg)} sg entries not inside the peer's BAR1")
             m_off = int(meta.get("offset", 0) or 0)
             if length < m_off + int(meta["size"]):
                 raise RuntimeError(f"contiguous BAR1 run {length} < offset {m_off} + window {meta['size']}")
