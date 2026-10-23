@@ -34,6 +34,7 @@ boot, no CUDA:
    committed" fails it while every existing test stays green.
 """
 
+import os
 import time
 import unittest
 from types import SimpleNamespace
@@ -76,6 +77,14 @@ class _FakeScheduler:
 
 
 class TestCheckAdmissionWedgeOnce(CustomTestCase):
+    def setUp(self):
+        # 27b-qclock-1023: the queue clock is armed by default in every form; these tests pin the PRE-FIX verdict (age =
+        # now - last_first_token_progress_time on a first poll), the armed semantics are in
+        # test_pdflip_wedge_qclock_1023.py / test_pdflip_admission_wedge_queue_clock_1981.py.
+        p = patch.dict(os.environ, {"FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK": "0"})
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_the_31_second_specimen_alarms_through_the_scheduler_reading(self):
         now = time.perf_counter()
         sched = _FakeScheduler(

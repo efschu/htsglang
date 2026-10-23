@@ -56,7 +56,7 @@ class _Sched:
 
 
 class QueueClockDefaultOn1023(CustomTestCase):
-    def test_unset_env_is_armed_in_the_dual_layout(self):
+    def test_unset_env_is_armed(self):
         with _unset_qc():
             self.assertTrue(IC._wedge_queue_clock_armed())
 
@@ -74,12 +74,13 @@ class QueueClockDefaultOn1023(CustomTestCase):
             alarm, detail = IC.check_admission_wedge_once(s, now=181.0)
             self.assertTrue(alarm, detail)                   # queued 20.4 s, 0 running, no token: a real stand still alarms
 
-    def test_outside_the_dual_layout_the_old_verdict_stays(self):
+    def test_outside_the_dual_layout_the_clock_is_armed_too(self):
+        # 27b-qclock-1023: boot 23.10. 17:35:55Z (pp=2, no dual layout) alarmed at 398 s for a 5 s old queue
         with _unset_qc(dual=False):
+            self.assertTrue(IC._wedge_queue_clock_armed())
             s = _Sched(last_token=0.0, queued=1)
             alarm, detail = IC.check_admission_wedge_once(s, now=100.0)
-            self.assertTrue(alarm, detail)
-            self.assertFalse(hasattr(s, "_wedge_queue_since"))
+            self.assertFalse(alarm, detail)
 
 
 class HashPrewarm1023(CustomTestCase):

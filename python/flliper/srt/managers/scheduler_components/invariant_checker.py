@@ -1386,25 +1386,57 @@ def _wedge_threshold_order_warning() -> Optional[str]:
 
 
 def _wedge_queue_clock_armed() -> bool:
-    """deskq 1981: FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK on AND the dual layout (default on since 27b-flipverdict-1023;
-    0 = the pre-fix verdict).
-    Never raises: a bad value reads as off."""
+    """deskq 1981 / 27b-qclock-1023: FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK (default on; 0 = the pre-fix verdict).
+
+    27b-qclock-1023: NOT bound to the dual layout any more. Boot dkr27bint4arbar1int4ar10231723 (23.10. 17:35:55Z, form
+    pp=2, FLLIPER_PDFLIP_GROUP=P, no FLLIPER_PDFLIP_DUAL_LAYOUT) ran the pre-fix verdict although the switch was on by
+    default: the former ``and FLLIPER_PDFLIP_DUAL_LAYOUT == "1"`` made the clock inert there and the age read
+    ``now - last_first_token_progress_time`` = 398 s (that stamp is seeded at scheduler init, 17:29:17Z) for a request
+    that was 5 s old. Never raises: a bad value reads as off."""
     try:
-        return bool(envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.get()) and (
-            str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "")).strip() == "1"
-        )
+        return bool(envs.FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK.get())
     except Exception:  # noqa: BLE001
         return False
+
+
+_WEDGE_ARRIVAL_SCAN_CAP = 1024
+
+
+def _oldest_waiting_arrival(scheduler) -> Optional[float]:
+    """perf_counter time the OLDEST request now in the waiting_queue first reached the scheduler
+    (``req.wedge_arrival_time``: kept across a Req rebuilt from a carried time_stats; else
+    ``req.time_stats.scheduler_recv_time``), or None when the queue is longer than the scan cap or any entry carries
+    no usable stamp (then the poll-seen stamp alone bounds the age -- never a too-young "oldest" from a partial scan).
+    Never raises."""
+    try:
+        queue = scheduler.waiting_queue
+        if len(queue) > _WEDGE_ARRIVAL_SCAN_CAP:
+            return None
+        oldest = None
+        for req in queue:
+            ts = getattr(req, "wedge_arrival_time", None)
+            if not isinstance(ts, (int, float)) or isinstance(ts, bool) or ts <= 0.0:
+                ts = getattr(getattr(req, "time_stats", None), "scheduler_recv_time", None)
+            if not isinstance(ts, (int, float)) or isinstance(ts, bool) or ts <= 0.0:
+                return None
+            oldest = ts if oldest is None else min(oldest, ts)
+        return oldest
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _wedge_progress_age(scheduler, now: float, queued: int) -> float:
     """Seconds since progress as the verdict reads it.
 
-    Off: ``now - last_first_token_progress_time`` (the pre-fix number). Armed (deskq 1981): never older than the
-    time the waiting_queue has been non-empty as the poll saw it. The stamp is taken by the first poll that finds
-    the queue non-empty (so it is at most one poll late: a real wedge alarms one poll later, never earlier) and
-    dropped when the queue is empty again. A queue that stays non-empty with no first token keeps aging, so a
-    genuine stand (queued, 0 running, nothing for a long time) still alarms."""
+    Off: ``now - last_first_token_progress_time`` (the pre-fix number). Armed (deskq 1981, 27b-qclock-1023): the first-
+    token age counts only from the arrival of the oldest waiting request, and the clock restarts at every transition
+    empty -> non-empty:
+    * the poll-seen stamp is taken by the first poll that finds the queue non-empty (at most one poll late) and
+      dropped when a poll finds the queue empty;
+    * the oldest waiting request's own scheduler arrival time (when the entries carry one) bounds the age too, so a
+      queue that emptied and refilled between two polls (stamp still old) cannot age a fresh arrival.
+    A queue that stays non-empty with no first token keeps aging, so a genuine stand (queued, 0 running, nothing for a
+    long time) still alarms -- never earlier than the pre-fix verdict, at most one poll later."""
     age = now - scheduler.last_first_token_progress_time
     if not _wedge_queue_clock_armed():
         return age
@@ -1415,7 +1447,11 @@ def _wedge_progress_age(scheduler, now: float, queued: int) -> float:
         return age
     if since is None:
         since = scheduler._wedge_queue_since = now
-    return min(age, max(0.0, now - since))
+    age = min(age, max(0.0, now - since))
+    arrival = _oldest_waiting_arrival(scheduler)
+    if arrival is not None:
+        age = min(age, max(0.0, now - arrival))
+    return age
 
 
 def check_admission_wedge_once(
@@ -1686,9 +1722,13 @@ class AdmissionWedgeRecovery:
         age = time.perf_counter() - self._scheduler.last_first_token_progress_time
         if _wedge_queue_clock_armed():
             # deskq 1981: the same age the verdict used (the queue's own age, not D's last-token age)
+            _now = time.perf_counter()
             _since = getattr(self._scheduler, "_wedge_queue_since", None)
             if _since is not None:
-                age = min(age, max(0.0, time.perf_counter() - _since))
+                age = min(age, max(0.0, _now - _since))
+            _arr = _oldest_waiting_arrival(self._scheduler)
+            if _arr is not None:
+                age = min(age, max(0.0, _now - _arr))
         if age < threshold:
             return None
         now = self._clock()

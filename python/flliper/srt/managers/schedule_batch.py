@@ -1777,7 +1777,21 @@ class Req(ReqDllmMixin):
         else:
             self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
         self.time_stats.set_metrics_collector(metrics_collector)
+        # 27b-qclock-1023: the admission-wedge queue clock reads the ORIGINAL arrival of a request. A Req rebuilt from a
+        # carried time_stats (resubmit / rebootstrap loops) would otherwise restart its age every cycle, because
+        # set_scheduler_recv_time() below overwrites the carried stamp unconditionally (that metrics stamp keeps its
+        # behaviour). The first arrival lives in its own field, carried by new_from_obj; a fresh request has none.
+        _first = getattr(self.time_stats, "first_scheduler_recv_time", 0.0)
+        _carried = getattr(self.time_stats, "scheduler_recv_time", 0.0)
         self.time_stats.set_scheduler_recv_time()
+        if not (isinstance(_first, (int, float)) and _first > 0.0):
+            _first = (
+                _carried
+                if isinstance(_carried, (int, float)) and _carried > 0.0
+                else self.time_stats.scheduler_recv_time
+            )
+        self.time_stats.first_scheduler_recv_time = _first
+        self.wedge_arrival_time: float = _first
         self.has_log_time_stats: bool = False
 
         # For disaggregation

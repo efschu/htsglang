@@ -607,6 +607,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     # only for request tracing
     scheduler_recv_time: float = 0.0
+    # 27b-qclock-1023: the FIRST scheduler arrival, kept across a Req rebuilt from this carried object (the stamp above is
+    # reset on every rebuild); read by the admission-wedge queue clock only.
+    first_scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
     last_decode_finish_time: float = 0.0
     decode_ct: int = 0
