@@ -43,6 +43,18 @@ THE RULE.
    peer is at a gate (the loops made different numbers of gate calls) pairs its gather with the peer's and is a
    named stop on both, instead of two ranks parked in two different collectives.
 
+4. CHUNK BUDGET (CHUNKGEOM 23.10., review qwen-chunkgeom-r1-1023): the carried chunked continuation never passes a
+   gate -- ``PrefillAdder.add_chunked_req`` sizes its chunk as ``min(rem_chunk_tokens, rem_total_tokens)`` before the
+   admission loop, and ``rem_total_tokens`` is THIS rank's allocator + tree (the "254-vs-301 shape" scheduler.py names
+   at the #996 capture; the #681 floor caps it only where a group floor was published). Same rid, same prefix, two
+   chunk lengths: the riegel saw the same set, ``dcp/prefix_lens_check`` compares prefix lengths only (and only on a
+   DCP group), and the forward's per-token all_reduces ran with two different token counts -> hang to the watchdog.
+   Now every rank gathers ``("chunk", rid, its budget)`` right there and the chunk is sized on the group's MIN -- no
+   rank is made to extend past its own pool, every rank cuts at the same length.
+5. The riegel carries every admitted request's extent ``(start, length)``: a length that still differs (a rank-local
+   cut behind the agreed budget) is a named stop before PW-R / the queue removal / prepare_for_extend
+   (``EXTEND-LEN SPLIT``), never a forward with two token counts.
+
 Every collective here is the same kind (``all_gather_object`` on the TP cpu group, under the blocked-recv stamp), so a
 count mismatch PAIRS with a peer's gather and is named by payload, never left as a hang. Ranks nie uneins: a split is a
 crash-stop by name. ``FLLIPER_TP_ADMISSION_AGREE=0`` switches it off (default ON)."""
@@ -60,8 +72,9 @@ MARK = "R11 TP-ADMISSION"
 ADMIT = "ADMIT"
 SITE_GATE = "tp-admission/tp<->gate"
 SITE_SET = "tp-admission/tp<->extend-set"
+SITE_CHUNK = "tp-admission/tp<->chunk-budget"
 
-_STATS = {"gate": 0, "follow": 0, "riegel": 0}
+_STATS = {"gate": 0, "follow": 0, "riegel": 0, "chunk": 0, "chunk_follow": 0}
 
 
 class RankAgreeSplit(RuntimeError):
@@ -150,13 +163,64 @@ def gate_verdict(rid: str, gate: Any, *, gather: Callable[[tuple], list], tp_ran
     return code
 
 
+def chunk_min(rid: str, local: int, *, gather: Callable[[tuple], list], tp_rank: int = 0) -> int:
+    """Rule 4: the group's chunk budget for the carried continuation ``rid`` -- the MIN of every rank's own budget
+    (``min(rem_chunk_tokens, rem_total_tokens)``, the SWA page reserve included). A peer at another collective (a gate,
+    the riegel: the continuation exists on one rank only) or at another rid is a named stop."""
+    rid = str(rid)
+    local = int(local)
+    got = gather(("chunk", rid, local))
+    if not isinstance(got, list) or not got or any(not isinstance(v, tuple) or len(v) < 3 for v in got):
+        raise RankAgreeSplit(
+            f"{MARK} CHUNK MALFORMED rid={rid} tp={tp_rank} got={str(got)[:160]}: stopping by name instead of "
+            "sizing a chunk on a guess (raenge-nie-uneins)."
+        )
+    tags = [str(v[0]) for v in got]
+    if any(t != "chunk" for t in tags):
+        raise RankAgreeSplit(
+            f"{MARK} CALL-COUNT SPLIT rid={rid} tp={tp_rank} at=chunk peers={tags}: this rank sizes the carried "
+            "chunked continuation while a peer is at a gate or the riegel -- the continuation exists on this rank "
+            "only; stopping by name instead of two ranks in two collectives (raenge-nie-uneins, SOLL R11)."
+        )
+    rids = [str(v[1]) for v in got]
+    if any(r != rid for r in rids):
+        raise RankAgreeSplit(
+            f"{MARK} CHUNK RID SPLIT tp={tp_rank} local_rid={rid} group_rids={rids}: the ranks carry different "
+            "chunked continuations; stopping by name (raenge-nie-uneins, SOLL R11)."
+        )
+    budgets = [int(v[2]) for v in got]
+    group = min(budgets)
+    _STATS["chunk"] += 1
+    if group != local:
+        _STATS["chunk_follow"] += 1
+        n = _STATS["chunk_follow"]
+        if n <= 20 or (n & (n - 1)) == 0 or n % 256 == 0:
+            logger.warning(
+                "%s CHUNK-MIN rid=%s tp=%d local=%d group=%d budgets=%s (n=%d): this rank's own pool funds a longer "
+                "chunk than a peer's -- every rank cuts the continuation at the group's MIN (SOLL R11; one token "
+                "count per forward)", MARK, rid, int(tp_rank), local, group, budgets, n,
+            )
+    return group
+
+
+def _extent(req: Any) -> Optional[tuple]:
+    """``(start, length)`` of a request's extend range; None when unreadable."""
+    rng = getattr(req, "extend_range", None)
+    try:
+        start, end = int(rng.start), int(rng.end)
+    except Exception:  # noqa: BLE001 -- a request without a range carries no extent
+        return None
+    return (start, end - start)
+
+
 def extend_set_riegel(admitted: Sequence[Any], hol_head: Optional[str], gate_calls: int, *,
                       gather: Callable[[tuple], list], tp_rank: int = 0) -> None:
-    """After the admission loop: every rank's admitted rids (in order) and HOL head must be the group's. Raises
-    :class:`RankAgreeSplit` on any difference; returns None when the ranks agree."""
+    """After the admission loop: every rank's admitted rids (in order), HOL head and extend LENGTHS must be the group's.
+    Raises :class:`RankAgreeSplit` on any difference; returns None when the ranks agree."""
     rids = tuple(str(getattr(r, "rid", r)) for r in admitted)
     head = None if hol_head is None else str(hol_head)
-    got = gather(("set", rids, head, int(gate_calls)))
+    extents = tuple(_extent(r) for r in admitted)
+    got = gather(("set", rids, head, int(gate_calls), extents))
     if not isinstance(got, list) or not got or any(not isinstance(v, tuple) or len(v) < 1 for v in got):
         raise RankAgreeSplit(
             f"{MARK} RIEGEL MALFORMED tp={tp_rank} got={str(got)[:160]}: stopping by name (raenge-nie-uneins)."
@@ -180,6 +244,15 @@ def extend_set_riegel(admitted: Sequence[Any], hol_head: Optional[str], gate_cal
             "agreed gate (a rank-local exit behind it: load-back wait, room short, chain mismatch) -- the next "
             "collectives (PW-R's group MIN, the DCP prefix check, the forward) would differ per rank; stopping by "
             "name instead (raenge-nie-uneins, SOLL R11)."
+        )
+    exts = [tuple(v[4]) if len(v) > 4 and v[4] is not None else None for v in got]
+    lens = [None if e is None else tuple(None if x is None else x[1] for x in e) for e in exts]
+    if any(ln is not None for ln in lens) and any(ln != lens[0] for ln in lens):
+        raise RankAgreeSplit(
+            f"{MARK} EXTEND-LEN SPLIT tp={tp_rank} rids={list(sets[0])} extents(start,len)={[list(e or ()) for e in exts]}: "
+            "the ranks admitted the same requests at different chunk lengths -- the forward's per-token collectives "
+            "would run with different token counts (a hang to the watchdog); stopping by name instead "
+            "(raenge-nie-uneins, SOLL R11)."
         )
 
 
@@ -209,9 +282,14 @@ def make_agree(sched: Any) -> Optional[Callable]:
         _agree.last_verdict = (str(req.rid), code, sink.get("price"), sink.get("budget"))
         return code
 
+    def _chunk_min(rid, local):
+        return chunk_min(rid, local, gather=lambda p: sched._form_a_tp_gather(SITE_CHUNK, p), tp_rank=tp_rank)
+
     _agree.calls = 0
     _agree.last_verdict = None
     _agree.tp_rank = tp_rank
+    #: rule 4: ``PrefillAdder.add_chunked_req`` sizes the carried continuation on the group's MIN budget
+    _agree.chunk_min = _chunk_min
     return _agree
 
 
