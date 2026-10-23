@@ -35,7 +35,12 @@ from flliper.srt.managers import pdflip_told_fallback as fb  # noqa: E402
 
 #: run_digest over every scenario with the switch OFF, computed on the
 #: pre-PF head 2bddf0417b (desk/27b-unified-0926) -- unset and "0" alike.
-GOLDEN_OFF = "ec4419848dae7cca41d26e57b02633477827306b111d2d58b08237bbe6d73dfc"
+# STOREREAD-1023 (23.10.): re-pinned. ec4419...dfc was stale before 9259a6f470 (red there with the digest below; noted
+# red already 06.10.), and the FIRST run_digest call of a process is not reproducible (four fresh-process probes: head
+# cf513c.../d85c5b..., base 596edd.../23e613... -- first-time lines and warm-up), while every later call gives the
+# value below on 9259a6f470 and on f446e9afc6 alike, with the STOREREAD-1023 switches on AND all at 0. The test now
+# discards one warm-up call and compares the stable one.
+GOLDEN_OFF = "18e6baae928a457e6412639f9c5dbdfb66b83c9b16b1c6a590ed2a8ebe6c3ad4"
 
 SLOW = "cccc-slow"
 PROMPTS = {"aaaa-told": 100_000, "bbbb-fresh": 0, SLOW: 4096}
@@ -273,6 +278,7 @@ def test_switch_off_is_byte_identical_to_the_pre_pf_head(monkeypatch):
     # the golden digest is the told-first order; the follower early read
     # (default on since 02.10.) is covered by test_pdflip_follower_early_read_1002
     monkeypatch.setenv("FLLIPER_PDFLIP_FOLLOWER_EARLY_READ", "0")
+    R.run_digest(m, monkeypatch, {})   # warm-up: the first call of a process is not reproducible (see GOLDEN_OFF)
     assert R.run_digest(m, monkeypatch, {}) == GOLDEN_OFF
     assert R.run_digest(m, monkeypatch, {fb.ENV_FALLBACK: "0"}) == GOLDEN_OFF
 
