@@ -28,9 +28,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 MIB = 1 << 20
 GIB = 1 << 30
-#: newest logs looked at, lines read per log (the posts appear before READY)
+#: newest DUAL-SHARE D logs of the model looked at, lines read per log (the posts appear before READY).
+#: The cap counts only logs that ARE dual-share D measurements of the asked model (rotation 23.10.: 26 newer
+#: int4ar/duo D logs in the shared 27b evidence dir pushed the newest dual log of 22.10. to place 27 by mtime,
+#: past the old "newest 24 of ALL logs" cut, and W64 refused a boot the measurement would have lifted).
 MAX_LOGS = 24
 MAX_LINES = 400000
+#: cost bound on files opened at all (a foreign-model log costs ~20 lines, a same-model non-dual log ~4000)
+MAX_FILES = 2000
 
 _RE_RANK = re.compile(r"\sTP(\d+)\]")
 _RE_MODEL = re.compile(r"model_path='([^']*)'")
@@ -73,6 +78,11 @@ def _scan(path: str, model: str, tp_size: int) -> Optional[DualDMeasurement]:
                     m = _RE_RATIOS.search(line)
                     if m:
                         weights = tuple(int(x) for x in m.group(1).split(",") if x.strip())
+                if weights is None and "KV pool sizing:" in line:
+                    # a dual-share D publishes its ratios BEFORE it sizes KV (metal 22.10. ..._021600:
+                    # ratios at line 3784/5502, first "KV pool sizing" at 5591); KV sized without them =
+                    # not a dual-share D log (flip D, duo, ...). Stop here instead of reading MAX_LINES.
+                    return None
                 if "KV budget posts (GiB):" in line:
                     r, p = _RE_RANK.search(line), _RE_POSTS.search(line)
                     if r and p:
@@ -99,12 +109,25 @@ def find_dual_d_measurement(evidence_dirs: Sequence[str], model: str,
     logs: List[str] = []
     for d in evidence_dirs:
         logs.extend(glob.glob(os.path.join(d, "boot_*.D.log")))
-    logs = sorted(set(logs), key=lambda p: os.path.getmtime(p), reverse=True)[:MAX_LOGS]
+    logs = sorted(set(logs), key=_mtime, reverse=True)[:MAX_FILES]
+    seen = 0   # dual-share D measurements of THIS model -- the only logs the MAX_LOGS cap counts
     for path in logs:
         m = _scan(path, model, len(want))
-        if m is not None and m.weights == want:
+        if m is None:
+            continue   # other model, not a dual-share D, or incomplete: does not use up the cap
+        if m.weights == want:
             return m
+        seen += 1
+        if seen >= MAX_LOGS:
+            break
     return None
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:   # rotated away between glob and sort
+        return 0.0
 
 
 def judge(m: DualDMeasurement, budgets: Sequence[int], min_tokens: int) -> DualW64Verdict:
