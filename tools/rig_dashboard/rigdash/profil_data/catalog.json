@@ -29202,7 +29202,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2885
+      "line": 2893
      }
     }
    },
@@ -30203,7 +30203,7 @@
    "id": "FLLIPER_BARLINK_BAR1_GRID_THRESHOLD",
    "kind": "env",
    "lesestellen": [
-    "distributed/device_communicators/barlink_bar1.py:2190"
+    "distributed/device_communicators/barlink_bar1.py:2191"
    ],
    "level": "expert",
    "name": "FLLIPER_BARLINK_BAR1_GRID_THRESHOLD",
@@ -30212,7 +30212,7 @@
    "source": {
     "file": "distributed/device_communicators/barlink_bar1.py",
     "kind": "os.environ",
-    "line": 2190,
+    "line": 2191,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -33982,6 +33982,34 @@
    ],
    "type": "EnvStr"
   },
+  "FLLIPER_CUDA_COREDUMP_SKIP_ABORT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "NF #162 (23.10.): with FLLIPER_CUDA_COREDUMP=1 every process importing debug_utils/cuda_coredump adds skip_abort to CUDA_COREDUMP_GENERATION_FLAGS -- effective for the scheduler ranks through the launch_server group process, before it spawns them (a rank's driver latches the env it was spawned with). The driver then writes the GPU dump and RETURNS the error (the rank dies down its logged exception path) instead of calling abort(), which drops the traceback/W113 lines and writes a CPU core of the rank.",
+   "id": "FLLIPER_CUDA_COREDUMP_SKIP_ABORT",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_CUDA_COREDUMP_SKIP_ABORT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2563,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_CUTLASS_MOE": {
    "bare": false,
    "choices": null,
@@ -34287,7 +34315,8 @@
    "status": "unexplained",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -36050,7 +36079,7 @@
    "id": "FLLIPER_DFLASH_SLOT_TRACE",
    "kind": "env",
    "lesestellen": [
-    "speculative/dflash_worker_v2.py:4032"
+    "speculative/dflash_worker_v2.py:4052"
    ],
    "level": "expert",
    "name": "FLLIPER_DFLASH_SLOT_TRACE",
@@ -36059,7 +36088,7 @@
    "source": {
     "file": "speculative/dflash_worker_v2.py",
     "kind": "os.environ",
-    "line": 4032,
+    "line": 4052,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -38700,7 +38729,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 5262
+      "line": 5270
      }
     }
    },
@@ -44112,7 +44141,8 @@
    "status": "unexplained",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -44143,7 +44173,8 @@
    "status": "harvested",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -44264,7 +44295,8 @@
    "status": "harvested",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -44724,7 +44756,8 @@
    "status": "unexplained",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -44755,7 +44788,8 @@
    "status": "unexplained",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -47358,7 +47392,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 5263
+      "line": 5271
      }
     }
    },
@@ -50483,7 +50517,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4028,
+    "line": 4036,
     "tree": "nf"
    },
    "status": "harvested",
@@ -50511,7 +50545,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4037,
+    "line": 4045,
     "tree": "nf"
    },
    "status": "harvested",
@@ -50539,7 +50573,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4042,
+    "line": 4050,
     "tree": "nf"
    },
    "status": "harvested",
@@ -50567,7 +50601,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4031,
+    "line": 4039,
     "tree": "nf"
    },
    "status": "harvested",
@@ -55310,7 +55344,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_BIG_SLOT_MIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:113"
+    "pdflip/bar1_lanes.py:115"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_BIG_SLOT_MIB",
@@ -55319,7 +55353,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 113,
+    "line": 115,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55342,7 +55376,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_COLLECT_BATCH",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:553"
+    "pdflip/bar1_lanes.py:647"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_COLLECT_BATCH",
@@ -55351,7 +55385,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 553,
+    "line": 647,
     "tree": "27b"
    },
    "status": "harvested",
@@ -55373,7 +55407,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_COLLECT_HOLD_GIL",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:491"
+    "pdflip/bar1_lanes.py:585"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_COLLECT_HOLD_GIL",
@@ -55382,7 +55416,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 491,
+    "line": 585,
     "tree": "27b"
    },
    "status": "harvested",
@@ -55404,7 +55438,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_COLLECT_LAG",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:483"
+    "pdflip/bar1_lanes.py:577"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_COLLECT_LAG",
@@ -55413,7 +55447,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 483,
+    "line": 577,
     "tree": "27b"
    },
    "status": "harvested",
@@ -55436,7 +55470,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_COLLECT_PREPLAN",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:487"
+    "pdflip/bar1_lanes.py:581"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_COLLECT_PREPLAN",
@@ -55445,7 +55479,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 487,
+    "line": 581,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55468,7 +55502,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_CONNECT_S",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:1575"
+    "pdflip/bar1_lanes.py:1763"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_CONNECT_S",
@@ -55477,7 +55511,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 1575,
+    "line": 1763,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55500,7 +55534,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_CYCLE_GRACE_S",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:914"
+    "pdflip/bar1_lanes.py:1056"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_CYCLE_GRACE_S",
@@ -55509,7 +55543,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 914,
+    "line": 1056,
     "tree": "27b"
    },
    "status": "harvested",
@@ -55532,7 +55566,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_DEPOSIT_HOLD_GIL",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:495"
+    "pdflip/bar1_lanes.py:589"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_DEPOSIT_HOLD_GIL",
@@ -55541,7 +55575,39 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 495,
+    "line": 589,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "-- LANE-INTEGRITY (27b-lanes3x80-1023, review of 9373c7647c) ----------------- The BAR1 payload path carried no content check: credit frames, the 16-B arrival readback per batch and the per-destination pointer probe prove that a batch ARRIVED and WHERE it goes, not WHAT arrived. The 3080 lanes run switch-direct for the first time since 23.10. 21:15Z (ACS 0011), and the same day saw wrong data on the switch path (#174). So every tag is now sampled: the depositor reads ``samples`` chunks of <= 4 KiB of its SOURCE (positions drawn deterministically from the seq over the plan's pieces, the first and the last piece always included; a STRIDED2D chunk lies inside one row) and sends their crc32 after its last batch (credit kind ``sum``, announced in the plan record so a peer without it is not waited for); the collector reads the same chunks from its DESTINATION after its last copy-out synced and compares. A mismatch is a NAMED refusal of the tag (the leg stops on it), never a silent continue. Per flip one ``PDFLIP-BAR1-INTEGRITY`` line (verified / sampled / skipped no-write / mismatch). Cost: 2 x samples synchronous 4-KiB D2H reads per tag. Sampled, not exhaustive: a systematic fault (wrong slot, stale visibility, a dropped batch, a torn region) is caught; a single flipped bit in an unsampled chunk is not. FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES (8, 0 = off).",
+   "id": "FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/bar1_lanes.py:2813",
+    "pdflip/bar1_lanes.py:2903"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/bar1_lanes.py",
+    "kind": "os.environ",
+    "line": 2813,
     "tree": "27b"
    },
    "status": "harvested",
@@ -55563,7 +55629,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_LANES",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:92"
+    "pdflip/bar1_lanes.py:94"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_LANES",
@@ -55572,7 +55638,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 92,
+    "line": 94,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55580,6 +55646,130 @@
    "trees": [
     "27b",
     "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_BAR1_MULTI_REGION": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "-- MULTI-REGION ring (27b-lanes3x80-1023) ----------------------------------- THE MEASUREMENT (boot dkr27bint4arbar1int4ar10231723, 2x RTX 3080, P = PP2, D = TP2, 677 BAR1 tag pairs). The D ranks own three group windows (world:0 15, tp:0 31, dcp:0 39 MiB) and receive on ONE lane, so the lane borrowed only the largest region (dcp:0 -> ring 4 x 9 MiB) and left tp:0 idle; the P ranks lend pp:0 (95 MiB -> 4 x 23 MiB). Per batch both directions ran at the same period (deposit (total - first_free) / batches, p50 1.55 ms P->D 84-batch tags, 1.58 ms D->P 33-batch tags): the credit round trip, not the wire (155.5 us + bytes / 20.45 GB/s = 0.62 ms for 9 MiB, 1.33 ms for 23 MiB), sets the pace, so the rate scales with the slot -- P->D p1 5.3 GB/s p50 against D->P 12.5 GB/s, ratio 2.4 for a slot ratio of 2.55. THE FORM (``FLLIPER_PDFLIP_BAR1_MULTI_REGION``, default on): a receiver with MORE borrowable regions than receiving lanes hands the spare ones to its lanes as further ring regions. One slot size for the whole ring (the plan's cut is ``batch_descs(slot_bytes)``), the largest MiB-aligned slot of which the lane's regions hold ``ring`` in total, largest region first; each region is exported as its own dma-buf and mapped by the depositor on its own. Taken only when the slot grows (D: dcp:0 + tp:0 -> 4 x 15 MiB instead of 4 x 9); otherwise the single-region plan byte for byte. Off = the old plan.",
+   "id": "FLLIPER_PDFLIP_BAR1_MULTI_REGION",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/bar1_lanes.py:244"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_BAR1_MULTI_REGION",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/bar1_lanes.py",
+    "kind": "os.environ",
+    "line": 244,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_BAR1_PREPLAN_BEFORE_TURN": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "PREPLAN-BEFORE-TURN (27b-lanes3x80-1023, default on). Boot dkr27bint4arbar1int4ar10231723: the collector built its preplan AFTER taking the lane's turn, i.e. while its depositor already waited for free(0) -- prep_ms p50/p90 29-37/55-84 ms on the P->D p1 tags (84 batches, D TP0), the largest single term of the mid-leg start offset (first_free_ms p50 45-109). Built before the turn it overlaps the lane's previous collect. Off = built after the turn as before.",
+   "id": "FLLIPER_PDFLIP_BAR1_PREPLAN_BEFORE_TURN",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/bar1_lanes.py:2954"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_BAR1_PREPLAN_BEFORE_TURN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/bar1_lanes.py",
+    "kind": "os.environ",
+    "line": 2954,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"0\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "PREPLAN-RECHECK (review of 9373c7647c): the preplan probed the destinations before the lane's turn; after a turn wait longer than this the probes are asked again (fresh) before the first copy-out -- one pointer query per destination, ~1 us each. 0 = always.",
+   "id": "FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/bar1_lanes.py:2917"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/bar1_lanes.py",
+    "kind": "os.environ",
+    "line": 2917,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_BAR1_READBACK_CONFIRM": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "READBACK-CONFIRM (27b-lanes3x80-1023): how many STALLED reads the probe needs before it refuses the lane. 1 = the 23.10. form (the first stall refuses). THE MEASUREMENT. 46 lane probes in the 23.10. boots of both 3080 pairs and the 5090 pair (ACS 0011, switch-direct): healthy reads 0.02-1.9 ms, single outliers 3.2-4.8 ms in six probes (each followed by fast reads), and TWO lanes refused for a whole boot by ONE outlier each -- ``boot_weg2_dkr27bint4arbar1int4ar10231723`` P PP0 p0 ``1 read(s): 10.46 ms`` (the probe stops at the first stall, so the next read was never taken; the P->D lane PP0 -> TP1 ran on the host path in all 37 P->D flips) and ``...int4ar10231824`` D TP0 p0 ``0.75, 224.91 ms``. The sick class this probe exists for (root-port hairpin, barlink-switch-1023) stalled on EVERY read (33-85 ms, every batch), so a stall that does not repeat is not that class. Default 2: the probe keeps reading after a first stall and refuses only when a second read stalls too (or a stalled read returned all-ones, the completion-timeout signature) -- worst case two stalled reads at connect, never more.",
+   "id": "FLLIPER_PDFLIP_BAR1_READBACK_CONFIRM",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/bar1_lanes.py:861"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_BAR1_READBACK_CONFIRM",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/bar1_lanes.py",
+    "kind": "os.environ",
+    "line": 861,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
    ],
    "type": "os.environ"
   },
@@ -55595,7 +55785,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_READBACK_PROBE_N",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:729"
+    "pdflip/bar1_lanes.py:842"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_READBACK_PROBE_N",
@@ -55604,7 +55794,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 729,
+    "line": 842,
     "tree": "27b"
    },
    "status": "harvested",
@@ -55626,7 +55816,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_READBACK_STALL_MS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:738"
+    "pdflip/bar1_lanes.py:851"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_READBACK_STALL_MS",
@@ -55635,7 +55825,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 738,
+    "line": 851,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55657,7 +55847,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_RECONNECT_S",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:1434"
+    "pdflip/bar1_lanes.py:1591"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_RECONNECT_S",
@@ -55666,7 +55856,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 1434,
+    "line": 1591,
     "tree": "27b"
    },
    "status": "harvested",
@@ -55689,7 +55879,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_RING_SLOTS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:98"
+    "pdflip/bar1_lanes.py:100"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_RING_SLOTS",
@@ -55698,7 +55888,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 98,
+    "line": 100,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55721,7 +55911,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_SMALL_SLOT_MIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:112"
+    "pdflip/bar1_lanes.py:114"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_SMALL_SLOT_MIB",
@@ -55730,7 +55920,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 112,
+    "line": 114,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55812,7 +56002,7 @@
    "id": "FLLIPER_PDFLIP_BAR1_WRITE_ORDER",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:669"
+    "pdflip/bar1_lanes.py:763"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_BAR1_WRITE_ORDER",
@@ -55821,7 +56011,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 669,
+    "line": 763,
     "tree": "27b"
    },
    "status": "harvested",
@@ -57326,7 +57516,8 @@
    "status": "harvested",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -61061,7 +61252,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4387,
+    "line": 4395,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61597,7 +61788,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4264,
+    "line": 4272,
     "tree": "nf"
    },
    "status": "harvested",
@@ -66026,7 +66217,8 @@
    "status": "unexplained",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -67628,7 +67820,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/scheduler.py:9113",
-    "managers/scheduler_components/weight_updater.py:12601",
+    "managers/scheduler_components/weight_updater.py:12611",
     "pdflip/front.py:18233",
     "pdflip/l15_deposit_hook.py:42",
     "pdflip/l15_plan.py:476"
@@ -67726,7 +67918,7 @@
    "lesestellen": [
     "managers/scheduler.py:9098",
     "managers/scheduler.py:23311",
-    "managers/scheduler_components/weight_updater.py:12720",
+    "managers/scheduler_components/weight_updater.py:12730",
     "pdflip/front.py:18194",
     "pdflip/front.py:9092",
     "pdflip/front.py:20845",
@@ -69640,7 +69832,7 @@
    "id": "FLLIPER_PDFLIP_LANE_SYNC_QUERY_HELD",
    "kind": "env",
    "lesestellen": [
-    "pdflip/bar1_lanes.py:499"
+    "pdflip/bar1_lanes.py:593"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_LANE_SYNC_QUERY_HELD",
@@ -69649,7 +69841,7 @@
    "source": {
     "file": "pdflip/bar1_lanes.py",
     "kind": "os.environ",
-    "line": 499,
+    "line": 593,
     "tree": "27b"
    },
    "status": "harvested",
@@ -76850,6 +77042,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "ARRIVALPROBE-1023: switch of the store arm's anchor start, default ON; \"0\" = the arm hashes ``fill_ids[local_match:]`` as before (byte-identical).",
+   "id": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
+   "kind": "env",
+   "lesestellen": [
+    "managers/scheduler.py:1731"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/scheduler.py",
+    "kind": "os.environ",
+    "line": 1731,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_STORE_JOURNAL": {
    "bare": false,
    "choices": null,
@@ -77054,7 +77277,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1009
+      "line": 1010
      }
     }
    },
@@ -78609,7 +78832,8 @@
    "status": "harvested",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -79448,6 +79672,26 @@
    "type": "os.environ"
   },
   "FLLIPER_PDFLIP_VISION_EMB_CACHE_MB": {
+   "abweichung": {
+    "27b": {
+     "default": "\"1024\"",
+     "help": "--------------------------------------------------------------------------- S66c EMB-CACHE: an image P encoded once is not encoded again --------------------------------------------------------------------------- rc17 boot 171636, P PP0, pdflip-6-245 / pdflip-8-254: P-KNOWN-IMAGE hit, told 96768 (1512 pages; the store's KV is page/anchor-granular), image_end 96799 -- the last 31 image positions lie past the deepest cached page, so the told cannot cover the image and the verdict is STAGE: pixel FETCH 1594-2963 ms (ATTACHED wait_ms) plus the tower (~0.6 s) for 210 / 917 new tokens. The rows of exactly these two images had been computed by this very rank one turn earlier. Upstream SGLang keeps such rows in ``MultiModalStaticCache`` keyed by the item's content hash (``mm_utils.embedding_cache``, ``get_single``/``set``, consulted in ``_get_chunked_embedding_by_item`` before the ViT). On P that path is never reached for a staged image: the transient stage decides before the embed routine. So the stage keeps its rows in the SAME upstream class (its own instance on PP0: the module global is re-made by ``kv_cache_builder`` and sized for the in-model ViT path) and, when a verdict says STAGE, attaches cached rows instead of fetching pixels and loading the tower -- for every pending item or for none. Key: ``item.hash`` = ``hash_feature(pixels)``, the content hash the prefix is keyed with (equal on the known-image path, S70 condition); the row count must equal the item's placeholder count and the width the tower's ``out_hidden_size``. Rows are stored and handed out as host copies (a req ...",
+     "source": {
+      "file": "pdflip/vision_rank_runner.py",
+      "kind": "os.environ",
+      "line": 309
+     }
+    },
+    "nf": {
+     "default": "\"1024\"",
+     "help": "--------------------------------------------------------------------------- S66c EMB-CACHE: an image P encoded once is not encoded again --------------------------------------------------------------------------- rc17 boot 171636, P PP0, pdflip-6-245 / pdflip-8-254: P-KNOWN-IMAGE hit, told 96768 (1512 pages; the store's KV is page/anchor-granular), image_end 96799 -- the last 31 image positions lie past the deepest cached page, so the told cannot cover the image and the verdict is STAGE: pixel FETCH 1594-2963 ms (ATTACHED wait_ms) plus the tower (~0.6 s) for 210 / 917 new tokens. The rows of exactly these two images had been computed by this very rank one turn earlier. In upstream SGLang such rows live in ``MultiModalStaticCache``, keyed by the item's content hash (``mm_utils.embedding_cache``, ``get_single``/``set``, consulted in ``_get_chunked_embedding_by_item`` before the ViT). On P that path is never reached for a staged image: the transient stage decides before the embed routine. So the stage keeps its rows in the SAME upstream class (its own instance on PP0: the module global is re-made by ``kv_cache_builder`` and sized for the in-model ViT path) and, when a verdict says STAGE, attaches cached rows instead of fetching pixels and loading the tower -- for every pending item or for none. Key: ``item.hash`` = ``hash_feature(pixels)``, the content hash the prefix is keyed with (equal on the known-image path, S70 condition); the row count must equal the item's placeholder count and the width the tower's ``out_hidden_size``. Rows are stored and handed out as host copies (a  ...",
+     "source": {
+      "file": "pdflip/vision_rank_runner.py",
+      "kind": "os.environ",
+      "line": 291
+     }
+    }
+   },
    "bare": false,
    "choices": null,
    "cost": "",
@@ -90023,7 +90267,8 @@
    "status": "unexplained",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "os.environ"
   },
@@ -93074,28 +93319,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2948,
-  "envs": 2069,
+  "entries": 2955,
+  "envs": 2076,
   "explained": 310,
   "flags": 864,
-  "harvested": 1820,
+  "harvested": 1827,
   "trees": {
-   "abweichung": 29,
-   "beide": 2704,
-   "nur_27b": 213,
-   "nur_nf": 13
+   "abweichung": 30,
+   "beide": 2714,
+   "nur_27b": 208,
+   "nur_nf": 15
   },
   "unexplained": 693
  },
- "tree_rev": "27b=b036b48c02+nf=c8c38d2a64",
+ "tree_rev": "27b=941bdabe0a+nf=8964fc35c6",
  "trees": {
   "27b": {
-   "entries": 2917,
-   "rev": "b036b48c02"
+   "entries": 2922,
+   "rev": "941bdabe0a"
   },
   "nf": {
-   "entries": 2717,
-   "rev": "c8c38d2a64"
+   "entries": 2729,
+   "rev": "8964fc35c6"
   }
  },
  "warnungen": []
