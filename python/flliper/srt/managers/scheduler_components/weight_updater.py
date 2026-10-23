@@ -465,6 +465,59 @@ def _pdflip_drafter_of(scheduler):
     return getattr(producer, "draft_runner", None)
 
 
+def _pdflip_static_models(owner):
+    """``(draft_model, target_model)`` of this process for the static-state stash."""
+    try:
+        drafter = _pdflip_drafter_of(owner)
+    except BaseException:  # noqa: BLE001 -- no drafter is an answer, not a failure
+        drafter = None
+    target = getattr(getattr(getattr(owner, "tp_worker", None), "model_runner", None), "model", None)
+    return getattr(drafter, "model", None), target
+
+
+def _pdflip_export_draft_static_state(owner):
+    """27b-korrekt-1023: the drafter's buffers before the sleep pauses its tag.
+
+    The target stash (``export_static_state_host(self.tp_worker.model_runner.model)``)
+    never reached the drafter; its RoPE ``cos_sin_cache`` lives in ``weights_draft``
+    and the exchange carries parameters only, so every wake left it undefined
+    (D accept_len 1.03, degenerate sampled answers; boots ..10231552/..10231704/
+    ..10231709). Same exporter, same host/pinned rule as the target's stash."""
+    import os as _os
+
+    from flliper.srt.pdflip import sleep_staging as _ss
+
+    draft, target = _pdflip_static_models(owner)
+    host = bool(_ss.enabled() and _os.environ.get("FLLIPER_PDFLIP_GROUP"))
+    stash = _ss.export_draft_static_state(draft, target, host=host)
+    if stash is not None and _ss.LAST_DRAFT_EXPORT:
+        e = _ss.LAST_DRAFT_EXPORT
+        logger.info(
+            "PDFLIP-DRAFT-STATIC-EXPORT n=%d bytes=%d ms=%.1f mode=%s names=%s "
+            "(27b-korrekt-1023: the drafter's buffers ride the sleep beside the target's)",
+            e.get("n", 0), e.get("bytes", 0), e.get("ms", 0.0), e.get("mode", "?"),
+            list(e.get("names", []))[:8],
+        )
+    elif draft is not None and not _ss.draft_static_state_on():
+        logger.warning(
+            "PDFLIP-DRAFT-STATIC-EXPORT off (%s=0): the drafter's buffers are NOT carried "
+            "across this sleep -- A/B only", _ss.ENV_DRAFT_STATIC,
+        )
+    return stash
+
+
+def _pdflip_import_draft_static_state(owner, stash) -> int:
+    """The wake's half: copy the drafter's stash back in place (after the reload)."""
+    if not stash:
+        return 0
+    from flliper.srt.pdflip import sleep_staging as _ss
+
+    draft, _target = _pdflip_static_models(owner)
+    n = _ss.import_draft_static_state(draft, stash)
+    logger.info("PDFLIP-DRAFT-STATIC-IMPORT n=%d", n)
+    return n
+
+
 def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     merged_checksums = dict(target["checksums"])
     for name, chk in draft["checksums"].items():
@@ -650,6 +703,9 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    #: 27b-korrekt-1023: the DRAFT runner's buffers (RoPE cos_sin_cache), stashed beside
+    #: the target's -- see sleep_staging.ENV_DRAFT_STATIC.
+    stashed_draft_static_state: Any = None
     #: #1233: the pre-pause census of the sleep in progress (taken at the
     #: first release RPC of a sleep, graded at the RPC that completes the
     #: PDFLIP_SLEEP_TAGS population).  A slots dataclass: a field, not an
@@ -10402,6 +10458,10 @@ class SchedulerWeightUpdaterManager:
                                 _ss.LAST_EXPORT.get("n", 0), _ss.LAST_EXPORT.get("bytes", 0),
                                 _ss.LAST_EXPORT.get("ms", 0.0), _ss.LAST_EXPORT.get("mode", "?"))
                     _ss.LAST_EXPORT.clear()
+                # 27b-korrekt-1023: and the DRAFT runner's, which nothing carried
+                # (its cos_sin_cache sits in weights_draft; the exchange moves
+                # parameters only). Before the pause, like the target's.
+                self.stashed_draft_static_state = _pdflip_export_draft_static_state(self)
             # FLIP-LEGS: census_credit split -- the stash, then the TP barrier
             _pdflip_ph("static_export")
             torch.distributed.barrier(self.tp_cpu_group)
@@ -12107,6 +12167,9 @@ class SchedulerWeightUpdaterManager:
                     self.tp_worker.model_runner.model,
                     self.stashed_model_static_state,
                 )
+                # 27b-korrekt-1023: the drafter's half (its RoPE cos_sin_cache).
+                _pdflip_import_draft_static_state(self, self.stashed_draft_static_state)
+                self.stashed_draft_static_state = None
                 _pdflip_sub_t("static_import", _sub_t0)
                 del self.stashed_model_static_state
                 # #1273 S5b: the DESTINATION half.  This hook runs after

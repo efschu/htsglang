@@ -3927,6 +3927,20 @@ def plan_param_lines(
     return lines
 
 
+def buffers_restored_by_static_state(region_tag: str) -> bool:
+    """Does a static-state stash carry THIS runner's registered buffers across a
+    sleep?  The target's always has (``export_static_state_host`` of
+    ``tp_worker.model_runner.model``); the drafter's (region ``weights_draft``)
+    only since 27b-korrekt-1023 and only with
+    ``sleep_staging.ENV_DRAFT_STATIC`` on.  The coverage books a buffer as
+    covered on this answer and on nothing else."""
+    if str(region_tag) != GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
+        return True
+    from flliper.srt.pdflip import sleep_staging as _ss
+
+    return bool(_ss.draft_static_state_on())
+
+
 def build_coverage(
     model: torch.nn.Module,
     *,
@@ -3969,6 +3983,7 @@ def build_coverage(
     no source of its own.  See :func:`_tiled_storages`.
     """
     mode = mode if mode is not None else weight_source()
+    buffers_restored = buffers_restored_by_static_state(region_tag)
     live = walk_live_tensors(model, region_tag=region_tag)
     # fnFL2x72: the rule the manifest and the plan already apply -- imported
     # here (the shadow imports this module) rather than restated.
@@ -4132,6 +4147,14 @@ def build_coverage(
                 if t.storage_key in shared:
                     # H79: a view of a shared storage -- judged with it below.
                     holders_of.setdefault(t.storage_key, []).append(t.name)
+                    continue
+                if not buffers_restored:
+                    # 27b-korrekt-1023: a buffer counts as covered only when a
+                    # static-state stash actually carries it across the sleep.
+                    # The drafter's (its RoPE cos_sin_cache) had none -- the
+                    # stash took the target model alone -- and this line
+                    # booked it as covered anyway (uncovered=0 on every boot).
+                    uncovered.append(t)
                     continue
                 if t.storage_key not in covered_storage:
                     covered_storage.add(t.storage_key)
