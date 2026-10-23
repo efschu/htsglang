@@ -144,6 +144,17 @@ def _fi_lse_to_merge_domain(lse):
     return lse * _LN2
 
 
+def _natural_merge_on_base2(merge_fn, v_a, s_a, v_b, s_b):
+    """B10 class (23.10.): run a NATURAL-log two-state merge (the in-tree
+    merge_state_triton: tl.exp / tl.log) on FlashInfer's BASE-2 LSEs and hand
+    the merged LSE back in base 2, so _safe_merge_state returns the same
+    (o, lse) contract from both of its branches (flashinfer merge_state is
+    base 2). Before, the >max-heads fallback silently re-weighted the two
+    states by Z ** (1/ln 2)."""
+    v, s = merge_fn(v_a, s_a * _LN2, v_b, s_b * _LN2)
+    return v, (s / _LN2 if s is not None else s)
+
+
 def _dcp_uneven_merge(
     o, lse, group, head_counts, return_lse: bool = False, block_tokens: int = 0
 ):
@@ -337,7 +348,7 @@ if is_flashinfer_available():
         max_heads = _merge_state_max_safe_num_heads(head_dim, v_a.element_size())
         if num_heads <= max_heads:
             return merge_state(v_a, s_a, v_b, s_b)
-        return merge_state_triton(v_a, s_a, v_b, s_b)
+        return _natural_merge_on_base2(merge_state_triton, v_a, s_a, v_b, s_b)
 
 
 class WrapperDispatch(Enum):

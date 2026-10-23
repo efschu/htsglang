@@ -206,5 +206,32 @@ class TestCrossRankUnevenMerge(CustomTestCase):
         torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
 
 
+def _torch_natural_merge(v_a, s_a, v_b, s_b):
+    """merge_state_triton's math (tl.exp / tl.log), in torch."""
+    m = torch.maximum(s_a, s_b)
+    ea, eb = torch.exp(s_a - m), torch.exp(s_b - m)
+    se = ea + eb
+    v = v_a * (ea / se).unsqueeze(-1) + v_b * (eb / se).unsqueeze(-1)
+    return v, torch.log(se) + m
+
+
+class TestSafeMergeStateFallback(CustomTestCase):
+    """_safe_merge_state's >max-heads fallback (merge_state_triton, natural
+    log) must give what flashinfer's base-2 merge_state gives."""
+
+    def test_fallback_on_base2_inputs_equals_full_attention(self):
+        q, kp, vp, kc, vc = _setup(seed=9)
+        o_a, l_a = _partial(q, kp, vp)
+        o_b, l_b = _partial(q, kc, vc)
+        v, s = fb._natural_merge_on_base2(_torch_natural_merge, o_a, l_a, o_b, l_b)
+        want = _reference(q, torch.cat([kp, kc]), torch.cat([vp, vc]))
+        torch.testing.assert_close(v, want, rtol=1e-6, atol=1e-6)
+        # merged LSE stays base 2 (log2 of the total partition function)
+        s_all = torch.logsumexp(
+            torch.einsum("thd,nhd->thn", q, torch.cat([kp, kc])) / math.sqrt(D), dim=-1
+        ) / math.log(2.0)
+        torch.testing.assert_close(s, s_all, rtol=1e-9, atol=1e-9)
+
+
 if __name__ == "__main__":
     unittest.main()
