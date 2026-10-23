@@ -258,22 +258,51 @@ def row_room_applies(tree, req) -> bool:
     return armed(tree)
 
 
+#: ROW-ROOM-REREAD (27B INT4 flip, P PP1 14:33:43Z, boot ..._a45112428e_1023_140032, rid pdflip-23-212): rounds the row's
+#: room may run. ``evict()`` ends in ``writing_check(write_back=True)`` (#1465), which releases the nodes an in-flight
+#: write-through held; the evictable count read BEFORE the peel (1902) cannot see them. Default on; ``0`` = one round.
+ROW_ROOM_REREAD_ENV = "FLLIPER_PDFLIP_LBV_ROW_ROOM_REREAD"
+_ROW_ROOM_MAX_ROUNDS = 4
+
+
+def row_room_max_rounds() -> int:
+    raw = (os.environ.get(ROW_ROOM_REREAD_ENV, "1") or "1").strip().lower()
+    return 1 if raw in ("0", "false", "no", "off") else _ROW_ROOM_MAX_ROUNDS
+
+
 def row_room(tree, kv_tokens: int, rid=None) -> Tuple[bool, int, int, int, int]:
     """Make this stage's room for a row-executed load-back on its LIVE pool: evict the shortfall (never more), read the
-    pool again. Returns ``(ok, avail, evictable, evicted, avail_after)``; ``ok`` = ``avail_after >= kv_tokens``. Decides
-    nothing: the caller loads on ``ok`` and stops the group by name otherwise."""
+    pool again. Returns ``(ok, avail, evictable, evicted, avail_after)`` (``evictable`` = the FIRST read); ``ok`` =
+    ``avail_after >= kv_tokens``. Decides nothing: the caller loads on ``ok`` and stops the group by name otherwise.
+
+    ROW-ROOM-REREAD: the evictable set is re-read after every eviction round and the shortfall evicted again until the
+    room is there or a round frees nothing and releases nothing (at most ``row_room_max_rounds``). The one-read form
+    stopped PP1 at 14:33:43Z: evictable=1902 (the 22-211 leaf was held by an in-flight write-through), the eviction
+    drained it (#1465 WRITE-BACK DRAIN n=1 ms=3730), the 105k rows behind it became evictable -- and the verdict, taken
+    from the read before, was ``ok=False`` while PP0 had loaded the row (``local_pp_room`` has had this loop since Q-640)."""
     from flliper.srt.mem_cache.base_prefix_cache import EvictParams
 
     kv_tokens = int(kv_tokens)
     alloc = tree.token_to_kv_pool_allocator
     avail0 = int(alloc.available_size())
-    evictable = int(tree.evictable_size())
+    evictable0 = evictable = int(tree.evictable_size())
     evicted = 0
-    short = kv_tokens - avail0
-    if short > 0 and evictable > 0:
+    rounds = 0
+    avail1 = avail0
+    max_rounds = row_room_max_rounds()
+    while rounds < max_rounds:
+        short = kv_tokens - avail1
+        if short <= 0 or evictable <= 0:
+            break
         res = tree.evict(EvictParams(num_tokens=min(short, evictable)))
-        evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
-    avail1 = int(alloc.available_size())
+        got = int(getattr(res, "num_tokens_evicted", 0) or 0)
+        rounds += 1
+        evicted += got
+        avail_prev, evictable_prev = avail1, evictable
+        avail1 = int(alloc.available_size())
+        evictable = int(tree.evictable_size())
+        if got <= 0 and avail1 <= avail_prev and evictable <= evictable_prev:
+            break  # nothing freed and nothing released: a true residual, no spin
     ok = avail1 >= kv_tokens
     try:
         n = int(getattr(tree, "_pdflip_lbv_row_room_n", 0) or 0) + 1
@@ -282,11 +311,12 @@ def row_room(tree, kv_tokens: int, rid=None) -> Tuple[bool, int, int, int, int]:
         n = 1
     if not ok or n <= _LOG_FIRST or (n & (n - 1)) == 0:
         (logger.info if ok else logger.error)(
-            "%s ROW-ROOM rid=%s kv_tokens=%d avail=%d evictable=%d evicted=%d avail_after=%d ok=%s (n=%d): this stage "
+            "%s ROW-ROOM rid=%s kv_tokens=%d avail=%d evictable=%d evicted=%d avail_after=%d evictable_after=%d "
+            "rounds=%d ok=%s (n=%d): this stage "
             "executes PP0's row -- no room verdict of its own (no agreed R of another pass, no refuse-this-pass); "
             "it makes the room on its live pool and loads in this pass, or the group stops by name",
-            MARK, rid, kv_tokens, avail0, evictable, evicted, avail1, ok, n)
-    return ok, avail0, evictable, evicted, avail1
+            MARK, rid, kv_tokens, avail0, evictable0, evicted, avail1, evictable, rounds, ok, n)
+    return ok, avail0, evictable0, evicted, avail1
 
 
 def absorb(tree, verdict: PdFlipPpLoadbackVerdict) -> None:
