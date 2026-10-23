@@ -2714,6 +2714,13 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
+            # CHUNKGEOM (SOLL R11, tp_admission_agree rule 4): `rem_total_tokens` is THIS rank's pool, so on a plain TP
+            # group two ranks cut the same continuation at two lengths (the 254-vs-301 shape) and the forward's
+            # collectives run with two token counts. The group's MIN sizes it on every rank -- before the park / grant
+            # branch below, so that decision is the group's too. None off a plain TP group (byte-identical).
+            _ra_chunk_min = getattr(getattr(self, "tp_admission_agree", None), "chunk_min", None)
+            if _ra_chunk_min is not None:
+                _rem_tokens = int(_ra_chunk_min(req.rid, int(_rem_tokens)))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
@@ -2780,6 +2787,12 @@ class PrefillAdder:
                 grant = chunk_tokens_the_pool_can_fund(
                     fundable, self.page_size, self.rem_chunk_tokens
                 )
+                # CHUNKGEOM B1 (SOLL R11): `fundable` carries THIS rank's deliverable evictable, so on unequal pools the
+                # small rank parks (grant 0) while the large one extends `grant` rows -- the split the riegel would stop
+                # by name in exactly the D-load case. Every rank entered this branch on the same group MIN above, so the
+                # second gather pairs on every rank; the grant is the group's MIN too.
+                if _ra_chunk_min is not None:
+                    grant = int(_ra_chunk_min(req.rid, int(grant)))
                 self._note_cap_blind_chunk(req, fundable, grant)
                 if grant <= 0:
                     req.set_extend_range(
