@@ -220,8 +220,11 @@ class DMmItemCache:
 
         ``None`` (the caller then runs the whole prompt, as before) when a
         tokenizer-side vision stage is installed (it would run on the dummy run
-        and again on the whole one) or the dummy run does not give one plain
-        image item per key."""
+        and again on the whole one), the request has more images than the cache
+        holds entries, or the dummy run does not give one plain image item per
+        key."""
+        if len(keys) > self._max_entries:
+            return None  # the hit path could not hold every image: the whole prompt, once (review A1)
         try:
             from flliper.srt.pdflip import vision_stage_service as _vss
 

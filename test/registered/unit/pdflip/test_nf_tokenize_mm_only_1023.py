@@ -146,6 +146,13 @@ class Fallback(unittest.TestCase):
         self.assertEqual(out.input_ids, [1])
         self.assertEqual((cache.hits, cache.misses), (0, 1))
 
+    def test_more_images_than_entries_runs_the_whole_prompt_once(self):
+        p = _Stub(items_for_dummy=[])
+        cache = C.DMmItemCache(processor=p, max_entries=1)
+        asyncio.run(cache.process(obj=base._req([base.IMG_A, base.IMG_B]), prompt="t <I> u <I>",
+                                  compact_ids=[1, 5, 9, 6, 2, 5, 9, 6], max_req_input_len=10))
+        self.assertEqual(p.texts, ["t <I> u <I>"])  # no thrown-away images-only run first
+
     def test_requests_the_cache_cannot_stand_behind_never_take_the_images_only_run(self):
         p = _Stub(items_for_dummy=[])
         cache = C.DMmItemCache(processor=p, max_entries=4)
@@ -227,6 +234,30 @@ class MediaHandoffLeg(unittest.TestCase):
         self.assertEqual(calls, [])  # no tokenization: P's ids are the key, as before
         self.assertEqual(tm.d_mm_item_cache.compact, [])
         self.assertEqual(list(out.input_ids), [3, 3, 3])
+
+    def test_a_leg_the_cache_cannot_stand_behind_is_not_tokenized(self):
+        obj = GenerateReqInput(rid="pdflip-5-324", text="a <img> b", image_data=["https://x/a.png"],
+                               sampling_params={"max_new_tokens": 1})
+        tm, calls, out = self._run(obj)
+        self.assertEqual(calls, [])
+        self.assertEqual(tm.d_mm_item_cache.compact, [None])
+
+    def test_a_failing_text_tokenization_falls_back_to_the_whole_prompt(self):
+        obj = GenerateReqInput(rid="pdflip-5-325", text="a <img> b", image_data=["data:image/png;base64,AAAA"],
+                               sampling_params={"max_new_tokens": 1})
+        tm = _tm()
+        tm.d_mm_item_cache = _Spy()
+
+        async def _tok(text, is_cross):
+            raise ValueError("no tokenizer")
+
+        tm._tokenize_texts = _tok
+        tm.rid_to_state = {obj.rid: SimpleNamespace(time_stats=SimpleNamespace(set_tokenize_finish_time=lambda: 0))}
+        obj.normalize_batch_and_arguments()
+        with mock.patch("flliper.srt.managers.tokenizer_manager._pdflip_handoff_ids", return_value=[3, 3]):
+            out = asyncio.run(tm._tokenize_one_request(obj))
+        self.assertEqual(tm.d_mm_item_cache.compact, [None])
+        self.assertEqual(list(out.input_ids), [1, 5, -7, -7, 6, 2])
 
     def test_without_an_item_cache_a_media_handoff_leg_is_untouched(self):
         obj = GenerateReqInput(rid="pdflip-5-323", text="a <img> b", image_data=["data:image/png;base64,AAAA"],

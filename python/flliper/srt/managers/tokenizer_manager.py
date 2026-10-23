@@ -311,6 +311,20 @@ def _pdflip_handoff_ids(obj):
     return ids
 
 
+def _pdflip_media_leg_cacheable(obj) -> bool:
+    """MEDIA-HANDOFF-COMPACT-1023 (review A2): the leg is one the per-image cache can stand behind (images only,
+    each an inline source, no caller hashes) -- the shape ``DMmItemCache._request_keys`` takes; anything else never
+    reads compact ids, so the text is not tokenized for it."""
+    if not isinstance(obj, GenerateReqInput) or getattr(obj, "mm_hashes", None):
+        return False
+    if obj.video_data or obj.audio_data or not obj.image_data:
+        return False
+    from flliper.srt.pdflip.d_mm_item_cache import image_source_bytes
+
+    images = obj.image_data if isinstance(obj.image_data, list) else [obj.image_data]
+    return all(image_source_bytes(item) is not None for item in images)
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -1181,16 +1195,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 isinstance(input_text, str)
                 and input_text
+                and self.tokenizer is not None
                 and (self.d_mm_item_cache or self.p_known_image_cache) is not None
-                and obj.contains_mm_input()
+                and _pdflip_media_leg_cacheable(obj)
             ):
                 # MEDIA-HANDOFF-COMPACT-1023 (#157): a media leg's ids are the processor's output below, never
                 # these -- so the per-image cache needs the compact ids of the text it hands the processor. Without
                 # them (rc33 pdflip-5-321, D leg 2 after P: LEG2-FIRST-CONTENT leg2_ms=2445, of which
                 # PDFLIP-MM-TOKENIZE total_ms=1592 for an image D's probe had cached) every hand-off leg ran the HF
                 # processor on the whole prompt. Segment-cached (GROUP-SEG): the probe encoded the same pieces.
-                _ids, _ = await self._tokenize_texts(input_text, is_cross_encoder_request)
-                media_compact_ids = _ids if isinstance(_ids, list) else None
+                try:
+                    _ids, _ = await self._tokenize_texts(input_text, is_cross_encoder_request)
+                    media_compact_ids = _ids if isinstance(_ids, list) else None
+                except Exception:  # noqa: BLE001 -- no compact ids: the processor runs on the whole prompt, as before
+                    logger.warning("MEDIA-HANDOFF-COMPACT rid=%s: text not tokenized, whole-prompt processor",
+                                   obj.rid, exc_info=True)
+                    media_compact_ids = None
         else:
             if self.tokenizer is None:
                 raise ValueError(
