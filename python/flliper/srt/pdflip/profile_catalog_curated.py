@@ -866,7 +866,7 @@ EXPLAINED: Dict[str, Dict[str, object]] = {
     'FLLIPER_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL': {"kind": 'env', "group": 'Diagnostics', "level": "expert", "planner_derived": False,
         "text": 'Diagnostics: interval of the SWA deviation statistics of the KV canary (0 = off).', "gain": '', "cost": '', "depends": []},
     'FLLIPER_LOGITS_PROCESSER_CHUNK_SIZE': {"kind": 'env', "group": 'Other', "level": "expert", "planner_derived": False,
-        "text": 'Chunk size in which the logits processor computes the logprobs.', "gain": '', "cost": '', "depends": []},
+        "text": 'Rows per chunk in which the logits processor computes input (prompt) logprobs (default 64; chunking itself is FLLIPER_ENABLE_LOGITS_PROCESSER_CHUNK, default on since B8 23.10.).', "gain": 'bounds the transient logits memory of a prompt-logprob request to chunk x vocab', "cost": 'one lm_head GEMM + logits all_gather per chunk', "depends": []},
     'FLLIPER_LOG_DECODE_GRAPH_KEY': {"kind": 'env', "group": 'Diagnostics', "level": "expert", "planner_derived": False,
         "text": 'Diagnostics: logs the key of the decode CUDA graph used.', "gain": '', "cost": '', "depends": []},
     'FLLIPER_LOG_EXPERT_LOCATION_METADATA': {"kind": 'env', "group": 'Diagnostics', "level": "expert", "planner_derived": False,

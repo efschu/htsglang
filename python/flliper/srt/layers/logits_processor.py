@@ -76,6 +76,25 @@ _is_cpu = is_cpu()
 VERIFY_LOCAL_VOCAB_ENV = "FLLIPER_DFLASH_VERIFY_VOCAB_ARGMAX"
 
 
+_LOGPROB_CHUNK_NOTED = [False]
+
+
+def _note_logprob_chunking(rows: int, chunk: int, vocab: int) -> None:
+    """B8 (23.10.): one line per process the first time input logprobs run
+    chunked -- the metal proof that a long prompt-logprob request no longer
+    materialises [rows, vocab] fp32 logits in one piece."""
+    if _LOGPROB_CHUNK_NOTED[0]:
+        return
+    _LOGPROB_CHUNK_NOTED[0] = True
+    logger.info(
+        "LOGPROB-CHUNK armed: %d input-logprob rows in %d chunks of <=%d rows "
+        "(fp32 logits per chunk %.1f MiB instead of %.1f MiB in one piece; "
+        "FLLIPER_LOGITS_PROCESSER_CHUNK_SIZE)",
+        rows, -(-rows // max(1, chunk)), chunk,
+        chunk * vocab * 4 / 2**20, rows * vocab * 4 / 2**20,
+    )
+
+
 def verify_local_vocab_requested() -> bool:
     import os
 
@@ -628,6 +647,9 @@ class LogitsProcessor(nn.Module):
 
             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:
+            _note_logprob_chunking(
+                pruned_states.shape[0], self.logprobs_chunk_size, self.vocab_size
+            )
             logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
                 pruned_states,
                 sample_indices,
