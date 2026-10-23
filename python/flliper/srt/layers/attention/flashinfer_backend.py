@@ -106,6 +106,56 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# B10 (27B duo, 23.10.): FlashInfer returns attention LSE in BASE 2
+# (attention/state.cuh ``get_lse() { return m + math::ptx_log2(d); }``, scores
+# pre-scaled by sm_scale*log2e; its own merge_state combines with exp2/log2).
+# The uneven-DCP merges below (_dcp_uneven_merge -> comm.cp_lse_ag_out_*_uneven,
+# _dcp_final_merge_rows) are the natural-log torch merges of upstream's TRITON
+# path (torch.logsumexp / torch.exp / torch.logaddexp). Fed base-2 values they
+# weight each partition (rank-owned prefix shards, current chunk) by
+# Z ** (1/ln 2) instead of Z -- exact only with a single partition (a prompt
+# inside one chunk), wrong as soon as a prefix is merged. Every FlashInfer LSE
+# is therefore moved into the merge's natural-log domain exactly once, at the
+# merge boundary: lse_e = lse_2 * ln 2. FLLIPER_DCP_FI_LSE_LN2=0 restores the
+# old reading (A/B on metal only); the value is read once per process, the
+# operation is a constant multiply (CUDA-graph safe, no collective).
+_LN2 = 0.6931471805599453
+_FI_LSE_LN2_CACHE: dict = {}
+
+
+def _fi_lse_ln2_on() -> bool:
+    v = _FI_LSE_LN2_CACHE.get("on")
+    if v is None:
+        v = str(os.environ.get("FLLIPER_DCP_FI_LSE_LN2", "1")).strip().lower() not in (
+            "0", "off", "false", "no"
+        )
+        _FI_LSE_LN2_CACHE["on"] = v
+        if not v:
+            logger.warning(
+                "FLLIPER_DCP_FI_LSE_LN2=0: uneven-DCP merges read FlashInfer's "
+                "base-2 LSE as natural log (pre-B10 behaviour, A/B only)."
+            )
+    return v
+
+
+def _fi_lse_to_merge_domain(lse):
+    """FlashInfer base-2 LSE -> the natural-log domain of the DCP merges."""
+    if not isinstance(lse, torch.Tensor) or not _fi_lse_ln2_on():
+        return lse
+    return lse * _LN2
+
+
+def _natural_merge_on_base2(merge_fn, v_a, s_a, v_b, s_b):
+    """B10 class (23.10.): run a NATURAL-log two-state merge (the in-tree
+    merge_state_triton: tl.exp / tl.log) on FlashInfer's BASE-2 LSEs and hand
+    the merged LSE back in base 2, so _safe_merge_state returns the same
+    (o, lse) contract from both of its branches (flashinfer merge_state is
+    base 2). Before, the >max-heads fallback silently re-weighted the two
+    states by Z ** (1/ln 2)."""
+    v, s = merge_fn(v_a, s_a * _LN2, v_b, s_b * _LN2)
+    return v, (s / _LN2 if s is not None else s)
+
+
 def _dcp_uneven_merge(
     o, lse, group, head_counts, return_lse: bool = False, block_tokens: int = 0,
     force_fused: bool = False,
@@ -133,6 +183,9 @@ def _dcp_uneven_merge(
         weightless_kv_active,
     )
 
+    # B10: every caller hands FlashInfer's raw base-2 LSE; the merge (and the
+    # global LSE it returns) is natural-log.
+    lse = _fi_lse_to_merge_domain(lse)
     # The weightless-KV workers' own merge sites (forward_*_weightless_worker)
     # stay on the all_reduce, so a weightless boot must too, or the head and its
     # workers would enter different collectives.
@@ -300,7 +353,7 @@ if is_flashinfer_available():
         max_heads = _merge_state_max_safe_num_heads(head_dim, v_a.element_size())
         if num_heads <= max_heads:
             return merge_state(v_a, s_a, v_b, s_b)
-        return merge_state_triton(v_a, s_a, v_b, s_b)
+        return _natural_merge_on_base2(merge_state_triton, v_a, s_a, v_b, s_b)
 
 
 class WrapperDispatch(Enum):
@@ -6572,6 +6625,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # [T,0,D] slice (the merged output goes to the head rank only).
         # 27B RC7: the SAME token blocks as the head's _dcp_uneven_merge (same
         # width, same T) -- one block is the call below, unchanged.
+        lse = _fi_lse_to_merge_domain(lse)  # B10: same domain as the head's merge
         if lse_merge_is_blocked(o.shape[0], self._dcp_merge_block_tokens, group.world_size):
             cp_lse_merge_token_blocks(
                 cp_lse_ag_out_ar_mha_uneven, o, lse, group, self.dcp_q_head_counts,
@@ -6649,6 +6703,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         # 27B RC7: the SAME token blocks as the head's prefix merge.
+        lse_pre = _fi_lse_to_merge_domain(lse_pre)  # B10: same domain as the head
         if lse_merge_is_blocked(o_pre.shape[0], self._dcp_merge_block_tokens, group.world_size):
             cp_lse_merge_token_blocks(
                 cp_lse_ag_out_ar_mha_uneven, o_pre, lse_pre, group,
@@ -7053,11 +7108,12 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def _dcp_extend_final_merge(self, q, layer, o_cur, lse_cur, o_pre, lse_pre):
         """4. Merge current chunk with prefix (both in this rank's local-head
-        space) by natural-log LSE. lse_pre is a torch.logsumexp (natural
-        log) from the cross-rank combine, and flashinfer's ragged
-        forward_return_lse also returns natural-log LSE, so logaddexp mixes
-        them consistently. (flashinfer's merge_state uses a different
-        internal convention and must NOT be used across these two sources.)"""
+        space) by natural-log LSE. lse_pre comes out of the cross-rank combine
+        already in the natural-log domain (_dcp_uneven_merge converts its
+        input). lse_cur is flashinfer's ragged forward_return_lse, which is
+        BASE 2 (B10, 23.10. -- the earlier note here said natural log; the
+        kernel writes m + log2(d)), so it is converted here, once."""
+        lse_cur = _fi_lse_to_merge_domain(lse_cur)
         # 27B RC7: rows beyond the LSE merge's token-block width are combined
         # in the same blocks. Purely local and elementwise, so each row's
         # value is the one-shot value; one block is the expression unchanged.
