@@ -410,6 +410,60 @@ def driver_report(
         return {"label": label, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def exception_dump_files(since_unix: float) -> list:
+    """The coredump files of this boot: the directory/prefix of CUDA_COREDUMP_FILE
+    (as this process has it), modified at or after ``since_unix``."""
+    pattern = os.environ.get("CUDA_COREDUMP_FILE") or f"{get_dump_dir()}/cuda_coredump_%h.%p.%t"
+    d, base = os.path.split(pattern)
+    prefix = base.split("%", 1)[0]
+    out = []
+    for path in glob.glob(os.path.join(d or ".", glob.escape(prefix) + "*")):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if st.st_mtime >= since_unix:
+            out.append((path, st.st_size, st.st_mtime))
+    return sorted(out)
+
+
+def wait_for_exception_dumps(since_unix: float, log: Optional[logging.Logger] = None, cap_s: float = 60.0,
+                             quiet_s: float = 2.0, poll_s: float = 0.25,
+                             clock: Callable[[], float] = None, sleep: Callable[[float], None] = None) -> list:
+    """NF #162: the crash path of launch_server (SIGQUIT -> 5 s settle -> kill_process_tree) must not cut a GPU
+    exception dump a rank is still writing (rc31b: SIGQUIT 23:58:39, kill 23:58:46). Wait while a coredump file of
+    this boot is still growing -- until none changed for ``quiet_s``, at most ``cap_s`` -- and name what is there."""
+    import time as _time
+
+    log = log or _logger
+    clock = clock or _time.time
+    sleep = sleep or _time.sleep
+    try:
+        if not is_enabled():
+            return []
+        t0 = clock()
+        files = exception_dump_files(since_unix)
+        while files and clock() - t0 < cap_s:
+            newest = max(m for _, _, m in files)
+            if clock() - newest >= quiet_s:
+                break
+            sleep(poll_s)
+            files = exception_dump_files(since_unix)
+        waited = clock() - t0
+        if files:
+            for path, size, _ in files:
+                log.error("CUDA-COREDUMP FILE at crash: %s size=%d (waited %.1f s for it to stop growing%s)",
+                          path, size, waited, ", CAP reached" if waited >= cap_s else "")
+        else:
+            log.error("CUDA-COREDUMP FILE at crash: none in %s since this boot -- no rank hit a GPU exception the "
+                      "driver dumped (or the rank was not armed: see its CUDA-COREDUMP DRIVER line)",
+                      os.path.dirname(os.environ.get("CUDA_COREDUMP_FILE") or "") or get_dump_dir())
+        return files
+    except Exception as exc:  # noqa: BLE001 - never blocks the teardown
+        log.error("CUDA-COREDUMP FILE at crash: check raised %s: %s", type(exc).__name__, exc)
+        return []
+
+
 # Auto-inject CUDA coredump env vars at import time.
 # The sentinel env var is inherited by child processes, so injection only
 # happens once in the top-level process.

@@ -314,5 +314,88 @@ class TheSchedulerEntryLogsBothWitnesses(unittest.TestCase):
         self.assertLess(rep, self._call_line("send"))
 
 
+class TheCrashPathWaitsForAGrowingDump(unittest.TestCase):
+    """rc31b: SIGQUIT 23:58:39, kill_process_tree 23:58:46. The launch_server crash path waits while a GPU exception
+    dump of this boot is still growing, then names it -- the kill must not cut it."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["FLLIPER_CUDA_COREDUMP"] = "1"
+        from flliper.srt.debug_utils import cuda_coredump as cc
+        cls.cc = cc
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("FLLIPER_CUDA_COREDUMP", None)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = os.environ.get("CUDA_COREDUMP_FILE")
+        os.environ["CUDA_COREDUMP_FILE"] = self.tmp.name + "/cuda_coredump_%h.%p.%t"
+        self.now = [1000.0]
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("CUDA_COREDUMP_FILE", None)
+        else:
+            os.environ["CUDA_COREDUMP_FILE"] = self.saved
+        self.tmp.cleanup()
+
+    def _file(self, name, size, mtime):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as fh:
+            fh.write(b"x" * size)
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_it_waits_until_the_dump_stops_growing_and_names_it(self):
+        path = self._file("cuda_coredump_CT999.1418.1792", 10, 1000.0)
+        grows = [3]
+
+        def sleep(dt):
+            self.now[0] += dt
+            if grows[0] > 0:  # the rank is still writing: size and mtime move
+                grows[0] -= 1
+                with open(path, "ab") as fh:
+                    fh.write(b"y" * 100)
+                os.utime(path, (self.now[0], self.now[0]))
+
+        with self.assertLogs("t_cc_wait", level="ERROR") as cm:
+            files = self.cc.wait_for_exception_dumps(900.0, logging.getLogger("t_cc_wait"), quiet_s=2.0,
+                                                     poll_s=0.5, clock=lambda: self.now[0], sleep=sleep)
+        self.assertEqual([(p, s) for p, s, _ in files], [(path, 310)])
+        self.assertGreaterEqual(self.now[0] - 1000.0, 1.5 + 2.0)  # three growth polls, then 2 s quiet
+        self.assertIn("CUDA-COREDUMP FILE at crash: " + path + " size=310", cm.output[0])
+
+    def test_the_cap_bounds_the_wait(self):
+        path = self._file("cuda_coredump_CT999.1418.1792", 10, 1000.0)
+
+        def sleep(dt):
+            self.now[0] += dt
+            os.utime(path, (self.now[0], self.now[0]))  # never stops growing
+
+        with self.assertLogs("t_cc_wait", level="ERROR") as cm:
+            self.cc.wait_for_exception_dumps(900.0, logging.getLogger("t_cc_wait"), cap_s=5.0, poll_s=1.0,
+                                             clock=lambda: self.now[0], sleep=sleep)
+        self.assertLessEqual(self.now[0] - 1000.0, 5.0 + 1.0)
+        self.assertIn("CAP reached", cm.output[0])
+
+    def test_an_old_dump_of_an_earlier_boot_is_not_this_boots(self):
+        self._file("cuda_coredump_CT999.77.1", 10, 500.0)
+        with self.assertLogs("t_cc_wait", level="ERROR") as cm:
+            files = self.cc.wait_for_exception_dumps(900.0, logging.getLogger("t_cc_wait"),
+                                                     clock=lambda: self.now[0], sleep=lambda dt: None)
+        self.assertEqual(files, [])
+        self.assertIn("none in " + self.tmp.name, cm.output[0])
+
+    def test_the_tokenizer_manager_calls_it_between_the_settle_and_the_diagnostics(self):
+        src = open(os.path.join(PY, "flliper", "srt", "managers", "tokenizer_manager.py"), encoding="utf-8").read()
+        i_sleep = src.index("time.sleep(5)")
+        i_wait = src.index("_cudacore.wait_for_exception_dumps(")
+        i_procs = src.index("scheduler_procs = collect_scheduler_processes()")
+        self.assertLess(i_sleep, i_wait)
+        self.assertLess(i_wait, i_procs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3203,6 +3203,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
             )
             time.sleep(5)
+            # NF #162: a rank may still be writing its GPU exception dump; the
+            # kill_process_tree after this function must not cut it.
+            try:
+                import psutil as _psutil
+
+                from flliper.srt.debug_utils import cuda_coredump as _cudacore
+
+                _cudacore.wait_for_exception_dumps(_psutil.Process().create_time(), logger)
+            except Exception:  # noqa: BLE001 - never blocks the teardown
+                pass
 
             scheduler_procs = collect_scheduler_processes()
             if scheduler_procs:
