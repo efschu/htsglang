@@ -3156,12 +3156,35 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ) = self._solo_pool_filter_prefill(
                     batch, target_hidden, batch.out_cache_loc, positions
                 )
+            window_mapper = (
+                self._solo_pool_mapper
+                if self._solo_pool_mapper is not None and self._window_pool
+                else None
+            )
+            if window_mapper is not None:
+                # 27b-ddeath-1023: under the WINDOW pool a prefill forward is a
+                # mapper ROUND. The LRU reclaim only frees slots "not touched
+                # in the current round", and the round used to advance on the
+                # DECODE prep alone. A long chunked D prefill with no decode in
+                # between (idle D, #running-req 0) wrote every chunk at ONE
+                # epoch: boot ...10231804 died at 18:10:03Z with 'DFLASH small
+                # solo pool exhausted: need 87 more draft slots but only 0
+                # reclaimable of 24673 total (ctx cap 2048)' at 22872 of a
+                # 32k-token prompt. Advancing here makes earlier forwards' rows
+                # reclaimable; this forward's rows stay protected.
+                # Window pool ONLY: the non-window solo pool is full-context
+                # (an evicted early chunk would be a permanent mid-context
+                # hole), and its live set is bounded by the sizing itself
+                # (over-cap requests are filtered out above).
+                window_mapper.begin_round()
             if prefill_cache_loc is not None and prefill_cache_loc.numel() > 0:
                 self._append_target_hidden_to_draft_kv_by_loc(
                     target_hidden=prefill_hidden,
                     cache_loc=prefill_cache_loc,
                     positions=prefill_positions,
                 )
+            if window_mapper is not None:
+                self._window_pool_mark_prefill_tails(batch, window_mapper)
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         self._release_target_context_hidden(logits_output)
@@ -3170,6 +3193,30 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             seq_lens=batch.seq_lens,
         )
+
+    def _window_pool_mark_prefill_tails(self, batch, mapper) -> None:
+        """27b-ddeath-1023 review: the reclaim's LAST victims are the next
+        decode window (last W rows) of every prefilled request. Rows of one
+        forward share one epoch, so epoch order alone can hole the window of
+        an earlier request of a back-to-back burst (6 x 4000 at X=4096).
+        Per request of this extend: rows [max(0, end - W), end) are marked as
+        window tail, rows that fell out of it since the previous chunk
+        ([max(0, prefix - W), max(0, end - W)) below prefix) are unmarked.
+        The decode prep clears all marks (it refreshes every running window's
+        epoch itself). Host-int slicing only, no device read."""
+        W = int(self.draft_window_size)
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        rows = batch.req_pool_indices
+        for i, (p, n) in enumerate(zip(batch.prefix_lens, batch.extend_lens)):
+            p = int(p)
+            e = p + int(n)
+            tail_lo = max(0, e - W)
+            old_lo = max(0, p - W)
+            row = req_to_token[rows[i]]
+            if old_lo < min(p, tail_lo):
+                mapper.unmark_window_tail(row[old_lo : min(p, tail_lo)])
+            if tail_lo < e:
+                mapper.mark_window_tail(row[tail_lo:e])
 
     def _solo_pool_filter_prefill(
         self, batch, target_hidden, cache_loc, positions
@@ -3578,6 +3625,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                     mapper = self._solo_pool_mapper
                     mapper.begin_round()
+                    mapper.clear_window_tail()
                     _holes = rebuild_window_rows_sync_free(
                         mapper=mapper,
                         target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
@@ -3631,6 +3679,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         # unmapped prefix rows read the zero-KV hole slot.
                         mapper = self._solo_pool_mapper
                         mapper.begin_round()
+                        mapper.clear_window_tail()
                         suffix_cache_loc = mapper.translate_read(suffix_cache_loc)
                         block_loc = mapper.translate_write(verify_out_cache_loc)
                     assign_req_to_token_pool_func(

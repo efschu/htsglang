@@ -202,6 +202,12 @@ class DraftKVSlotMapper:
             (self.num_draft_slots,), dtype=torch.int64, device=device
         )
         self._epoch = 1
+        # 27b-ddeath-1023: window-tail marks (the next decode window of a
+        # prefilled request); the reclaim takes marked slots LAST. Set by the
+        # window-pool prefill, cleared by the decode prep and on allocation.
+        self._slot_tail = torch.zeros(
+            (self.num_draft_slots,), dtype=torch.bool, device=device
+        )
         # Cross-thread free queue (allocator listener -> worker drain).
         self._pending_lock = threading.Lock()
         self._pending_free: List[torch.Tensor] = []
@@ -429,6 +435,36 @@ class DraftKVSlotMapper:
     def begin_round(self) -> None:
         self._epoch += 1
 
+    # -- window-tail marks (27b-ddeath-1023) -------------------------------
+    def _tail_slots(self, global_locs: torch.Tensor):
+        g = global_locs.to(device=self.map.device, dtype=torch.int64).reshape(-1)
+        ok = (g >= 0) & (g <= self.num_global_slots)
+        g = torch.where(ok, g, torch.zeros_like(g))
+        d = self.map[g].to(torch.int64)
+        live = ok & (d > 0)
+        return torch.where(live, d, torch.zeros_like(d)), live
+
+    def mark_window_tail(self, global_locs: torch.Tensor) -> None:
+        """Mark the mapped draft slots of *global_locs* as a live request's
+        window tail (reclaimed last). Fixed-shape, no host read; unmapped
+        globals mark nothing (the hole slot is reset after the scatter)."""
+        self._drain_pending()
+        if global_locs.numel() == 0:
+            return
+        d, live = self._tail_slots(global_locs)
+        self._slot_tail.index_put_((d,), live)
+        self._slot_tail[0] = False
+
+    def unmark_window_tail(self, global_locs: torch.Tensor) -> None:
+        self._drain_pending()
+        if global_locs.numel() == 0:
+            return
+        d, _ = self._tail_slots(global_locs)
+        self._slot_tail.index_fill_(0, d, False)
+
+    def clear_window_tail(self) -> None:
+        self._slot_tail.zero_()
+
     def _drain_pending(self) -> None:
         with self._pending_lock:
             pending = self._pending_free
@@ -492,6 +528,7 @@ class DraftKVSlotMapper:
         self._free_count = self.num_draft_slots - 1
         self._slot_global.fill_(-1)
         self._slot_epoch.zero_()
+        self._slot_tail.zero_()
 
     def _apply_free(self, free_index: torch.Tensor) -> None:
         if self.sync_free and not self._in_exact and self._on_owner_stream():
@@ -697,6 +734,9 @@ class DraftKVSlotMapper:
             (torch.where(need, new_slots.to(torch.int64), zero),),
             torch.where(need, g, torch.full_like(g, -1)),
         )
+        self._slot_tail.index_fill_(
+            0, torch.where(need, new_slots.to(torch.int64), zero), False
+        )
         self._counters[0].sub_(n)
         cur = self.map[g]
         d = torch.where(valid_mask & (cur >= 0), cur.to(torch.int64), zero)
@@ -730,6 +770,7 @@ class DraftKVSlotMapper:
             fresh_g = g[need]
             self.map[fresh_g] = new_slots
             self._slot_global[new_slots.to(torch.int64)] = fresh_g
+            self._slot_tail[new_slots.to(torch.int64)] = False
             cur = self.map[g]
         d = torch.where(
             valid_mask & (cur >= 0),
@@ -757,7 +798,14 @@ class DraftKVSlotMapper:
                 f"{SOLO_POOL_CAP_ENV}."
             )
         take = min(int(cand.numel()), target)
-        order = torch.argsort(self._slot_epoch[cand])
+        # 27b-ddeath-1023 review: order by (window tail, epoch). Rows of one
+        # prefill forward share an epoch, so epoch alone breaks ties
+        # arbitrarily and could hole the next decode window of an earlier
+        # request of a burst; marked window-tail slots go LAST.
+        key = self._slot_epoch[cand] + self._slot_tail[cand].to(torch.int64) * (
+            1 << 40
+        )
+        order = torch.argsort(key)
         victims = cand[order[:take]]
         self.reclaim_events += 1
         self.reclaimed_slots_total += take
