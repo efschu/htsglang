@@ -217,6 +217,36 @@ def test_sample_docker_inspects_stopped_containers_for_their_state_root(monkeypa
         "/spinning/docker-acceptance/27b/state-duo", "/spinning/docker-acceptance/nf/state-dev"]
 
 
+def test_sample_docker_without_an_inspect_reading_keeps_the_glob_fallback(monkeypatch):
+    """Review 23.10.: unparsable docker inspect output is no reading -- not "no container mounts a state root" ([] would drop the glob)."""
+    ps = "\t".join(["flliper-27b-nvfp4-duo", "img", "st", "running", "", "2026-10-23 05:00:00", "1h"])
+    monkeypatch.setattr(sources, "run", lambda cmd, timeout: ps if cmd[-1].startswith("docker ps") else "not json")
+    rows = sources.Sources({"docker_ssh": ["ssh", "h"], "docker_host_prefix": "/p"}).sample_docker()
+    assert [r["Names"] for r in rows] == ["flliper-27b-nvfp4-duo"] and "state_root" not in rows[0]
+    assert sources.state_roots_from_view({"docker": {"value": rows}}) is None
+    st = ipcstate.StateRoots(static=(), containers=lambda: sources.state_roots_from_view({"docker": {"value": rows}}),
+                             pattern="/nonexistent-1023/*/state*")
+    st.resolve()
+    assert st.source == "glob"
+
+
+def test_sample_docker_keeps_the_newest_stopped_containers_beyond_twelve(monkeypatch):
+    """Review 23.10.: with more than 12 matching containers the NEWEST stopped ones stay (with their state roots); before, the
+    oldest stayed and a container stopped a minute ago fell off.  Page order (running first, then oldest first) is unchanged."""
+    names = [("old-%02d" % i, "exited", "2026-09-%02d 05:00:00" % (i + 1)) for i in range(12)]
+    names += [("flliper-27b-nvfp4-duo", "exited", "2026-10-23 10:59:37"), ("flliper-nf", "running", "2026-10-21 02:13:46")]
+    ps = "\n".join("\t".join([n, "img", "st", state, "", created, "1h"]) for n, state, created in names)
+    ins = [_inspect(n, state == "running", "/var/lib/htsglang/stateroot", "/p/spinning/docker-acceptance/%s/state" % n)
+           for n, state, _ in names]
+    monkeypatch.setattr(sources, "run", lambda cmd, timeout: ps if cmd[-1].startswith("docker ps") else json.dumps(ins))
+    rows = sources.Sources({"docker_ssh": ["ssh", "h"], "docker_host_prefix": "/p"}).sample_docker()
+    got = [r["Names"] for r in rows]
+    assert len(got) == 12
+    assert got[0] == "flliper-nf" and got[-1] == "flliper-27b-nvfp4-duo"
+    assert "old-00" not in got and "old-01" not in got and "old-02" in got
+    assert "/spinning/docker-acceptance/flliper-27b-nvfp4-duo/state" in sources.state_roots_from_view({"docker": {"value": rows}})
+
+
 # ---------------------------------------------------------------- the feature view sees the new root too
 
 def test_feature_view_takes_a_further_root_of_the_ipc_reader(tmp_path):

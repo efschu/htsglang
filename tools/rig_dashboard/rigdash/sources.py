@@ -120,6 +120,8 @@ def state_roots_from_view(view: Optional[dict]) -> Optional[List[str]]:
     rows = ((view or {}).get("docker") or {}).get("value")
     if not isinstance(rows, list):
         return None
+    if rows and not any(isinstance(r, dict) and "state_root" in r for r in rows):
+        return None         # containers listed, but no docker inspect reading (sample_docker leaves the key out then)
     out = []
     for r in rows:
         root = r.get("state_root") if isinstance(r, dict) else None
@@ -400,18 +402,27 @@ class Sources:
             try:
                 parsed = json.loads(ins)
             except ValueError:
-                parsed = []
+                # review 23.10.: no inspect reading is not "no container mounts a state root" -- the rows then carry no state_root key,
+                # state_roots_from_view says None and ipcstate.StateRoots keeps its glob fallback (an empty list would drop it)
+                parsed, roots = [], None
             prefix = self.cfg.get("docker_host_prefix", "")
             live = [c for c in parsed if (c.get("Name") or "").lstrip("/") in running]
             dirs = container_log_dirs(live, prefix)
             health_out = container_health_output(live)
-            roots = container_state_roots(parsed, prefix)
+            if roots is not None:
+                roots = container_state_roots(parsed, prefix)
+        # review 23.10.: more than 12 matching containers keep the running ones and the NEWEST stopped ones (before: the oldest stayed, so a
+        # container stopped a minute ago fell off the list and its state root with it); the page order below is unchanged
+        keep = sorted(rows, key=lambda r: r.get("CreatedAt", ""), reverse=True)
+        keep = sorted(keep, key=lambda r: r.get("State") != "running")[:12]
+        rows = [r for r in rows if any(r is k for k in keep)]
         rows.sort(key=lambda r: (r.get("State") != "running", r.get("CreatedAt", "")), reverse=False)
         for r in rows:
             r["evidence_dir"] = dirs.get(r.get("Names"))
             r["health_output"] = health_out.get(r.get("Names"))
-            r["state_root"] = roots.get(r.get("Names"))
-        return rows[:12]
+            if roots is not None:
+                r["state_root"] = roots.get(r.get("Names"))
+        return rows
 
     def sample_gpuq(self):
         base = self.cfg.get("gpuq", "http://127.0.0.1:8770").rstrip("/")
