@@ -238,5 +238,77 @@ class TestLongChunkedPrefillWindowPool(CustomTestCase):
             prefill(*_chunk(0, 32, 0))
 
 
+class TestPerRequestTailClear(CustomTestCase):
+    """27b-ddeath2-1023 review RISK: the decode prep cleared ALL tail marks,
+    dropping those of requests prefilled but not yet in a decode batch."""
+
+    def _setup(self, sync_free):
+        m = _mapper(sync_free)
+        prefill = _fake_worker(m)
+        for r in (0, 1):
+            prefill(*_chunk(0, 3000, r))  # both prefilled + marked (last W)
+        self.assertEqual(int(m._slot_tail.sum()), 2 * W)
+        return m
+
+    def _tail_count(self, m, r):
+        tail = torch.arange(_base(r) + 3000 - W, _base(r) + 3000)
+        d = m.map[tail].to(torch.int64)
+        return int(m._slot_tail[d].sum())
+
+    def test_decode_prep_of_b_keeps_a_marks_and_clears_b(self):
+        for sync_free in (False, True):
+            m = self._setup(sync_free)
+            req_to_token = _req_to_token()
+            # request B (row 1) is in decode prep: window = its last W rows.
+            m.clear_window_tail_for_rows(
+                req_to_token,
+                torch.tensor([1]),
+                torch.tensor([3000 - W]),
+                torch.tensor([W]),
+                W,
+                lookback=W,
+            )
+            self.assertEqual(self._tail_count(m, 0), W, f"sync_free={sync_free}")
+            self.assertEqual(self._tail_count(m, 1), 0, f"sync_free={sync_free}")
+            self.assertEqual(int(m._slot_tail.sum()), W)
+
+    def test_slid_out_rows_of_decoding_request_are_cleared(self):
+        m = self._setup(False)
+        # B decoded 100 tokens past its prompt: window start moved by 100.
+        m.clear_window_tail_for_rows(
+            _req_to_token(),
+            torch.tensor([1]),
+            torch.tensor([3000 + 100 - W]),
+            torch.tensor([W]),
+            W,
+            lookback=W,
+        )
+        self.assertEqual(self._tail_count(m, 1), 0)
+        self.assertEqual(self._tail_count(m, 0), W)
+
+    def test_padding_columns_clear_nothing(self):
+        m = self._setup(False)
+        # batch of one short row padded to a wider host bound: columns past
+        # lengths[b] must not unmark request A's rows.
+        m.clear_window_tail_for_rows(
+            _req_to_token(),
+            torch.tensor([1]),
+            torch.tensor([3000 - 4]),
+            torch.tensor([4]),
+            64,
+        )
+        self.assertEqual(self._tail_count(m, 0), W)
+        self.assertEqual(self._tail_count(m, 1), W - 4)
+
+    def test_decode_prep_sites_do_not_clear_globally(self):
+        import inspect
+
+        from flliper.srt.speculative import dflash_worker_v2
+
+        src = inspect.getsource(dflash_worker_v2)
+        self.assertNotIn("mapper.clear_window_tail()", src)
+        self.assertEqual(src.count("mapper.clear_window_tail_for_rows("), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

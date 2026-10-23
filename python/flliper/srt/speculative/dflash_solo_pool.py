@@ -463,7 +463,51 @@ class DraftKVSlotMapper:
         self._slot_tail.index_fill_(0, d, False)
 
     def clear_window_tail(self) -> None:
+        # Global clear: reset paths only. A decode prep must use
+        # clear_window_tail_for / clear_window_tail_for_rows (review RISK
+        # 27b-ddeath2-1023: the global form also drops the marks of requests
+        # that are prefilled but not yet in a decode batch).
         self._slot_tail.zero_()
+
+    def clear_window_tail_for(self, global_locs: torch.Tensor) -> None:
+        """Per-request clear: drop the tail marks of the mapped draft slots of
+        *global_locs* (the window rows of the requests in the current decode
+        batch); marks of every other request survive. Device ops only."""
+        self.unmark_window_tail(global_locs)
+
+    def clear_window_tail_for_rows(
+        self,
+        target_req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        start: torch.Tensor,
+        lengths: torch.Tensor,
+        max_len: int,
+        lookback: int = 0,
+    ) -> None:
+        """Per-request clear for the decode prep: rows
+        ``[start[b] - lookback, start[b] + lengths[b])`` (lower end clamped at
+        0) of target req_to_token row ``req_pool_indices[b]``, padded to the
+        host bound *max_len* + *lookback*. *lookback* (the window size) also
+        drops the stale marks of rows that slid out of the window since the
+        prefill marked them. No host read; padding columns clear nothing."""
+        bs = int(req_pool_indices.shape[0])
+        if bs == 0 or max_len <= 0:
+            return
+        if lookback > 0:
+            start = start.to(torch.int64)
+            lo = (start - lookback).clamp_(min=0)
+            lengths = lengths.to(torch.int64) + (start - lo)
+            start = lo
+            max_len = max_len + int(lookback)
+        device = target_req_to_token.device
+        rows = req_pool_indices.to(device=device, dtype=torch.int64).unsqueeze(1)
+        offsets = torch.arange(max_len, device=device, dtype=torch.int64).unsqueeze(0)
+        mask = offsets < lengths.to(device=device, dtype=torch.int64).unsqueeze(1)
+        pos = (start.to(device=device, dtype=torch.int64).unsqueeze(1) + offsets)
+        pos = pos.masked_fill(~mask, 0)
+        g = target_req_to_token[rows, pos].to(torch.int64)
+        g = torch.where(mask, g, torch.zeros_like(g))
+        self.unmark_window_tail(g)
 
     def _drain_pending(self) -> None:
         with self._pending_lock:

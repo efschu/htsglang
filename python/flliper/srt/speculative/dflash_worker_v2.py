@@ -3625,7 +3625,17 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                     mapper = self._solo_pool_mapper
                     mapper.begin_round()
-                    mapper.clear_window_tail()
+                    # Per request (review RISK 27b-ddeath2-1023): only the
+                    # marks of THIS batch's windows; prefilled-but-not-yet-
+                    # decoding requests keep theirs.
+                    mapper.clear_window_tail_for_rows(
+                        self.model_runner.req_to_token_pool.req_to_token,
+                        batch.req_pool_indices,
+                        suffix_start,
+                        draft_prefix_lens,
+                        int(seq_lens_cpu.max()) if bs > 0 else 0,
+                        lookback=int(self.draft_window_size),
+                    )
                     _holes = rebuild_window_rows_sync_free(
                         mapper=mapper,
                         target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
@@ -3679,7 +3689,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                         # unmapped prefix rows read the zero-KV hole slot.
                         mapper = self._solo_pool_mapper
                         mapper.begin_round()
-                        mapper.clear_window_tail()
+                        # Per request (review RISK 27b-ddeath2-1023): the
+                        # request rows of this batch's windows (+ the rows
+                        # that slid out since the prefill marked them).
+                        mapper.clear_window_tail_for_rows(
+                            self.model_runner.req_to_token_pool.req_to_token,
+                            batch.req_pool_indices,
+                            suffix_start,
+                            draft_prefix_lens,
+                            int(draft_prefix_lens.max().item()),
+                            lookback=int(self.draft_window_size),
+                        )
                         suffix_cache_loc = mapper.translate_read(suffix_cache_loc)
                         block_loc = mapper.translate_write(verify_out_cache_loc)
                     assign_req_to_token_pool_func(
