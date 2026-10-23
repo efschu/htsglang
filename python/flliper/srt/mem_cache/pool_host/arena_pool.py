@@ -977,6 +977,44 @@ ARENA_PAGE_LOAD_BLOCK_ENV = "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_BLOCK"
 
 _PAGE_LOAD_N = 0
 _ARENA_WRITE_N = 0
+#: #179: writes whose run stage the card refused (OOM) and that went the cell way.
+_ARENA_WRITE_OOM = [0]
+
+
+def _make_write_clock():
+    from flliper.srt.pdflip import arena_write as _aw
+
+    return _aw.WriteClock()
+
+
+_ARENA_WRITE_CLOCK = _make_write_clock()
+_STAGE_CHUNK_TOKENS = []
+
+
+def _pinned_to(t: torch.Tensor, dev) -> torch.Tensor:
+    """Host tensor -> card through pinned memory, non-blocking (no stream sync).
+    One door, so the desk can run the arena write on a CPU-only box."""
+    return t.pin_memory().to(dev, non_blocking=True)
+
+
+def _stage_chunk_tokens():
+    """#179: ``chunked_prefill_size`` of this process (the stage holds at most one
+    extend chunk's pages); None when the value is not positive (no chunked
+    prefill: the write stays one fill, named in the log line). Server args not
+    published or not readable yet: None for THIS write, read again next time
+    (never frozen as None)."""
+    if not _STAGE_CHUNK_TOKENS:
+        try:
+            from flliper.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+            if sa is None:
+                return None
+            ct = int(getattr(sa, "chunked_prefill_size", 0) or 0)
+        except Exception:  # noqa: BLE001 -- not readable now: one fill for THIS write
+            return None
+        _STAGE_CHUNK_TOKENS.append(ct if ct > 0 else None)
+    return _STAGE_CHUNK_TOKENS[0]
 
 
 class _NoEvent:
@@ -3113,18 +3151,23 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # on the card, then two contiguous runs per page (K, V) go to the
             # slot with the pointer/stride kernel -- L KiB per transfer instead
             # of 1 KiB, and the loader's block quota instead of the default 2.
+            # #179: the stage holds at most one extend chunk's pages
+            # (arena_write.stage_chunk_pages); a longer write (a finished
+            # request's decode tail: 882 MiB at boot 10231552) refills it on the
+            # same stream instead of asking the card for pages x 2 x run.
+            _t0 = _ARENA_WRITE_CLOCK.mark()
+            _cp = 0
+            stage = None
             try:
                 k_off, v_off, run = runs
                 L = len(self._k_offs)
+                _ct = _stage_chunk_tokens()
+                _cp = _aw.stage_chunk_pages(_ct, P, b)
                 didx = device_indices.to(device=dev, dtype=torch.int64)
-                stage = torch.empty((b, 2 * run), dtype=torch.uint8, device=dev)
-                for l in range(L):
-                    kv = device_pool.k_buffer[l]
-                    vv = device_pool.v_buffer[l]
-                    stage[:, l * block:(l + 1) * block].copy_(
-                        kv.view(torch.uint8).reshape(kv.shape[0], -1)[didx].reshape(b, block))
-                    stage[:, run + l * block:run + (l + 1) * block].copy_(
-                        vv.view(torch.uint8).reshape(vv.shape[0], -1)[didx].reshape(b, block))
+                # the previous write's stage is released first (same stream: its
+                # block is reusable at once) -- never two stages on the card
+                self._write_stage_keep = None
+                stage = torch.empty((_cp, 2 * run), dtype=torch.uint8, device=dev)
                 dst_ptrs, src_ptrs, _src_stride = _aw.run_pointers(
                     self._data_base, k_off, v_off, run, stage.data_ptr())
                 # fnFL2 H47: the run goes in RUN_ELEMENT_BYTES items, never as
@@ -3137,36 +3180,71 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     raise ValueError(
                         f"run {run} B / page {self._page_bytes} B not a whole number of "
                         f"{_E}-B elements (H47: the whole-run element would grow the card's LMEM)")
-                idx_dst, idx_src = _aw.run_split_indices(slots, _n, self._page_bytes, _E)
-                _nb = lambda t: t.pin_memory().to(dev, non_blocking=True)   # noqa: E731 -- no stream sync
-                jit_transfer_hicache_all_layer_mla(
-                    ptr_dst=_nb(torch.tensor(dst_ptrs, dtype=torch.uint64)),
-                    indices_dst=_nb(idx_dst),
-                    ptr_src=_nb(torch.tensor(src_ptrs, dtype=torch.uint64)),
-                    indices_src=_nb(idx_src),
-                    cache_src_stride_bytes=_E,
-                    cache_dst_stride_bytes=_E,
-                    element_size=_E,
-                    block_quota=_quota,
-                )
+                _nb = lambda t: _pinned_to(t, dev)   # noqa: E731 -- pinned + non-blocking, no stream sync
+                _pd = _nb(torch.tensor(dst_ptrs, dtype=torch.uint64))
+                _ps = _nb(torch.tensor(src_ptrs, dtype=torch.uint64))
+                _chunks = _aw.stage_chunks(b, _cp)
+                for c0, c1 in _chunks:
+                    m = c1 - c0
+                    dc = didx[c0 * P:c1 * P]
+                    for l in range(L):
+                        kv = device_pool.k_buffer[l]
+                        vv = device_pool.v_buffer[l]
+                        stage[:m, l * block:(l + 1) * block].copy_(
+                            kv.view(torch.uint8).reshape(kv.shape[0], -1)[dc].reshape(m, block))
+                        stage[:m, run + l * block:run + (l + 1) * block].copy_(
+                            vv.view(torch.uint8).reshape(vv.shape[0], -1)[dc].reshape(m, block))
+                    idx_dst, idx_src = _aw.run_split_indices(slots[c0:c1], _n, self._page_bytes, _E)
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=_pd,
+                        indices_dst=_nb(idx_dst),
+                        ptr_src=_ps,
+                        indices_src=_nb(idx_src),
+                        cache_src_stride_bytes=_E,
+                        cache_dst_stride_bytes=_E,
+                        element_size=_E,
+                        block_quota=_quota,
+                    )
                 self._write_stage_keep = stage   # alive until the write stream is done with it
+                _ARENA_WRITE_CLOCK.stop(_t0, "run", b * 2 * run)
                 if _n_log <= 8 or _n_log % 256 == 0:
                     logger.info("PDFLIP-ARENA-WRITE n=%d pages=%d bytes=%d mode=run runs=2x%dB "
-                                "elem=%dB items=%d quota=%s",
-                                _n_log, b, b * 2 * run, run, _E, b * _n, _quota)
+                                "elem=%dB items=%d quota=%s stage_pages=%d stage_bytes=%d fills=%d "
+                                "chunk_tokens=%s oom_cell=%d done[%s]",
+                                _n_log, b, b * 2 * run, run, _E, b * _n, _quota, _cp,
+                                _aw.run_stage_bytes(_cp, run), len(_chunks),
+                                _ct if _ct else "none(one fill)", _ARENA_WRITE_OOM[0],
+                                _ARENA_WRITE_CLOCK.summary())
                 return
             except Exception as exc:  # noqa: BLE001 -- one named fallback, then the cell kernel
-                logger.warning("PDFLIP-ARENA-WRITE run mode failed (%s: %s); cell mode from now on",
-                               type(exc).__name__, exc)
-                self._write_mode = mode = "cell"
+                stage = None   # release before the fallback runs
+                # the begun run is timed as aborted (fills already enqueued), the fallback on its own
+                _ARENA_WRITE_CLOCK.stop(_t0, "run_aborted", 0)
+                if _aw.is_oom(exc):
+                    # #179: the card was full for THIS stage -- this write goes the
+                    # cell way (no stage), the run mode stays for the next one.
+                    _ARENA_WRITE_OOM[0] += 1
+                    if _ARENA_WRITE_OOM[0] <= 8 or _ARENA_WRITE_OOM[0] % 256 == 0:
+                        logger.warning("PDFLIP-ARENA-WRITE run stage refused (%s: %s); stage_pages=%d of "
+                                       "pages=%d stage_bytes=%d -- cell for this write (oom_cell=%d), run mode stays",
+                                       type(exc).__name__, str(exc)[:240], _cp, b,
+                                       _aw.run_stage_bytes(_cp, runs[2]), _ARENA_WRITE_OOM[0])
+                    mode = "cell"
+                else:
+                    logger.warning("PDFLIP-ARENA-WRITE run mode failed (%s: %s); cell mode from now on",
+                                   type(exc).__name__, exc)
+                    self._write_mode = mode = "cell"
                 if P != 1:
+                    _tp = _ARENA_WRITE_CLOCK.mark()
                     self._backup_paged_copy(device_pool, slots, device_indices)
+                    _ARENA_WRITE_CLOCK.stop(_tp, "paged", b * 2 * runs[2])
                     return
         if P != 1:
             self._backup_paged_copy(device_pool, slots, device_indices)
             return
         k_ptrs, v_ptrs = self._arena_ptrs(dev)
-        _slots_dev = (slots.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+        _tc = _ARENA_WRITE_CLOCK.mark() if dev.type == "cuda" else None
+        _slots_dev = (_pinned_to(slots.to(dtype=torch.int64), dev)
                       if dev.type == "cuda" else slots.to(device=dev, dtype=torch.int64))
         jit_transfer_hicache_all_layer(
             k_ptr_dst=k_ptrs,
@@ -3180,9 +3258,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             element_size=cell,
             block_quota=_quota,
         )
+        if _tc is not None:
+            _ARENA_WRITE_CLOCK.stop(_tc, "cell", b * 2 * len(self._k_offs) * cell)
         if _n_log <= 8 or _n_log % 256 == 0:
-            logger.info("PDFLIP-ARENA-WRITE n=%d pages=%d bytes=%d mode=cell cell=%dB quota=%s",
-                        _n_log, b, b * 2 * len(self._k_offs) * cell, cell, _quota)
+            logger.info("PDFLIP-ARENA-WRITE n=%d pages=%d bytes=%d mode=cell cell=%dB quota=%s oom_cell=%d done[%s]",
+                        _n_log, b, b * 2 * len(self._k_offs) * cell, cell, _quota, _ARENA_WRITE_OOM[0],
+                        _ARENA_WRITE_CLOCK.summary() if dev.type == "cuda" else "-")
 
     def backup_from_device_all_layer(self, device_pool, host_indices, device_indices, io_backend):
         if self.arena is None and host_indices.numel():
