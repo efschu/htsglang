@@ -85,6 +85,14 @@ class PageIO:
                 ctypes.POINTER(ctypes.c_int8),
                 ctypes.POINTER(ctypes.c_int8),
             ]
+        self._has_touch_paths = hasattr(lib, "hicache_touch_paths")
+        if self._has_touch_paths:
+            lib.hicache_touch_paths.restype = ctypes.c_int64
+            lib.hicache_touch_paths.argtypes = [
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_char_p),
+                ctypes.POINTER(ctypes.c_int8),
+            ]
         self._has_direct_write = hasattr(lib, "hicache_write_pages_direct")
         if self._has_direct_write:
             lib.hicache_write_pages_direct.restype = ctypes.c_int64
@@ -209,6 +217,21 @@ class PageIO:
         sizes = (ctypes.c_int64 * n)()
         self._lib.hicache_stat_sizes(n, c_paths, sizes)
         return list(sizes)
+
+    @property
+    def has_touch_paths(self) -> bool:
+        return bool(getattr(self, "_has_touch_paths", False))
+
+    def touch_paths(self, paths: Sequence[str]) -> list[int]:
+        """WAKEEXT-1023: ``utimensat(path, NULL)`` for every path in ONE C call (GIL released once); status per
+        path, 0 = touched, 1 = failed (best effort, like the Python touch)."""
+        n = len(paths)
+        if n == 0:
+            return []
+        c_paths = (ctypes.c_char_p * n)(*[os.fsencode(p) for p in paths])
+        status = (ctypes.c_int8 * n)()
+        self._lib.hicache_touch_paths(n, c_paths, status)
+        return list(status)
 
     @property
     def has_read_mt(self) -> bool:

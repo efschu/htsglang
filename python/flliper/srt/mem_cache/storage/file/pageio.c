@@ -35,6 +35,23 @@ int64_t hicache_stat_sizes(int64_t n, const char **paths, int64_t *sizes) {
     return found;
 }
 
+/* WAKEEXT-1023 (write path, qwen-schreibpfad-stat-1023): bump the mtime of n EXISTING page files in one call --
+ * the LRU recency the sibling eviction owner reads (LRUFileEvictor._touch_mtime), without one Python os.utime
+ * (one GIL hand-off) per page. status[i]: 0 ok, 1 failed (missing / read-only; best effort like the Python touch).
+ * Returns the number touched. */
+int64_t hicache_touch_paths(int64_t n, const char **paths, int8_t *status) {
+    int64_t ok = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (utimensat(AT_FDCWD, paths[i], NULL, 0) == 0) {
+            status[i] = 0;
+            ok++;
+        } else {
+            status[i] = 1;
+        }
+    }
+    return ok;
+}
+
 /* Read the extents of n canonical blobs into n caller buffers.
  *
  * For page i: expect_total[i] >= 0 demands that exact file size (a blob of

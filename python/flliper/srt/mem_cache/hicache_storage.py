@@ -3076,7 +3076,7 @@ class HiCacheFile(HiCacheStorage):
         if self.exists(key):
             # A complete blob is content-addressed: it already holds exactly
             # these bytes. Refresh recency, write nothing.
-            self._evictor.touch(suffixed, self._existing_path(suffixed))
+            self._touch_present([suffixed])
             return True
 
         tensor_path = self._sharded_path(suffixed)
@@ -3474,7 +3474,7 @@ class HiCacheFile(HiCacheStorage):
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
-            self._evictor.touch(suffixed, self._existing_path(suffixed))
+            self._touch_present([suffixed])
             return True
 
         # New pages are always sharded, whatever the directory looked like before.
@@ -3626,11 +3626,17 @@ class HiCacheFile(HiCacheStorage):
                 return results
         # Presence for the whole batch in one call: a complete blob is
         # content-addressed and only gets its recency refreshed.
-        present = self._stat_stems([p[2] for p in plan])
+        _prev_pm = getattr(_FILL_TL, "paths", None)
+        _FILL_TL.paths = {} if write_nostat_on() else None   # WAKEEXT-1023: the batched stat names the paths
+        try:
+            present = self._stat_stems([p[2] for p in plan])
+            _pm = _FILL_TL.paths
+        finally:
+            _FILL_TL.paths = _prev_pm
+        self._touch_present([p[2] for p in plan if p[2] in present], _pm)
         todo = []
         for i, key, suffixed, window, flat in plan:
             if suffixed in present:
-                self._evictor.touch(suffixed, self._existing_path(suffixed))
                 continue
             if not self._evictor.reserve(
                 suffixed,
@@ -5115,6 +5121,46 @@ class HiCacheFile(HiCacheStorage):
                 _touch(force=True)
         finally:
             _wb.read_exit()
+
+    def _known_paths(self, stems, pm: Optional[dict] = None) -> list:
+        """WAKEEXT-1023 (write path, ``qwen-schreibpfad-stat-1023``): the file path of stems KNOWN to be on disk
+        (a batched stat, ``exists`` or the read just found them) without a stat of its own. Without a legacy flat
+        layout every file is sharded (new pages are always sharded; ``_flat_layout_present`` is decided once), so
+        the path is ``_sharded_path``. With one, the batched stat's path map ``pm`` names it, else ``_existing_path``
+        (one stat) as before. ``FLLIPER_HICACHE_L3_WRITE_NOSTAT=0`` = ``_existing_path`` per page."""
+        if not write_nostat_on():
+            return [self._existing_path(st) for st in stems]
+        if not self._flat_layout_present():
+            return [self._sharded_path(st) for st in stems]
+        pm = pm or {}
+        return [pm.get(st) or self._existing_path(st) for st in stems]
+
+    def _touch_present(self, stems, pm: Optional[dict] = None) -> None:
+        """WAKEEXT-1023: refresh the recency of pages a write found complete on disk. Was one ``_existing_path``
+        (1-2 Python ``os.stat``) plus one ``os.utime`` per page, each a GIL hand-off in the rank process
+        (``_batch_set_each``: hundreds to thousands of stems per backup batch). Now the paths come without a stat
+        (:meth:`_known_paths`) and the eviction owner's mtime bump is ONE C call (``pageio.touch_paths``); the
+        in-memory LRU and the journal ``T`` line are the evictor's ``touch`` as before (``mtime=False``)."""
+        if not stems:
+            return
+        if not write_nostat_on():
+            for st in stems:
+                self._evictor.touch(st, self._existing_path(st))
+            return
+        paths = self._known_paths(stems, pm)
+        mtime = True
+        if getattr(self._evictor, "enabled", False):
+            try:
+                from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+                _pio = _load_pageio()
+                if _pio is not None and getattr(_pio, "has_touch_paths", False):
+                    _pio.touch_paths(paths)
+                    mtime = False
+            except Exception:  # noqa: BLE001 -- best effort, the per-page utime below
+                mtime = True
+        for st, p in zip(stems, paths):
+            self._evictor.touch(st, p, mtime=mtime)
 
     def _fill_read_paths(self, stems) -> list:
         """STOREREAD-1023: the file path of every stem a fill reads.
@@ -7165,6 +7211,15 @@ def l3_read_mt_on() -> bool:
 
 def fill_read_nostat_on() -> bool:
     return _env_on(L3_FILL_NOSTAT_ENV)
+
+
+#: WAKEEXT-1023: the write path's recency touch of pages already on disk without a Python stat per page and with
+#: one C utime call (``HiCacheFile._touch_present``). Default ON, "0" = ``_existing_path`` + ``os.utime`` per page.
+L3_WRITE_NOSTAT_ENV = "FLLIPER_HICACHE_L3_WRITE_NOSTAT"
+
+
+def write_nostat_on() -> bool:
+    return _env_on(L3_WRITE_NOSTAT_ENV)
 _l3_pool = None
 _l3_pool_n = 0
 _l3_pool_lock = threading.Lock()

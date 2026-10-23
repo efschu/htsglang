@@ -31,6 +31,9 @@ def _boot_capped(tmp_path, monkeypatch):
     ``adopt_foreign`` are live)."""
     import test_rereview_s109_a5a8_1020 as RV
 
+    # one uninterrupted pass: the 25-ms slice cuts a pass short on a loaded desk (CPUQuota) -- a timing flake, not
+    # the behaviour under test
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_SLICE_MS", "0")
     return RV._boot(tmp_path, monkeypatch, cap=1 << 40)
 
 
@@ -375,3 +378,115 @@ def test_first_forward_record_carries_the_thread_cpu(monkeypatch):
     line = F.summarize(rec)
     assert line is not None and " cpu[wall_ms=" in line
     F.S.pending, F.S.cur = [], None
+
+
+# ------------------------------------------------------------------------------------------------ write path (Planer)
+def _pio_or_skip():
+    from flliper.srt.mem_cache.storage.file.pageio import load
+
+    pio = load()
+    if pio is None or not pio.has_touch_paths:
+        pytest.skip("pageio helper not buildable here")
+    return pio
+
+
+@_needs_gcc
+def test_pageio_touch_paths_bumps_mtime_in_one_call(tmp_path):
+    pio = _pio_or_skip()
+    files = []
+    for i in range(5):
+        f = tmp_path / ("p%d.bin" % i)
+        f.write_bytes(b"x")
+        os.utime(f, (1_000_000, 1_000_000))
+        files.append(str(f))
+    st = pio.touch_paths(files + [str(tmp_path / "gone.bin")])
+    assert st == [0, 0, 0, 0, 0, 1]
+    assert all(os.stat(f).st_mtime > 1_000_000 + 1e6 for f in files)
+
+
+class _CountingEvictor:
+    enabled = True
+
+    def __init__(self):
+        self.calls = []
+
+    def touch(self, stem, path, mtime=True):
+        self.calls.append((stem, path, mtime))
+
+
+def _bare_backend(tmp_path, flat=False):
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    be = object.__new__(HiCacheFile)
+    be.file_path = str(tmp_path)
+    be._known_shards = set()
+    be._legacy_flat = bool(flat)
+    be._evictor = _CountingEvictor()
+    be.n_stat = 0
+    orig = HiCacheFile._stat_stem
+
+    def _counted(self_, stem):
+        self_.n_stat += 1
+        return orig(self_, stem)
+
+    be._stat_stem = types.MethodType(_counted, be)
+    return be
+
+
+@_needs_gcc
+def test_write_path_touch_of_present_pages_needs_no_python_stat(tmp_path, monkeypatch):
+    pio = _pio_or_skip()
+    monkeypatch.delenv("FLLIPER_HICACHE_L3_WRITE_NOSTAT", raising=False)
+    be = _bare_backend(tmp_path)
+    stems = ["%064x_sfx" % i for i in range(64)]
+    for st in stems:
+        p = be._sharded_path(st)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").write(b"y")
+        os.utime(p, (1_000_000, 1_000_000))
+    calls = []
+    monkeypatch.setattr(type(pio), "touch_paths", lambda self_, ps: calls.append(list(ps)) or [0] * len(ps))
+    be._touch_present(stems)
+    assert be.n_stat == 0, "no Python stat per page (sharded-only store)"
+    assert len(calls) == 1 and calls[0] == [be._sharded_path(st) for st in stems], "ONE C utime call"
+    assert be._evictor.calls == [(st, be._sharded_path(st), False) for st in stems], "LRU + journal as before"
+
+
+def test_write_path_with_a_legacy_flat_layout_takes_the_batched_stat_paths(tmp_path, monkeypatch):
+    monkeypatch.delenv("FLLIPER_HICACHE_L3_WRITE_NOSTAT", raising=False)
+    be = _bare_backend(tmp_path, flat=True)
+    pm = {"a_sfx": "/x/a.bin"}
+    paths = be._known_paths(["a_sfx", "b_sfx"], pm)
+    assert paths[0] == "/x/a.bin" and be.n_stat == 1, "a stem the map does not name falls back to one stat"
+
+
+def test_write_path_switch_off_is_the_per_page_stat(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLLIPER_HICACHE_L3_WRITE_NOSTAT", "0")
+    be = _bare_backend(tmp_path)
+    be._touch_present(["a_sfx", "b_sfx"])
+    assert be.n_stat == 2
+    assert [c[2] for c in be._evictor.calls] == [True, True]
+
+
+def test_batch_set_each_touches_from_the_batched_stat_and_the_durchlauf_resolves_without_stat():
+    import inspect
+
+    from flliper.srt.managers import cache_controller as CC
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    src = inspect.getsource(HiCacheFile._batch_set_each)
+    assert "self._evictor.touch(suffixed, self._existing_path(suffixed))" not in src
+    i_arm = src.index("_FILL_TL.paths = {} if write_nostat_on() else None")
+    assert i_arm < src.index("present = self._stat_stems(") < src.index("self._touch_present(")
+    assert "_kv_dl_paths(be, [stems[j] for j in pos])" in inspect.getsource(CC._kv_dl_resolve)
+
+    class _Be:
+        def __init__(self):
+            self.n = 0
+
+        def _existing_path(self, st):
+            self.n += 1
+            return "/old/" + st
+
+    b = _Be()
+    assert CC._kv_dl_paths(b, ["a", "b"]) == ["/old/a", "/old/b"] and b.n == 2, "a double keeps the old path"
