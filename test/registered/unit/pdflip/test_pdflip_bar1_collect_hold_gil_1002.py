@@ -37,6 +37,17 @@ PAIRS = ((0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1))
 SLOT = 4096
 
 
+
+@pytest.fixture(autouse=True)
+def _lanes3x80_call_counting(monkeypatch):
+    """27b-lanes3x80-1023: this file pins exact copy/sync/probe call sequences
+    of the lane; LANE-INTEGRITY adds sampled D2H reads + syncs per tag and
+    PREPLAN-RECHECK a second probe pass -- both have their own tests in
+    test_pdflip_bar1_lanes3x80_1023.py, so they are held off here."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS", "1e9")
+
+
 def _addr(buf):
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
