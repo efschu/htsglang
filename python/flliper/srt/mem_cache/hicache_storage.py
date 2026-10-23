@@ -1956,6 +1956,29 @@ def _969g_trace(direction: str, tag: str, stem: str) -> None:
         pass
 
 
+def _probe_timed(fn):
+    """FLIPTIME-1023: ``batch_exists_v2`` reports its keys, wall and thread CPU to the D-DECODE-GAP instrument
+    (``d_decode_gap.note_probe``) -- the presence probes on the prefetch thread hold the GIL the scheduler waits for, and
+    no scheduler span saw them (boot 1023_144422 14:49:12-36Z, ``rest`` 400-500 ms per round). Instrument only."""
+    import functools
+
+    @functools.wraps(fn)
+    def _timed(self, keys, *a, **k):
+        t0, c0 = time.perf_counter(), time.thread_time()
+        try:
+            return fn(self, keys, *a, **k)
+        finally:
+            try:
+                from flliper.srt.pdflip import d_decode_gap as _dgap
+
+                _dgap.note_probe(len(keys or ()), (time.perf_counter() - t0) * 1000.0,
+                                 (time.thread_time() - c0) * 1000.0)
+            except Exception:  # noqa: BLE001 -- an instrument never breaks a probe
+                pass
+
+    return _timed
+
+
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
@@ -6082,6 +6105,7 @@ class HiCacheFile(HiCacheStorage):
                 )
         return None
 
+    @_probe_timed
     def batch_exists_v2(
         self,
         keys: List[str],
