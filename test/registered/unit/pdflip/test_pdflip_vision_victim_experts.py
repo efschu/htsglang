@@ -372,15 +372,19 @@ def test_switch_off_never_touches_the_rows_and_nf_resolves_only_experts(tmp_path
     assert out.ok and out.place == vrs.PLACE_KVTAIL and not out.victim_fields
     assert log == [] and calls == [] and model.same_as(snap)
 
-    assert vv.SOURCE_MODULES == ("flliper.srt.pdflip.vision_victim_experts",)
+    # experts FIRST (applies only with refill rows), then the 27B dense/pp_only module (applies to every
+    # non-dual rank) -- the 27B line serves a dense model whose only source is ``dense``
+    assert vv.SOURCE_MODULES == ("flliper.srt.pdflip.vision_victim_experts",
+                                 "flliper.srt.pdflip.vision_victim_27b")
     sched = types.SimpleNamespace(tp_worker=types.SimpleNamespace(
         model_runner=types.SimpleNamespace(model=model)))
     got = vv.resolve_source(sched)
     assert isinstance(got, vve.ExpertRowVictims) and got.kind == "experts" and got.host_bytes == 0
     bare = types.SimpleNamespace(tp_worker=types.SimpleNamespace(
         model_runner=types.SimpleNamespace(model=_Model([]))))
-    with pytest.raises(vv.VisionVictimPlanRefused, match="no victim source applies"):
-        vv.resolve_source(bare)
+    # a rank without refill rows is no longer W111b on this line: the 27B ``dense`` source applies to
+    # every non-dual rank (the dense 27B serves vision from its own MLP weights)
+    assert vv.resolve_source(bare).kind == "dense"
 
 
 def test_arming_line_plans_the_header_tower_on_the_slot_rows():

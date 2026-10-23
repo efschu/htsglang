@@ -847,7 +847,10 @@ def encode_air_refusal(*, work: int, air: EncodeAir, patches: int) -> str:
 #: is not on this line, and its ``dense`` source applies to EVERY non-dual
 #: rank, so in a tree that carries both the experts module must come FIRST
 #: (its ``applies`` is "this rank has Platztausch refill rows").
-SOURCE_MODULES: Tuple[str, ...] = ("flliper.srt.pdflip.vision_victim_experts",)
+SOURCE_MODULES: Tuple[str, ...] = ("flliper.srt.pdflip.vision_victim_experts",
+                                   # 27B line: the dense/pp_only sources (W111b on every 27B image request
+                                   # while this module was not listed -- lost in the NF-line merge 381773425c)
+                                   "flliper.srt.pdflip.vision_victim_27b")
 
 #: (kind, applies(scheduler) -> bool, build(scheduler) -> VictimSource), in order
 _SOURCES: List[Tuple[str, Callable[[Any], bool], Callable[[Any], VictimSource]]] = []
