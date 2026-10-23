@@ -262,6 +262,7 @@ from flliper.srt.pdflip.p_known_image import consume_at_origin as _pki_consume  
 from flliper.srt.pdflip.pp_loadback_verdict import PdFlipPpLoadbackVerdict  # LB-VERDICT-1014 on the chain
 from flliper.srt.pdflip import pp_loadback_verdict as _pdflip_lbv  # LBV-ADMIT (h16h 19:33:48Z)
 from flliper.srt.pdflip import form_a_post_admit as _pdflip_fa_post_admit  # S35: an admit reads CONTINUE on a Form A group
+from flliper.srt.managers import tp_admission_agree as _tp_admission_agree  # RA (R11): plain-TP admission = one group verdict
 from flliper.srt.pdflip import extend_trim as _pdflip_extend_trim  # rc12g extend chunk cap
 from flliper.srt.pdflip import d_seat_vram as _pdflip_d_seat_vram  # D-MEM-SCHED stage between wakes
 from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D-TRANSIENT-LEND
@@ -17990,6 +17991,14 @@ class Scheduler(
         # H105: on a Form A group the attention host's gate verdict is the
         # group's (None elsewhere: every gate in add_one_req stays rank-local).
         adder.form_a_admission_follow = self._form_a_admission_follow_fn()
+        # RA (SOLL R11, managers/tp_admission_agree.py): off a Form A group, on a
+        # plain TP group, every rank's gate is gathered into ONE verdict (MIN)
+        # and the built set is checked after the loop (None elsewhere).
+        adder.tp_admission_agree = (
+            _tp_admission_agree.make_agree(self)
+            if adder.form_a_admission_follow is None
+            else None
+        )
         # PRIORITY LANES 1008 (L3): this pass's lane floor (and the lane chunk) for the adder; nothing is written without
         # lane state (no RPC / switch off), so the adder keeps its class defaults.
         _lanes_p.configure_adder(self, adder)
@@ -19381,6 +19390,13 @@ class Scheduler(
             # S35 (SOLL R11, raenge-nie-uneins; rc9 09:51:22Z pdflip-29-190): an ADMITTED request's budget_state() is
             # this rank's own pool on a Form A group -- NO_TOKEN on the host alone made it take the D-HOL head and enter
             # PW-R's group MIN by itself. The admit was the group's verdict; it reads CONTINUE on every rank there.
+            # RA (R11): the same rule on a plain TP group -- the admit was the
+            # group verdict; the next request's fit is its own group verdict.
+            res = _tp_admission_agree.uniform_result(
+                res,
+                bool(adder.can_run_list) and req is adder.can_run_list[-1],
+                getattr(adder, "tp_admission_agree", None),
+            )
             res = _pdflip_fa_post_admit.uniform_result(
                 res,
                 bool(adder.can_run_list) and req is adder.can_run_list[-1],
@@ -19548,6 +19564,14 @@ class Scheduler(
         # whose loop raised a schedule refusal: that rank stops below anyway.
         if schedule_refusal is None:
             self._form_a_extend_set_riegel(adder.can_run_list)
+            # RA (SOLL R11): the plain-TP riegel -- same admitted rids, same HOL
+            # head on every rank BEFORE PW-R's group MIN (entered only with a
+            # HOL head), the queue removal and prepare_for_extend's collectives.
+            # A split is a named stop, never two ranks in two collectives.
+            _tp_admission_agree.riegel(
+                self, getattr(adder, "tp_admission_agree", None),
+                adder.can_run_list, _hol.head,
+            )
 
         # C11: answer the requests this pass refused by name. AFTER the loop,
         # because the loop iterates `waiting_queue` in place.

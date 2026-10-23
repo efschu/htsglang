@@ -20,6 +20,11 @@ last entry of ``can_run_list``) never reads NO_TOKEN in the loop -- the admit wa
 the NEXT request fits is that request's own H105 verdict (the host's gate, broadcast / gathered, identical on every
 rank). So it reads CONTINUE on every rank; a refusal (not added) and every other result stay as they are. Off a Form
 A group the budgets are the group's already (``_update_uniform_pool_budget``): unchanged.
+
+CORRECTION (RA 23.10., 27B duo boot ..._114625): off a Form A group only the FLOOR term of ``rem_total_tokens`` is
+the group's; the local term (available + deliverable evictable) can bind on one rank alone -- TP0 admitted
+pdflip-36-127, TP1 refused it, PW-R's MIN was entered by TP1 alone. The plain-TP group now has its own group verdict,
+riegel and this same post-admit rule: ``managers/tp_admission_agree.py``.
 """
 from __future__ import annotations
 
