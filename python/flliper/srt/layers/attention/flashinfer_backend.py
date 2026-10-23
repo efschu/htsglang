@@ -156,6 +156,76 @@ def _natural_merge_on_base2(merge_fn, v_a, s_a, v_b, s_b):
     return v, (s / _LN2 if s is not None else s)
 
 
+def _dcp_selfcheck_rows() -> int:
+    """FLLIPER_DCP_ATTN_SELFCHECK=<n>: B10 metal probe (23.10.). n > 0 checks n
+    rows per full-attention layer and rank against an fp32 torch reference.
+    Default OFF on purpose: it is a diagnostic that synchronises the device per
+    layer (a probe for one boot, not a serving feature)."""
+    v = _FI_LSE_LN2_CACHE.get("selfcheck")
+    if v is None:
+        try:
+            v = max(0, int(str(os.environ.get("FLLIPER_DCP_ATTN_SELFCHECK", "0")).strip() or 0))
+        except ValueError:
+            v = 0
+        _FI_LSE_LN2_CACHE["selfcheck"] = v
+    return v
+
+
+def dcp_attn_reference_check(q, k, v, o, lse, scale, rows, causal, q_offset=0, k_scale=1.0, v_scale=1.0):
+    """fp32 reference for selected query rows of ONE request (pure torch).
+
+    q [T, Hq, D]; k/v [N, Hkv, D] (any dtype, scaled by k_scale/v_scale);
+    o [T, Hq, D] and lse [T, Hq] are what the kernel returned. Causal: row t
+    sees keys [0, q_offset + t]. GQA: q head h reads kv head h // (Hq // Hkv).
+    Returns (max |o - ref|, max |lse - ref_log2|, max |lse - ref_ln|) -- the
+    last two say empirically which base the kernel's LSE is in."""
+    Hq, Hkv = q.shape[1], k.shape[1]
+    grp = max(1, Hq // Hkv)
+    kf = k.float() * float(k_scale)
+    vf = v.float() * float(v_scale)
+    eo = el2 = eln = 0.0
+    for t in rows:
+        n = (q_offset + t + 1) if causal else kf.shape[0]
+        if n <= 0:
+            continue
+        kv_idx = torch.arange(Hq, device=q.device) // grp
+        kk = kf[:n][:, kv_idx]                     # [n, Hq, D]
+        vv = vf[:n][:, kv_idx]
+        s = torch.einsum("hd,nhd->hn", q[t].float(), kk) * float(scale)
+        ln = torch.logsumexp(s, dim=-1)            # [Hq]
+        ref = torch.einsum("hn,nhd->hd", torch.softmax(s, dim=-1), vv)
+        eo = max(eo, float((o[t].float() - ref).abs().max()))
+        got = lse[t].float()
+        el2 = max(el2, float((got - ln / 0.6931471805599453).abs().max()))
+        eln = max(eln, float((got - ln).abs().max()))
+    return eo, el2, eln
+
+
+def _dcp_selfcheck_log(kind, layer, rank, q, k, v, o, lse, causal, q_offset=0):
+    n = _dcp_selfcheck_rows()
+    if n <= 0:
+        return
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        T = int(q.shape[0])
+        if T == 0:
+            return
+        rows = sorted({max(0, T - 1 - (i * T) // max(1, n)) for i in range(n)})
+        eo, el2, eln = dcp_attn_reference_check(
+            q, k, v, o, lse, layer.scaling, rows, causal, q_offset=q_offset,
+            k_scale=(layer.k_scale_float if getattr(layer, "k_scale_float", None) is not None else 1.0),
+            v_scale=(layer.v_scale_float if getattr(layer, "v_scale_float", None) is not None else 1.0),
+        )
+        logger.info(
+            "DCP-SELFCHECK kind=%s layer=%d rank=%d T=%d kv=%d rows=%s o_err=%.4g "
+            "lse_err_vs_log2=%.4g lse_err_vs_ln=%.4g",
+            kind, int(layer.layer_id), int(rank), T, int(k.shape[0]), rows, eo, el2, eln,
+        )
+    except Exception as e:  # noqa: BLE001 - a probe never breaks the forward
+        logger.warning("DCP-SELFCHECK %s failed: %r", kind, e)
+
+
 def _dcp_uneven_merge(
     o, lse, group, head_counts, return_lse: bool = False, block_tokens: int = 0,
     force_fused: bool = False,
@@ -6869,6 +6939,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     k_scale=layer.k_scale_float,
                     v_scale=layer.v_scale_float,
                 )
+                self._dcp_selfcheck_prefix(layer, q_full, prefill_wrapper_paged, o_pre_raw, lse_pre_raw)
             _fft.dcp_mark(layer.layer_id, "prefix")
             o_pre, lse_pre = _dcp_uneven_merge(
                 o_pre_raw,
@@ -6981,6 +7052,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            self._dcp_selfcheck_prefix(layer, q_full, prefill_wrapper_paged, o_pre_raw, lse_pre_raw)
         _fft.dcp_mark(layer.layer_id, "prefix")
         # comm lane: C (LSE all-gather) + merge math + D (out all-reduce) --
         # unchanged function, unchanged reduction order, just issued on the
@@ -7097,7 +7169,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if _kv_idx is not None:
                 k_cur = k_cur[:, _kv_idx, :]
                 v_cur = v_cur[:, _kv_idx, :]
-        return self.active_ragged_wrapper.forward_return_lse(
+        o_cur, lse_cur = self.active_ragged_wrapper.forward_return_lse(
             q_local,
             k_cur,
             v_cur,
@@ -7105,6 +7177,36 @@ class FlashInferAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             logits_soft_cap=logits_soft_cap,
         )
+        if _dcp_selfcheck_rows() > 0 and int(self.forward_metadata_bs_hint()) == 1:
+            _dcp_selfcheck_log("cur", layer, self.dcp_rank, q_local, k_cur, v_cur,
+                               o_cur, lse_cur, causal)
+        return o_cur, lse_cur
+
+    def forward_metadata_bs_hint(self) -> int:
+        """Batch size of the planned ragged extend (qo_indptr length - 1); the
+        B10 self-check only runs for single-request forwards."""
+        try:
+            w = self.active_ragged_wrapper
+            return int(w._qo_indptr_buf.numel()) - 1
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def _dcp_selfcheck_prefix(self, layer, q_full, prefill_wrapper_paged, o_pre_raw, lse_pre_raw):
+        """B10 probe: this rank's paged OWNED-prefix partial (all heads,
+        non-causal) against an fp32 reference over the same owned slots."""
+        if _dcp_selfcheck_rows() <= 0:
+            return
+        try:
+            ind = prefill_wrapper_paged._paged_kv_indptr_buf
+            if int(ind.numel()) != 2:
+                return
+            a, b = int(ind[0]), int(ind[1])
+            slots = prefill_wrapper_paged._paged_kv_indices_buf[a:b].long()
+            kb, vb = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            _dcp_selfcheck_log("pre", layer, self.dcp_rank, q_full,
+                               kb[slots], vb[slots], o_pre_raw, lse_pre_raw, False)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DCP-SELFCHECK pre failed: %r", e)
 
     def _dcp_extend_final_merge(self, q, layer, o_cur, lse_cur, o_pre, lse_pre):
         """4. Merge current chunk with prefix (both in this rank's local-head

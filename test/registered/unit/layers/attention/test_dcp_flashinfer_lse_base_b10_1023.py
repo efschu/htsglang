@@ -233,5 +233,53 @@ class TestSafeMergeStateFallback(CustomTestCase):
         torch.testing.assert_close(s, s_all, rtol=1e-9, atol=1e-9)
 
 
+class TestSelfCheckProbe(CustomTestCase):
+    """FLLIPER_DCP_ATTN_SELFCHECK reference: correct kernel output -> o_err ~ 0
+    and the LSE error says which base the kernel used."""
+
+    def test_reference_matches_base2_partials_and_tells_the_base(self):
+        q, kp, vp, kc, vc = _setup(T=6, H=4, n_pre=30, seed=12)
+        # non-causal prefix partial, FlashInfer convention (base 2)
+        o, l2 = _partial(q, kp, vp)
+        eo, e2, eln = fb.dcp_attn_reference_check(q, kp, vp, o, l2, 1 / math.sqrt(D),
+                                                  [0, 3, 5], causal=False)
+        self.assertLess(eo, 1e-5)
+        self.assertLess(e2, 1e-5)
+        self.assertGreater(eln, 1e-2)
+        # same, natural-log LSE -> the probe reports the other base
+        eo, e2, eln = fb.dcp_attn_reference_check(q, kp, vp, o, l2 * math.log(2.0),
+                                                  1 / math.sqrt(D), [0, 3, 5], causal=False)
+        self.assertLess(eln, 1e-5)
+        self.assertGreater(e2, 1e-2)
+
+    def test_causal_rows_and_gqa(self):
+        g = torch.Generator().manual_seed(13)
+        T, Hq, Hkv = 7, 6, 2
+        q = torch.randn(T, Hq, D, generator=g, dtype=torch.float64)
+        k = torch.randn(T, Hkv, D, generator=g, dtype=torch.float64)
+        v = torch.randn(T, Hkv, D, generator=g, dtype=torch.float64)
+        o = torch.empty(T, Hq, D, dtype=torch.float64)
+        l2 = torch.empty(T, Hq, dtype=torch.float64)
+        kx, vx = k[:, torch.arange(Hq) // 3], v[:, torch.arange(Hq) // 3]
+        for t in range(T):
+            oo, ll = _partial(q[t : t + 1], kx[: t + 1], vx[: t + 1])
+            o[t], l2[t] = oo[0], ll[0]
+        eo, e2, _ = fb.dcp_attn_reference_check(q, k, v, o, l2, 1 / math.sqrt(D),
+                                                list(range(T)), causal=True)
+        self.assertLess(eo, 1e-5)
+        self.assertLess(e2, 1e-5)
+        o[4, 1] += 0.5  # a wrong row is caught
+        eo, _, _ = fb.dcp_attn_reference_check(q, k, v, o, l2, 1 / math.sqrt(D),
+                                               [4], causal=True)
+        self.assertGreater(eo, 0.4)
+
+    def test_probe_off_by_default(self):
+        fb._FI_LSE_LN2_CACHE.pop("selfcheck", None)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLLIPER_DCP_ATTN_SELFCHECK", None)
+            self.assertEqual(fb._dcp_selfcheck_rows(), 0)
+        fb._FI_LSE_LN2_CACHE.pop("selfcheck", None)
+
+
 if __name__ == "__main__":
     unittest.main()
