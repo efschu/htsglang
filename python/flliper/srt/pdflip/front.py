@@ -1982,6 +1982,43 @@ def leg1_input_ids_payload(path: str, payload: Any, ids: Any) -> Optional[dict]:
 
 
 
+def logprob_prefix_cap(payload: Any, n: int) -> Optional[int]:
+    """STOREREAD-1023: the deepest prefix D may reuse for a request that asks input logprobs, or None (no cap).
+
+    D's scheduler caps every request's reusable prefix at ``logprob_start_len`` when ``return_logprob`` is set
+    (``Req._compute_max_prefix_len``, upstream rule): the logprob of an input token needs its logits, so D computes
+    from there. The front priced such a request from the store alone: 27B duo boot 15 (1023_114625) probe
+    pdflip-1-5, 3089 ids, ``D-PROBE ... store=3088 uncached_d=1`` -> class kurz, P rider; on D ``#915 PREFETCH
+    REFUSED reason=vote_negative ... need=0`` and ``LOGPROB-CHUNK armed: 1325 input-logprob rows`` -> D computed all
+    3089 tokens again (11.25 s) after P's leg (P's leg-1 body drops the logprob fields, so P read and trimmed
+    normally). Native ``/generate`` fields (``return_logprob`` + ``logprob_start_len`` >= 0) and the completions
+    ``echo`` + ``logprobs`` form (input logprobs from 0). ``FLLIPER_PDFLIP_FRONT_LOGPROB_CAP=0`` = no cap."""
+    if (os.environ.get("FLLIPER_PDFLIP_FRONT_LOGPROB_CAP", "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    n = int(n)
+    if payload.get("return_logprob") is True:
+        lsl = payload.get("logprob_start_len", -1)
+        if isinstance(lsl, bool) or not isinstance(lsl, int):
+            return None
+        if 0 <= lsl < n:
+            return int(lsl)
+        return None
+    if payload.get("echo") is True and payload.get("logprobs") not in (None, False, 0):
+        return 0
+    return None
+
+
+def apply_logprob_prefix_cap(payload: Any, n: int, pending: int, credit: int) -> Tuple[int, int, Optional[int]]:
+    """STOREREAD-1023: ``(pending, credit, cap)`` -- the front's uncached count raised to what D will compute for
+    a logprob request (see :func:`logprob_prefix_cap`); unchanged when no cap applies or it does not bind."""
+    cap = logprob_prefix_cap(payload, n)
+    if cap is None or int(n) - int(cap) <= int(pending):
+        return int(pending), int(credit), None
+    return int(n) - int(cap), min(int(credit), int(cap)), int(cap)
+
+
 def payload_namespace(payload: Any) -> Tuple[bool, Optional[str]]:
     """Q-530 SALT-ISOLATION (port of 27B Q-460): ``(known, extra_key)`` of a client
     payload -- the KV namespace the groups run it under (serving_base.
@@ -8173,6 +8210,15 @@ class Front:
                         int(_xp.tail_rows), len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
                         (int(_c_front.n) if _c_front is not None else "-"), _probe.tokenize_ms,
                         _probe.handle_ms, _probe.total_ms)
+        # STOREREAD-1023: a request that asks input logprobs from position s is computed on D from s on, whatever
+        # the store holds (Req._compute_max_prefix_len) -- the exact uncached count (order 19.10. "nichts schaetzen")
+        _lp_pending, _lp_credit, _lp_cap = apply_logprob_prefix_cap(payload, int(c.n), int(pending), int(credit))
+        if _lp_cap is not None:
+            self.counters["logprob_prefix_cap"] += 1
+            logger.info("PDFLIP LOGPROB-PREFIX-CAP rid=%s n=%d logprob_start=%d pending=%d -> %d credit=%d -> %d "
+                        "(STOREREAD-1023: D reuses no prefix past the first input-logprob position)",
+                        rid, int(c.n), int(_lp_cap), int(pending), _lp_pending, int(credit), _lp_credit)
+            pending, credit = _lp_pending, _lp_credit
         # NF-NEXT-1006-21: which entry (its rid, its kind) the credit came from --
         # read off the spans AFTER the price was taken; it feeds log lines only
         win = None if (isolated or _probe is not None) else self.tspans.last_winner

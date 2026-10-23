@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -42,6 +43,47 @@ int64_t hicache_stat_sizes(int64_t n, const char **paths, int64_t *sizes) {
  * out[i]. touch != 0 bumps the mtime through the open fd (the LRU recency the
  * evictor's sibling owner reads). status[i]: 0 ok, 1 missing, 2 size
  * mismatch, 3 short read, 4 other error. Returns the number of ok pages. */
+static int8_t pio_read_one(const char *path, int64_t expect_total, int64_t k,
+                           const int64_t *ext_off, const int64_t *ext_len, uint8_t *out,
+                           int32_t touch) {
+    int8_t s = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return (errno == ENOENT) ? 1 : 4;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        s = 4;
+    } else if (expect_total >= 0 && (int64_t)st.st_size != expect_total) {
+        s = 2;
+    } else {
+        int64_t taken = 0;
+        for (int64_t j = 0; j < k && s == 0; j++) {
+            int64_t off = ext_off[j], len = ext_len[j], got = 0;
+            while (got < len) {
+                ssize_t r = pread(fd, out + taken + got, (size_t)(len - got),
+                                  (off_t)(off + got));
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    s = 4;
+                    break;
+                }
+                if (r == 0) {
+                    s = 3;
+                    break;
+                }
+                got += r;
+            }
+            taken += len;
+        }
+        if (s == 0 && touch) {
+            struct timespec ts[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
+            (void)futimens(fd, ts);
+        }
+    }
+    close(fd);
+    return s;
+}
+
 int64_t hicache_read_pages(int64_t n, const char **paths, const int64_t *expect_total,
                            const int64_t *n_ext, const int64_t *ext_off,
                            const int64_t *ext_len, uint8_t **out, int32_t touch,
@@ -49,48 +91,90 @@ int64_t hicache_read_pages(int64_t n, const char **paths, const int64_t *expect_
     int64_t ok = 0, e = 0;
     for (int64_t i = 0; i < n; i++) {
         int64_t k = n_ext[i];
-        int8_t s = 0;
-        int fd = open(paths[i], O_RDONLY | O_CLOEXEC);
-        if (fd < 0) {
-            s = (errno == ENOENT) ? 1 : 4;
-        } else {
-            struct stat st;
-            if (fstat(fd, &st) != 0) {
-                s = 4;
-            } else if (expect_total[i] >= 0 && (int64_t)st.st_size != expect_total[i]) {
-                s = 2;
-            } else {
-                int64_t taken = 0;
-                for (int64_t j = 0; j < k && s == 0; j++) {
-                    int64_t off = ext_off[e + j], len = ext_len[e + j], got = 0;
-                    while (got < len) {
-                        ssize_t r = pread(fd, out[i] + taken + got, (size_t)(len - got),
-                                          (off_t)(off + got));
-                        if (r < 0) {
-                            if (errno == EINTR) continue;
-                            s = 4;
-                            break;
-                        }
-                        if (r == 0) {
-                            s = 3;
-                            break;
-                        }
-                        got += r;
-                    }
-                    taken += len;
-                }
-                if (s == 0 && touch) {
-                    struct timespec ts[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
-                    (void)futimens(fd, ts);
-                }
-            }
-            close(fd);
-        }
+        int8_t s = pio_read_one(paths[i], expect_total[i], k, ext_off + e, ext_len + e, out[i], touch);
         status[i] = s;
         if (s == 0) ok++;
         e += k;
     }
     return ok;
+}
+
+/* ---------------------------------------------------------------------------
+ * STOREREAD-1023: the same page reads on nthreads C threads in ONE call.
+ *
+ * Boot 15 of the 27B duo line (1023_114625, P PP0 11:51:17-37Z): L3 -> L2
+ * fills of 1024 pages took 3.2-5.1 s (200-316 pages/s, 6-10 MB/s) while the
+ * disk gives 38.7k pages/s cold to the same reader (storeread probe, 1023).
+ * Every return from a ctypes call into Python re-acquires the GIL; beside a
+ * busy Python thread (the scheduler loop, the background L3 evictor) each
+ * re-acquire waits up to the switch interval. The pool path returned to
+ * Python after every 16 pages on each of 16 threads (plus a per-page Python
+ * os.stat in the caller). Here the whole batch is read by C threads that pull
+ * page indices from one atomic counter; Python is re-entered once. ``done``
+ * (optional) counts finished pages, so a Python caller can report the read's
+ * progress (the S23 JOIN-IDLE witness) only when bytes actually moved.
+ * ------------------------------------------------------------------------- */
+#include <pthread.h>
+
+typedef struct {
+    int64_t n;
+    const char **paths;
+    const int64_t *expect_total;
+    const int64_t *n_ext;
+    const int64_t *ext_start;
+    const int64_t *ext_off;
+    const int64_t *ext_len;
+    uint8_t **out;
+    int32_t touch;
+    int8_t *status;
+    int64_t next;
+    int64_t ok;
+    int64_t *done;
+} pio_mt_job;
+
+static void *pio_mt_worker(void *arg) {
+    pio_mt_job *j = (pio_mt_job *)arg;
+    int64_t ok = 0;
+    for (;;) {
+        int64_t i = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+        if (i >= j->n) break;
+        int64_t e = j->ext_start[i];
+        int8_t s = pio_read_one(j->paths[i], j->expect_total[i], j->n_ext[i], j->ext_off + e,
+                                j->ext_len + e, j->out[i], j->touch);
+        j->status[i] = s;
+        if (s == 0) ok++;
+        if (j->done) __atomic_fetch_add(j->done, 1, __ATOMIC_RELAXED);
+    }
+    __atomic_fetch_add(&j->ok, ok, __ATOMIC_RELAXED);
+    return NULL;
+}
+
+int64_t hicache_read_pages_mt(int64_t n, const char **paths, const int64_t *expect_total,
+                              const int64_t *n_ext, const int64_t *ext_off,
+                              const int64_t *ext_len, uint8_t **out, int32_t touch,
+                              int8_t *status, int32_t nthreads, int64_t *done) {
+    if (n <= 0) return 0;
+    int64_t *ext_start = (int64_t *)malloc(sizeof(int64_t) * (size_t)n);
+    if (!ext_start) return hicache_read_pages(n, paths, expect_total, n_ext, ext_off, ext_len, out, touch, status);
+    int64_t e = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ext_start[i] = e;
+        e += n_ext[i];
+        status[i] = 4;
+    }
+    pio_mt_job job = {n, paths, expect_total, n_ext, ext_start, ext_off, ext_len, out, touch, status, 0, 0, done};
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > 64) nthreads = 64;
+    if ((int64_t)nthreads > n) nthreads = (int32_t)n;
+    pthread_t tids[64];
+    int started = 0;
+    for (int t = 1; t < nthreads; t++) {
+        if (pthread_create(&tids[started], NULL, pio_mt_worker, &job) == 0) started++;
+    }
+    pio_mt_worker(&job); /* the calling thread reads too; a failed create only costs parallelism */
+    for (int t = 0; t < started; t++) pthread_join(tids[t], NULL);
+    free(ext_start);
+    return job.ok;
 }
 
 /* ---------------------------------------------------------------------------

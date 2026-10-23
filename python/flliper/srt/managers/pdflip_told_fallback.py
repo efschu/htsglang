@@ -236,6 +236,16 @@ def _env_float(name: str, default: float) -> float:
     return value if value >= 0 else default
 
 
+#: STOREREAD-1023: PP0's own read time counts as a lifesign of the told's Frist (see :func:`deadline`). Default on;
+#: "0" = only armed room waits move the ``intake + TOTAL_S`` clamp (the Frist before 23.10.).
+ENV_OWN_READ_LIFESIGN = "FLLIPER_PDFLIP_TOLD_OWN_READ_LIFESIGN"
+
+
+def own_read_lifesign_on() -> bool:
+    raw = (os.environ.get(ENV_OWN_READ_LIFESIGN, "1") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def frist_s(window_s: float) -> float:
     """Seconds from the read-ahead's publication PP0 waits for every
     follower's ack before it sends told=0."""
@@ -313,6 +323,17 @@ def deadline(published_at: float, own_read_s: float, window_s: float, room_wait_
     reads 5114/7748/10032 ms, ``PF TOLD-FALLBACK told=43392 -> 0 reason=frist after=0.16s``). 0 (no armed wait,
     READ-ROOM off) = the old Frist, byte for byte."""
     total = _env_float(ENV_TOTAL_S, TOTAL_S_DEFAULT)
+    if own_read_lifesign_on():
+        # STOREREAD-1023 (27B duo boot 15, 1023_114625, P 11:52:30Z, pdflip-0-3): PP0's own read of the span took
+        # 92.29 s (two short reads, 53248 tokens landed and anchored), so ``intake + TOTAL_S`` lay 76 s in the past:
+        # ``PF TOLD-OPEN ... window=10.00s frist=0.00s`` and 0.13 s later ``PF TOLD-FALLBACK told=53248 -> 0
+        # reason=frist acks={}`` -- the follower had no time to ack, P recomputed all 64500 tokens. A read that ran
+        # IS the lifesign the READ-ROOM rule below grants an armed room wait: the clamp moves by the read time
+        # (capped by told2's absolute ceiling), so the followers always get ``frist_s(window)`` after publication.
+        # Only where the clamp collapses the Frist (own read longer than TOTAL_S); a read inside TOTAL_S keeps the
+        # Frist byte for byte.
+        if float(own_read_s) > float(total):
+            room_wait_s = max(float(room_wait_s), max(0.0, float(own_read_s)))
     intake_at = float(published_at) - max(0.0, float(own_read_s))
     room = min(max(0.0, float(room_wait_s)), max(0.0, float(own_read_s)),
                _env_float(ENV_WAIT_ABS_S, WAIT_ABS_S_DEFAULT))

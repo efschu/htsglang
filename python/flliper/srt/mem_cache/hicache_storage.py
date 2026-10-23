@@ -4494,11 +4494,16 @@ class HiCacheFile(HiCacheStorage):
         store read): a stem the FULL arena cannot take is answered ``kv_durchlauf.DURCHLAUF`` instead of waiting."""
         _prev = getattr(_FILL_TL, "active", False)
         _FILL_TL.active = True
+        # STOREREAD-1023: the batched C stat of this fill records WHERE each stem lives; the read takes the path
+        # from there instead of one Python os.stat per page (``_existing_path``) -- see ``_fill_read_paths``
+        _prev_paths = getattr(_FILL_TL, "paths", None)
+        _FILL_TL.paths = {} if fill_read_nostat_on() else None
         try:
             return self._arena_fill_from_disk_impl(arena, stems, total_bytes, prefix=prefix, room_wait=room_wait,
                                                    take_ref=take_ref, durchlauf=durchlauf)
         finally:
             _FILL_TL.active = _prev
+            _FILL_TL.paths = _prev_paths
             _fill_live_drop_thread()
 
     def _arena_fill_from_disk_impl(self, arena, stems, total_bytes: int, prefix: bool = False,
@@ -5036,6 +5041,23 @@ class HiCacheFile(HiCacheStorage):
         finally:
             _wb.read_exit()
 
+    def _fill_read_paths(self, stems) -> list:
+        """STOREREAD-1023: the file path of every stem a fill reads.
+
+        Boot 15 of the 27B duo line (``..._1023_114625``, P PP0 11:51:17-37Z): L3 -> L2 fills of 1024 pages took
+        3.2-5.1 s (200-316 pages/s, 6-10 MB/s) on XFS/NVMe. The read resolved each page's path with
+        ``_existing_path`` -- one Python ``os.stat`` per page, i.e. one GIL release + re-acquire per page; beside a
+        busy Python thread of the rank process (the scheduler loop, the background L3 evictor that unlinked 408k
+        files from 11:50:51Z) every re-acquire waits up to the switch interval (5 ms). Storeread probe on a copy of
+        the store's pages (8192 cold pages, one busy Python thread): that stat pass alone 5.96-20.9 s = 381-1188
+        pages/s, the C read itself 0.6-0.9 s. The fill's batched C stat (``_stat_stems``) has already found every
+        stem it reads; its path is taken from there. A stem it did not record (a reaped join claimed fresh, a test
+        double's stat) falls back to ``_existing_path``. ``FLLIPER_HICACHE_L3_FILL_NOSTAT=0`` = the per-page stat."""
+        pm = getattr(_FILL_TL, "paths", None) or {}
+        if not pm:
+            return [self._existing_path(st) for st in stems]
+        return [pm.get(st) or self._existing_path(st) for st in stems]
+
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:
         """#1433: read this fill's OWN claims from disk into their slots and
         complete them; ``out[index]`` gets the slot of every completed one."""
@@ -5043,7 +5065,7 @@ class HiCacheFile(HiCacheStorage):
             return
         from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
         pio = _load_pageio()
-        paths = [self._existing_path(st) for _, _, _, st in todo]
+        paths = self._fill_read_paths([st for _, _, _, st in todo])
         ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
         rc, threads = self._l3_read_with_progress(arena, pio, todo, paths, int(total_bytes), ptrs)
         rc = list(rc)
@@ -5818,19 +5840,28 @@ class HiCacheFile(HiCacheStorage):
         from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
 
         pio = _load_pageio()
+        _pm = getattr(_FILL_TL, "paths", None)   # STOREREAD-1023: armed by a fill on this thread, else None
         if pio is None:
             out = {}
             for stem in stems:
                 found = self._stat_stem(stem)
                 if found is not None:
                     out[stem] = int(found[1])
+                    if _pm is not None:
+                        _pm[stem] = found[0]
             return out
-        sizes = pio.stat_sizes([self._sharded_path(s) for s in stems])
+        _sh = [self._sharded_path(s) for s in stems]
+        sizes = pio.stat_sizes(_sh)
         out = {s: int(sz) for s, sz in zip(stems, sizes) if sz >= 0}
+        if _pm is not None:
+            _pm.update({s: p for s, p, sz in zip(stems, _sh, sizes) if sz >= 0})
         if len(out) < len(stems) and self._flat_layout_present():
             rest = [s for s in stems if s not in out]
-            sizes = pio.stat_sizes([self._flat_path(s) for s in rest])
+            _fl = [self._flat_path(s) for s in rest]
+            sizes = pio.stat_sizes(_fl)
             out.update({s: int(sz) for s, sz in zip(rest, sizes) if sz >= 0})
+            if _pm is not None:
+                _pm.update({s: p for s, p, sz in zip(rest, _fl, sizes) if sz >= 0})
         if _idx is not None and len(out) < len(stems):
             # 28.09.: the index named them, the disk does not have them (a
             # crash after an unlink, before its E line): a miss, and struck
@@ -7058,6 +7089,27 @@ class FormAWorkerNullStorage(HiCacheStorage):
 L3_READ_THREADS_ENV = "FLLIPER_HICACHE_L3_READ_THREADS"
 L3_READ_THREADS_DEFAULT = 16
 L3_PARALLEL_MIN_PAGES = 64
+#: STOREREAD-1023 (27B duo boot 15, 1023_114625): the pool path re-entered Python after every 16 pages on each of
+#: its 16 threads; beside a busy Python thread every re-entry waits for the GIL. Default ON: the whole batch is read
+#: by C threads in ONE ctypes call (``pageio.read_pages_mt``), the caller reports progress <= 10/s and only when the
+#: C page counter moved. Probe on a copy of the store (8192 cold pages, one busy Python thread): 381-1188 pages/s
+#: (pool path + per-page stat) -> 15.9-23.8k pages/s. "0" = the pool path.
+L3_READ_MT_ENV = "FLLIPER_HICACHE_L3_READ_MT"
+#: STOREREAD-1023: the fill takes each page's path from its batched C stat instead of one Python os.stat per page
+#: (``HiCacheFile._fill_read_paths``). Default ON, "0" = the per-page stat.
+L3_FILL_NOSTAT_ENV = "FLLIPER_HICACHE_L3_FILL_NOSTAT"
+
+
+def _env_on(name: str) -> bool:
+    return (os.environ.get(name, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def l3_read_mt_on() -> bool:
+    return _env_on(L3_READ_MT_ENV)
+
+
+def fill_read_nostat_on() -> bool:
+    return _env_on(L3_FILL_NOSTAT_ENV)
 _l3_pool = None
 _l3_pool_n = 0
 _l3_pool_lock = threading.Lock()
@@ -7124,6 +7176,29 @@ def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int, progress=None):
     return rc, k
 
 
+def _l3_read_mt(pio, paths, total: int, ptrs, k: int, progress=None):
+    """STOREREAD-1023: ``l3_read_pages_parallel`` as ONE ``pageio.read_pages_mt`` call -- the same entries (a page,
+    or for a page of ``L3_SPLIT_MIN_BYTES`` or more its ``L3_SPLIT_CHUNK_BYTES`` pieces, BS), the same statuses
+    (a split page takes its first failing piece's), the same touch; ``(status per page, threads used)``."""
+    n = len(paths)
+    if total >= L3_SPLIT_MIN_BYTES:
+        pieces = [(i, off, min(L3_SPLIT_CHUNK_BYTES, total - off))
+                  for i in range(n) for off in range(0, total, L3_SPLIT_CHUNK_BYTES)]
+        kk = min(k, len(pieces))
+        st = pio.read_pages_mt([paths[i] for i, _o, _l in pieces], [total] * len(pieces),
+                               [((o, l),) for _i, o, l in pieces], [int(ptrs[i]) + o for i, o, _l in pieces],
+                               True, kk, progress=progress, poll_s=L3_TOUCH_MIN_S)
+        rc = [0] * n
+        for (i, _o, _l), r in zip(pieces, st):
+            if r != 0 and rc[i] == 0:
+                rc[i] = r
+        return rc, kk
+    kk = min(k, n)
+    st = pio.read_pages_mt(list(paths), [total] * n, [((0, total),)] * n, list(ptrs), True, kk,
+                           progress=progress, poll_s=L3_TOUCH_MIN_S)
+    return list(st), kk
+
+
 #: S23: pages per pageio sub-call of an L3 read. The READING worker thread reports progress after each sub-call
 #: (``arena.touch_progress`` of the batch's claims), so the touch grain is one sub-call -- far below the 1 s JOIN-IDLE
 #: bound even on a cold disk (metal: 65 pages 1189 ms = 18 ms/page, 16 pages = ~0.3 s) -- while the batch keeps the
@@ -7144,6 +7219,8 @@ def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional
     ext = ((0, int(total_bytes)),)
     progress = getattr(_L3_PROGRESS, "cb", None)     # S23: set by ``_l3_read_with_progress`` for this call only
     step = max(1, int(L3_TOUCH_PAGES))
+    if k > 1 and n and l3_read_mt_on() and getattr(pio, "has_read_mt", False):
+        return _l3_read_mt(pio, paths, int(total_bytes), ptrs, k, progress)
     if k > 1 and n and int(total_bytes) >= L3_SPLIT_MIN_BYTES:
         return _l3_read_split(pio, paths, total_bytes, ptrs, k, progress)
     if k <= 1 or n < L3_PARALLEL_MIN_PAGES:

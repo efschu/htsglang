@@ -1070,6 +1070,48 @@ class PrefetchRidMismatch(RuntimeError):
     collective for different rids -- a named group stop (raenge-nie-uneins)."""
 
 
+def _prefetch_nothing_to_read(operation) -> bool:
+    """STOREREAD-1023: a read whose group probe ANSWERED 0 claimable tokens is complete -- there is nothing left
+    to land. Before, an empty ``hash_value`` never counted as complete and the read sat until its timeout budget,
+    which is priced on the REQUESTED span when nothing was hit: 27B AutoRound boot (1023_140032, P PP0 14:08:05 ->
+    14:08:15Z) pdflip-11-20, ``PDFLIP-CLAIM-SHORT asked=8044 kv=8 claimed=0`` at 14:08:05, then ``#1157 PREFETCH
+    REAPED ... hit_pages=0 completed=0 elapsed=9.86s budget=9.86s`` -- 9.86 s before P could start the prefill it
+    had to do anyway (5 such reaps, 20.2 s, on the two 27B boots of 23.10. with this form). ``probed_hit_tokens``
+    is the MIN over the group (rank-uniform), so every rank answers alike. ``FLLIPER_HICACHE_PREFETCH_HIT0_DONE=0``
+    = wait for the budget as before."""
+    if (os.environ.get("FLLIPER_HICACHE_PREFETCH_HIT0_DONE", "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return False
+    hit = getattr(operation, "probed_hit_tokens", None)
+    return hit is not None and int(hit) == 0 and len(getattr(operation, "hash_value", ()) or ()) == 0
+
+
+def _prefetch_budget_clock_t0(operation, budget_s=None) -> float:
+    """STOREREAD-1023: where the #1157 timeout budget is counted from.
+
+    The budget (base + per page) prices the READ. It used to run from the issue (``start_time``), so a read that
+    waited in the io queue behind other rids' reads spent its budget there: 27B duo boot 15 (1023_114625, P PP1
+    11:50:58-11:51:03Z) pdflip-1-5, 3086 pages, budget 5.0 s, ``queue_parts pick=3785`` ms behind three 61k-page
+    reads, ``#1157 PREFETCH REAPED ... completed=0 elapsed=5.04s`` -> 3088 tokens recomputed. Once an io worker has
+    picked the read (``read_start_time``) the budget runs from there; a read still queued keeps the issue clock, so
+    one that is never picked still ends at ``issue + budget`` (a read ends at most at ``issue + 2 x budget``).
+    ``FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ=0`` = the issue clock throughout."""
+    t0 = float(operation.start_time)
+    if (os.environ.get("FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ", "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return t0
+    rs = getattr(operation, "read_start_time", None)
+    if rs is None:
+        return t0
+    # a pick later than issue + budget does not buy a second full budget: the clock starts at most there
+    try:
+        budget = float(budget_s) if budget_s is not None else None
+    except (TypeError, ValueError):
+        budget = None
+    rs = float(rs) if budget is None else min(float(rs), t0 + budget)
+    return max(t0, rs)
+
+
 def _prefetch_rid_fingerprint(rid: str) -> int:
     """PREFETCH-RID-NET-1014: a positive 30-bit fingerprint of a rid, the same on
     every rank (crc32 of the utf-8 bytes; no process-salted hash)."""
@@ -12332,10 +12374,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
-        return (
-            time.monotonic() - operation.start_time
-            > self._prefetch_timeout_budget_s(operation)
-        )
+        budget = self._prefetch_timeout_budget_s(operation)
+        return time.monotonic() - _prefetch_budget_clock_t0(operation, budget) > budget
 
     def can_terminate_prefetch(
         self, operation: PrefetchOperation, tail_hold: int = 0
@@ -12350,7 +12390,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return True
 
         if len(operation.hash_value) == 0:
-            completed = False
+            completed = _prefetch_nothing_to_read(operation)
         else:
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size

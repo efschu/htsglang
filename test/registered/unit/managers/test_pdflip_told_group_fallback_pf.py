@@ -249,7 +249,11 @@ def test_frist_values(monkeypatch):
     # intake + 16 s bounds it: PP0's own read took 8 s
     assert fb.deadline(100.0, 8.0, 10.0) == pytest.approx(108.0)
     # never before the publication itself
+    # STOREREAD-1023: an own read longer than TOTAL_S is a lifesign -- the followers keep frist_s(window)
+    assert fb.deadline(100.0, 30.0, 1.0) == pytest.approx(100.0 + fb.frist_s(1.0))
+    monkeypatch.setenv(fb.ENV_OWN_READ_LIFESIGN, "0")
     assert fb.deadline(100.0, 30.0, 1.0) == pytest.approx(100.0)
+    monkeypatch.delenv(fb.ENV_OWN_READ_LIFESIGN)
     monkeypatch.setenv(fb.ENV_GRACE_S, "0.5")
     monkeypatch.setenv(fb.ENV_CAP_S, "3")
     monkeypatch.setenv(fb.ENV_TOTAL_S, "4")

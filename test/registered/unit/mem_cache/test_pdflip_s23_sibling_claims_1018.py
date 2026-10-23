@@ -96,6 +96,8 @@ def _slow_pageio(monkeypatch, per_page_s):
 def test_p1_a_sibling_reading_slowly_per_page_longer_than_join_idle_is_not_reaped(tmp_path, monkeypatch, caplog):
     """Reviewer's P1s: slow PER PAGE (0.7 s x 3 pages = 2.1 s > the 1 s idle bound). Kills the 'no touch' mutant."""
     monkeypatch.delenv("FLLIPER_PDFLIP_L3FILL_JOIN_IDLE_MS", raising=False)   # default 1000 ms
+    monkeypatch.setenv(hs.L3_READ_MT_ENV, "0")   # STOREREAD-1023: the pool path's per-sub-call witness (the C-thread
+    # read's counter witness: test_storeread_1023::test_the_c_thread_read_reports_only_moving_progress)
     monkeypatch.setattr(hs, "L3_TOUCH_PAGES", 1)
     arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 16)
     be = _backend(_store(tmp_path, ("p1", "p2", "p3")))
