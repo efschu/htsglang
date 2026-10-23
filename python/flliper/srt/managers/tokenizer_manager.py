@@ -1159,6 +1159,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # D-MM-ITEM-CACHE-1007: the ids tokenized from ``input_text`` here, None
         # when the prompt's ids came from anywhere else
         text_ids = None
+        # MEDIA-HANDOFF-COMPACT-1023: the same for a media leg whose ids are a #1442 hand-off (only the item cache
+        # reads it; the leg's ids stay the processor's)
+        media_compact_ids = None
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -1175,6 +1178,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids = obj.input_ids
         elif _pdflip_handoff_ids(obj) is not None:
             input_ids = _pdflip_handoff_ids(obj)  # #1442: P tokenised this prompt already
+            if (
+                isinstance(input_text, str)
+                and input_text
+                and (self.d_mm_item_cache or self.p_known_image_cache) is not None
+                and obj.contains_mm_input()
+            ):
+                # MEDIA-HANDOFF-COMPACT-1023 (#157): a media leg's ids are the processor's output below, never
+                # these -- so the per-image cache needs the compact ids of the text it hands the processor. Without
+                # them (rc33 pdflip-5-321, D leg 2 after P: LEG2-FIRST-CONTENT leg2_ms=2445, of which
+                # PDFLIP-MM-TOKENIZE total_ms=1592 for an image D's probe had cached) every hand-off leg ran the HF
+                # processor on the whole prompt. Segment-cached (GROUP-SEG): the probe encoded the same pieces.
+                _ids, _ = await self._tokenize_texts(input_text, is_cross_encoder_request)
+                media_compact_ids = _ids if isinstance(_ids, list) else None
         else:
             if self.tokenizer is None:
                 raise ValueError(
@@ -1245,7 +1261,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         mm_inputs = await _item_cache.process(
                             obj=obj,
                             prompt=(input_text or input_ids),
-                            compact_ids=text_ids,
+                            compact_ids=(
+                                text_ids if text_ids is not None else media_compact_ids
+                            ),
                             max_req_input_len=self.max_req_input_len,
                         )
                     else:

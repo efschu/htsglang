@@ -171,6 +171,15 @@ class DMmItemCache:
                 self.hits += 1
                 self._log(obj=obj, verdict="hit", n=len(keys), t0=t0)
                 return out
+        if keys is not None:
+            out = await self._miss_images_only(
+                obj=obj, keys=keys, compact_ids=compact_ids,
+                max_req_input_len=max_req_input_len,
+            )
+            if out is not None:
+                self.misses += 1
+                self._log(obj=obj, verdict="miss", n=len(keys), t0=t0, path="mm_only")
+                return out
         out = await self._processor.process_mm_data_async(
             image_data=obj.image_data,
             audio_data=obj.audio_data,
@@ -181,8 +190,70 @@ class DMmItemCache:
         if keys is not None:
             self.misses += 1
             self._remember(keys=keys, output=out)
-            self._log(obj=obj, verdict="miss", n=len(keys), t0=t0)
+            self._log(obj=obj, verdict="miss", n=len(keys), t0=t0, path="whole")
         return out
+
+    async def _miss_images_only(
+        self, *, obj: Any, keys: List[str], compact_ids: List[int], max_req_input_len: Any
+    ) -> Optional[MultimodalProcessorOutput]:
+        """MISS-MM-ONLY-1023 (#157): a miss runs the processor on the IMAGES ONLY.
+
+        THE CLASS (NF rc31b pdflip-10-439, 208k tokens, one new image): the
+        miss handed the processor the WHOLE prompt text, so the HF processor
+        (Qwen3VLProcessor) re-tokenized all 208k tokens with each placeholder
+        expanded -- ``PDFLIP-MM-TOKENIZE process_ms=2457`` of the D probe's
+        ``tokenize_ms=4536`` -- and the result was the very id run the hit path
+        builds from ``compact_ids`` (the tokenizer manager's segment-cached
+        encode of the same text). Desk, real processor: the pixels are ~15 ms
+        of a ~1.9 s miss at 230k.
+
+        THE MECHANISM (vLLM ``_apply_hf_processor_mm_only``: the HF processor
+        gets a dummy text of one placeholder per item, the prompt ids come from
+        the tokenizer): the processor sees ``image_token * n``; its items --
+        pixels, grid, token count -- are remembered exactly as a whole-prompt
+        miss remembers them, and the request is built by the hit path from
+        ``compact_ids``, each item then carrying its pixels as before. The
+        image processor's output does not depend on the text, the placeholder
+        is a special added token (the text between placeholders tokenizes alike,
+        ``build_output_for_known_images``), so the result equals the
+        whole-prompt miss bit for bit: ids, offsets, mrope, hash, pixels.
+
+        ``None`` (the caller then runs the whole prompt, as before) when a
+        tokenizer-side vision stage is installed (it would run on the dummy run
+        and again on the whole one) or the dummy run does not give one plain
+        image item per key."""
+        try:
+            from flliper.srt.pdflip import vision_stage_service as _vss
+
+            if _vss.installed() is not None:
+                return None
+        except ImportError:
+            pass
+        p = self._processor
+        dummy = p.mm_tokens.image_token * len(keys)
+        out = await p.process_mm_data_async(
+            image_data=obj.image_data,
+            audio_data=None,
+            input_text=dummy,
+            request_obj=obj,
+            max_req_input_len=max_req_input_len,
+        )
+        items = [] if out is None else list(out.mm_items or ())
+        if len(items) != len(keys) or not all(_rememberable(item) for item in items):
+            logger.warning(
+                "%s rid=%s images-only run gave %d item(s) for %d image(s): the whole prompt runs",
+                self._tag, obj.rid, len(items), len(keys),
+            )
+            return None
+        self._remember(keys=keys, output=out)
+        built = self._try_hit(keys=keys, compact_ids=compact_ids)
+        if built is None:
+            return None
+        for item, done in zip(built.mm_items, items):
+            item.feature = done.feature  # the pixels the whole-prompt miss carried
+            for k, v in done.model_specific_data.items():
+                item.model_specific_data.setdefault(k, v)
+        return built
 
     def _request_keys(
         self, *, obj: Any, prompt: Any, compact_ids: Any
@@ -245,11 +316,11 @@ class DMmItemCache:
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)
 
-    def _log(self, *, obj: Any, verdict: str, n: int, t0: float) -> None:
+    def _log(self, *, obj: Any, verdict: str, n: int, t0: float, path: str = "-") -> None:
         logger.info(
-            "%s rid=%s verdict=%s images=%d ms=%.1f hits=%d misses=%d entries=%d",
+            "%s rid=%s verdict=%s images=%d ms=%.1f hits=%d misses=%d entries=%d path=%s",
             self._tag, obj.rid, verdict, n, (time.perf_counter() - t0) * 1000.0,
-            self.hits, self.misses, len(self._entries),
+            self.hits, self.misses, len(self._entries), path,
         )
 
 
