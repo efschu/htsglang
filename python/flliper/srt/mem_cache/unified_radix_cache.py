@@ -40,6 +40,7 @@ from flliper.srt.pdflip.read_room import tick as _read_room_tick
 from flliper.srt.pdflip.read_room import l3_complete as _read_room_l3_complete
 from flliper.srt.pdflip import tail_adopt, tail_handoff
 from flliper.srt.pdflip import short_read as _pdflip_short_read
+from flliper.srt.pdflip import store_reprobe_epoch as _store_reprobe_epoch  # REPROBE-1023
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read
 from flliper.srt.pdflip import park_retract_laps as _prl  # FLIP-EDGE 2: park retract sub-laps
 from flliper.srt.pdflip import rank_timing as _rank_timing  # RANK-TIMING: L2 load-back ms
@@ -13975,6 +13976,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            # REPROBE-1023 (pdflip/store_reprobe_epoch.py): this rank's store
+            # epoch -- storage writes seen land. MIN-reduced in the head vote,
+            # it re-schedules the store arm's re-ask of a short answer.
+            if drained:
+                _store_reprobe_epoch.note_store_write(self, drained)
             return drained
 
         def _drain_release():

@@ -247,6 +247,7 @@ from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
 from flliper.srt.pdflip import mixed_d_short as _mds_stamp  # MIXED-D chunk stamp + S50 total (short-chunked)
+from flliper.srt.pdflip import store_reprobe_epoch as _store_reprobe_epoch  # REPROBE-1023 (SOLL R11)
 from flliper.srt.managers import pdflip_told_ack_early as _pdflip_told_ack_early  # S50 TOLD-ACK-EARLY
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
@@ -12012,6 +12013,12 @@ class Scheduler(
             _head_canonical,
             {} if _s42_held else self._pdflip_local_store_matches(_head_canonical),
         )
+        # REPROBE-1023 (pdflip/store_reprobe_epoch.py, SOLL R11): this rank's
+        # STORE EPOCH (storage writes seen land), ONE slot on every rank; the
+        # MIN is the group epoch -- moved on ALL ranks -- that re-schedules the
+        # store arm's re-ask. Same reduce, no new collective (MUST NOT 6).
+        _xstore_epoch_at = len(vals)
+        vals = vals + _store_reprobe_epoch.build_epoch_payload(self)
         # RU (nf_rank_divergence): THE USABLE-MATCH ARM, fourth consumer of this
         # same reduce, on the SAME canonical head. The order arm votes the
         # match LENGTH; this arm votes it as 0 when the match ends on a node
@@ -12102,6 +12109,17 @@ class Scheduler(
                 "foreign number here would admit a prefill the group cannot "
                 "serve. The group stops here by name instead."
             )
+        # REPROBE-1023: the group epoch, read back by its own captured index;
+        # every rank then re-schedules the store arm from the GROUP's values
+        # (tick, epoch, store vote) alike.
+        if _xstore_epoch_at >= len(vals):
+            raise RuntimeError(
+                "REPROBE-1023 STORE-EPOCH LAYOUT STOP: the reduced payload carries "
+                f"no store-epoch slot (at={_xstore_epoch_at}, available={len(vals)})."
+            )
+        _store_reprobe_epoch.after_reduce(
+            self, _head_canonical, _xstore_lens, int(t[_xstore_epoch_at].item()),
+        )
         # RU: read back by its own captured head index, before the ballot.
         _usable_lens = t[
             _usable_at : _usable_at + tp_head_congruence.TP_HEAD_SLOTS
@@ -15217,10 +15235,23 @@ class Scheduler(
                 # and stays cached; only a SHORT answer -- the one a W31 is priced
                 # on -- is asked again (the hash chain is ~20 ms per 100k tokens).
                 _fresh = _s64_store_arm_fresh_on()
+                # REPROBE-1023 (pdflip/store_reprobe_epoch.py, SOLL R11): a SHORT
+                # cached answer under the same key is re-asked on the GROUP's
+                # schedule (store-epoch move / changed group vote / back-off
+                # bound), read from replicated values only -- not in every pass
+                # (27B 1023_144422: 2 x ~210 ms per round for two lifetime-refused
+                # hand-backs, 1984 probes, STALE 0).
+                _reprobe_held = False
+                if cached is not None and cached[0] == key and _fresh and not (
+                        (len(cached) > 2 and cached[2] == _vote_pass)
+                        or int(cached[1]) * page_size >= len(span)):
+                    _reprobe_held = _store_reprobe_epoch.held(self, req)
+                    _store_reprobe_epoch.note_vote(not _reprobe_held)
                 if cached is not None and cached[0] == key and (
                         not _fresh
                         or (len(cached) > 2 and cached[2] == _vote_pass)
-                        or int(cached[1]) * page_size >= len(span)):
+                        or int(cached[1]) * page_size >= len(span)
+                        or _reprobe_held):
                     pages = int(cached[1])
                 else:
                     # Q-460 SALT-ISOLATION: the request's namespace
