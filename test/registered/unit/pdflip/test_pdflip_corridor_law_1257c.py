@@ -335,6 +335,9 @@ class TheActuationGate(unittest.TestCase):
         self.assertIn(cb.UNMEASURED_FLOOR_NAME, text)
         self.assertIn("REFUSED-UNMEASURED-FLOOR", text)
         self.assertNotIn("INSTALLED", text)
+        # planer-n2fix2 1023 (review A1, reserve-semantik): the verdict never advises the reserve as a lever for the pass
+        self.assertNotIn("make it actuate", text)
+        self.assertNotIn("reserve-mib", text.split("REFUSED-UNMEASURED-FLOOR", 1)[1].split("\n", 1)[0])
 
     def test_an_explicit_reserve_makes_the_same_card_actuate(self):
         """The knob the user kept is exactly what turns the cut back on."""

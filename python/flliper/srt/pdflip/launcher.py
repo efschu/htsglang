@@ -15980,16 +15980,22 @@ def budgets_from_dc(
     # VERDICT-ONLY: it says so by name and returns the budgets byte-identical.
     # (User decision 2026-09-09, consequences 3 and 4.)
     if not any(f.actuates for f in floors.values()):
-        # planer-n2fix 1023 (B7): the user reserve was NOT zero on the 27B duo
-        # boot (1800,1400) -- it is CONTAINED in the card's booked awake rest
-        # (VRAM-GRUNDGESETZ 29.09., pdflip/budget_rest.py: the measured rest
-        # replaces floor transient, reserve and overshoot; see _reserve_eff
-        # above), so the corridor pass sees 0. Say which of the two it is per
-        # card, and name the launcher's own flag (--user-reserve-mib; the
-        # --rank-user-reserve-mib of the old text is the server's per-rank flag).
+        # planer-n2fix 1023 (B7) / planer-n2fix2 1023 (review A1): the user
+        # reserve was NOT zero on the 27B duo boot (1800,1400), but on a card
+        # whose measured awake rest is BOOKED it is NOT CHARGED: the measured
+        # rest replaces floor transient, reserve and overshoot (laws 19.09.
+        # keine-korridor-reserve-nie and 29.09. VRAM-GRUNDGESETZ,
+        # pdflip/budget_rest.py; see _reserve_eff above), so the corridor pass
+        # sees 0 and NO external headroom is kept on that card. The line says
+        # so per card and never offers the reserve as a lever that makes the
+        # pass actuate: the reserve is external headroom for the operator's
+        # other processes only (reserve-semantik), never a run knob. (Only D
+        # books a rest; P charges reserve + awake overshoot + measured
+        # overshoot as before and its floor is then priced.)
         _res_txt = "; ".join(
             f"nvml{c.nvml_index} {int((user_reserve_by_card or {}).get(c.uuid, 0))} MiB"
-            + (f" contained in the booked awake rest {int(booked[i])} MiB"
+            + (f" NOT charged: the measured awake rest {int(booked[i])} MiB replaces it "
+               f"(laws 19.09./29.09.), no external headroom is kept on this card"
                if booked[i] is not None and int((user_reserve_by_card or {}).get(c.uuid, 0)) else "")
             for i, c in enumerate(cards))
         log(
@@ -16000,8 +16006,7 @@ def budgets_from_dc(
             f"pass is VERDICT-ONLY on this boot and every budget stands "
             f"byte-identical ({','.join(str(b) for b in out)} MiB). Measure the "
             f"awake group's transient (scripts/vram_ledger/probe_activation.py "
-            f"ingest) or pass --user-reserve-mib on a card without a booked rest "
-            f"to make it actuate."
+            f"ingest) to price the floor."
         )
         for cf in floors.values():
             log(cf.line)
@@ -19069,6 +19074,19 @@ def card_power_limits_w(cards: Sequence[Card]) -> List[Optional[float]]:
     measured at one limit is not the cost at another, so every boot prints
     its limits (:func:`card_power_line`) and a stage fit is checked against
     them (:func:`stage_fit_family_cost`)."""
+    # planer-n2fix2 1023 (review A3): the same replay lock as pcie_lanes. On a
+    # REPLAYED inventory (the planner's dry runs, desk runs) a live query by
+    # NVML index read the BOX's card of that index (since 22.10. NVML 0 is the
+    # 5090: a replayed 3080 was declared at 400 W). The recording's own limit
+    # is read by UUID through the registry's replay seam
+    # (registry.nvml.power_snapshot: a row without power_limit_w is None,
+    # "an old recording does not know the limit -- it is not 0 W").
+    if nvml_registry.replay_armed():
+        try:
+            rec = {p.uuid: p.power_limit_w for p in nvml_registry.power_snapshot()}
+        except Exception:
+            return [None for _ in cards]
+        return [rec.get(c.uuid) for c in cards]
     out: List[Optional[float]] = []
     try:
         import pynvml
@@ -25283,7 +25301,11 @@ def build_parser() -> argparse.ArgumentParser:
              "raises that card's corridor floor by exactly as much, lowers its "
              "--rank-gpu-memory-mib by exactly as much, and MAKES THE CORRIDOR "
              "PASS ACTUATE on that card even when nothing measured the "
-             "transient -- an explicit reserve is a priced floor.",
+             "transient -- an explicit reserve is a priced floor. On a card "
+             "of group D whose measured awake rest is BOOKED "
+             "(VRAM-GRUNDGESETZ 29.09.) the reserve is NOT charged: the rest "
+             "replaces floor transient, reserve and overshoot, and no "
+             "external headroom stays free on that card (planer-n2fix2 1023).",
     )
     ap.add_argument(
         "--corridor-budget-sample", default=corridor_budget.DEFAULT_SAMPLE_PATH,

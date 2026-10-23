@@ -22081,7 +22081,7 @@
      "belegt": true,
      "calc": "text",
      "edge": "K03",
-     "effect": "The planner subtracts the reserve for your other processes from the budget.",
+     "effect": "The planner subtracts the reserve for your other processes from the budget of P; on D a booked measured awake rest replaces it (no external headroom stays there).",
      "evidence": {
       "anchor": "RAISES the floor",
       "aufloesung": "eindeutig",
@@ -22091,7 +22091,7 @@
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
-     "satz": "The operator reserve raises the floor per card and thereby lowers the KV budget by exactly that amount -- safety costs context.",
+     "satz": "The operator reserve raises the floor per card of P (and of D where no measured awake rest is booked) and thereby lowers that KV budget by exactly that amount -- headroom for other processes costs context.",
      "to": "--user-reserve-mib",
      "to_kind": "flag",
      "value": null
@@ -27135,14 +27135,14 @@
   "--user-reserve-mib": {
    "bare": false,
    "choices": null,
-   "cost": "Directly reduces the budget and with it KV/experts. Default 0.",
+   "cost": "Reduces the budget (and with it KV/experts) of every card of group P, and of group D only where no measured awake rest is booked: there the rest replaces it and no external headroom stays free (laws 19.09./29.09.). Default 0.",
    "default": "0",
    "depends": [
     {
      "belegt": true,
      "calc": "text",
      "edge": "K04",
-     "effect": "Is subtracted from the budget.",
+     "effect": "Is subtracted from the budget of P (on D only where no measured awake rest is booked).",
      "evidence": {
       "anchor": "RAISES the floor",
       "aufloesung": "eindeutig",
@@ -27152,7 +27152,7 @@
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
-     "satz": "Every MiB of reserve is one MiB less that the KV pool gets -- the reserve acts directly on the budget.",
+     "satz": "Every MiB of reserve is one MiB less that the KV pool of P gets -- the reserve acts directly on P's budget; on D a booked measured awake rest replaces it (laws 19.09./29.09.).",
      "to": "--rank-gpu-memory-mib",
      "to_kind": "flag",
      "value": null
@@ -27160,7 +27160,7 @@
    ],
    "gain": "Keeps room for other programs on the cards.",
    "group": "Memory",
-   "help": "#1257c. EXTERNAL headroom, MiB PER CARD: VRAM left free for YOUR OTHER PROCESSES while this boot serves. A scalar applied to every card, or a comma-separated list in RANK/CUDA-ORDINAL ORDER -- the 5090 FIRST, then the 3080s by NVML index. That is NOT NVML order: nvml0 is a 3080 while ordinal 0 is the 5090, so the standing form on this rig is `1800,1400,1400`. Every boot prints a PDFLIP-USER-RESERVE PROVENANCE line giving the argv position, card NAME and UUID beside each MiB value, so the mapping never has to be inferred from this sentence (#1342). Default 0 (user decision 2026-09-09): the 1024 this used to default to existed only because the engine could not price its own transient, and it now can -- the corridor floor is `measured transient peak of the awake group + THIS value`, per card, printed with its provenance on every CORRIDOR-FLOOR line. THE KNOB IS KEPT, deliberately, because the operator sometimes runs other VRAM consumers beside the rig. A nonzero value here raises that card's corridor floor by exactly as much, lowers its --rank-gpu-memory-mib by exactly as much, and MAKES THE CORRIDOR PASS ACTUATE on that card even when nothing measured the transient -- an explicit reserve is a priced floor.",
+   "help": "#1257c. EXTERNAL headroom, MiB PER CARD: VRAM left free for YOUR OTHER PROCESSES while this boot serves. A scalar applied to every card, or a comma-separated list in RANK/CUDA-ORDINAL ORDER -- the 5090 FIRST, then the 3080s by NVML index. That is NOT NVML order: nvml0 is a 3080 while ordinal 0 is the 5090, so the standing form on this rig is `1800,1400,1400`. Every boot prints a PDFLIP-USER-RESERVE PROVENANCE line giving the argv position, card NAME and UUID beside each MiB value, so the mapping never has to be inferred from this sentence (#1342). Default 0 (user decision 2026-09-09): the 1024 this used to default to existed only because the engine could not price its own transient, and it now can -- the corridor floor is `measured transient peak of the awake group + THIS value`, per card, printed with its provenance on every CORRIDOR-FLOOR line. THE KNOB IS KEPT, deliberately, because the operator sometimes runs other VRAM consumers beside the rig. A nonzero value here raises that card's corridor floor by exactly as much, lowers its --rank-gpu-memory-mib by exactly as much, and MAKES THE CORRIDOR PASS ACTUATE on that card even when nothing measured the transient -- an explicit reserve is a priced floor. On a card of group D whose measured awake rest is BOOKED (VRAM-GRUNDGESETZ 29.09.) the reserve is NOT charged: the rest replaces floor transient, reserve and overshoot, and no external headroom stays free on that card (planer-n2fix2 1023).",
    "id": "--user-reserve-mib",
    "kind": "flag",
    "level": "einfach",

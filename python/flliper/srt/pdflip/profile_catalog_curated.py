@@ -54,7 +54,7 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": 'The entire memory budget of each card in MiB for this group (list, card 1 first). The planner computes it from card size minus driver carve, sleep remainder and reserve.',
         "gain": 'A larger budget gives weights, experts and KV more room.',
         "cost": 'The value is the whole budget, no safety margin is taken off it: chosen too high, the start ends in OOM.',
-        "depends": [_d("--user-reserve-mib", "derived_from", 'The planner subtracts the reserve for your other processes from the budget.', "text"),
+        "depends": [_d("--user-reserve-mib", "derived_from", 'The planner subtracts the reserve for your other processes from the budget of P; on D a booked measured awake rest replaces it (no external headroom stays there).', "text"),
                     _d("--pp-stage-ratio", "trades", 'The budget is shared between weights (layer cut), experts and KV.', "S4"),
                     _d("--rank-moe-resident-fraction", "trades", 'More resident experts fill the free room that would otherwise be KV.', "S4")]},
     "--rank-tp-ratio": {
@@ -176,8 +176,8 @@ CURATED: Dict[str, Dict[str, object]] = {
     "--user-reserve-mib": {
         "kind": "flag", "group": 'Memory', "level": "einfach", "planner_derived": False,
         "text": 'VRAM in MiB per card that stays free for your own other processes (scalar or list in card ordinal order, 5090 first).',
-        "gain": 'Keeps room for other programs on the cards.', "cost": 'Directly reduces the budget and with it KV/experts. Default 0.',
-        "depends": [_d("--rank-gpu-memory-mib", "derived_from", 'Is subtracted from the budget.', "text")]},
+        "gain": 'Keeps room for other programs on the cards.', "cost": 'Reduces the budget (and with it KV/experts) of every card of group P, and of group D only where no measured awake rest is booked: there the rest replaces it and no external headroom stays free (laws 19.09./29.09.). Default 0.',
+        "depends": [_d("--rank-gpu-memory-mib", "derived_from", 'Is subtracted from the budget of P (on D only where no measured awake rest is booked).', "text")]},
     "--store-max-gb": {
         "kind": "flag", "group": 'Cache', "level": "einfach", "planner_derived": False,
         "text": 'Size of the store (directory on disk) in GB, absolute. 0 = derive from the pool of the P group.',

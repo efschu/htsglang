@@ -572,8 +572,9 @@ def solve_corridor_budgets(
                  f"({cf.provenance}); nothing priced this floor, so it is a "
                  f"verdict and not a cut -- the budget stands byte-identical. "
                  f"Measure the awake group's transient "
-                 f"(scripts/vram_ledger/probe_activation.py ingest) or pass "
-                 f"--rank-user-reserve-mib to make it actuate")
+                 f"(scripts/vram_ledger/probe_activation.py ingest) to price "
+                 f"it -- the user reserve is external headroom for other "
+                 f"processes, never a lever for this pass (reserve-semantik)")
             )
             continue
         need = card_law - free

@@ -88,11 +88,16 @@ def _int_or_none(x: Any) -> Optional[int]:
     return None if x is None else int(x)
 
 
+def _float_or_none(x: Any) -> Optional[float]:
+    return None if x is None else float(x)
+
+
 def replay_row(index: int, *, uuid: str, name: str, total_mib: int, cc: Optional[Sequence[int]] = None,
                pci_bus_id: str = "", reserved_mib: int = 0, bar1_total_mib: Optional[int] = None,
                pcie_max_gen: Optional[int] = None, pcie_max_width: Optional[int] = None,
                mem_bus_width_bits: Optional[int] = None, mem_clock_max_mhz: Optional[int] = None,
-               bar1_free_mib: Optional[int] = None, pcie_cur_width: Optional[int] = None) -> Dict[str, Any]:
+               bar1_free_mib: Optional[int] = None, pcie_cur_width: Optional[int] = None,
+               power_limit_w: Optional[float] = None, power_limit_default_w: Optional[float] = None) -> Dict[str, Any]:
     """One replay row in the exact field set of ``nvml_devices_1378.json`` (+ the optional properties when known).
 
     ``total_mib`` is MiB as NVML reports it (``total_bytes = total_mib << 20``, the 5090 fixture row is 32607 MiB);
@@ -117,6 +122,11 @@ def replay_row(index: int, *, uuid: str, name: str, total_mib: int, cc: Optional
                  ("pcie_cur_width", pcie_cur_width)):        # planer-n2fix 1023: the trained width (launcher.pcie_lanes on a replay)
         if v is not None:
             row[k] = int(v)
+    # planer-n2fix2 1023 (A3): the enforced power limit the card ran under (registry.nvml.power_snapshot reads these fields of a
+    # replay row; launcher.card_power_limits_w reads them by UUID on a replay instead of the live card of the same NVML index)
+    for k, v in (("power_limit_w", power_limit_w), ("power_limit_default_w", power_limit_default_w)):
+        if v is not None:
+            row[k] = float(v)
     return row
 
 
@@ -144,7 +154,9 @@ def replay_from_hardware_profile(profile: Mapping[str, Any]) -> List[Dict[str, A
             bar1_free_mib=_int_or_none(_node_v(c.get("bar1_free_mib"))),
             pcie_max_gen=_int_or_none(_node_v(pcie.get("max_gen"))),
             pcie_max_width=_int_or_none(_node_v(pcie.get("max_width"))),
-            pcie_cur_width=_int_or_none(_node_v(pcie.get("cur_width")))))
+            pcie_cur_width=_int_or_none(_node_v(pcie.get("cur_width"))),
+            power_limit_w=_float_or_none(_node_v((c.get("power") or {}).get("limit_w"))),
+            power_limit_default_w=_float_or_none(_node_v((c.get("power") or {}).get("default_w")))))
     rows.sort(key=lambda r: r["index"])
     if [r["index"] for r in rows] != list(range(len(rows))):
         raise ValueError("hardware profile NVML indices are not 0..N-1: %s" % [r["index"] for r in rows])
