@@ -282,7 +282,12 @@ def _selector_walk_kernel(
             index = tl.sum(
                 tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
             )
-            index = tl.minimum(index, top_k - 1)
+        # Both branches: a NaN score row matches no `best` (greedy) and no cumsum
+        # (sampling); without the clamp the greedy index is top_k and the token
+        # load reads the NEXT slot's candidate, or past the buffer on the last
+        # slot (27b-specverify-1023). The q row is then all-zero / NaN, which the
+        # verify's q guard turns into the target-only rule.
+        index = tl.minimum(index, top_k - 1)
         tl.store(q_ptr + base + offsets, probabilities)
         tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
         previous = index

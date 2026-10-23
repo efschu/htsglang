@@ -605,6 +605,91 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
+#: 27b-specverify-1023: q-row checks of the DFlash2 selector sample before the
+#: rejection-sampling verify. Column order of the stats tensor
+#: (``selector_q_guard_scatter(stats=...)``).
+SELECTOR_Q_GUARD_STATS = ("slots", "fallback", "nonfinite", "badsum", "notin", "dup")
+_SELECTOR_Q_SUM_TOL = 1e-3
+
+
+def selector_q_guard_scatter(
+    *,
+    draft_probs: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    q_rows: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    stats: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Scatter the selector's sparse q into ``draft_probs`` so that the verify stays
+    EXACT whatever the draft handed over (27b-specverify-1023).
+
+    The classic verify (reject_sampling.speculative_sampling_classic_kernel)
+    accepts the drafted token x with ``u * q(x) < p(x)`` and samples a rejection
+    from ``relu(p - q)``. That reproduces the target distribution p only when q
+    is a probability row and x was drawn from it. A non-finite q row (one +inf
+    selector score already turns the whole softmax row into NaN) breaks it
+    silently: ``u * NaN < p`` is False (always reject) and ``relu(p - NaN)`` is
+    0, so every selector candidate drops out of the output distribution -- the
+    target's own top token never comes out once the draft listed it (boot
+    dkr27bint4arbar1int4ar10231552: broken draft RoPE, foreign tokens and
+    degeneration in long SAMPLED answers, greedy clean). q(x) == 0 (x not among
+    the candidates) would accept x whenever p(x) > 0.
+
+    Every slot whose q row is not a valid proposal for x -- non-finite or
+    negative entries, a sum off 1, x not exactly once among the candidate ids,
+    q(x) <= 0, duplicate candidate ids -- gets the point mass at x instead. That
+    is the target-only rule (accept with p(x), residual p without x), which is
+    exact for ANY proposal mechanism; a valid slot keeps its q. No host sync.
+
+    ``draft_probs``: [bs, gamma, vocab], all zero on entry (the caller's buffer).
+    ``candidate_ids`` / ``q_rows``: [bs, gamma, K]. ``draft_tokens``: [bs, gamma],
+    the drafted tokens the target verifies (candidates[:, 1:]).
+    ``stats``: optional int64 [len(SELECTOR_Q_GUARD_STATS)] accumulator.
+    Returns the per-slot fallback mask [bs, gamma] (bool).
+    """
+    ids = candidate_ids.to(torch.int64)
+    x = draft_tokens.to(device=ids.device, dtype=torch.int64)
+    q = q_rows.to(torch.float32)
+    finite = torch.isfinite(q)
+    row_finite = finite.all(dim=-1)
+    nonfinite = ~row_finite
+    q0 = torch.where(finite, q, torch.zeros_like(q))
+    # The counters below are reported per cause, so a non-finite row counts there
+    # only (it would trip the sum and the q(x) checks as well).
+    negative = row_finite & (q0 < 0).any(dim=-1)
+    badsum = row_finite & ((q0.sum(dim=-1) - 1.0).abs() > _SELECTOR_Q_SUM_TOL)
+    match = ids == x.unsqueeze(-1)
+    qx = torch.where(match, q0, torch.zeros_like(q0)).sum(dim=-1)
+    notin = row_finite & ((match.sum(dim=-1) != 1) | ~(qx > 0))
+    if ids.shape[-1] > 1:
+        srt = torch.sort(ids, dim=-1).values
+        dup = (srt[..., 1:] == srt[..., :-1]).any(dim=-1)
+    else:
+        dup = torch.zeros_like(notin)
+    fallback = nonfinite | negative | badsum | notin | dup
+    keep = (~fallback).unsqueeze(-1)
+    draft_probs.scatter_(-1, ids, torch.where(keep, q0, torch.zeros_like(q0)))
+    # Invalid rows are all zero now (duplicates scattered zeros), so adding 1 at x
+    # makes them the point mass at the drafted token.
+    draft_probs.scatter_add_(
+        -1, x.unsqueeze(-1), fallback.to(draft_probs.dtype).unsqueeze(-1)
+    )
+    if stats is not None:
+        stats.add_(
+            torch.stack(
+                (
+                    torch.full_like(fallback, True).sum(),
+                    fallback.sum(),
+                    nonfinite.sum(),
+                    (badsum | negative).sum(),
+                    notin.sum(),
+                    dup.sum(),
+                )
+            ).to(stats.dtype)
+        )
+    return fallback
+
+
 def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,

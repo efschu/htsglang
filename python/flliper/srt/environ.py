@@ -325,6 +325,13 @@ class Envs:
     # A/B: keep the DFLASH draft sampler (greedy head or DFlash2 selector) eager,
     # not folded into the draft cuda graph.
     FLLIPER_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # 27b-specverify-1023: the DFlash2 selector's sampling verify checks every
+    # q row before the rejection-sampling kernel; a row that is no proposal
+    # distribution for the drafted token (non-finite, off-sum, token missing,
+    # duplicate ids) verifies target-only (point mass at the token), which is
+    # exact for any proposal. Off (0) = the unchecked scatter (A/B only): a
+    # NaN row then drops every selector candidate from the output.
+    FLLIPER_DFLASH_Q_GUARD = EnvBool(True)
     # DFLASH window pool (FLLIPER_DFLASH_WINDOW_POOL=1): run the draft-slot
     # mapper and the per-round window rebuild without host reads, so the host
     # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
