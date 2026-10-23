@@ -2390,6 +2390,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         try:
             st = streams[0]
             for x in rest:
+                _sample_batch(x, st)
                 for piece in batches[x].pieces:
                     desc = descs[piece.desc_index]
                     if desc.src_ptr is None:
@@ -2461,36 +2462,57 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         lanes.backlog_push(lane_key, job)
         return ""
 
-    # LANE-INTEGRITY: the depositor samples its SOURCE before any batch (the
-    # spill path below still has it), announces the record in the plan
+    # LANE-INTEGRITY: the depositor DRAWS the sample positions here (no device
+    # access, deterministic from seq and the cut) and announces the sum record
+    # in the plan; the crc32 of each sampled SOURCE chunk is computed lazily by
+    # _sample_batch right before the copies of the batch that contains it (after
+    # the plan send and the credit waits, on that batch's own stream, so the
+    # read is stream-ordered ahead of the copy) -- also on the spill path, where
+    # the spill's host copy is the "copy time" (review RISK 1: a source write in
+    # the plan/credit window must not look like a corrupted copy).
     integ_f = ""
     want_sum = False
-    _sum_payload = None
+    _integ_picks = None
+    _integ_rows: dict = {}
+    _integ_done: set = set()
+    _integ_err: list = []
     _sum_state = {"sent": False}
     if role == "src" and integrity_samples() > 0:
         try:
-            _ist = streams[0] if streams else 0
-            _irows = []
-            for g_, i_, r_, o_, n_ in integrity_plan(batches, seq, integrity_samples(), tp):
+            _integ_picks = list(integrity_plan(batches, seq, integrity_samples(), tp))
+            integ_f = f"sent:{len(_integ_picks)}"
+        except Exception as exc:  # noqa: BLE001 -- unchecked tag, named on the line
+            _integ_picks = None
+            integ_f = f"OFF why={_compact(f'{type(exc).__name__}: {exc}', 60)}"
+    elif role == "src":
+        integ_f = f"OFF why={ENV_INTEGRITY_SAMPLES}=0"
+    _plan_rec = {"batches": plan, **({"sum": True} if _integ_picks is not None else {})}
+
+    def _sample_batch(g, stream) -> None:
+        if _integ_picks is None or g in _integ_done:
+            return
+        _integ_done.add(g)
+        for k_, (g_, i_, r_, o_, n_) in enumerate(_integ_picks):
+            if g_ != g:
+                continue
+            try:
                 pc_ = batches[g_].pieces[i_]
                 d_ = descs[pc_.desc_index]
                 if d_.src_ptr is None:
                     continue
-                _irows.append([g_, i_, r_, o_, n_, zlib.crc32(_read_dev(
-                    ops, _sample_addr(int(d_.src_ptr), pc_, r_, o_, "src", tp), n_, _ist))])
-            _sum_payload = {"samples": _irows}
-            integ_f = f"sent:{len(_irows)}"
-        except Exception as exc:  # noqa: BLE001 -- unchecked tag, named on the line
-            _sum_payload = None
-            integ_f = f"OFF why={_compact(f'{type(exc).__name__}: {exc}', 60)}"
-    elif role == "src":
-        integ_f = f"OFF why={ENV_INTEGRITY_SAMPLES}=0"
-    _plan_rec = {"batches": plan, **({"sum": True} if _sum_payload is not None else {})}
+                _integ_rows[k_] = [g_, i_, r_, o_, n_, zlib.crc32(_read_dev(
+                    ops, _sample_addr(int(d_.src_ptr), pc_, r_, o_, "src", tp), n_, stream))]
+            except Exception as exc:  # noqa: BLE001 -- this sample is dropped, named on the line
+                _integ_err.append(_compact(f"{type(exc).__name__}: {exc}", 60))
 
     def _send_sum(c) -> None:
-        if _sum_payload is not None and not _sum_state["sent"]:
+        nonlocal integ_f
+        if _integ_picks is not None and not _sum_state["sent"]:
             _sum_state["sent"] = True
-            c.send("sum", 0, _sum_payload)
+            rows = [_integ_rows[k] for k in sorted(_integ_rows)]
+            integ_f = f"sent:{len(rows)}" + (f" dropped={len(_integ_err)} why={_integ_err[0]}"
+                                              if _integ_err else "")
+            c.send("sum", 0, {"samples": rows})
 
     try:
         if role == "src":
@@ -2544,6 +2566,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         clk.first_free += time.perf_counter() - tw
                 if _gate is not None:
                     _gate_ms += _gate.before_issue(lane_key, ops)
+                _sample_batch(g, stream)
                 ti = time.perf_counter()
                 for piece in batch.pieces:
                     desc = descs[piece.desc_index]
@@ -2801,9 +2824,14 @@ def integrity_plan(batches, seq, n: int, tp) -> list:
     if not flat or n <= 0:
         return []
     rng = random.Random(zlib.crc32(str(seq).encode()))
-    picks = [flat[0], flat[-1]] + [flat[rng.randrange(len(flat))] for _ in range(max(0, n - 2))]
+    # DISTINCT pieces (review RISK 2): first + last, then a sample WITHOUT
+    # replacement of the interior; n is capped at the number of pieces
+    n = min(max(1, n), len(flat))
+    picks = [flat[0]] if len(flat) == 1 else [flat[0], flat[-1]]
+    interior = flat[1:-1]
+    picks += rng.sample(interior, min(len(interior), max(0, n - len(picks))))
     out = []
-    for g, i, pc in picks[:max(1, n)]:
+    for g, i, pc in picks[:n]:
         if pc.kind == tp.FLAT:
             row, span = 0, int(pc.nbytes)
         else:

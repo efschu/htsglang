@@ -405,7 +405,8 @@ class TestPreplanBeforeTurn(CustomTestCase):
         self.assertFalse(bl.preplan_before_turn_on({bl.ENV_COLLECT_PREPLAN: "0"}))
 
 
-def _pair_run(col_ops=None, dep_ops=None, env=None, n=6, lanes_cls=None, budget_s=10.0, seq="17-weights_7"):
+def _pair_run(col_ops=None, dep_ops=None, env=None, n=6, lanes_cls=None, budget_s=10.0, seq="17-weights_7",
+              on_send=None):
     """Depositor + collector over one contiguous 4-slot window in one process."""
     bl._RB_SCRATCH.clear()
     slot, ring = 4096, 4
@@ -422,7 +423,17 @@ def _pair_run(col_ops=None, dep_ops=None, env=None, n=6, lanes_cls=None, budget_
                              param_name=f"w{i}", tag="weights_7",
                              src_ptr=_addr(srcs[i]), dst_ptr=_addr(dsts[i])) for i in range(n)]
     out, clog, dlog = {}, [], []
-    with mock.patch.dict("os.environ", env or {}):
+
+    def _hooked(orig):
+        def send(self, kind, g=0, payload=None):
+            if on_send is not None and on_send(kind, srcs, payload) is False:
+                return None                 # the hook swallows this record
+            return orig(self, kind, g, payload)
+        return send
+
+    with mock.patch.dict("os.environ", env or {}), \
+            mock.patch.object(bl.FileCredits, "send", _hooked(bl.FileCredits.send)), \
+            mock.patch.object(bl.SocketCredits, "send", _hooked(bl.SocketCredits.send)):
         def collect():
             out["c"] = bl.run_bar1_units(descs, col_ops or _Ops(), lanes=col, lane_key="p0",
                                          role="dst", seq=seq, phase="collect", budget_s=budget_s,
@@ -442,7 +453,7 @@ class TestLaneIntegrity(CustomTestCase):
 
     def test_clean_tag_is_verified_and_counted_per_flip(self):
         bl._INTEG.clear()
-        out, srcs, dsts, clog, dlog = _pair_run()
+        out, srcs, dsts, clog, dlog = _pair_run(n=10)
         self.assertEqual(out, {"c": "", "d": ""})
         cl = [x for x in clog if "lane-time" in x][0]
         dl = [x for x in dlog if "lane-time" in x][0]
@@ -463,7 +474,7 @@ class TestLaneIntegrity(CustomTestCase):
                     b = (ctypes.c_ubyte * 1).from_address(dst + 100)
                     b[0] ^= 0x5A
 
-        out, _s, _d, clog, _dl = _pair_run(col_ops=Corrupt())
+        out, _s, _d, clog, _dl = _pair_run(col_ops=Corrupt(), n=10)
         self.assertEqual(out["d"], "")                     # the depositor got its done
         self.assertIn("INTEGRITY MISMATCH", out["c"])
         self.assertIn("source crc32", out["c"])
@@ -481,12 +492,14 @@ class TestLaneIntegrity(CustomTestCase):
         pcs = [SimpleNamespace(kind=tp.FLAT, nbytes=10000, src_off=0, dst_off=0),
                SimpleNamespace(kind=tp.STRIDED2D, nbytes=6 * 512, rows=6, run_bytes=512,
                                spitch=4096, dpitch=1024, src_off=0, dst_off=0)]
+        pcs = pcs + [SimpleNamespace(kind=tp.FLAT, nbytes=5000 + k, src_off=k, dst_off=k)
+                     for k in range(8)]
         batches = [SimpleNamespace(pieces=pcs)]
         a = bl.integrity_plan(batches, "9-weights_3", 8, tp)
         self.assertEqual(a, bl.integrity_plan(batches, "9-weights_3", 8, tp))
         self.assertEqual(len(a), 8)
         self.assertEqual(a[0][:2], (0, 0))
-        self.assertEqual(a[1][:2], (0, 1))
+        self.assertEqual(a[1][:2], (0, len(pcs) - 1))
         for g, i, row, off, n in a:
             pc = pcs[i]
             span = pc.nbytes if pc.kind == tp.FLAT else pc.run_bytes
@@ -494,6 +507,80 @@ class TestLaneIntegrity(CustomTestCase):
             self.assertLess(row, getattr(pc, "rows", 1))
         self.assertEqual(bl.integrity_samples({}), 8)
         self.assertEqual(bl.integrity_samples({bl.ENV_INTEGRITY_SAMPLES: "0"}), 0)
+
+    def test_picks_are_distinct_pieces_and_capped(self):
+        """RISK 2: no piece is sampled twice; n is capped at the piece count."""
+        pcs = [SimpleNamespace(kind=tp.FLAT, nbytes=9000, src_off=0, dst_off=0) for _ in range(12)]
+        batches = [SimpleNamespace(pieces=pcs[:6]), SimpleNamespace(pieces=pcs[6:])]
+        for seq in ("1-weights_1", "2-weights_1", "9-weights_3", "31-weights_7", "77-w"):
+            a = bl.integrity_plan(batches, seq, 8, tp)
+            self.assertEqual(len(a), 8)
+            self.assertEqual(len({(g, i) for g, i, *_ in a}), 8, a)
+            self.assertEqual({a[0][:2], a[1][:2]}, {(0, 0), (1, 5)})
+            self.assertEqual(a, bl.integrity_plan(batches, seq, 8, tp))      # deterministic
+        a = bl.integrity_plan(batches, "5-w", 50, tp)
+        self.assertEqual(sorted((g, i) for g, i, *_ in a),
+                         [(g, i) for g in (0, 1) for i in range(6)])      # all 12, once each
+        one = bl.integrity_plan([SimpleNamespace(pieces=pcs[:1])], "5-w", 8, tp)
+        self.assertEqual([x[:2] for x in one], [(0, 0)])
+
+    def test_source_written_after_the_plan_is_no_false_mismatch(self):
+        """RISK 1: the crcs are taken from the source as it is at copy time,
+        after the plan send -- a write in the plan/credit window is not a
+        corrupted copy."""
+        bl._INTEG.clear()
+
+        def on_send(kind, srcs, payload):
+            if kind == "plan":
+                for b in srcs:
+                    for k in range(0, len(b), 97):
+                        b[k] ^= 0xFF           # every source byte-ish changes after the plan
+            return True
+
+        out, srcs, dsts, clog, dlog = _pair_run(n=10, on_send=on_send)
+        self.assertEqual(out, {"c": "", "d": ""})
+        self.assertTrue(all(bytes(a) == bytes(b) for a, b in zip(srcs, dsts)))
+        self.assertIn("integrity=verified:8/8 skipped=0", [x for x in clog if "lane-time" in x][0])
+        self.assertIn("mismatch=0", bl.integrity_flip_line(17))
+
+    def test_plan_announces_the_sum_before_any_crc_is_read(self):
+        seen = {}
+
+        class Spy(_Ops):
+            def memcpy_async(self, dst, src, nb, stream):
+                seen.setdefault("first_read_after_plan", seen.get("plan", False))
+                ctypes.memmove(dst, src, nb)
+
+        def on_send(kind, srcs, payload):
+            if kind == "plan":
+                seen["plan"] = True
+                seen["announced"] = bool(payload.get("sum"))
+            return True
+
+        out, *_ = _pair_run(n=10, dep_ops=Spy(), on_send=on_send)
+        self.assertEqual(out, {"c": "", "d": ""})
+        self.assertTrue(seen["announced"])
+        self.assertTrue(seen["first_read_after_plan"])
+
+    def test_announced_sum_that_never_arrives_is_a_named_refusal(self):
+        """The collector must not hang forever nor pass silently: after its
+        (short) budget it refuses the tag by name."""
+        bl._INTEG.clear()
+        dropped = []
+
+        def on_send(kind, srcs, payload):
+            if kind == "sum":
+                dropped.append(payload)
+                return False
+            return True
+
+        t0 = time.perf_counter()
+        out, _s, _d, clog, _dl = _pair_run(n=10, on_send=on_send, budget_s=1.0)
+        self.assertEqual(len(dropped), 1)                 # it was announced AND sent -- but lost
+        self.assertIn("the announced integrity record did not come within", out["c"])
+        self.assertIn("seq=17-weights_7", out["c"])
+        self.assertLess(time.perf_counter() - t0, 25)
+        self.assertIsNone(bl.integrity_flip_line(17))      # never counted as verified
 
 
 class TestPreplanRecheck(CustomTestCase):
