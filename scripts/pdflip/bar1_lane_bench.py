@@ -261,6 +261,15 @@ def build_parser():
     ap.add_argument("--gpuq-booking", default="")
     ap.add_argument("--max-used-mib", type=int, default=64)
     ap.add_argument("--flliper-python", default=DEFAULT_PYTHON)
+    ap.add_argument("--refuse-contended", type=int, default=1,
+                    help="1 (default): refuse the run (exit 3, no worker "
+                         "started) when the pre-start sample shows foreign "
+                         "load on a card (> --contend-pct utilisation; "
+                         "memory.used > --max-used-mib is refused by "
+                         "preflight); 0: only tag it CONTENDED")
+    ap.add_argument("--contend-samples", type=int, default=8,
+                    help="NVML reads of the pre-start contention sample, "
+                         "0.5 s apart (8 = a 4 s window)")
     ap.add_argument("--plan", action="store_true",
                     help="print the matrix + estimates and exit (no gpuq/NVML/CUDA)")
     ap.add_argument("--contend-pct", type=float, default=CONTEND_PCT,
@@ -1993,8 +2002,8 @@ def main(argv=None):
     # -- baseline: no worker of ours is alive -----------------------------
     before = {c: nvml_snapshot(nv, c) for c in cards}
     util_samples = {c: [before[c]["util_gpu"]] for c in cards}
-    for _ in range(5):
-        time.sleep(0.4)
+    for _ in range(max(0, int(a.contend_samples) - 1)):
+        time.sleep(0.5)
         for c in cards:
             util_samples[c].append(nvml_snapshot(nv, c)["util_gpu"])
     verdict = contention_verdict(util_samples, a.contend_pct)
@@ -2008,6 +2017,27 @@ def main(argv=None):
                   f"{v['max_util']}% utilisation with no worker of ours alive "
                   f"(foreign processes per NVML: {procs or 'none listed'}) -- "
                   f"every number measured on it is confounded", flush=True)
+    if art["contended"] and a.refuse_contended:
+        # Refuse BEFORE any worker/subprocess exists: a contended lane run is
+        # thrown away afterwards anyway (3080 pair 1<->2, 23.10.). The
+        # memory.used side is preflight()'s SystemExit above.
+        why = "; ".join(
+            f"card {c}: {v['max_util']:.0f} % utilization, "
+            f"{before[c].get('mem_used_mib')} MiB used with none of this "
+            f"bench's processes on it"
+            for c, v in sorted(verdict.items()) if v["contended"])
+        reason = f"CONTENDED before start -- {why}"
+        print(f"REFUSED: {reason} (no rank started; --refuse-contended 0 "
+              f"runs anyway and only tags it)", flush=True)
+        art["refused_before_start"] = True
+        art["calibration_refused"] = reason
+        art["contention_pre"] = {str(c): v for c, v in verdict.items()}
+        art["finished_utc"] = utc_now()
+        if a.out:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+            with open(a.out, "w") as f:
+                json.dump(art, f, indent=1, default=str)
+        return 3
 
     rc = 0
     try:
