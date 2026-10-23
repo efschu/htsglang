@@ -127,6 +127,51 @@ def test_window_zero_is_the_old_park_at_once(monkeypatch):
     assert _run(st) == ("park", 0.0) and st.calls == []
 
 
+# 2b. Review-Auflage A1: only tp0 has a chain receiver -> tp / cp / dp-attention = the old park at once -------------
+
+def test_tp_size_2_is_the_old_park_at_once_even_with_a_frame_posted():
+    st = _TwoStage(frame_t=0.0)
+    st.ps = SimpleNamespace(pp_rank=1, tp_size=2, attn_cp_size=1)
+    assert _run(st) == ("park", 0.0) and st.calls == []
+
+
+def test_attn_cp_size_2_is_the_old_park_at_once():
+    st = _TwoStage(frame_t=0.0)
+    st.ps = SimpleNamespace(pp_rank=1, tp_size=1, attn_cp_size=2)
+    assert _run(st) == ("park", 0.0) and st.calls == []
+
+
+def test_dp_attention_is_the_old_park_at_once():
+    st = _TwoStage(frame_t=0.0)
+    st.ps = SimpleNamespace(pp_rank=1, tp_size=1, attn_cp_size=1)
+    st.enable_dp_attention = True
+    assert _run(st) == ("park", 0.0) and st.calls == []
+
+
+def test_tp1_cp1_still_takes_the_frame():
+    st = _TwoStage(frame_t=0.0)
+    st.ps = SimpleNamespace(pp_rank=1, tp_size=1, attn_cp_size=1)
+    assert _run(st)[0] == "proxy"
+
+
+def test_mutant_without_the_tp_guard_is_caught():
+    src = textwrap.dedent(inspect.getsource(WAIT))
+    a = src.index('    ps = getattr(self, "ps", None)\n    if (')
+    b = src.index("    bound = float(")
+    m = _mutant2((src[a:b], '    ps = getattr(self, "ps", None)\n'))
+    st = _TwoStage(frame_t=0.0)
+    st.ps = SimpleNamespace(pp_rank=1, tp_size=2, attn_cp_size=2)
+    assert _run(st, fn=m)[0] == "proxy"                   # the mutant hangs a tp group on the proxy arm
+    assert _run(st)[0] == "park"                          # the real code does not
+
+
+def test_the_window_expiry_names_itself(monkeypatch, caplog):
+    monkeypatch.setenv("FLLIPER_PP_FOLLOWER_FRAME_WAIT_S", "2")
+    with caplog.at_level("INFO"):
+        _run(_TwoStage())
+    assert any("PPAUSE FRAME-WAIT-EXPIRED pp_rank=1" in r.getMessage() for r in caplog.records)
+
+
 # 3. mutants of the real source --------------------------------------------------------------------------------------
 
 def _mutant(old, new):

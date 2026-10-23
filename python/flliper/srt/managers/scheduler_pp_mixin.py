@@ -10130,6 +10130,16 @@ class SchedulerPPMixin:
         A follower therefore never runs a frame while a posted chain is unread (danger direction:
         the stages drift apart), and never waits for a chain while PP0's frame lies on its wire.
         """
+        # Review-Auflage A1 (SOLL R11): only tp0 has a chain receiver (p_row_authority); tp>0 always waits in
+        # the TP broadcast (request_receiver). If tp0 took the proxy arm while tp>0 sits in that broadcast, the
+        # group would hang unnamed -- so with tp / attention-cp / dp-attention the old indefinite park, at once.
+        ps = getattr(self, "ps", None)
+        if (
+            int(getattr(ps, "tp_size", 1) or 1) != 1
+            or int(getattr(ps, "attn_cp_size", 1) or 1) != 1
+            or bool(getattr(self, "enable_dp_attention", False))
+        ):
+            return "park"
         bound = float(envs.FLLIPER_PP_FOLLOWER_FRAME_WAIT_S.get() or 0.0)
         if bound <= 0.0:
             return "park"
@@ -10155,6 +10165,15 @@ class SchedulerPPMixin:
                     )
                 return "proxy"
             if clock() - t0 >= bound:
+                # Review-Auflage A2: once per event, throttled like the neighbouring lines
+                n = int(getattr(self, "_ppause_frame_wait_expired_n", 0) or 0) + 1
+                self._ppause_frame_wait_expired_n = n
+                if n <= 32 or (n & (n - 1)) == 0:
+                    logger.info(
+                        "PPAUSE FRAME-WAIT-EXPIRED pp_rank=%s bound_s=%.1f (n=%d): neither chain nor frame "
+                        "within the window -- the old indefinite chain park",
+                        getattr(ps, "pp_rank", "?"), bound, n,
+                    )
                 return "park"
             sleep(0.002)
 
