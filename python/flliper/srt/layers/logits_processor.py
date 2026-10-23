@@ -95,6 +95,58 @@ def _note_logprob_chunking(rows: int, chunk: int, vocab: int) -> None:
     )
 
 
+def _logprob_rowhash_on() -> bool:
+    import os
+
+    return str(os.environ.get("FLLIPER_LOGPROB_ROWHASH", "1")).strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
+def _rowhash_blocks(t: torch.Tensor, block: int = 64) -> str:
+    """Hex digest (8 chars) per block of ``block`` rows of ``t`` -- bitwise,
+    from the raw bytes. Rank-comparable: TP ranks hold the SAME post-norm
+    hidden rows and the SAME gathered logits, so their digests must agree."""
+    import hashlib
+
+    if t is None or t.numel() == 0:
+        return "-"
+    host = t.detach().contiguous().view(t.shape[0], -1).cpu()
+    raw = host.view(torch.uint8) if host.dtype != torch.uint8 else host
+    out = []
+    for s in range(0, host.shape[0], block):
+        out.append(hashlib.sha1(raw[s : s + block].numpy().tobytes()).hexdigest()[:8])
+    return ",".join(out)
+
+
+def _note_logprob_rowhash(pruned_states, input_token_logprobs) -> None:
+    """B10 instrument (23.10.): one line per input-logprob forward with the
+    per-64-row digests of the post-norm hidden rows and of the input logprobs.
+    Compare the TP0 and TP1 lines of the same forward: equal hidden + equal
+    logprob digests = the ranks agree, so a wrong row was computed wrong by
+    the shared model forward (not by the logits gather or a rank-local
+    divergence); unequal hidden = the ranks disagree before lm_head.
+    FLLIPER_LOGPROB_ROWHASH=0 silences it. Only on extend forwards that carry
+    prompt logprobs (one D2H copy of their rows)."""
+    if not _logprob_rowhash_on():
+        return
+    try:
+        lp = input_token_logprobs
+        worst = ""
+        if lp is not None and lp.numel():
+            v, i = torch.min(lp.float(), dim=0)
+            worst = " min_lp=%.2f at_row=%d" % (float(v), int(i))
+        logger.info(
+            "LOGPROB-ROWHASH rows=%d hidden=[%s] lp=[%s]%s",
+            int(pruned_states.shape[0]),
+            _rowhash_blocks(pruned_states),
+            _rowhash_blocks(lp.float().unsqueeze(-1) if lp is not None else None),
+            worst,
+        )
+    except Exception as e:  # noqa: BLE001 - an instrument never breaks the forward
+        logger.warning("LOGPROB-ROWHASH failed: %r", e)
+
+
 def verify_local_vocab_requested() -> bool:
     import os
 
@@ -659,6 +711,7 @@ class LogitsProcessor(nn.Module):
                 logits_metadata,
             )
 
+        _note_logprob_rowhash(pruned_states, logprobs_result.input_token_logprobs)
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
