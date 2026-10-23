@@ -5680,8 +5680,15 @@ class Envs:
     FLLIPER_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
     # Logits processor
-    FLLIPER_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
-    FLLIPER_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+    # Input (prompt) logprobs in row chunks (upstream sglang's
+    # process_input_logprobs_by_chunk). B8 23.10.: ON by default and 64 rows,
+    # not upstream's False/2048 -- one /generate with logprob_start_len=0 over
+    # ~3000 tokens ran a 943-row extend through the unchunked branch
+    # ([943, 248320] fp32 = 894 MiB, twice) and OOM-killed the D group. Chunked,
+    # the transient logits footprint is bounded by chunk x vocab independent of
+    # the prompt length. Rank-uniform by construction (env + batch row count).
+    FLLIPER_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(True)
+    FLLIPER_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(64)
 
     # Tool-Call behavior
     FLLIPER_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
