@@ -224,6 +224,9 @@ class _ServingStage(R.Stage):
 
 
 def _late_ring(monkeypatch, serving=True, **env):
+    # STOREREAD-1023: these rings pin T2 under the pre-1023 Frist (own read > TOTAL_S collapses it to the
+    # publication); the own-read lifesign has its own ring below
+    monkeypatch.setenv(fb.ENV_OWN_READ_LIFESIGN, "0")
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setenv(fb.ENV_FALLBACK, "1")
@@ -277,6 +280,16 @@ def test_ring_idle_box_keeps_the_fallback(monkeypatch):
     ring = _late_ring(monkeypatch, serving=False)
     assert _admits(ring) == [(0, 1, None)]
     assert _uniform(ring, RID_L) == 0
+
+
+def test_ring_pdflip_4_25_the_own_read_lifesign_admits_told_without_the_wait(monkeypatch):
+    """STOREREAD-1023: the same late ack, T2 off -- the Frist after a long own read leaves the follower frist_s(window)
+    after the publication, the ack lands inside it, told is admitted on every rank (27B duo 1023_114625 pdflip-0-3:
+    frist=0.00s, told=53248 -> 0)."""
+    ring = _late_ring(monkeypatch, **{fb.ENV_WAIT_PROGRESS: "0", fb.ENV_OWN_READ_LIFESIGN: "1"})
+    assert _admits(ring) == [(TOLD_L, None, None)]
+    assert _uniform(ring, RID_L) == TOLD_L
+    assert getattr(ring.stages[0], "_pf_fallback_n", 0) == 0
 
 
 def test_ring_a_follower_that_never_acks_ends_in_frist_hard(monkeypatch):

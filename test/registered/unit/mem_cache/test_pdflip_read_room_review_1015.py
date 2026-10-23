@@ -109,9 +109,12 @@ def test_three_reads_of_10s_room_wait_without_progress_do_not_end_in_frist_told0
     assert fb.pp0_decide(sched, "pdflip-4-25", now + 4.0) == (told, fb.REASON_ACKS)
 
 
-def test_without_an_armed_room_wait_the_frist_is_the_old_one_and_the_lifesign_is_capped():
+def test_without_an_armed_room_wait_the_frist_is_the_old_one_and_the_lifesign_is_capped(monkeypatch):
     from flliper.srt.managers import pdflip_told_fallback as fb
 
+    # STOREREAD-1023: with the own read as lifesign (default) the clamp moves by the read time
+    # (test_storeread_1023); this test pins the READ-ROOM rule alone
+    monkeypatch.setenv(fb.ENV_OWN_READ_LIFESIGN, "0")
     pub, own, win = 1000.0, 23.0, 6.0
     old = max(pub, min(pub + fb.frist_s(win), pub - own + fb.TOTAL_S_DEFAULT))
     assert fb.deadline(pub, own, win) == old == pub
