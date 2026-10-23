@@ -535,3 +535,87 @@ def test_collector_columns_for_the_batch_ab():
         "collect_batch=OFF calls=0 why=cudart_batch_copier_refused:_canary"), "verify": None}]
     st2 = B.lane_stats(deps[:1], off, 640 << 20)
     assert st2["collect_batch"] == "OFF" and st2["collect_batch_why"].startswith("cudart_batch")
+
+
+# ------------------------------------------------- refuse a contended start
+
+class _FakeNV:
+    """nvml_snapshot() reads only through helper calls; the tests patch
+    nvml_init/nvml_static/nvml_snapshot, so this is just a token."""
+
+
+def _drive_main(monkeypatch, tmp_path, util_by_card, mem_by_card, extra=()):
+    """main() with gpuq/preflight/NVML faked and every worker launcher
+    recording (or raising). Returns (rc, launched_calls, out_path)."""
+    out = tmp_path / "art.json"
+    monkeypatch.setattr(B._rb, "require_gpuq_window",
+                        lambda cards, booking="": {"id": "t", "owner": "t",
+                                                   "cards": list(cards)})
+    monkeypatch.setattr(B._rb, "preflight", lambda cards, mx: None)
+    monkeypatch.setattr(B, "nvml_init", lambda: _FakeNV())
+    monkeypatch.setattr(B, "nvml_static", lambda nv, c: {
+        "nvml_index": c, "name": "RTX 3080", "uuid": f"GPU-{c}", "bdf": f"0:{c}",
+        "mem_total_mib": 20480, "bar1_total_mib": 256, "pcie_gen": 4,
+        "pcie_width": 16})
+    monkeypatch.setattr(B, "nvml_snapshot", lambda nv, c: {
+        "t": 0.0, "util_gpu": util_by_card[c], "util_mem": 0, "power_w": 100.0,
+        "mem_used_mib": mem_by_card[c], "bar1_used_mib": 0, "procs": []})
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    launched = []
+
+    def launcher(*a, **k):
+        launched.append(a)
+        return {}
+    monkeypatch.setattr(B, "run_lane_configs", launcher)
+    import subprocess
+
+    def no_popen(*a, **k):
+        raise AssertionError("subprocess.Popen called")
+    monkeypatch.setattr(subprocess, "Popen", no_popen)
+    rc = B.main(["--src-card", "1", "--dst-card", "2", "--directions", "fwd",
+                 "--out", str(out), *extra])
+    return rc, launched, out
+
+
+def test_contended_pre_sample_is_refused_before_any_worker(
+        monkeypatch, tmp_path, capsys):
+    rc, launched, out = _drive_main(
+        monkeypatch, tmp_path, {1: 0, 2: 38}, {1: 1, 2: 1245})
+    text = capsys.readouterr().out
+    assert rc == 3 and launched == []
+    refused = [l for l in text.splitlines() if l.startswith("REFUSED: ")]
+    assert len(refused) == 1
+    assert ("CONTENDED before start -- card 2: 38 % utilization, 1245 MiB used"
+            in refused[0])
+    assert ("(no rank started; --refuse-contended 0 runs anyway and only "
+            "tags it)") in refused[0]
+    doc = json.loads(out.read_text())
+    assert doc["refused_before_start"] is True
+    assert doc["contention_pre"]["2"]["contended"] is True
+    assert doc["contention_pre"]["1"]["contended"] is False
+    assert doc["calibration_refused"].startswith("CONTENDED before start -- ")
+
+
+def test_clean_pre_sample_proceeds_to_the_launcher(monkeypatch, tmp_path, capsys):
+    rc, launched, out = _drive_main(
+        monkeypatch, tmp_path, {1: 0, 2: 0}, {1: 1, 2: 1})
+    assert "REFUSED" not in capsys.readouterr().out
+    assert len(launched) == 1 and rc == 0
+
+
+def test_refuse_contended_0_runs_anyway_and_only_tags(
+        monkeypatch, tmp_path, capsys):
+    rc, launched, out = _drive_main(
+        monkeypatch, tmp_path, {1: 0, 2: 38}, {1: 1, 2: 1245},
+        extra=("--refuse-contended", "0"))
+    text = capsys.readouterr().out
+    assert len(launched) == 1 and "REFUSED" not in text
+    assert "# CONTENDED: card 2" in text
+    assert json.loads(out.read_text())["contended"] is True
+
+
+def test_contend_samples_default_and_flag():
+    assert B.parse_args([]).refuse_contended == 1
+    assert B.parse_args([]).contend_samples == 8
+    a = B.parse_args(["--refuse-contended", "0", "--contend-samples", "3"])
+    assert (a.refuse_contended, a.contend_samples) == (0, 3)

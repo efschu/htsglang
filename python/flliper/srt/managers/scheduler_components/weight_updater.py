@@ -11982,6 +11982,16 @@ class SchedulerWeightUpdaterManager:
                             (f"on early={int(_ra_stats.get('early', 0))}" if _ra_dep else "off"))
                 if _errs:
                     raise _errs[0][1]
+            # LANE-INTEGRITY (27b-lanes3x80-1023): one line per flip with what
+            # this rank's BAR1 collects verified (sampled crc32 source vs dest.)
+            try:
+                from flliper.srt.pdflip import bar1_lanes as _b1_integ
+
+                _il = _b1_integ.integrity_flip_line(getattr(self, "_pdflip_flip_index_now", None))
+                if _il:
+                    logger.info(_il)
+            except Exception:  # noqa: BLE001 -- an instrument never fails the wake
+                pass
             # xsn265/266: the collector is the LAST reader of every lane it
             # mapped -- the depositor finished writing before it posted full
             # -- so THIS is where the files are truncated (tmpfs bytes

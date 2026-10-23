@@ -29,6 +29,19 @@ from flliper.srt.pdflip import weight_exchange_transport as tp  # noqa: E402
 PAIRS = ((0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1))
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _lanes3x80_call_counting(monkeypatch):
+    """27b-lanes3x80-1023: this file pins exact copy/sync/probe call sequences
+    of the lane; LANE-INTEGRITY adds sampled D2H reads + syncs per tag and
+    PREPLAN-RECHECK a second probe pass -- both have their own tests in
+    test_pdflip_bar1_lanes3x80_1023.py, so they are held off here."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS", "1e9")
+
+
 def _lanes(tmp_path, group, rank):
     return b1.Bar1Lanes("n1", group, rank, 0, PAIRS, log=lambda *_a: None, root=str(tmp_path))
 

@@ -941,7 +941,15 @@ def main() -> int:
     ap.add_argument("--gloo-rung", type=int, default=1)
     ap.add_argument("--pg-timeout", type=float, default=300.0)
     ap.add_argument("--port", type=int, default=29593)
-    ap.add_argument("--max-used-mib", type=int, default=64)
+    ap.add_argument("--max-used-mib", type=int, default=64,
+                    help="preflight() refuses a card holding more than this")
+    ap.add_argument("--refuse-contended", type=int, default=1,
+                    help="1 (default): refuse the run (exit 3, no rank "
+                         "started) when the pre-start sample shows foreign "
+                         "load on a card; 0: only tag it CONTENDED")
+    ap.add_argument("--contend-samples", type=int, default=8,
+                    help="NVML reads of the pre-start contention sample "
+                         "(0.5 s apart; 8 = a 4 s window)")
     ap.add_argument("--gpuq-booking", default="")
     ap.add_argument("--flliper-python",
                     default=os.path.join(
@@ -967,9 +975,23 @@ def main() -> int:
           f"cards {window.get('cards')} -- running. The service plans, it "
           f"does not lock; the nvidia-smi net below is the real check.")
     preflight(a.cards, a.max_used_mib)
-    pre = contention_sample(a.cards)
-    for line in contention_verdict(pre):
+    pre = contention_sample(a.cards, samples=a.contend_samples)
+    pre_why = contention_verdict(pre)
+    for line in pre_why:
         print(f"# CONTENDED before start: {line}")
+    # preflight() above already refuses on memory.used > --max-used-mib
+    # (SystemExit), so only utilization reaches this verdict.
+    if pre_why and a.refuse_contended:
+        reason = "CONTENDED before start -- " + "; ".join(pre_why)
+        print(f"REFUSED: {reason} (no rank started; --refuse-contended 0 "
+              f"runs anyway and only tags it)")
+        if a.out:
+            with open(a.out, "w") as f:
+                json.dump({"calibration_ok": False,
+                           "calibration_refused": reason,
+                           "refused_before_start": True,
+                           "contention_pre": pre}, f, indent=2)
+        return 3
 
     env = {**os.environ,
            "BARLINK_BENCH_CONTENTION_PRE": json.dumps(pre),

@@ -9,9 +9,15 @@ verbatim; the switch-direct 2-card run of 09:10Z is the accepted control.
 CPU-only: nvidia-smi is faked.
 """
 
+import contextlib
 import importlib.util
+import io
+import json
 import os
+import sys
+import tempfile
 import unittest
+from unittest import mock
 
 from flliper.test.ci.ci_register import register_cpu_ci
 from flliper.test.test_utils import CustomTestCase
@@ -139,6 +145,103 @@ class TestContention(CustomTestCase):
         snap = {2: {"util_max": 37.0, "power_max": 228.0, "mem_used_mib": 1779}}
         back = json.loads(json.dumps(snap))
         self.assertTrue(self.b.contention_verdict(back))
+
+
+#: card 2 under the seat load of 23.10. (the thrown-away 1<->2 calibration)
+_CONTENDED_SMI = "0, 0, 18.4, 18\n1, 0, 17.5, 1\n2, 38, 228.1, 1245\n"
+_CLEAN_SMI = "0, 0, 18.4, 18\n1, 0, 17.5, 1\n2, 0, 17.0, 1\n"
+
+
+class TestRefuseContendedBeforeStart(CustomTestCase):
+    """--refuse-contended (default ON): a contended pre-start sample ends the
+    run with exit 3 BEFORE any rank process exists."""
+
+    def setUp(self):
+        self.b = _bench()
+        self.tmp = tempfile.mkdtemp()
+        self.out = os.path.join(self.tmp, "art.json")
+        self.sample_counts = []
+
+    def _main(self, smi, extra=(), popen=None):
+        b = self.b
+        orig = b.contention_sample
+        run = _Run([smi])
+
+        def sample(cards, samples=4, gap_s=0.5, run_=None):
+            self.sample_counts.append(samples)
+            return orig(cards, samples, 0.0, run=run)
+
+        if popen is None:
+            def popen(*a, **k):
+                raise AssertionError("a rank was spawned: Popen called")
+        argv = ["bench", "--cards", "0,1,2", "--out", self.out, *extra]
+        buf = io.StringIO()
+        with mock.patch.object(b, "require_gpuq_window",
+                               return_value={"id": "t", "owner": "t",
+                                             "cards": [0, 1, 2]}), \
+                mock.patch.object(b, "preflight"), \
+                mock.patch.object(b, "contention_sample", sample), \
+                mock.patch.object(b.subprocess, "Popen", popen), \
+                mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(buf):
+            rc = b.main()
+        return rc, buf.getvalue()
+
+    def test_contended_pre_sample_is_refused_with_exit_3(self):
+        rc, out = self._main(_CONTENDED_SMI)  # Popen raises if reached
+        self.assertEqual(rc, 3)
+        lines = [l for l in out.splitlines() if l.startswith("REFUSED: ")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("CONTENDED before start -- card 2: 38 % utilization", lines[0])
+        self.assertIn("1245 MiB used", lines[0])
+        self.assertIn("(no rank started; --refuse-contended 0 runs anyway "
+                      "and only tags it)", lines[0])
+        with open(self.out) as f:
+            doc = json.load(f)
+        self.assertIs(doc["refused_before_start"], True)
+        self.assertIs(doc["calibration_ok"], False)
+        self.assertTrue(doc["calibration_refused"].startswith(
+            "CONTENDED before start -- "))
+        self.assertEqual(doc["contention_pre"]["2"]["util_max"], 38.0)
+
+    def test_pre_sample_uses_contend_samples_default_8_post_stays_4(self):
+        spawned = []
+
+        class P:
+            def wait(self, timeout=None):
+                return 0
+        self._main(_CLEAN_SMI, popen=lambda *a, **k: spawned.append(a) or P())
+        self.assertEqual(self.sample_counts, [8, 4])
+        self.sample_counts.clear()
+        self._main(_CLEAN_SMI, extra=("--contend-samples", "3"),
+                   popen=lambda *a, **k: spawned.append(a) or P())
+        self.assertEqual(self.sample_counts[0], 3)
+
+    def test_clean_sample_proceeds_to_the_rank_launcher(self):
+        spawned = []
+
+        class P:
+            def wait(self, timeout=None):
+                return 0
+        rc, out = self._main(_CLEAN_SMI,
+                             popen=lambda *a, **k: spawned.append(a) or P())
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(spawned), 3)  # one rank process per card
+        self.assertNotIn("REFUSED", out)
+
+    def test_refuse_contended_0_runs_anyway_and_only_tags(self):
+        spawned = []
+
+        class P:
+            def wait(self, timeout=None):
+                return 0
+        rc, out = self._main(_CONTENDED_SMI, extra=("--refuse-contended", "0"),
+                             popen=lambda *a, **k: spawned.append(a) or P())
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(spawned), 3)
+        self.assertIn("# CONTENDED before start: card 2", out)
+        self.assertNotIn("REFUSED", out)
+        self.assertFalse(os.path.exists(self.out))
 
 
 if __name__ == "__main__":

@@ -48,7 +48,9 @@ import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass
+import random
+import zlib
+from dataclasses import dataclass, field
 from typing import Mapping as _Map, Optional
 
 from flliper.srt.pdflip.host_pause import PauseAwareDeadline
@@ -213,6 +215,89 @@ def _slotted(name: str, offset: int, size: int, ring: int):
     return (name, int(offset), slot * int(ring), slot)
 
 
+# -- MULTI-REGION ring (27b-lanes3x80-1023) -----------------------------------
+#
+# THE MEASUREMENT (boot dkr27bint4arbar1int4ar10231723, 2x RTX 3080, P = PP2,
+# D = TP2, 677 BAR1 tag pairs). The D ranks own three group windows (world:0
+# 15, tp:0 31, dcp:0 39 MiB) and receive on ONE lane, so the lane borrowed only
+# the largest region (dcp:0 -> ring 4 x 9 MiB) and left tp:0 idle; the P ranks
+# lend pp:0 (95 MiB -> 4 x 23 MiB). Per batch both directions ran at the same
+# period (deposit (total - first_free) / batches, p50 1.55 ms P->D 84-batch
+# tags, 1.58 ms D->P 33-batch tags): the credit round trip, not the wire
+# (155.5 us + bytes / 20.45 GB/s = 0.62 ms for 9 MiB, 1.33 ms for 23 MiB),
+# sets the pace, so the rate scales with the slot -- P->D p1 5.3 GB/s p50
+# against D->P 12.5 GB/s, ratio 2.4 for a slot ratio of 2.55.
+#
+# THE FORM (``FLLIPER_PDFLIP_BAR1_MULTI_REGION``, default on): a receiver with
+# MORE borrowable regions than receiving lanes hands the spare ones to its
+# lanes as further ring regions. One slot size for the whole ring (the plan's
+# cut is ``batch_descs(slot_bytes)``), the largest MiB-aligned slot of which
+# the lane's regions hold ``ring`` in total, largest region first; each region
+# is exported as its own dma-buf and mapped by the depositor on its own. Taken
+# only when the slot grows (D: dcp:0 + tp:0 -> 4 x 15 MiB instead of 4 x 9);
+# otherwise the single-region plan byte for byte. Off = the old plan.
+ENV_MULTI_REGION = "FLLIPER_PDFLIP_BAR1_MULTI_REGION"
+
+
+def multi_region_on(env: Optional[_Map[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_MULTI_REGION, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def multi_region_slots(regions, ring: int):
+    """``(slot_bytes, [(name, offset, size), ...])`` -- the largest MiB slot of
+    which ``regions`` ((name, offset, size), any order) hold ``ring`` in total,
+    filled largest region first, each part ``n * slot`` bytes -- or None."""
+    ring = max(1, int(ring))
+    regs = sorted(((str(n), int(o), int(z)) for n, o, z in regions),
+                  key=lambda r: (-r[2], r[0], r[1]))
+    if not regs:
+        return None
+    top = max(z for _n, _o, z in regs) >> 20
+    for mib in range(int(top), 1, -1):
+        slot = mib << 20
+        if sum(z // slot for _n, _o, z in regs) < ring:
+            continue
+        parts, left = [], ring
+        for name, off, size in regs:
+            k = min(left, size // slot)
+            if k > 0:
+                parts.append((name, off, k * slot))
+                left -= k
+            if left == 0:
+                break
+        return slot, parts
+    return None
+
+
+def borrow_plan_regions(group: str, lane_key: str, cross_pairs, big_cards, windows,
+                        ring: int = 4, dst_lanes=None, env: Optional[_Map[str, str]] = None):
+    """:func:`borrow_plan` with MULTI-REGION rings: a list of
+    ``(window name, offset, size, slot_bytes)`` parts (one part = exactly the
+    single-region plan) or the refusal text. The lane's primary region is the
+    one :func:`borrow_plan` gives it; the regions left over once every lane has
+    one go round-robin to the lanes in :func:`lane_order`."""
+    single = borrow_plan(group, lane_key, cross_pairs, big_cards, windows, ring,
+                         dst_lanes=dst_lanes)
+    if isinstance(single, str) or not multi_region_on(env):
+        return single if isinstance(single, str) else [single]
+    lanes = lane_order(list(dst_lanes or [lane_key]), cross_pairs, big_cards)
+    if lane_key not in lanes:
+        lanes = lane_order(lanes + [lane_key], cross_pairs, big_cards)
+    regs = borrow_regions(windows, len(lanes))
+    n, i = len(lanes), lanes.index(lane_key)
+    mine = [regs[i]] + [regs[j] for j in range(n, len(regs)) if (j - n) % n == i]
+    if len(mine) < 2:
+        return [single]
+    got = multi_region_slots(mine, ring)
+    if got is None or got[0] <= int(single[3]):
+        return [single]
+    slot, parts = got
+    if len(parts) < 2:
+        return [single]
+    return [(name, off, size, slot) for name, off, size in parts]
+
+
 def collect_gate_is_bar1(lanes, lane_key: str, pair) -> bool:
     """H89: may a collector skip the host lanes' tag-order gate on this lane?
     Only for a cross lane whose window this rank serves AND whose depositor
@@ -245,6 +330,15 @@ def flag_dir(boot_nonce: str, lane_key: str, dst_group: str, root: str = "/dev/s
 
 def ring_slot(g: int, ring: int) -> int:
     return int(g) % max(1, int(ring))
+
+
+def slot_addr(base, g: int, ring: int, slot_bytes: int) -> int:
+    """Device address of batch ``g``'s ring slot. ``base`` is the window's
+    start (one contiguous ring) or, for a MULTI-REGION ring
+    (27b-lanes3x80-1023), the tuple of every slot's own address."""
+    if isinstance(base, (tuple, list)):
+        return int(base[ring_slot(g, ring)])
+    return int(base) + ring_slot(g, ring) * int(slot_bytes)
 
 
 # -- flags (cross-process credits) -------------------------------------------
@@ -370,7 +464,7 @@ class SocketCredits:
     """One 5-byte frame per credit on the lane's open connection; a plan
     frame carries a length-prefixed JSON. Both sides read in order, so the
     kinds are checked, never searched."""
-    KINDS = {"plan": b"P", "full": b"F", "free": b"R", "done": b"D"}
+    KINDS = {"plan": b"P", "full": b"F", "free": b"R", "done": b"D", "sum": b"S"}
 
     def __init__(self, sock, liveness=None):
         self.sock, self.liveness = sock, liveness
@@ -720,6 +814,25 @@ ENV_READBACK_STALL_MS = "FLLIPER_PDFLIP_BAR1_READBACK_STALL_MS"
 #: below the second.
 READBACK_STALL_MS_DEFAULT = 5.0
 READBACK_PROBE_N_DEFAULT = 4
+#: READBACK-CONFIRM (27b-lanes3x80-1023): how many STALLED reads the probe needs
+#: before it refuses the lane. 1 = the 23.10. form (the first stall refuses).
+#:
+#: THE MEASUREMENT. 46 lane probes in the 23.10. boots of both 3080 pairs and the
+#: 5090 pair (ACS 0011, switch-direct): healthy reads 0.02-1.9 ms, single
+#: outliers 3.2-4.8 ms in six probes (each followed by fast reads), and TWO
+#: lanes refused for a whole boot by ONE outlier each --
+#: ``boot_weg2_dkr27bint4arbar1int4ar10231723`` P PP0 p0 ``1 read(s): 10.46 ms``
+#: (the probe stops at the first stall, so the next read was never taken; the
+#: P->D lane PP0 -> TP1 ran on the host path in all 37 P->D flips) and
+#: ``...int4ar10231824`` D TP0 p0 ``0.75, 224.91 ms``. The sick class this probe
+#: exists for (root-port hairpin, barlink-switch-1023) stalled on EVERY read
+#: (33-85 ms, every batch), so a stall that does not repeat is not that class.
+#: Default 2: the probe keeps reading after a first stall and refuses only when
+#: a second read stalls too (or a stalled read returned all-ones, the
+#: completion-timeout signature) -- worst case two stalled reads at connect,
+#: never more.
+ENV_READBACK_CONFIRM = "FLLIPER_PDFLIP_BAR1_READBACK_CONFIRM"
+READBACK_CONFIRM_DEFAULT = 2
 _ALL_ONES = b"\xff" * READBACK_BYTES
 
 
@@ -741,37 +854,66 @@ def readback_stall_ms(env: Optional[_Map[str, str]] = None) -> float:
     return v if v > 0 else READBACK_STALL_MS_DEFAULT
 
 
-def run_readback_probe(read_once, n: int, stall_ms: float, clock=time.perf_counter):
-    """Time ``n`` calls of ``read_once()`` (one synchronous 16-byte peer read
-    each, returning the bytes read). Stops at the FIRST stalled read: every
-    further stalled read is another completion-timeout-sized hold of the
-    link, and one already decides. Returns ``(latencies_ms, all_ones)``."""
-    lat, ones = [], 0
+def readback_confirm(env: Optional[_Map[str, str]] = None) -> int:
+    """Stalled reads needed before the probe refuses (READBACK-CONFIRM)."""
+    env = os.environ if env is None else env
+    try:
+        k = int(env.get(ENV_READBACK_CONFIRM, str(READBACK_CONFIRM_DEFAULT)))
+    except ValueError:
+        k = READBACK_CONFIRM_DEFAULT
+    return max(1, min(8, k))
+
+
+def run_readback_probe(read_once, n: int, stall_ms: float, clock=time.perf_counter,
+                       confirm: Optional[int] = None):
+    """Time up to ``n`` calls of ``read_once()`` (one synchronous 16-byte peer
+    read each, returning the bytes read). Stops at the ``confirm``-th stalled
+    read (READBACK-CONFIRM, default 2; 1 = the first stall stops it): every
+    further stalled read is another completion-timeout-sized hold of the link,
+    and a REPEATED stall already decides -- a single one does not (one cold
+    10.46-ms read refused a whole boot's P->D lane). A stalled read that
+    returned all-ones stops it at once. Returns ``(latencies_ms, all_ones)``."""
+    need = readback_confirm() if confirm is None else max(1, int(confirm))
+    lat, ones, stalls = [], 0, 0
     for _ in range(int(n)):
         t0 = clock()
         got = read_once()
         ms = (clock() - t0) * 1000.0
         lat.append(ms)
-        if got is not None and bytes(got) == _ALL_ONES:
-            ones += 1
+        one = got is not None and bytes(got) == _ALL_ONES
         if ms > stall_ms:
-            break
+            stalls += 1
+            if one:          # the completion-timeout signature is a STALLED read's data
+                ones += 1
+            if stalls >= need or one:
+                break
     return lat, ones
 
 
-def readback_verdict(lat_ms, stall_ms: float, all_ones: int = 0) -> str:
+def readback_verdict(lat_ms, stall_ms: float, all_ones: int = 0,
+                     confirm: Optional[int] = None) -> str:
     """'' (the readback is a usable arrival proof) or the named reason why
     it is not. Pure, desk-testable. All-ones data is what a requester
-    synthesizes for a timed-out read; it is NAMED with the stall, but on its
-    own (a fast read of window bytes that happen to be 0xff) it decides
-    nothing."""
+    synthesizes for a timed-out read; it is NAMED with the stall, and together
+    with a stall it refuses on its own; without one (a fast read of window
+    bytes that happen to be 0xff) it decides nothing.
+
+    READBACK-CONFIRM: the lane is refused when ``confirm`` reads stalled
+    (default 2), or every read taken stalled (a probe of fewer reads), or a
+    stall came with all-ones data. One stall among fast reads keeps the lane;
+    the note on the mapped line still carries every read."""
     if not lat_ms:
         return ""
-    worst = max(lat_ms)
-    if worst <= stall_ms:
+    need = readback_confirm() if confirm is None else max(1, int(confirm))
+    stalled = [x for x in lat_ms if x > stall_ms]
+    if not stalled:
         return ""
+    if len(stalled) < min(need, len(lat_ms)) and not all_ones:
+        return ""
+    worst = max(lat_ms)
     return (f"write-order readback stalls: a 16-B P2P read of the peer window took "
-            f"{worst:.1f} ms (> {stall_ms:g} ms; {len(lat_ms)} read(s): "
+            f"{worst:.1f} ms (> {stall_ms:g} ms; {len(stalled)} of {len(lat_ms)} read(s) "
+            f"stalled, confirm={need}: "
             f"{', '.join(f'{x:.2f}' for x in lat_ms)} ms"
             + (f"; {all_ones} returned all-ones, the completion-timeout signature"
                if all_ones else "")
@@ -1001,6 +1143,10 @@ class RecvWindow:
     thread: object = None
     borrowed: str = ""     # the group window whose payload region this ring borrows
     conn: object = None    # the depositor's open connection = the credit channel
+    #: MULTI-REGION: every slot's own device address (None = one contiguous ring)
+    slot_addrs: Optional[list] = None
+    #: MULTI-REGION: the dma-buf fds of the further regions (sent after dmabuf_fd)
+    extra_fds: list = field(default_factory=list)
 
 
 @dataclass
@@ -1015,6 +1161,10 @@ class PeerWindow:
     mmap_obj: object
     reg_address: int
     sock: object = None    # the open connection to the receiver = the credit channel
+    #: MULTI-REGION: every slot's own device address (None = one contiguous ring)
+    slot_addrs: Optional[list] = None
+    #: MULTI-REGION: (holder handle, mmap, registered address) of the further regions
+    extra: list = field(default_factory=list)
 
 
 class Bar1Lanes:
@@ -1392,6 +1542,13 @@ class Bar1Lanes:
         p = self.peers.get(lane_key)
         return (int(p.dev_ptr), int(p.slot_bytes), int(p.ring)) if p is not None else None
 
+    def slot_table(self, lane_key: str, role: str):
+        """MULTI-REGION: the tuple of every ring slot's address on this side,
+        or None for a contiguous ring (the address is base + i * slot)."""
+        w = self.recv.get(lane_key) if role == "dst" else self.peers.get(lane_key)
+        addrs = getattr(w, "slot_addrs", None) if w is not None else None
+        return tuple(int(a) for a in addrs) if addrs else None
+
     # -- the per-tag agreement ------------------------------------------------
     def lane_mode(self, lane_key: str, role: str, seq, timeout_s: float = 120.0,
                   liveness=None) -> str:
@@ -1496,27 +1653,56 @@ class Bar1Lanes:
                     self._windows_logged = True
                     self.log(f"PDFLIP-BAR1 group windows of this process: "
                              f"{ {k: v >> 20 for k, v in wins.items()} } MiB; dst lanes={self._dst_lanes}")
-                plan = borrow_plan(self.group, lane_key, self.cross_pairs, self.big_cards(),
-                                   wins, ring, dst_lanes=self._dst_lanes)
+                plan = borrow_plan_regions(self.group, lane_key, self.cross_pairs, self.big_cards(),
+                                           wins, ring, dst_lanes=self._dst_lanes)
                 if isinstance(plan, str):
                     self.refusals[lane_key] = plan
                     self.log(f"PDFLIP-BAR1 lane={lane_key} role=dst group={self.group} NO-WINDOW {plan} -> host lane")
                     self._mark_no_window(lane_key, plan)
                     return None
-                borrowed, offset, size, slot = plan
+                borrowed, offset, size, slot = plan[0]
                 dptr, handle, full = self._group_own[borrowed]
+                parts = list(plan[1:])
             else:
                 slot = slot_bytes_for(int(win.size))
                 dptr, handle, full = cu.vmm_alloc(self._ordinal(), slot * ring)
                 size = full
+                parts = []
             fd, hold_fds, how = cu.dmabuf_fd(dptr, handle, full, self._ordinal())
+            # MULTI-REGION: each further region is its own group window, so its
+            # own dma-buf; the slot table lists every slot's address in ring order
+            regions_meta, extra_fds, slot_addrs = [], [], None
+            if parts:
+                slot_addrs = [int(dptr) + int(offset) + j * int(slot)
+                              for j in range(int(size) // int(slot))]
+                regions_meta.append({"borrowed": borrowed, "offset": int(offset),
+                                     "size": int(size), "full": int(full)})
+                for p_name, p_off, p_size, _p_slot in parts:
+                    p_dptr, p_handle, p_full = self._group_own[p_name]
+                    p_fd, p_hold, _p_how = cu.dmabuf_fd(p_dptr, p_handle, p_full, self._ordinal())
+                    extra_fds.append(int(p_fd))
+                    hold_fds = list(hold_fds) + list(p_hold)
+                    slot_addrs += [int(p_dptr) + int(p_off) + j * int(slot)
+                                   for j in range(int(p_size) // int(slot))]
+                    regions_meta.append({"borrowed": p_name, "offset": int(p_off),
+                                         "size": int(p_size), "full": int(p_full)})
+                ring = len(slot_addrs)
+                borrowed = "+".join(r["borrowed"] for r in regions_meta)
         except Exception as exc:  # noqa: BLE001 -- a named refusal, the host lane stays
+            for _fd in ([locals().get("fd")] + list(locals().get("extra_fds") or [])):
+                if isinstance(_fd, int) and _fd >= 0:
+                    try:
+                        os.close(_fd)
+                    except OSError:
+                        pass
             self.refusals[lane_key] = f"window: {type(exc).__name__}: {exc}"
             self.log(f"PDFLIP-BAR1 lane={lane_key} role=dst REFUSED {self.refusals[lane_key]} -> host lane")
             self._mark_no_window(lane_key, self.refusals[lane_key])
             return None
-        w = RecvWindow(lane_key, int(dptr) + int(offset), int(handle), int(size), slot, ring, int(fd),
-                       list(hold_fds), bdf, self._ordinal(), borrowed=borrowed)
+        w = RecvWindow(lane_key, int(dptr) + int(offset), int(handle),
+                       (int(slot) * int(ring)) if slot_addrs else int(size), slot, ring, int(fd),
+                       list(hold_fds), bdf, self._ordinal(), borrowed=borrowed,
+                       slot_addrs=slot_addrs, extra_fds=extra_fds)
         path = socket_path(self.boot_nonce, lane_key, self.group, self.root)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
@@ -1528,7 +1714,8 @@ class Bar1Lanes:
         ls.listen(4)
         meta = json.dumps({"lane": lane_key, "size": w.size, "slot_bytes": slot, "ring": ring,
                            "bdf": bdf, "how": how, "offset": int(offset), "full": int(full),
-                           "borrowed": borrowed}).encode()
+                           "borrowed": borrowed,
+                           **({"regions": regions_meta} if regions_meta else {})}).encode()
 
         def _serve():
             while True:
@@ -1544,7 +1731,7 @@ class Bar1Lanes:
                 old = w.conn
                 w.conn = conn
                 try:
-                    socket.send_fds(conn, [meta], [w.dmabuf_fd])
+                    socket.send_fds(conn, [meta], [w.dmabuf_fd] + list(w.extra_fds))
                 except OSError as exc:
                     self.log(f"PDFLIP-BAR1 lane={lane_key} serve failed: {exc!r}")
                     w.conn = old
@@ -1559,9 +1746,10 @@ class Bar1Lanes:
         th.start()
         w.listener, w.thread = ls, th
         self.recv[lane_key] = w
-        self.log(f"PDFLIP-BAR1 lane={lane_key} role=dst group={self.group} window={size >> 20} MiB "
+        self.log(f"PDFLIP-BAR1 lane={lane_key} role=dst group={self.group} window={w.size >> 20} MiB "
                  f"slot={slot >> 20} MiB ring={ring} bdf={bdf} export={how} "
-                 f"borrowed={borrowed or '-'} offset={offset >> 20}MiB served={path}")
+                 f"borrowed={borrowed or '-'} offset={offset >> 20}MiB served={path}"
+                 + (f" regions={len(regions_meta)} multi_region=on" if regions_meta else ""))
         return w
 
     # -- depositor: connect + map --------------------------------------------
@@ -1582,7 +1770,7 @@ class Bar1Lanes:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.settimeout(10.0)
                 s.connect(path)
-                data, fds, _flags, _addr = socket.recv_fds(s, 4096, 4)
+                data, fds, _flags, _addr = socket.recv_fds(s, 4096, 17)  # MULTI-REGION: up to ring 16 + 1
                 meta = json.loads(data.decode())
                 break
             except (OSError, ValueError):
@@ -1608,38 +1796,97 @@ class Bar1Lanes:
             return None
         fd = int(fds[0])
         handle_ = None
+        # MULTI-REGION (27b-lanes3x80-1023): the receiver may serve several
+        # borrowed regions, one dma-buf each, in ring order after the first.
+        regions = list(meta.get("regions") or [])
+        r0_off = int((regions[0] if regions else meta).get("offset", 0) or 0)
+        r0_size = int(regions[0]["size"]) if regions else int(meta["size"])
+        extra_maps: list = []
+
+        def _map_region(cu_, fd_k: int, m_off: int, size_k: int, window):
+            """Hold one served dma-buf, map its BAR1 run, register it:
+            ``(holder handle, mmap, registered address, device pointer)``."""
+            h_k, mm, reg = None, None, None
+            try:
+                h_k, sg, _total = self._holder.hold(fd_k, self.bdf())
+                # Buffer-order run from offset 0, NOT the address-sorted run: with
+                # ALLOW_DISCONTIG BAR1 pieces need not ascend, and sorting would map
+                # window offset X to some other buffer offset (barlink-visibility-1023).
+                start, length, _n_run = bar1_contiguous_prefix(sg, window)
+                if length == 0:
+                    raise RuntimeError(f"first of {len(sg)} sg entries not inside the peer's BAR1")
+                if length < m_off + size_k:
+                    raise RuntimeError(f"contiguous BAR1 run {length} < offset {m_off} + window {size_k}")
+                offset = start - window.base + m_off
+                page = mmap.PAGESIZE
+                m_offset = (offset // page) * page
+                lead = offset - m_offset
+                m_length = size_k + lead
+                res_fd = os.open(f"/sys/bus/pci/devices/{peer_bdf}/resource1_wc", os.O_RDWR | os.O_SYNC)
+                try:
+                    mm = mmap.mmap(res_fd, m_length, mmap.MAP_SHARED,
+                                   mmap.PROT_READ | mmap.PROT_WRITE, offset=m_offset)
+                finally:
+                    os.close(res_fd)
+                hst = ctypes.addressof(ctypes.c_char.from_buffer(mm)) + lead
+                cu_.register_io(hst - lead, m_length)
+                reg = hst - lead
+                return h_k, mm, reg, cu_.dev_ptr(reg) + lead
+            except BaseException:
+                if reg is not None:
+                    try:
+                        cu_.unregister(reg)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if mm is not None:
+                    try:
+                        mm.close()
+                    except Exception:  # noqa: BLE001 -- a buffer still exported
+                        pass
+                if h_k is not None:
+                    try:
+                        self._holder.release(h_k)
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise
+
+        def _drop_extras(cu_):
+            for h_k, mm, reg, _dev in extra_maps:
+                for undo in (lambda: cu_.unregister(reg), mm.close,
+                             lambda: self._holder.release(h_k)):
+                    try:
+                        undo()
+                    except Exception:  # noqa: BLE001
+                        pass
+            extra_maps.clear()
+
         try:
             cu = self._cu()
             if self._holder is None:
                 self._holder = Holder()
             peer_bdf = str(meta["bdf"])
             window = bar1_window(peer_bdf)
-            handle_, sg, _total = self._holder.hold(fd, self.bdf())
-            # Buffer-order run from offset 0, NOT the address-sorted run: with
-            # ALLOW_DISCONTIG BAR1 pieces need not ascend, and sorting would map
-            # window offset X to some other buffer offset (barlink-visibility-1023).
-            start, length, _n_run = bar1_contiguous_prefix(sg, window)
-            if length == 0:
-                raise RuntimeError(f"first of {len(sg)} sg entries not inside the peer's BAR1")
-            m_off = int(meta.get("offset", 0) or 0)
-            if length < m_off + int(meta["size"]):
-                raise RuntimeError(f"contiguous BAR1 run {length} < offset {m_off} + window {meta['size']}")
-            offset = start - window.base + m_off
-            page = mmap.PAGESIZE
-            m_offset = (offset // page) * page
-            lead_in = offset - m_offset
-            m_length = int(meta["size"]) + lead_in
-            res_fd = os.open(f"/sys/bus/pci/devices/{peer_bdf}/resource1_wc", os.O_RDWR | os.O_SYNC)
-            try:
-                mapped = mmap.mmap(res_fd, m_length, mmap.MAP_SHARED,
-                                   mmap.PROT_READ | mmap.PROT_WRITE, offset=m_offset)
-            finally:
-                os.close(res_fd)
-            host = ctypes.addressof(ctypes.c_char.from_buffer(mapped)) + lead_in
-            cu.register_io(host - lead_in, m_length)
-            dev = cu.dev_ptr(host - lead_in) + lead_in
+            handle_, mapped, reg0, dev = _map_region(cu, fd, r0_off, r0_size, window)
+            handle_ = int(handle_)
+            host, lead_in = reg0, 0
+            if len(regions) > 1:
+                if len(fds) < len(regions):
+                    raise RuntimeError(f"{len(regions)} regions served with {len(fds)} fd(s)")
+                for k in range(1, len(regions)):
+                    extra_maps.append(_map_region(cu, int(fds[k]), int(regions[k].get("offset", 0) or 0),
+                                                  int(regions[k]["size"]), window))
         except Exception as exc:  # noqa: BLE001 -- a named refusal, the host lane stays
+            if extra_maps:
+                _drop_extras(cu)
             if handle_ is not None:
+                try:
+                    cu.unregister(host - lead_in)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    mapped.close()
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     self._holder.release(handle_)
                 except Exception:  # noqa: BLE001
@@ -1652,15 +1899,17 @@ class Bar1Lanes:
                 pass
             return None
         finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            for _fd in fds:
+                try:
+                    os.close(int(_fd))
+                except OSError:
+                    pass
         rb_why, rb_note = self._probe_readback(cu, int(dev))
         if rb_why:
             # Named refusal BEFORE the lane is published: no PeerWindow, no
             # mapped marker -> the collector keeps the host lane's gate and
             # the depositor's lane_mode posts "host" with this reason.
+            _drop_extras(cu)
             try:
                 cu.unregister(host - lead_in)
             except Exception:  # noqa: BLE001
@@ -1681,14 +1930,34 @@ class Bar1Lanes:
             self.log(f"PDFLIP-BAR1 lane={lane_key} role=src REFUSED peer={peer_bdf} {rb_why} -> host lane")
             return None
         s.settimeout(None)
-        p = PeerWindow(lane_key, int(dev), int(meta["size"]), int(meta["slot_bytes"]), int(meta["ring"]),
-                       peer_bdf, int(handle_), mapped, host - lead_in, sock=s)
+        slot_b = int(meta["slot_bytes"])
+        slot_addrs = None
+        if len(regions) > 1:
+            devs = [int(dev)] + [int(m[3]) for m in extra_maps]
+            sizes = [int(r["size"]) for r in regions]
+            slot_addrs = [d + j * slot_b for d, z in zip(devs, sizes) for j in range(z // slot_b)]
+            if len(slot_addrs) != int(meta["ring"]):
+                _drop_extras(cu)
+                for undo in (lambda: cu.unregister(host - lead_in), mapped.close,
+                             lambda: self._holder.release(handle_), s.close):
+                    try:
+                        undo()
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.refusals[lane_key] = (f"map: {len(slot_addrs)} slots in {len(regions)} regions "
+                                           f"!= ring {meta['ring']}")
+                self.log(f"PDFLIP-BAR1 lane={lane_key} role=src REFUSED {self.refusals[lane_key]} -> host lane")
+                return None
+        p = PeerWindow(lane_key, int(dev), int(meta["size"]), slot_b, int(meta["ring"]),
+                       peer_bdf, int(handle_), mapped, host - lead_in, sock=s,
+                       slot_addrs=slot_addrs, extra=[(int(m[0]), m[1], int(m[2])) for m in extra_maps])
         self.peers[lane_key] = p
         self._mark_mapped(lane_key)
         self.log(f"PDFLIP-BAR1 lane={lane_key} role=src group={self.group} mapped peer={peer_bdf} "
                  f"window={p.size >> 20} MiB slot={p.slot_bytes >> 20} MiB ring={p.ring} "
                  f"borrowed={meta.get('borrowed') or '-'} "
                  f"dev_ptr={p.dev_ptr:#x} ms={(time.perf_counter() - t0) * 1000:.0f}"
+                 + (f" regions={len(regions)} multi_region=on" if slot_addrs else "")
                  + (f" {rb_note}" if rb_note else ""))
         return p
 
@@ -1725,7 +1994,8 @@ class Bar1Lanes:
                 except Exception:  # noqa: BLE001
                     pass
         note = (f"readback_probe_ms={','.join(f'{x:.3f}' for x in lat)} "
-                f"stall_ms={stall:g} all_ones={ones}")
+                f"stall_ms={stall:g} all_ones={ones} "
+                f"stalls={sum(1 for x in lat if x > stall)} confirm={readback_confirm()}")
         return readback_verdict(lat, stall, ones), note
 
     # -- setup for all cross lanes of this rank ---------------------------------
@@ -1860,16 +2130,49 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     if win is None:
         return f"bar1 lane {lane_key}: no window on this side (role={role})"
     base, slot_bytes, ring = win
+    # MULTI-REGION (27b-lanes3x80-1023): a ring over several borrowed regions
+    # addresses every slot by its own pointer; a contiguous ring keeps base
+    _table = getattr(lanes, "slot_table", None)
+    _slots = _table(lane_key, role) if callable(_table) else None
+    if _slots:
+        if len(_slots) != int(ring):
+            return (f"bar1 lane {lane_key}: slot table of {len(_slots)} != ring {ring} "
+                    f"(role={role})")
+        base = tuple(_slots)
     batches = tp.batch_descs(list(descs), slot_bytes=int(slot_bytes), first_seq=0)
     if not batches:
         return ""
+    preplan = None
+    if role == "dst" and preplan_before_turn_on():
+        # PREPLAN-BEFORE-TURN: the copy list, the pointer probes and the batch
+        # arrays need the resumed tag and the own window, not the lane -- built
+        # while the lane's previous tag is still being collected
+        preplan = collect_preplan(ops, device, batches, descs, no_write or (), lane_key, tp,
+                                  base, ring, slot_bytes)
+        preplan["at"] = "pre-turn"
+    tt0 = time.perf_counter()
     if role == "dst" and not lanes.take_turn(lane_key, order_key, budget_s):
         return (f"bar1 collect lane={lane_key} seq={seq}: the lane's turn {order_key} did not "
                 f"come within {budget_s:.0f} s (an earlier tag's collect is stuck; pending="
                 f"{sorted(lanes.turn.get(lane_key) or ())})")
+    if preplan is not None:
+        preplan["turn_s"] = time.perf_counter() - tt0
+        preplan["recheck"] = "-"
+        if preplan["turn_s"] * 1000.0 >= preplan_recheck_ms():
+            # PREPLAN-RECHECK: the destinations may have changed state while
+            # the turn waited; a refused one rebuilds the plan after the turn,
+            # where the per-piece cut names it exactly as before
+            _rw = preplan_recheck(preplan, batches, descs, no_write or (), lane_key, tp)
+            if _rw:
+                preplan = {"at": "turn", "turn_s": preplan["turn_s"], "recheck": "rebuilt"}
+                preplan = dict(collect_preplan(ops, device, batches, descs, no_write or (), lane_key,
+                                               tp, base, ring, slot_bytes), **preplan)
+            else:
+                preplan["recheck"] = "ok"
     try:
         return _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
-                             budget_s, device, log, base, slot_bytes, ring, batches, tp)
+                             budget_s, device, log, base, slot_bytes, ring, batches, tp,
+                             preplan=preplan)
     finally:
         if role == "dst":
             lanes.leave_turn(lane_key, order_key)
@@ -1960,12 +2263,14 @@ def lane_streams(ops, device: int, ring: int):
 
 
 def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
-                  budget_s, device, log, base, slot_bytes, ring, batches, tp) -> str:
+                  budget_s, device, log, base, slot_bytes, ring, batches, tp,
+                  preplan=None) -> str:
     with lane_streams(ops, device, ring) as streams:
         try:
             return _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase,
                                           no_write, liveness, budget_s, device, log, base,
-                                          slot_bytes, ring, batches, tp, streams)
+                                          slot_bytes, ring, batches, tp, streams,
+                                          preplan=preplan)
         finally:
             # FLIPCYCLE H4: the top lane's streams go now -- no peer may sync them
             _g = getattr(lanes, "_engine_gate", None)
@@ -1975,7 +2280,7 @@ def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liven
 
 def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_write,
                            liveness, budget_s, device, log, base, slot_bytes, ring,
-                           batches, tp, streams) -> str:
+                           batches, tp, streams, preplan=None) -> str:
     d = lanes.flags(lane_key, role)
     chan = lanes.channel(lane_key, role)
     cred = SocketCredits(chan, liveness) if chan is not None else FileCredits(d, seq, liveness)
@@ -2028,30 +2333,20 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     lag = (1 if (role == "src" or collect_lag_on()) else 0) if int(ring) >= 3 else 0
     from flliper.srt.pdflip import weight_exchange_transport as tp
 
-    probe = tp.dst_pointer_probe(ops) if role == "dst" else None
-    probed: set = set()
     # 01.10.: the collector's per-piece work (no-write filter, the x33 pointer
     # probe, the address arithmetic) is done for the whole tag here, before the
     # plan arrives -- measured issue_ms up to 140 ms of a 151-ms collect
     # (TP0 p4 11-weights_14) while its depositor sat 598 ms in credit_ms.
-    pre = None
-    pre_why = ""
-    prep_s = 0.0
-    bcp, bwhy, bprep, bcalls = None, "", None, 0
-    if role == "dst" and not collect_preplan_on():
-        bwhy = f"{ENV_COLLECT_PREPLAN}=0 (the batch is built by the preplan)"
-    elif role == "dst":
-        bcp, bwhy = collect_batch_copier(ops, device)
-    if role == "dst" and collect_preplan_on():
-        tp0 = time.perf_counter()
-        pre, pre_why = _collect_plan(batches, descs, _nw, probe, probed, lane_key, tp)
-        if bcp is not None:
-            try:
-                bprep = [bcp.prepare(batch_rows(pre[g], base + ring_slot(g, ring) * slot_bytes))
-                         if pre[g] else None for g in range(len(pre))]
-            except Exception as exc:  # noqa: BLE001 -- the per-piece path, named
-                bprep, bwhy = None, f"prepare {type(exc).__name__}: {exc}"
-        prep_s = time.perf_counter() - tp0
+    # PREPLAN-BEFORE-TURN (27b-lanes3x80-1023): run_bar1_units builds it before
+    # the lane's turn and hands it in; else it is built here as before.
+    if role == "dst" and preplan is None:
+        preplan = collect_preplan(ops, device, batches, descs, _nw, lane_key, tp,
+                                  base, ring, slot_bytes)
+    pp_ = preplan or {}
+    probe = pp_.get("probe")
+    probed: set = pp_.get("probed") if pp_.get("probed") is not None else set()
+    pre, pre_why, prep_s = pp_.get("pre"), pp_.get("pre_why", ""), float(pp_.get("prep_s", 0.0))
+    bcp, bwhy, bprep, bcalls = pp_.get("bcp"), pp_.get("bwhy", ""), pp_.get("bprep"), 0
     plan = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
               str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
              for pc in b.pieces] for b in batches]
@@ -2129,7 +2424,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 c2 = (SocketCredits(chan, liveness) if chan is not None
                       else FileCredits(d, seq, liveness))
                 if not plan_sent:
-                    c2.send("plan", 0, {"batches": plan})
+                    c2.send("plan", 0, _plan_rec)
                 nf = int(next_free)
                 with lane_streams(ops, device, 1) as fst:
                     for x in rest:
@@ -2143,10 +2438,11 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                             elif c2.recv("free", x - ring, budget_s) is None:
                                 return (f"bar1 backlog lane={lane_key} seq={seq}: no 'free' "
                                         f"for batch {x - ring} within {budget_s:.0f} s")
-                        ops.memcpy_async(base + ring_slot(x, ring) * slot_bytes, host.ptr + offs[x],
+                        ops.memcpy_async(slot_addr(base, x, ring, slot_bytes), host.ptr + offs[x],
                                          int(batches[x].total_bytes), fst[0])
                         ops.synchronize(fst[0])
                         c2.send("full", x)
+                    _send_sum(c2)
                     if via == "sock":
                         while nf < nb:
                             if c2.recv("free", nf, budget_s) is None:
@@ -2165,13 +2461,44 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         lanes.backlog_push(lane_key, job)
         return ""
 
+    # LANE-INTEGRITY: the depositor samples its SOURCE before any batch (the
+    # spill path below still has it), announces the record in the plan
+    integ_f = ""
+    want_sum = False
+    _sum_payload = None
+    _sum_state = {"sent": False}
+    if role == "src" and integrity_samples() > 0:
+        try:
+            _ist = streams[0] if streams else 0
+            _irows = []
+            for g_, i_, r_, o_, n_ in integrity_plan(batches, seq, integrity_samples(), tp):
+                pc_ = batches[g_].pieces[i_]
+                d_ = descs[pc_.desc_index]
+                if d_.src_ptr is None:
+                    continue
+                _irows.append([g_, i_, r_, o_, n_, zlib.crc32(_read_dev(
+                    ops, _sample_addr(int(d_.src_ptr), pc_, r_, o_, "src", tp), n_, _ist))])
+            _sum_payload = {"samples": _irows}
+            integ_f = f"sent:{len(_irows)}"
+        except Exception as exc:  # noqa: BLE001 -- unchecked tag, named on the line
+            _sum_payload = None
+            integ_f = f"OFF why={_compact(f'{type(exc).__name__}: {exc}', 60)}"
+    elif role == "src":
+        integ_f = f"OFF why={ENV_INTEGRITY_SAMPLES}=0"
+    _plan_rec = {"batches": plan, **({"sum": True} if _sum_payload is not None else {})}
+
+    def _send_sum(c) -> None:
+        if _sum_payload is not None and not _sum_state["sent"]:
+            _sum_state["sent"] = True
+            c.send("sum", 0, _sum_payload)
+
     try:
         if role == "src":
             _busy = getattr(lanes, "backlog_busy", None)
             if _busy is not None and _busy(lane_key):
                 # the lane's byte stream belongs to the backlog until it drains
                 return _spill_rest(0, 0, plan_sent=False)
-            cred.send("plan", 0, {"batches": plan})
+            cred.send("plan", 0, _plan_rec)
         else:
             tw = time.perf_counter()
             got = cred.recv("plan", 0, budget_s)
@@ -2183,6 +2510,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 return (f"bar1 collect lane={lane_key} seq={seq}: the deposit plan "
                         f"({len(got.get('batches') or [])} batches) differs from this side's cut "
                         f"({len(plan)}) -- the two plans disagree")
+            want_sum = bool(got.get("sum"))
 
         def _finish(g):
             timed_sync(ops, streams[ring_slot(g, ring)], clk, query=sync_q)
@@ -2191,7 +2519,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             clk.send += time.perf_counter() - ts
 
         for g, batch in enumerate(batches):
-            sbase = base + ring_slot(g, ring) * slot_bytes
+            sbase = slot_addr(base, g, ring, slot_bytes)
             stream = streams[ring_slot(g, ring)]
             if role == "src":
                 if g >= ring:
@@ -2320,6 +2648,23 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 _finish(g - lag)
         for g in range(max(0, nb - lag), nb):
             _finish(g)
+        if role == "src":
+            _send_sum(cred)
+        _imiss = ""
+        if role == "dst" and want_sum:
+            tw = time.perf_counter()
+            srec = cred.recv("sum", 0, budget_s)
+            clk.credit += time.perf_counter() - tw
+            if srec is None:
+                return (f"bar1 collect lane={lane_key} seq={seq}: the announced integrity "
+                        f"record did not come within {budget_s:.0f} s")
+            n_s, n_v, n_k, _imiss = integrity_verify(srec, batches, descs, _nw, ops,
+                                                     streams[0] if streams else 0, tp)
+            integrity_record(seq, n_s, n_v, n_k, 1 if _imiss else 0)
+            integ_f = (f"MISMATCH verified:{n_v}/{n_s}" if _imiss
+                       else f"verified:{n_v}/{n_s} skipped={n_k}")
+        elif role == "dst":
+            integ_f = "not-announced"
         if role == "dst":
             if via == "file":
                 for g in range(max(0, nb - ring), nb):
@@ -2328,6 +2673,11 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     except FileNotFoundError:
                         pass
             cred.send("done", 0)
+            if _imiss:
+                # the depositor is released (done), the leg stops on the name
+                log(f"PDFLIP-BAR1-INTEGRITY MISMATCH lane={lane_key} seq={seq} {_imiss}")
+                return (f"bar1 INTEGRITY MISMATCH lane={lane_key} seq={seq}: {_imiss} -- the "
+                        f"bytes in this rank's weights differ from the source; refusing the tag")
         else:
             # the collector's done closes the tag: its last copies out of the
             # slots are through before this side's next tag writes them. On a
@@ -2386,17 +2736,219 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"xfer_GBs={(total / max(total_s - clk.first_free, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
         f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
         f"lag={lag} prep_ms={prep_s * 1000:.0f}"
+        + (f" prep_at={pp_.get('at', 'turn')} turn_ms={float(pp_.get('turn_s', 0.0)) * 1000:.0f}"
+           f" prep_recheck={pp_.get('recheck', '-')}"
+           if role == "dst" else "")
+        + (f" integrity={integ_f}" if integ_f else "")
         + (f" issue_gil={gil_mode}" if gil_mode else "")
         + f" sync_query={'held' if sync_q else 'off'} sync_skipped={clk.sync_skipped}/{clk.syncs}"
         + (f" ffwait={ffwait_n if first_free_flag_on() else 'off'}" if role == "src" else "")
         + ((f" collect_batch=on calls={bcalls}" if (bcp is not None and not bwhy)
             else f" collect_batch=OFF calls={bcalls} why={_compact(bwhy)}")
-           if role == "dst" else ""))
+           if role == "dst" else "")
+        # 27b-lanes3x80-1023: wall-clock span of this tag (epoch s, the clock of
+        # SLEEP-/WAKE-TAG-TIME and the SEQ lane-time t0/t) -- the per-tag overlap
+        # with the rank's other collect, resume and write-behind needs it.
+        + f" t0={time.time() - (time.perf_counter() - t0):.3f} t={time.time() - (time.perf_counter() - t_end):.3f}")
     if _gate is not None and _gate_ms > 0:
         log(f"PDFLIP-FLIPCYCLE stage=legs_engine lane={lane_key} seq={seq} top={_gate.top} "
             f"ms={_gate_ms:.0f} floor_ms=0 (H4: this slower-receiver lane yielded the D2H "
             f"engine to the lane into the widest receiver)")
     return ""
+
+
+# -- LANE-INTEGRITY (27b-lanes3x80-1023, review of 9373c7647c) -----------------
+#
+# The BAR1 payload path carried no content check: credit frames, the 16-B
+# arrival readback per batch and the per-destination pointer probe prove that
+# a batch ARRIVED and WHERE it goes, not WHAT arrived. The 3080 lanes run
+# switch-direct for the first time since 23.10. 21:15Z (ACS 0011), and the same
+# day saw wrong data on the switch path (#174). So every tag is now sampled:
+# the depositor reads ``samples`` chunks of <= 4 KiB of its SOURCE (positions
+# drawn deterministically from the seq over the plan's pieces, the first and
+# the last piece always included; a STRIDED2D chunk lies inside one row) and
+# sends their crc32 after its last batch (credit kind ``sum``, announced in the
+# plan record so a peer without it is not waited for); the collector reads the
+# same chunks from its DESTINATION after its last copy-out synced and compares.
+# A mismatch is a NAMED refusal of the tag (the leg stops on it), never a
+# silent continue. Per flip one ``PDFLIP-BAR1-INTEGRITY`` line (verified /
+# sampled / skipped no-write / mismatch). Cost: 2 x samples synchronous 4-KiB
+# D2H reads per tag. Sampled, not exhaustive: a systematic fault (wrong slot,
+# stale visibility, a dropped batch, a torn region) is caught; a single flipped
+# bit in an unsampled chunk is not. FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES (8,
+# 0 = off).
+ENV_INTEGRITY_SAMPLES = "FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES"
+INTEGRITY_SAMPLES_DEFAULT = 8
+INTEGRITY_CHUNK = 4096
+_INTEG_LOCK = threading.Lock()
+_INTEG: dict = {}      # flip -> [tags, sampled, verified, skipped, mismatch]
+
+
+def integrity_samples(env: Optional[_Map[str, str]] = None) -> int:
+    env = os.environ if env is None else env
+    try:
+        n = int(env.get(ENV_INTEGRITY_SAMPLES, str(INTEGRITY_SAMPLES_DEFAULT)))
+    except ValueError:
+        n = INTEGRITY_SAMPLES_DEFAULT
+    return max(0, min(256, n))
+
+
+def integrity_plan(batches, seq, n: int, tp) -> list:
+    """``[(g, piece index, row, offset, length), ...]`` -- deterministic from
+    ``seq`` and the cut, so both sides could derive it; the depositor sends it."""
+    flat = [(g, i, pc) for g, b in enumerate(batches) for i, pc in enumerate(b.pieces)
+            if int(getattr(pc, "nbytes", 0) or 0) > 0]
+    if not flat or n <= 0:
+        return []
+    rng = random.Random(zlib.crc32(str(seq).encode()))
+    picks = [flat[0], flat[-1]] + [flat[rng.randrange(len(flat))] for _ in range(max(0, n - 2))]
+    out = []
+    for g, i, pc in picks[:max(1, n)]:
+        if pc.kind == tp.FLAT:
+            row, span = 0, int(pc.nbytes)
+        else:
+            row, span = rng.randrange(max(1, int(pc.rows))), int(pc.run_bytes)
+        length = max(1, min(INTEGRITY_CHUNK, span))
+        out.append((g, i, row, rng.randrange(0, span - length + 1), length))
+    return out
+
+
+def _sample_addr(base: int, pc, row: int, off: int, side: str, tp) -> int:
+    if pc.kind == tp.FLAT:
+        return int(base) + int(pc.src_off if side == "src" else pc.dst_off) + int(off)
+    if side == "src":
+        return int(base) + int(pc.src_off) + int(row) * int(pc.spitch) + int(off)
+    return int(base) + int(pc.dst_off) + int(row) * int(pc.dpitch) + int(off)
+
+
+def _read_dev(ops, addr: int, n: int, stream) -> bytes:
+    buf = ctypes.create_string_buffer(int(n))
+    ops.memcpy_async(ctypes.addressof(buf), int(addr), int(n), stream)
+    ops.synchronize(stream)
+    return buf.raw
+
+
+def integrity_verify(srec, batches, descs, no_write, ops, stream, tp):
+    """The collector's side: ``(sampled, verified, skipped, mismatch text)``."""
+    sampled = verified = skipped = 0
+    for row in (srec or {}).get("samples") or []:
+        sampled += 1
+        try:
+            g, i, r, off, n, crc = (int(x) for x in row)
+            pc = batches[g].pieces[i]
+        except (ValueError, TypeError, IndexError):
+            return sampled, verified, skipped, f"sample {row!r} lies outside this side's cut"
+        desc = descs[pc.desc_index]
+        name = str(getattr(desc, "param_name", "?"))
+        tag = str(getattr(desc, "tag", "") or "")
+        if (tag, name) in no_write or name in no_write or desc.dst_ptr is None:
+            skipped += 1
+            continue
+        got = zlib.crc32(_read_dev(ops, _sample_addr(int(desc.dst_ptr), pc, r, off, "dst", tp),
+                                   n, stream))
+        if got != crc:
+            return (sampled, verified, skipped,
+                    f"batch {g} piece {i} {name!r} tag={tag} row={r} off={off} len={n}: "
+                    f"source crc32 {crc:08x} != destination {got:08x}")
+        verified += 1
+    return sampled, verified, skipped, ""
+
+
+def integrity_record(seq, sampled: int, verified: int, skipped: int, mismatch: int) -> None:
+    flip = str(seq).split("-", 1)[0]
+    with _INTEG_LOCK:
+        r = _INTEG.setdefault(flip, [0, 0, 0, 0, 0])
+        for k, v in enumerate((1, sampled, verified, skipped, mismatch)):
+            r[k] += int(v)
+
+
+def integrity_flip_line(flip) -> Optional[str]:
+    """One line per flip for the collecting rank (and removes the entry)."""
+    if flip is None:
+        return None
+    with _INTEG_LOCK:
+        r = _INTEG.pop(str(int(flip)) if str(flip).lstrip("-").isdigit() else str(flip), None)
+    if r is None:
+        return None
+    return (f"PDFLIP-BAR1-INTEGRITY flip={flip} tags={r[0]} sampled={r[1]} verified={r[2]} "
+            f"skipped_no_write={r[3]} mismatch={r[4]} (crc32 of <= {INTEGRITY_CHUNK} B chunks, "
+            f"depositor source vs collector destination; {ENV_INTEGRITY_SAMPLES}="
+            f"{integrity_samples()})")
+
+
+#: PREPLAN-RECHECK (review of 9373c7647c): the preplan probed the destinations
+#: before the lane's turn; after a turn wait longer than this the probes are
+#: asked again (fresh) before the first copy-out -- one pointer query per
+#: destination, ~1 us each. 0 = always.
+ENV_PREPLAN_RECHECK_MS = "FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS"
+
+
+def preplan_recheck_ms(env: Optional[_Map[str, str]] = None) -> float:
+    env = os.environ if env is None else env
+    try:
+        return max(0.0, float(env.get(ENV_PREPLAN_RECHECK_MS, "0")))
+    except ValueError:
+        return 0.0
+
+
+def preplan_recheck(preplan: dict, batches, descs, no_write, lane_key, tp) -> str:
+    """Probe every destination of the hoisted preplan again with a FRESH probed
+    set; '' when all are still mapped device memory, else the refusal text."""
+    probe = preplan.get("probe")
+    if probe is None:
+        return ""
+    fresh: set = set()
+    for batch in batches:
+        for pc in batch.pieces:
+            desc = descs[pc.desc_index]
+            name = str(getattr(desc, "param_name", "?"))
+            tag = str(getattr(desc, "tag", "") or "")
+            if (tag, name) in no_write or name in no_write or desc.dst_ptr is None:
+                continue
+            why = tp.refuse_unmapped_dst(probe, fresh, dst=int(desc.dst_ptr), lane_key=lane_key,
+                                         i=pc.desc_index, name=name, tag=tag)
+            if why:
+                return why
+    return ""
+
+
+#: PREPLAN-BEFORE-TURN (27b-lanes3x80-1023, default on). Boot
+#: dkr27bint4arbar1int4ar10231723: the collector built its preplan AFTER taking
+#: the lane's turn, i.e. while its depositor already waited for free(0) --
+#: prep_ms p50/p90 29-37/55-84 ms on the P->D p1 tags (84 batches, D TP0), the
+#: largest single term of the mid-leg start offset (first_free_ms p50 45-109).
+#: Built before the turn it overlaps the lane's previous collect. Off = built
+#: after the turn as before.
+ENV_PREPLAN_BEFORE_TURN = "FLLIPER_PDFLIP_BAR1_PREPLAN_BEFORE_TURN"
+
+
+def preplan_before_turn_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return collect_preplan_on(env) and _env_on(ENV_PREPLAN_BEFORE_TURN, env)
+
+
+def collect_preplan(ops, device, batches, descs, no_write, lane_key, tp, base, ring,
+                    slot_bytes) -> dict:
+    """The collector's per-tag preplan (01.10.) as one value: pointer probe,
+    copy list per batch, the batch copier's arrays. Pure of the lane: no credit,
+    no turn, no window write."""
+    out = {"probe": tp.dst_pointer_probe(ops), "probed": set(), "pre": None,
+           "pre_why": "", "prep_s": 0.0, "bcp": None, "bwhy": "", "bprep": None}
+    if not collect_preplan_on():
+        out["bwhy"] = f"{ENV_COLLECT_PREPLAN}=0 (the batch is built by the preplan)"
+        return out
+    out["bcp"], out["bwhy"] = collect_batch_copier(ops, device)
+    tp0 = time.perf_counter()
+    out["pre"], out["pre_why"] = _collect_plan(batches, descs, no_write, out["probe"],
+                                               out["probed"], lane_key, tp)
+    if out["bcp"] is not None:
+        try:
+            out["bprep"] = [out["bcp"].prepare(batch_rows(out["pre"][g],
+                                                          slot_addr(base, g, ring, slot_bytes)))
+                            if out["pre"][g] else None for g in range(len(out["pre"]))]
+        except Exception as exc:  # noqa: BLE001 -- the per-piece path, named
+            out["bprep"], out["bwhy"] = None, f"prepare {type(exc).__name__}: {exc}"
+    out["prep_s"] = time.perf_counter() - tp0
+    return out
 
 
 def _collect_plan(batches, descs, no_write, probe, probed, lane_key, tp):

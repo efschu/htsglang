@@ -34,6 +34,17 @@ PAIRS = ((0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1))
 SLOT = 4096
 
 
+
+@pytest.fixture(autouse=True)
+def _lanes3x80_call_counting(monkeypatch):
+    """27b-lanes3x80-1023: this file pins exact copy/sync/probe call sequences
+    of the lane; LANE-INTEGRITY adds sampled D2H reads + syncs per tag and
+    PREPLAN-RECHECK a second probe pass -- both have their own tests in
+    test_pdflip_bar1_lanes3x80_1023.py, so they are held off here."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_BAR1_INTEGRITY_SAMPLES", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_BAR1_PREPLAN_RECHECK_MS", "1e9")
+
+
 def _addr(buf):
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
@@ -163,7 +174,8 @@ def test_a_drained_stream_skips_the_blocking_sync(tmp_path, monkeypatch):
 @pytest.mark.parametrize("answer", [False, None])
 def test_a_busy_or_unknown_stream_still_synchronizes(tmp_path, monkeypatch, answer):
     monkeypatch.delenv(b1.ENV_SYNC_QUERY_HELD, raising=False)
-    descs, _, _ = _flat_descs(6, SLOT)
+    descs, _srcs, _dsts = _flat_descs(  # keep the buffers alive (dangling src_ptr otherwise)
+        6, SLOT)
     dep = _Ops(done=answer)
     out, _, dlog = _run(tmp_path, descs, dep, _HostOps())
     assert out == {"c": "", "d": ""}
@@ -173,7 +185,8 @@ def test_a_busy_or_unknown_stream_still_synchronizes(tmp_path, monkeypatch, answ
 
 def test_sync_query_off_never_asks(tmp_path, monkeypatch):
     monkeypatch.setenv(b1.ENV_SYNC_QUERY_HELD, "0")
-    descs, _, _ = _flat_descs(4, SLOT)
+    descs, _srcs, _dsts = _flat_descs(  # keep the buffers alive (dangling src_ptr otherwise)
+        4, SLOT)
     dep = _Ops(done=True)
     out, _, dlog = _run(tmp_path, descs, dep, _HostOps())
     assert out == {"c": "", "d": ""}
