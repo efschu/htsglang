@@ -599,6 +599,99 @@ def write_order_ops(ops, role: str):
     return fn, ""
 
 
+# -- the readback's own price, measured before a lane relies on it (23.10.) --
+#
+# barlink-switch-1023: in boot dkr27bnvfp4duobar1duo10230546 (ACS redirect on,
+# P2P through root port 00:03.1) EVERY lane in which the RTX 5090 deposited into
+# a 3080's BAR1 window cost ~33 ms per batch, independent of the batch size
+# (7-MiB slots 0.2 GB/s, 19-MiB slots 0.6 GB/s, max_sync 50.5/67.1/84.6 ms,
+# sync_cpu ~= sync wall: the thread spun in cudaStreamSynchronize), while the
+# same code with the 3080 depositing into the 5090 cost ~0.2 ms per batch and
+# the pre-Fix-A lanes of 22.10. 1-2 ms. The one per-batch operation whose cost
+# does not scale with the bytes is the 16-byte ARRIVAL readback above: a
+# non-posted P2P read of the peer's BAR1. Read stalls of that size are the
+# PCIe completion-timeout scale (requester DevCtl2 "50us to 50ms"), and the
+# same class -- a peer reading a pre-Blackwell GeForce's BAR1, each read
+# hanging 55-63 ms -- ended in Xid 154 on efeu-tc on 21.10.; here Xid 154 hit
+# the 5090 21 s into the slow P->D leg of epoch 8.
+#
+# So the arrival proof is measured before it is used: at connect time the
+# depositor times a few synchronous 16-byte reads of the mapped peer window
+# (the exact production read: peer BAR1 -> device scratch). A read slower than
+# ``readback_stall_ms`` is no proof of anything but the stall itself, and
+# every batch would pay it: the lane is REFUSED BY NAME and runs on the host
+# path (2.9-4.1 GB/s per 5090 lane, no P2P read at all), never on bar1 at
+# 0.2 GB/s and never on bar1 without the proof. A fast read keeps the lane and
+# Fix A exactly as before. FLLIPER_PDFLIP_BAR1_READBACK_PROBE_N=0 skips the
+# probe (operator word only); FLLIPER_PDFLIP_BAR1_WRITE_ORDER=0 has no readback
+# and therefore no probe.
+ENV_READBACK_PROBE_N = "FLLIPER_PDFLIP_BAR1_READBACK_PROBE_N"
+ENV_READBACK_STALL_MS = "FLLIPER_PDFLIP_BAR1_READBACK_STALL_MS"
+#: A healthy lane batch INCLUDING its 7-19 MiB of writes synced in 0.4-1.9 ms
+#: (max_sync, 3080 -> 5090 lanes of the same boot); the stalled reads took
+#: 33 ms on average and up to 84.6 ms. 5 ms sits 2.6x above the first and 6.6x
+#: below the second.
+READBACK_STALL_MS_DEFAULT = 5.0
+READBACK_PROBE_N_DEFAULT = 4
+_ALL_ONES = b"\xff" * READBACK_BYTES
+
+
+def readback_probe_n(env: Optional[_Map[str, str]] = None) -> int:
+    env = os.environ if env is None else env
+    try:
+        n = int(env.get(ENV_READBACK_PROBE_N, str(READBACK_PROBE_N_DEFAULT)))
+    except ValueError:
+        n = READBACK_PROBE_N_DEFAULT
+    return max(0, min(64, n))
+
+
+def readback_stall_ms(env: Optional[_Map[str, str]] = None) -> float:
+    env = os.environ if env is None else env
+    try:
+        v = float(env.get(ENV_READBACK_STALL_MS, str(READBACK_STALL_MS_DEFAULT)))
+    except ValueError:
+        v = READBACK_STALL_MS_DEFAULT
+    return v if v > 0 else READBACK_STALL_MS_DEFAULT
+
+
+def run_readback_probe(read_once, n: int, stall_ms: float, clock=time.perf_counter):
+    """Time ``n`` calls of ``read_once()`` (one synchronous 16-byte peer read
+    each, returning the bytes read). Stops at the FIRST stalled read: every
+    further stalled read is another completion-timeout-sized hold of the
+    link, and one already decides. Returns ``(latencies_ms, all_ones)``."""
+    lat, ones = [], 0
+    for _ in range(int(n)):
+        t0 = clock()
+        got = read_once()
+        ms = (clock() - t0) * 1000.0
+        lat.append(ms)
+        if got is not None and bytes(got) == _ALL_ONES:
+            ones += 1
+        if ms > stall_ms:
+            break
+    return lat, ones
+
+
+def readback_verdict(lat_ms, stall_ms: float, all_ones: int = 0) -> str:
+    """'' (the readback is a usable arrival proof) or the named reason why
+    it is not. Pure, desk-testable. All-ones data is what a requester
+    synthesizes for a timed-out read; it is NAMED with the stall, but on its
+    own (a fast read of window bytes that happen to be 0xff) it decides
+    nothing."""
+    if not lat_ms:
+        return ""
+    worst = max(lat_ms)
+    if worst <= stall_ms:
+        return ""
+    return (f"write-order readback stalls: a 16-B P2P read of the peer window took "
+            f"{worst:.1f} ms (> {stall_ms:g} ms; {len(lat_ms)} read(s): "
+            f"{', '.join(f'{x:.2f}' for x in lat_ms)} ms"
+            + (f"; {all_ones} returned all-ones, the completion-timeout signature"
+               if all_ones else "")
+            + ") -- every batch would pay it and it proves no arrival "
+            "(barlink-switch-1023)")
+
+
 _RB_LOCK = threading.Lock()
 _RB_SCRATCH: dict = {}       # device -> raw device address of the readback target
 
@@ -1407,6 +1500,30 @@ class Bar1Lanes:
                 os.close(fd)
             except OSError:
                 pass
+        rb_why, rb_note = self._probe_readback(cu, int(dev))
+        if rb_why:
+            # Named refusal BEFORE the lane is published: no PeerWindow, no
+            # mapped marker -> the collector keeps the host lane's gate and
+            # the depositor's lane_mode posts "host" with this reason.
+            try:
+                cu.unregister(host - lead_in)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                mapped.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._holder.release(handle_)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+            self.refusals[lane_key] = rb_why
+            self.log(f"PDFLIP-BAR1 lane={lane_key} role=src REFUSED peer={peer_bdf} {rb_why} -> host lane")
+            return None
         s.settimeout(None)
         p = PeerWindow(lane_key, int(dev), int(meta["size"]), int(meta["slot_bytes"]), int(meta["ring"]),
                        peer_bdf, int(handle_), mapped, host - lead_in, sock=s)
@@ -1415,8 +1532,45 @@ class Bar1Lanes:
         self.log(f"PDFLIP-BAR1 lane={lane_key} role=src group={self.group} mapped peer={peer_bdf} "
                  f"window={p.size >> 20} MiB slot={p.slot_bytes >> 20} MiB ring={p.ring} "
                  f"borrowed={meta.get('borrowed') or '-'} "
-                 f"dev_ptr={p.dev_ptr:#x} ms={(time.perf_counter() - t0) * 1000:.0f}")
+                 f"dev_ptr={p.dev_ptr:#x} ms={(time.perf_counter() - t0) * 1000:.0f}"
+                 + (f" {rb_note}" if rb_note else ""))
         return p
+
+    def _probe_readback(self, cu, dev: int):
+        """``(refusal or '', note)`` for the arrival readback on this mapping.
+
+        The production read, peer BAR1 -> device scratch, synchronous,
+        ``readback_probe_n()`` times (barlink-switch-1023). A probe that
+        cannot run (no scratch, a driver error) refuses nothing -- the lane
+        keeps Fix A as before and the note says the price is unmeasured."""
+        if not write_order_on():
+            return "", ""
+        n = readback_probe_n()
+        if n <= 0:
+            return "", f"readback_probe=OFF ({ENV_READBACK_PROBE_N}=0)"
+        stall = readback_stall_ms()
+        scratch = 0
+        try:
+            scratch = int(cu.malloc(4096))
+            buf = ctypes.create_string_buffer(READBACK_BYTES)
+
+            def read_once():
+                cu.memcpy(scratch, int(dev), READBACK_BYTES)
+                cu.memcpy(ctypes.addressof(buf), scratch, READBACK_BYTES)
+                return buf.raw
+
+            lat, ones = run_readback_probe(read_once, n, stall)
+        except Exception as exc:  # noqa: BLE001 -- unmeasured, named, not refused
+            return "", f"readback_probe=FAILED {type(exc).__name__}: {_compact(str(exc), 80)}"
+        finally:
+            if scratch:
+                try:
+                    cu.free(scratch)
+                except Exception:  # noqa: BLE001
+                    pass
+        note = (f"readback_probe_ms={','.join(f'{x:.3f}' for x in lat)} "
+                f"stall_ms={stall:g} all_ones={ones}")
+        return readback_verdict(lat, stall, ones), note
 
     # -- setup for all cross lanes of this rank ---------------------------------
     def setup(self, lane_keys) -> dict:

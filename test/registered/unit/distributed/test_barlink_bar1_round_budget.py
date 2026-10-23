@@ -80,8 +80,9 @@ AG_Q_FULL_SHARD = 23068672
 #: The calibration that SHIPS, read off the module rather than typed: the
 #: stub must grade what the boot runs. Measured 2026-09-07 by
 #: ``scripts/pdflip/barlink_round_bench.py`` (artifact
-#: ``roundbench_fixed_0907.json``, 323.2 us / 6.02 GB/s, residual max
-#: 0.052 ms over four rows including a 33-round decomposition).
+#: ``p2p_rebar_1023_0909.B_switch_direct.json``, 155.5 us / 20.45 GB/s,
+#: residual max 0.064 ms over six rows including a 19-round decomposition;
+#: until 23.10. ``roundbench_fixed_0907.json``, 323.2 us / 6.02 GB/s).
 #: The tests pin the DECISION, not these numbers -- see ``round_budget``.
 ROUND_US = DEFAULT_ROUND_US
 WIRE_GBPS = DEFAULT_WIRE_GBPS
@@ -402,10 +403,13 @@ class TestCoverageCeiling(CustomTestCase):
     def test_t7c_a_slower_bar1_than_the_rung_does_get_a_ceiling(self):
         """Make the next rung nearly as fast as bar1 and the cap binds again.
 
-        At 4.0 GB/s one round's payload no longer pays for its own round, so
-        the crossover has a root and ``coverage_ceiling`` must find it.
+        At 12 GB/s one round's payload no longer pays for its own round
+        (dcp:0 geometry, switch-direct calibration 155.5 us / 20.45 GB/s:
+        0.52 ms on the rung vs 0.155 + 0.41 ms on bar1), so the crossover has
+        a root and ``coverage_ceiling`` must find it. Was 4.0 GB/s against
+        the 0907 calibration (6.02 GB/s); at 20.45 GB/s 4.0 no longer binds.
         """
-        t = _stub(next_rung_gbps=4.0)
+        t = _stub(next_rung_gbps=12.0)
         ceiling = t.coverage_ceiling("all_reduce")
         self.assertIsNotNone(ceiling)
         self.assertTrue(t.handles("all_reduce", ceiling))
@@ -625,15 +629,19 @@ class TestServerArgsFlag(CustomTestCase):
 # FIX 1 (review of #1234, 2026-09-07): the abort's scope, and the calibration
 # ---------------------------------------------------------------------------
 
-#: The four rows the microbench actually EXECUTED (artifact
-#: ``/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.json``, boot
-#: window jpvycx, cards 0/1/2, world 3, all four ``correct: true``).
+#: The six rows the microbench actually EXECUTED (artifact
+#: ``/spinning/gpu-arb/weg2/barlink-1023/p2p_rebar_1023_0909.B_switch_direct.json``,
+#: gpuq window wxs2e5, 2026-10-23 09:10Z, cards 0 (5090) + 1 (3080), world 2,
+#: switch-direct ACS 0011, all six ``correct: true``). Superseded the 0907
+#: world-3 artifact (roundbench_fixed_0907.json, pre-switch topology).
 #: ``(window_mib, nbytes, rounds, wire_bytes, measured_ms)``.
 BENCH_ROWS = (
-    (16, 100663296, 25, 134217728, 30.3647774271667),
-    (16, 134217728, 33, 178956972, 40.396679658442736),
-    (40, 100663296, 10, 134217728, 25.576976127922535),
-    (40, 134217728, 13, 178956972, 33.888129983097315),
+    (16, 25165824, 5, 25165824, 2.0489715000167052),
+    (16, 100663296, 19, 100663296, 7.853801999999632),
+    (40, 25165824, 2, 25165824, 1.6057719999480469),
+    (40, 100663296, 8, 100663296, 6.188763499949346),
+    (128, 25165824, 1, 25165824, 1.3701689999834343),
+    (128, 100663296, 3, 100663296, 5.365819000189731),
 )
 
 
@@ -765,13 +773,14 @@ class TestRefusalScopeIsItsReason(CustomTestCase):
 class TestCalibrationIsMeasured(CustomTestCase):
     """F7-F8: the shipped constants come from the bench, not from a fit.
 
-    Spec section 6 conditions C2 on three deliverables. They have now run
-    (window jpvycx, 2026-09-07 18:20Z): the per-round term isolated by
-    differencing two windows at the SAME byte count (319.2 / 325.4 us,
-    median 322.3, n=2), the joint fit over both windows, and TWO
-    decompositions above 16 rounds -- 25 and 33 -- EXECUTED with a
-    correctness check that passed. Section 10.3 is closed: the 16 was
-    policy, and the policy was wrong.
+    Spec section 6 conditions C2 on three deliverables. They first ran in
+    window jpvycx (2026-09-07, world 3, pre-switch topology, 323.2 us /
+    6.02 GB/s). Re-run 2026-10-23 09:10Z on the switch-direct topology
+    (window wxs2e5, world 2): the per-round term isolated by differencing
+    windows at the SAME byte count (147.7..235.6 us, median 158.0, n=4),
+    the joint fit over three windows (155.5 us / 20.45 GB/s, residual max
+    0.064 ms), and a 19-round decomposition EXECUTED with a correctness
+    check that passed.
     """
 
     def _predict(self, rounds, wire_bytes):
@@ -803,8 +812,9 @@ class TestCalibrationIsMeasured(CustomTestCase):
             by_bytes.setdefault(nbytes, []).append((rounds, measured))
         isolated = []
         for rows in by_bytes.values():
-            (r1, m1), (r2, m2) = sorted(rows)
-            isolated.append((m2 - m1) / (r2 - r1) * 1e3)
+            rows = sorted(rows)
+            for (r1, m1), (r2, m2) in zip(rows, rows[1:]):
+                isolated.append((m2 - m1) / (r2 - r1) * 1e3)
         self.assertGreaterEqual(len(isolated), 2)
         self.assertGreater(barlink_bar1.DEFAULT_ROUND_US, min(isolated) - 5)
         self.assertLess(barlink_bar1.DEFAULT_ROUND_US, max(isolated) + 5)
@@ -819,15 +829,15 @@ class TestCalibrationIsMeasured(CustomTestCase):
         src = inspect.getsource(barlink_bar1)
         start = src.index("ROUND_CAP_AUTO = ")
         block = src[start:src.index("def parse_round_cap", start)]
-        self.assertIn("roundbench_fixed_0907.json", block)
-        for token in ("25", "33", "residual"):
+        self.assertIn("p2p_rebar_1023_0909.B_switch_direct.json", block)
+        for token in ("19", "residual", "sha256"):
             self.assertIn(token, block)
         self.assertNotIn("INTERIM", block)
 
     def test_f8b_the_setup_line_no_longer_calls_itself_interim(self):
         lines = _stub().coverage_lines()
         self.assertNotIn("INTERIM", lines[0])
-        self.assertIn("roundbench", lines[0])
+        self.assertIn("p2p_rebar_1023_0909.B_switch_direct.json", lines[0])
 
 
 class TestTheDerivedBoundNeverBindsHere(CustomTestCase):

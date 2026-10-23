@@ -851,6 +851,19 @@ class _Cuda:
         self._r("cudaMemcpy", ctypes.c_void_p(dst), ctypes.c_void_p(source),
                 ctypes.c_size_t(n), ctypes.c_int(CUDA_MEMCPY_DEFAULT))
 
+    def malloc(self, n: int) -> int:
+        """Plain device memory on the CURRENT device (cudaMalloc). Used for
+        tiny scratch buffers only (bar1_lanes' readback probe)."""
+        p = ctypes.c_void_p(0)
+        self._r("cudaMalloc", ctypes.byref(p), ctypes.c_size_t(int(n)))
+        return int(p.value or 0)
+
+    def free(self, dptr: int) -> None:
+        try:
+            self.rt.cudaFree(ctypes.c_void_p(int(dptr)))
+        except Exception:
+            pass
+
 
 # ===========================================================================
 # /dev/dmabuf_holder
@@ -1544,54 +1557,81 @@ def ar_plan(nbytes: int, chunk_max: int, world: int) -> list:
 #: Sentinel for a cap that is derived per call instead of pinned.
 ROUND_CAP_AUTO = "auto"
 
+#: Where the two constants below come from, carried into the boot's L1
+#: coverage line so a reader of a boot log can trace the numbers without
+#: opening this file.
+DEFAULT_CALIBRATION_SOURCE = (
+    "p2p_rebar_1023_0909.B_switch_direct.json (2026-10-23 09:10Z, 5090+3080 "
+    "world 2, PEX880xx switch-direct ACS 0011, windows 16/40/128 MiB x "
+    "24/96 MiB, 1-19 rounds, residual max 0.064 ms, n=6)"
+)
+
 #: Fixed cost of ONE round, microseconds: kernel launch + the entry barrier
 #: against the #622 ack banks + the ``len(plan) > 1`` D2D ``copy_`` at
 #: ``_all_reduce_one_round``.
 #:
-#: BIND PROOF -- MEASURED, not fitted from boot logs. Artifact
-#: ``/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.json`` (and
-#: ``.out``), produced by ``scripts/pdflip/barlink_round_bench.py`` on
-#: 2026-09-07 18:20Z, gpuq window ``jpvycx``, cards 0/1/2, world 3, three
-#: 3080/5090 peers over PCIe with no P2P.
+#: BIND PROOF -- MEASURED by ``scripts/pdflip/barlink_round_bench.py``,
+#: artifact ``/spinning/gpu-arb/weg2/barlink-1023/
+#: p2p_rebar_1023_0909.B_switch_direct.json`` (sha256 2e87678f...a9c, copy of
+#: ``/root/.claude/jobs/a7d09d42/tmp/``; refit printout beside it as
+#: ``.refit.out``), 2026-10-23 09:10Z, gpuq window wxs2e5, cards 0 (RTX 5090,
+#: BAR1 32 GiB after ReBAR) and 1 (RTX 3080, BAR1 256 MiB), world 2, tree with
+#: the buffer-order sg fix (a3b96b9376), P2P straight through the PEX880xx
+#: switch (ACS 0011 on 0e:04.0/0e:08.0) -- the operating topology since the
+#: user's ``pci=disable_acs_redir=pci:1000:c010`` (23.10.).
 #:
-#: The four rows it executed, all with a correctness check that PASSED --
-#: ``(window MiB, payload, rounds, measured ms)``::
+#: The six rows it executed, every one with a correctness check that PASSED --
+#: ``(window MiB, payload, rounds, measured ms, joint-fit residual ms)``::
 #:
-#:     16 MiB   96 MiB   25 rounds   30.365 ms
-#:     16 MiB  128 MiB   33 rounds   40.397 ms
-#:     40 MiB   96 MiB   10 rounds   25.577 ms
-#:     40 MiB  128 MiB   13 rounds   33.888 ms
+#:     16 MiB   24 MiB    5 rounds   2.049 ms   +0.041
+#:     16 MiB   96 MiB   19 rounds   7.854 ms   -0.023
+#:     40 MiB   24 MiB    2 rounds   1.606 ms   +0.064
+#:     40 MiB   96 MiB    8 rounds   6.189 ms   +0.023
+#:    128 MiB   24 MiB    1 round    1.370 ms   -0.016
+#:    128 MiB   96 MiB    3 rounds   5.366 ms   -0.022
 #:
-#: DELIVERABLE 1 (the term in ISOLATION, no regression, no collinearity):
-#: the same byte count at two windows gives two round counts, and the time
-#: difference over the round difference is the per-round term outright --
-#: 96 MiB: (30.365 - 25.577)/(25 - 10) = 319.2 us; 128 MiB:
-#: (40.397 - 33.888)/(33 - 13) = 325.4 us. Median 322.3, spread 6.2.
-#: DELIVERABLE 2 (the joint fit over both windows): 323.2 us with the wire
-#: term below, residual mean 0.026 ms, max 0.052 ms, n = 4.
-#: DELIVERABLE 3 (spec section 6.3, which C2 does not ship without): the
-#: 25- and 33-round decompositions above are the first above 16 rounds ever
-#: EXECUTED on this rig, and both returned the CORRECT sum. Section 10.3 is
-#: closed in barlink's favour: the 16 was policy, and the policy was wrong.
+#: DELIVERABLE 1 (the term in ISOLATION, same bytes at two windows):
+#: 24 MiB w128->w40 235.6, w40->w16 147.7; 96 MiB w128->w40 164.6,
+#: w40->w16 151.4 us. Median 158.0 (the 235.6 is a 1->2-round difference
+#: of 0.24 ms, the least resolved of the four).
+#: DELIVERABLE 2 (joint fit over all six rows): 155.5 us with the wire term
+#: below, residual mean 0.032 ms, max 0.064 ms, n = 6.
+#: DELIVERABLE 3: the 19-round decomposition (w16, 96 MiB) EXECUTED and
+#: returned the CORRECT sum.
 #:
-#: This supersedes two boot-log fits -- 249.6 us (single window, normalised
-#: condition 1.9e5, UNIDENTIFIED: at one window ``rounds`` and ``wire_bytes``
-#: are collinear) and 432 us (three windows, cond 16.4, residual max 1.86 ms,
-#: overpredicting the w40 point by 7 %). Boot ``wait`` carries rank skew and
-#: is not a transport timing; both were shipped as interim and both are now
-#: retired. The DECISION never depended on them -- at the operating point the
-#: budget is 385 rounds against the 10 the call needs -- but the ``est ms``
-#: term in L1/L4/L5 did, and that is what these numbers repair.
-DEFAULT_ROUND_US = 323.2
+#: TOPOLOGY CHECK (task barlink-switch-1023): the host-detour arm of the same
+#: session (ACS 001d, p2p_rebar_1023_0909.A_host_detour.json) fits 156.3 us /
+#: 11.93 GB/s, the 09:01Z host-detour run 148.1 us / 12.26 GB/s -- the
+#: round term does not move with the topology, only the wire term does
+#: (x1.71). Neither value changes a decision: :func:`round_budget` is
+#: scale-invariant and has no root while ONE round's bar1 time (round term +
+#: that round's wire bytes) stays below the next rung's time for the same
+#: payload -- w16/world 2: 0.420 ms switch-direct, 0.609 ms host detour,
+#: against 7.89 ms on the gloo rung, a margin of 19x / 13x
+#: (``test_barlink_bar1_calib_switch_1023`` pins it for every geometry the
+#: benches ran, with a negative control that does bind). The host detour is
+#: no operating case any more (ACS redirect disabled at boot), so there is
+#: ONE calibration and no topology switch; a measurement that demanded one
+#: would come back through that test.
+#:
+#: WORLD 3 IS NOT DESCRIBED BY THESE NUMBERS. The 3-card runs of the same
+#: morning (p2p3_rebar_1023_0914.A_host_detour.json and
+#: p2p3sw_rebar_1023_0921.B_switch_direct.json) do not fit the linear model at all (residual max
+#: 2.1 / 3.0 ms, wire 9.8 / 172 GB/s) and were taken with card 2 carrying a
+#: foreign desktop load (NVML 24-41 % utilization, 87-96 W, 2.4 GB used in
+#: every 60-s sample 09:12-09:22Z): w16 96 MiB took 47.48 ms over BOTH
+#: topologies, a cost that does not see the PCIe path. Not a calibration.
+#:
+#: Supersedes ``roundbench_fixed_0907.json`` (323.2 us / 6.02 GB/s, world 3,
+#: 2026-09-07, the pre-switch topology without P2P through a switch).
+DEFAULT_ROUND_US = 155.5
 
 #: Rate at which bytes cross the peer aperture, GB/s. Same artifact, same
-#: joint fit, same residuals (mean 0.026 ms, max 0.052 ms over the four rows
-#: above). The in-boot cross-check: bar1's measured payload rate is flat at
-#: 3.15-3.20 GB/s from 3 MiB to 95 MiB across 80 size buckets, and
-#: ``wire = 4/3 x payload`` at R = 3 puts that at ~4.3 GB/s of wire; the
-#: bench reads 6.02 because it measures the aperture without the scheduler
-#: gaps a boot's ``wait`` instrument folds in. Supersedes the interim 5.47.
-DEFAULT_WIRE_GBPS = 6.02
+#: joint fit, same residuals (mean 0.032 ms, max 0.064 ms over the six rows
+#: above). The switch-direct path is what moved it: 6.02 GB/s (0907, old
+#: topology) -> 11.93 (host detour through root port 00:03.1, 23.10.) ->
+#: 20.45 GB/s (switch-direct, 23.10.).
+DEFAULT_WIRE_GBPS = 20.45
 
 #: The rung a refused decomposition actually falls to: the inline host-staged
 #: plane in ``BarlinkCommunicator`` (pinned D2H -> ``dist.all_reduce`` on the
@@ -3965,14 +4005,21 @@ class BarlinkBar1Transport:
         round_us, wire_gbps, next_rung_gbps = self._calibration()
         group = self.group or "<unnamed>"
         window_mib = int(getattr(self, "window_bytes", 0) or 0) / 2**20
+        # The source names the artifact only when the shipped constants are
+        # the ones in use; an env override is named as such, never passed
+        # off as the bench run.
+        if (round_us, wire_gbps) == (DEFAULT_ROUND_US, DEFAULT_WIRE_GBPS):
+            calib = f"calibration MEASURED, {DEFAULT_CALIBRATION_SOURCE}"
+        else:
+            calib = ("calibration from the environment "
+                     "(FLLIPER_BARLINK_BAR1_ROUND_US / _WIRE_GBPS), NOT the "
+                     f"shipped bench run {DEFAULT_CALIBRATION_SOURCE}")
         l1 = (
             f"barlink-BAR1 coverage[{group}]: window {window_mib:.1f} MiB, "
             f"slot {chunk_max // 1024} KiB, per-round {unit // 1024} KiB, "
             f"world {self.world}, budget={how} (round {round_us:.0f} us, "
             f"wire {wire_gbps:.2f} GB/s, next rung host-staged gloo "
-            f"{next_rung_gbps:.3f} GB/s) -- calibration MEASURED, "
-            f"roundbench_fixed_0907.json (windows 16/40 MiB x 96/128 MiB, "
-            f"10-33 rounds, residual max 0.052 ms, n=4)"
+            f"{next_rung_gbps:.3f} GB/s) -- {calib}"
         )
 
         def _ceil(op: str) -> str:

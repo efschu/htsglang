@@ -189,8 +189,12 @@ D2D_REFERENCES = (
     {"what": "barlink BAR1 collectives, 3 ranks, p50, whole operation (measured 07.09.): all_reduce 20 KiB hub 28.22 µs, 80 KiB mesh 50.81 µs, "
              "1 MiB ring 328.60 µs, 4 MiB mesh 1301.05 µs, 16 MiB ring 4077.43 µs (NCCL of the same runs: 41.75 / 73.58 / 372.79 / 1356.69 / 5172.83 µs)",
      "source": "python/flliper/srt/distributed/device_communicators/barlink_bar1.py:75-83 (module docstring)"},
-    {"what": "barlink BAR1 round term 323.2 µs per round and wire 6.02 GB/s (joint fit, gpuq window jpvycx, 07.09.)",
-     "source": "/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.out:19; barlink_bar1.py:1528 (DEFAULT_ROUND_US), :1537 (DEFAULT_WIRE_GBPS)"},
+    {"what": "barlink BAR1 round term 323.2 µs per round and wire 6.02 GB/s (joint fit, 3 ranks, pre-switch topology, gpuq window jpvycx, 07.09.)",
+     "source": "/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.out:19"},
+    {"what": "barlink BAR1 round term 155.5 µs per round and wire 20.45 GB/s (joint fit, 2 ranks 5090+3080, PEX880xx switch-direct ACS 0011, "
+             "gpuq window wxs2e5, 23.10.); host detour ACS 001d same session 156.3 µs / 11.93 GB/s",
+     "source": "/spinning/gpu-arb/weg2/barlink-1023/p2p_rebar_1023_0909.B_switch_direct.json (+ .refit.out); "
+               "barlink_bar1.py DEFAULT_ROUND_US / DEFAULT_WIRE_GBPS"},
     {"what": "barlink_host (pinned host, flags in host memory) ping-pong 20 KiB 7.30 µs against NCCL 37.41 µs (measured on this rig)",
      "source": "benchmark/bench_host_transport.py:10-12; docs/dev/ANALYSE_732_bar1_repricing.md (section B)"},
     {"what": "BAR1 three-rank all_reduce 20 KiB 45.59 µs; aperture 3080 256 MiB (96 MiB contiguous), 5090 32 GiB (ReBAR)",

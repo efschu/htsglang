@@ -1188,9 +1188,9 @@ class TestSecondLatencyAndReferences(CustomTestCase):
     def test_the_references_carry_the_measured_values_with_file_and_line_and_no_comparison(self):
         refs = hp.D2D_REFERENCES
         blob = " ".join(r["what"] + " " + r["source"] for r in refs)
-        for needle in ("28.22", "323.2", "6.02", "7.30", "37.41", "45.59", "0.08 ms", "0.53-0.80", "SHM/direct/direct", "32.4", "361.3"):
+        for needle in ("28.22", "323.2", "6.02", "155.5", "20.45", "7.30", "37.41", "45.59", "0.08 ms", "0.53-0.80", "SHM/direct/direct", "32.4", "361.3"):
             self.assertIn(needle, blob, needle)
-        for src in ("barlink_bar1.py:75-83", "roundbench_fixed_0907.out:19", "bench_host_transport.py:10-12", "ANALYSE_732_bar1_repricing.md:58-64",
+        for src in ("barlink_bar1.py:75-83", "roundbench_fixed_0907.out:19", "p2p_rebar_1023_0909.B_switch_direct.json", "bench_host_transport.py:10-12", "ANALYSE_732_bar1_repricing.md:58-64",
                     "27b-nvfp4-dual.env:122", "nccl_transport.json", "hw_profile-9a5e9b49b7dc.json"):
             self.assertIn(src, blob, src)
         self.assertTrue(all(r["what"] and r["source"] for r in refs))
@@ -1210,8 +1210,10 @@ class TestSecondLatencyAndReferences(CustomTestCase):
         bb = lines("python/flliper/srt/distributed/device_communicators/barlink_bar1.py")
         self.assertIn("28.22", " ".join(bb[74:83]))
         self.assertIn("4077.43", " ".join(bb[74:83]))
-        self.assertTrue(bb[1527].startswith("DEFAULT_ROUND_US = 323.2"))
-        self.assertTrue(bb[1536].startswith("DEFAULT_WIRE_GBPS = 6.02"))
+        # by content, not by line number: the bind-proof block above the
+        # constants grows with every recalibration (23.10.: 155.5 / 20.45)
+        self.assertIn("DEFAULT_ROUND_US = 155.5", bb)
+        self.assertIn("DEFAULT_WIRE_GBPS = 20.45", bb)
         host = " ".join(lines("benchmark/bench_host_transport.py")[9:12])
         self.assertIn("7.30 us", host)
         self.assertIn("37.41 us", host)

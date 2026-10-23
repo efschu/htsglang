@@ -33,8 +33,17 @@ Run 2026-09-07 18:20Z, gpuq window ``jpvycx``, cards 0/1/2, world 3; artifact
 Per-round term in isolation 319.2 / 325.4 us (median 322.3), joint fit
 323.2 us and 6.02 GB/s with residual mean 0.026 ms / max 0.052 ms over four
 rows, and **25- and 33-round decompositions executed with CORRECT results** --
-the first above 16 rounds on this rig. Those are the numbers
-``barlink_bar1.DEFAULT_{ROUND_US,WIRE_GBPS}`` now carry.
+the first above 16 rounds on this rig. Those were the numbers
+``barlink_bar1.DEFAULT_{ROUND_US,WIRE_GBPS}`` carried until 23.10.
+
+Run 2026-10-23 09:10Z, gpuq window ``wxs2e5``, cards 0 (5090) + 1 (3080),
+world 2, PEX880xx switch-direct (ACS 0011); artifact
+``/spinning/gpu-arb/weg2/barlink-1023/p2p_rebar_1023_0909.B_switch_direct.json``:
+155.5 us and 20.45 GB/s, residual max 0.064 ms over six rows, a 19-round
+decomposition CORRECT -- what ``DEFAULT_*`` carry since barlink-switch-1023.
+The 3-card runs of the same morning were contended (card 2 under a foreign
+desktop load) and non-linear; since then the report refuses such a run as a
+calibration (``contention_verdict`` / ``calibration_verdict``).
 
 The first version of this script could not have delivered any of it: its
 correctness gate called the out-of-place ``comm.all_reduce`` for effect and
@@ -166,6 +175,107 @@ def preflight(cards: list, max_used_mib: int) -> None:
             "window says it is your turn; the hardware says somebody is still "
             "on it. Find the process before measuring anything."
         )
+
+
+# ---------------------------------------------------------------------------
+# contention and fit quality: when a run is NOT a calibration (23.10.)
+# ---------------------------------------------------------------------------
+#
+# barlink-switch-1023: the two 3-card runs of 23.10. (09:14Z host detour,
+# 09:21Z switch-direct) gave w16 96 MiB = 47.48 ms on BOTH topologies and a
+# joint fit of 1320 us / 9.8 GB/s and 1816 us / 172 GB/s with residuals up to
+# 3.0 ms -- while card 2 carried the user's desktop load (NVML 24-41 %,
+# 87-96 W, 2.4 GB in every 60-s sample 09:12-09:22Z). Every round of a
+# barlink collective is one kernel launch per rank that spins until all
+# ranks arrived; on a time-sliced card the round waits for the foreign
+# context's slice, which no PCIe path changes. preflight() only looked at
+# memory.used. The run now samples the cards before it starts (and after it
+# ends) and the report refuses to call a contended or non-linear fit a
+# calibration -- the numbers stay in the artifact, the sentence that hands
+# them to barlink_bar1.DEFAULT_* does not appear.
+
+#: Utilization a card may show with none of our processes on it before the
+#: run counts as contended. The idle cards of 23.10. read 0 % in every sample.
+CONTENDED_UTIL_PCT = 5.0
+#: A joint fit whose worst residual exceeds max(this, 5 % of the shortest
+#: measured cell) is not a two-term law. The accepted runs: 0.052 ms (0907),
+#: 0.064 ms (switch 0909), 0.096 ms (host 0909); the refused 3-card runs
+#: 2.06 and 3.01 ms.
+FIT_RESIDUAL_MAX_MS = 0.25
+
+
+def contention_sample(cards: list, samples: int = 4, gap_s: float = 0.5,
+                      run=subprocess.run) -> dict:
+    """``{card: {"util_max", "power_max", "mem_used_mib"}}`` over a few NVML
+    reads (utilization is a moving window; one read can miss a burst)."""
+    want = {int(c) for c in cards}
+    out = {c: {"util_max": 0.0, "power_max": 0.0, "mem_used_mib": 0}
+           for c in want}
+    for i in range(max(1, int(samples))):
+        try:
+            txt = run(["nvidia-smi",
+                       "--query-gpu=index,utilization.gpu,power.draw,memory.used",
+                       "--format=csv,noheader,nounits"],
+                      capture_output=True, text=True, check=True).stdout
+        except Exception as e:  # noqa: BLE001 -- recorded, never fatal
+            for c in want:
+                out[c]["error"] = f"{type(e).__name__}: {e}"
+            break
+        for line in txt.strip().splitlines():
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) < 4:
+                continue
+            try:
+                idx = int(parts[0])
+            except ValueError:
+                continue
+            if idx not in want:
+                continue
+            row = out[idx]
+
+            def _f(x):
+                try:
+                    return float(x)
+                except ValueError:
+                    return 0.0
+            row["util_max"] = max(row["util_max"], _f(parts[1]))
+            row["power_max"] = max(row["power_max"], _f(parts[2]))
+            row["mem_used_mib"] = max(row["mem_used_mib"], int(_f(parts[3])))
+        if i + 1 < samples:
+            time.sleep(gap_s)
+    return out
+
+
+def contention_verdict(*snapshots, util_pct: float = CONTENDED_UTIL_PCT) -> list:
+    """Named reasons (empty = clean) from snapshots taken while NONE of our
+    processes ran on the cards -- every percent there is somebody else's."""
+    why = []
+    for snap in snapshots:
+        for card, row in sorted((snap or {}).items(), key=lambda kv: int(kv[0])):
+            if float(row.get("util_max", 0.0)) > util_pct:
+                why.append(f"card {card}: {row['util_max']:.0f} % utilization, "
+                           f"{row.get('power_max', 0):.0f} W, "
+                           f"{row.get('mem_used_mib', 0)} MiB used with none "
+                           f"of this bench's processes on it")
+    return why
+
+
+def calibration_verdict(rows: list, fit, contended: list) -> str:
+    """'' when this run may feed barlink_bar1.DEFAULT_*, else why not."""
+    if contended:
+        return "CONTENDED -- " + "; ".join(contended)
+    if not fit:
+        return "no joint fit (fewer than 3 independent cells)"
+    resid = fit[2]
+    shortest = min(float(r["bar1_ms"]) for r in rows) if rows else 0.0
+    limit = max(FIT_RESIDUAL_MAX_MS, 0.05 * shortest)
+    worst = max(abs(x) for x in resid)
+    if worst > limit:
+        return (f"NONLINEAR -- worst residual {worst:.3f} ms > {limit:.3f} ms: "
+                f"time is not round_us*R + wire/wire_Bps here")
+    if not all(r.get("correct") for r in rows):
+        return "a cell returned a WRONG result"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -560,16 +670,32 @@ def report(rows: list, next_rung, a) -> None:
     if next_rung:
         print(f"\nnext_rung_gbps (host-staged gloo, measured): "
               f"{next_rung:.3f}")
-    print("\nThese three numbers are what "
-          "barlink_bar1.DEFAULT_{ROUND_US,WIRE_GBPS,NEXT_RUNG_GBPS} must "
-          "carry, together with this run's artifact path, windows, round "
-          "counts and residuals. A bare number in that docstring is the "
-          "defect #1234 removed.")
+    try:
+        pre = json.loads(os.environ.get("BARLINK_BENCH_CONTENTION_PRE", "")
+                         or "{}")
+    except ValueError:
+        pre = {}
+    contended = contention_verdict(pre)
+    refused = calibration_verdict(rows, fit, contended)
+    if refused:
+        print(f"\nNOT A CALIBRATION: {refused}\nThe rows above stay in the "
+              "artifact as a measurement of THIS condition; they must not be "
+              "copied into barlink_bar1.DEFAULT_*.")
+    else:
+        print("\nThese three numbers are what "
+              "barlink_bar1.DEFAULT_{ROUND_US,WIRE_GBPS,NEXT_RUNG_GBPS} must "
+              "carry, together with this run's artifact path, windows, round "
+              "counts and residuals. A bare number in that docstring is the "
+              "defect #1234 removed.")
     if a.out:
         with open(a.out, "w") as f:
             json.dump({"rows": rows, "next_rung_gbps": next_rung,
                        "fit": fit and {"round_us": fit[0],
-                                       "wire_gbps": fit[1]}}, f, indent=2)
+                                       "wire_gbps": fit[1],
+                                       "residuals_ms": list(fit[2])},
+                       "contention_pre": pre,
+                       "calibration_ok": not refused,
+                       "calibration_refused": refused}, f, indent=2)
         print(f"\nartifact: {a.out}")
 
 
@@ -636,8 +762,12 @@ def main() -> int:
           f"cards {window.get('cards')} -- running. The service plans, it "
           f"does not lock; the nvidia-smi net below is the real check.")
     preflight(a.cards, a.max_used_mib)
+    pre = contention_sample(a.cards)
+    for line in contention_verdict(pre):
+        print(f"# CONTENDED before start: {line}")
 
     env = {**os.environ,
+           "BARLINK_BENCH_CONTENTION_PRE": json.dumps(pre),
            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
            "CUDA_VISIBLE_DEVICES": ",".join(str(c) for c in a.cards),
            "MASTER_ADDR": "127.0.0.1",
@@ -666,6 +796,26 @@ def main() -> int:
         for p in procs:
             p.kill()
         rc = 4
+    # After our ranks are gone every percent is foreign again: a load that
+    # began DURING the run shows here. Appended to the artifact, and it
+    # withdraws the calibration verdict if it finds anything.
+    post = contention_sample(a.cards)
+    late = contention_verdict(post)
+    for line in late:
+        print(f"# CONTENDED after the run: {line}")
+    if a.out and os.path.exists(a.out):
+        try:
+            with open(a.out) as f:
+                doc = json.load(f)
+            doc["contention_post"] = post
+            if late and doc.get("calibration_ok"):
+                doc["calibration_ok"] = False
+                doc["calibration_refused"] = "CONTENDED after the run -- " + "; ".join(late)
+                print(f"NOT A CALIBRATION: {doc['calibration_refused']}")
+            with open(a.out, "w") as f:
+                json.dump(doc, f, indent=2)
+        except (OSError, ValueError) as e:
+            print(f"# could not append the post-run contention sample: {e!r}")
     return rc
 
 
