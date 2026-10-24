@@ -119,10 +119,25 @@ class Classifier(Base):
         lying = head + "1 blocker(s): " + "; ".join(b.text() for b in (metal, nvec))   # count says 1, list has 2
         self.assertIsNone(R.records_class("HW-COUNT", lying))
 
-    def test_generic_topology_refusal_is_not_neutral(self):
-        with self.assertRaises(T.TopologyRefused) as cm:
-            T.plan_topology(2, T.TopologyContext())
-        self.assertIsNone(R.records_class("HW-COUNT", str(cm.exception)))
+    def test_every_real_topology_refusal_is_judged_by_its_own_blocker_list(self):
+        """Over every N the planner can refuse with HW-COUNT (generic context and a profile context with
+        positional vectors), the verdict follows the refusal's OWN blocker objects: neutral iff all METAL-UNPROVEN."""
+        seen = {True: 0, False: 0}
+        ctxs = (T.TopologyContext(),
+                T.TopologyContext(vectors={"p_budget": 3}))     # a 3-vector on N != 3 cards: PROFILE-VECTORS
+        for ctx in ctxs:
+            for n in range(T.MIN_CARDS, T.MAX_CARDS_BAR1 + 1):
+                try:
+                    T.plan_topology(n, ctx)
+                except T.TopologyRefused as exc:
+                    if not str(exc).startswith(T.CODE_COUNT):
+                        continue
+                    metal_only = all(b.code == "METAL-UNPROVEN" for b in exc.blockers)
+                    got = R.records_class("HW-COUNT", str(exc) + " || visible: x")
+                    self.assertEqual(got is not None, metal_only, str(exc)[:300])
+                    seen[metal_only] += 1
+        self.assertGreater(seen[True], 0)
+        self.assertGreater(seen[False], 0)
 
     def test_count_mismatch_of_order_cards_is_a_foreign_configuration(self):
         self.force()
