@@ -565,7 +565,9 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
     mx = group_max([cnt, -cnt, dig, -dig, err, res], label="s86_sleep_l3_release/digest")
     g_max, g_min, d_max, d_min, g_err, g_res = (int(mx[0]), -int(mx[1]), int(mx[2]), -int(mx[3]), int(mx[4]),
                                                 int(mx[5]))
-    out.update(nodes=sum(1 for c in map(_cand, cands) if not any(int(agreed[s]) for s in c[3])), pages=cnt,
+    # FLIPCOST-1024: one index read per candidate (``_any_set``), not an ``int(agreed[s])`` per slot -- 0.24 s of a
+    # 0.82 s release for 78396 slots in the desk profile (282 nodes, one intra-op thread)
+    out.update(nodes=sum(1 for c in map(_cand, cands) if not _any_set(agreed, c[3])), pages=cnt,
                group_released=g_max, agreed=(d_max == d_min and g_res == 0),
                vetoed=int((agreed > 0).sum()), why=why, ms=(time.monotonic() - t0) * 1000.0, group_error=g_err,
                fix_rounds=rounds, residual=res)

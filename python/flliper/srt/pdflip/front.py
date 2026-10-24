@@ -1348,12 +1348,44 @@ def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
     return str(p)
 
 
+#: FRONT-LCP-1024: the first segment the galloping prefix compare tries (chars).
+_LCP_GALLOP0 = 4096
+
+
 def common_prefix_len(a: str, b: str) -> int:
+    """Length of the longest common character prefix of ``a`` and ``b``.
+
+    FRONT-LCP-1024 (NF boot ..._1023_234711, front log): every arrival runs
+    :meth:`SpanLRU.uncached_tokens` -- this function against EACH of up to
+    ``SPAN_LRU`` (512) served texts of 100-600k chars -- on the event loop
+    before the exact count starts. The old binary search copied ``a[:mid]``
+    and ``b[:mid]`` on all ~19 steps (O(n log n) bytes per entry), so the
+    SESSION -> exact-count gap grew with the LRU from p50 12-45 ms (first
+    requests) to 220-359 ms (last third); the tokenizer's own count_ms
+    stayed 8-90 ms.
+
+    Same answer, O(cp) copies: the invariant ``a[:lo] == b[:lo]`` lets every
+    compare touch only the NEW segment ``[lo, hi)``. A gallop (4096, 8192,
+    ... chars) brackets the first mismatch, then a binary search inside the
+    bracket, again on new segments only. The boundary step is exact: a
+    mismatch inside ``[lo, hi)`` means the answer is in ``[lo, hi - 1]``."""
     n = min(len(a), len(b))
-    lo, hi = 0, n
+    if n == 0 or a[0] != b[0]:
+        return 0
+    lo, step = 0, max(1, int(_LCP_GALLOP0))  # >= 1: lo must advance
+    while True:
+        hi = min(n, lo + step)
+        if a[lo:hi] == b[lo:hi]:
+            lo = hi
+            if lo == n:
+                return n
+            step *= 2
+        else:
+            break
+    hi -= 1  # a[:hi] may still match: the first mismatch lies in [lo, hi)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if a[:mid] == b[:mid]:
+        if a[lo:mid] == b[lo:mid]:
             lo = mid
         else:
             hi = mid - 1
@@ -4924,6 +4956,10 @@ def _decode_collect_window_s() -> float:
     except (TypeError, ValueError):
         return 0.0
 
+#: SHORT-FLIP-REPRICE-1024: the ``u_src`` of a RESUME-VIA-P leg classed on its ARRIVAL u (``Front._rvp_unrun_kurz_u``)
+RVP_U_SRC_ARRIVAL = "d_probe_arrival"
+
+
 def _dual_decode_collect_window_s() -> float:
     """27B DUAL (port 20.10.): the dual layout keeps the 27B DECODE-COLLECT window -- 15 s, the 27B
     default before the port -- unless FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S names one. The flip form
@@ -5939,7 +5975,11 @@ class Front:
                 if _usrc == "unpriced":
                     self.counters["rvp_text_unpriced"] = self.counters.get("rvp_text_unpriced", 0) + 1
                     _cls = "unpriced"  # B5: the line never says kurz for an entry that has no number
-                if str(r.get("reason", "")) == _rvp.REASON_WALL:
+                if _usrc == RVP_U_SRC_ARRIVAL:
+                    # SHORT-FLIP-REPRICE-1024: the leg's ids are the probed prompt (it never ran) -- D's number NOW on them
+                    Front._rvp_reprice_start(self, rid, p, ids=ids, extra_key=payload.get("extra_key"),
+                                             site="rvp_store_short")
+                elif str(r.get("reason", "")) == _rvp.REASON_WALL:
                     # NF-VISION-CACHED A2: the arrival's S63 key asks on the PROMPT ids -- applied to this leg it would drop
                     # the streamed output. The leg's own key (its context ids) replaces it when its exact number lands.
                     _rb = self.__dict__.get("_reprobe_book")
@@ -6019,9 +6059,95 @@ class Front:
         WENN DAS BILD UND DER GANZE KONTEXT GECACHT IST"): the rows are NEVER a class -- the interim class of
         ``_wall_interim`` (kurz or unpriced), and D's exact number on the leg's context ids NOW (``_rvp_reprice``)."""
         d_ext = int(rec.get("d_extent") or len(rec.get("input_ids") or ()))
-        if str(rec.get("reason", "")) != _rvp.REASON_WALL:
-            return d_ext, "d_extent"
-        return Front._wall_interim(self, rid, len(rec.get("input_ids") or ()), d_ext)
+        if str(rec.get("reason", "")) == _rvp.REASON_WALL:
+            return Front._wall_interim(self, rid, len(rec.get("input_ids") or ()), d_ext)
+        u_arr = Front._rvp_unrun_kurz_u(self, rid, rec, d_ext)
+        if u_arr is not None:
+            return u_arr, RVP_U_SRC_ARRIVAL
+        return d_ext, "d_extent"
+
+    #: SHORT-FLIP-REPRICE-1024 review SOLL-3: arrival prices kept (bounded, oldest out)
+    ARRIVAL_PRICES_KEPT = 4096
+
+    def _note_arrival_price(self, rid: str, xp: Any) -> None:
+        """SHORT-FLIP-REPRICE-1024 review SOLL-3: D's exact price of ``rid`` AT ITS ARRIVAL, written once (the arrival
+        D-PROBE, or the NF-1b late answer of that same probe). ``_probe_price`` is the LATEST price (SET-REPROBE and
+        ``_rvp_reprice`` overwrite it); the arrival class (SOLL R1, the one single-request decision) needs this one.
+        Never raises."""
+        try:
+            book = self.__dict__.setdefault("_arrival_price", collections.OrderedDict())
+            if str(rid) in book:
+                return
+            book[str(rid)] = xp
+            while len(book) > Front.ARRIVAL_PRICES_KEPT:
+                book.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- an instrument book
+            pass
+
+    def _arrival_placed(self, p: "Pending") -> str:
+        """SHORT-FLIP-REPRICE-1024 question (1): where an arrival that fell through the seat path STANDS, for the
+        ``PDFLIP-ROUTE ... BATCH queued`` line, which is written after every placement branch -- also after SHORT-IN-FLIP
+        put the entry into D's admission line (215: ``ARRIVAL-SEAT ... SHORT-IN-FLIP`` and ``BATCH queued (awake=P ...
+        queue=0)`` read as a double enqueue; it was one entry, in ``_ready_for_d``). ``d_line`` / ``queue`` /
+        ``none`` (by identity: ``Pending.__eq__`` compares fields). Instrument only."""
+        try:
+            if any(x is p for x in (getattr(self, "_ready_for_d", None) or ())):
+                return "d_line"
+            if any(x is p for x in (getattr(self, "queue", None) or ())):
+                return "queue"
+        except Exception:  # noqa: BLE001 -- an instrument
+            return "?"
+        return "none"
+
+    def _rvp_unrun_kurz_u(self, rid: str, rec: dict, d_ext: int) -> Optional[int]:
+        """SHORT-FLIP-REPRICE-1024 (SOLL R1 "ausser der Einstufung bei Ankunft", R2, R7, R11; 27B rc41 boot
+        ..._1024_110644, pdflip-21-215): the arrival u of a request D sent back with ``store_short_after_flip`` BEFORE it
+        ran -- or None (the leg keeps D's extent as before).
+
+        215 arrived kurz on D's exact number (D-PROBE u=865: device 53750 + store 70134, tier l2_arena; CLASSIFY R2), was
+        admitted on D, and D's settle answered ``d_extent=53908`` -- a store-read count taken as a prompt depth (the D
+        half of this fix, ``d_norecompute.span_base``). The front classed the leg on that number: ``RESUME-VIA-P CLASS
+        u=53908 class=gross`` -> ``SET-VERDICT ... COLLECT R4`` for a request whose remainder was 158 (SET-REPROBE 865 ->
+        158 five seconds later; P computed 158). A d_extent that contradicts the arrival class of a request that never
+        produced a token is no class number: the arrival u stands (kurz: no set member, no flip reason) and D's exact
+        number NOW follows (``_rvp_reprice``, started by the caller) -- the S63 rule, the verdict on D's number now.
+
+        Only for: reason ``store_short_after_flip``; the FIRST P leg (``attempt == 1``); the rid's ARRIVAL D price
+        (``_arrival_price``, write-once -- not ``_probe_price``) known, kurz at its X, no image in the
+        uncached tail; the leg's context ids exactly the probed prompt (nothing decoded: a PARKED decode resumed after a
+        flip is the other family -- its device copy is gone with the sleep and its extent is real, measured: P computed
+        the d_extent in 18 of 18 such legs on 24.10.); and d_extent at or above that request's halbX (a d_extent that
+        is itself kurz needs no override)."""
+        try:
+            from flliper.srt.pdflip import d_norecompute as _dnr
+
+            if str(rec.get("reason", "")) != _dnr.REASON:
+                return None
+            if int(rec.get("attempt") or 1) != 1:
+                return None   # review SOLL-3: a second P leg follows a P leg that ran -- D's extent stands
+            # review SOLL-3: the ARRIVAL price (write-once), never ``_probe_price`` -- SET-REPROBE and ``_rvp_reprice``
+            # overwrite that one with the latest price on the latest ids (a decoded request's leg ids would then match)
+            xp = (self.__dict__.get("_arrival_price") or {}).get(str(rid))
+            if xp is None or bool(getattr(xp, "image_in_tail", False)):
+                return None
+            n_ctx = len(rec.get("input_ids") or ())
+            if not n_ctx or int(xp.covered) + int(xp.uncached) != n_ctx:
+                return None   # streamed output past the probed prompt (a resumed decode) or other ids
+            u = int(_dmp.class_uncached(xp))
+            x = int(Front._x_at_depth(self, max(0, n_ctx - u)))
+            frac = Front._set_cfg()[0]
+            if phase_policy.classify_arrival(u, x, frac, False) != phase_policy.CLASS_KURZ:
+                return None
+            if int(d_ext) < phase_policy.half_x_of(x, frac):
+                return None   # D's extent is kurz itself: nothing to override
+        except Exception:  # noqa: BLE001 -- no number: D's extent as before
+            return None
+        self.counters["rvp_unrun_kurz_kept"] = self.counters.get("rvp_unrun_kurz_kept", 0) + 1
+        logger.warning("RESUME-VIA-P KURZ-KEPT rid=%s u=%d d_extent=%d reason=%s -- D sent back a request that never ran "
+                       "with an extent its arrival class (kurz, D's exact number at the arrival) contradicts: the arrival "
+                       "u stands, no set member, no flip reason (SOLL R1 R2 R7); D's exact number NOW follows",
+                       rid, u, int(d_ext), rec.get("reason", "?"))
+        return u
 
     #: NF-VISION-CACHED A3: pause between two rounds of an unpriced wall request's exact number (each round itself is
     #: bounded by the probe deadline and two store reads)
@@ -7968,6 +8094,7 @@ class Front:
                 _pbook[str(rid)] = _xp
                 while len(_pbook) > 4096:
                     _pbook.popitem(last=False)
+                Front._note_arrival_price(self, rid, _xp)  # SHORT-FLIP-REPRICE-1024 review SOLL-3 (NF-1b late arrival)
                 Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
                     ids=ans.ids, spans=tuple(ans.mm_spans), rows=tuple(ans.mm_rows), extra_key=ans.extra_key,
                     extra_key_known=bool(ans.extra_key_known), path=str(path),
@@ -8237,6 +8364,7 @@ class Front:
             _pbook[str(rid)] = _xp  # a later D refusal of this rid knows P's exact number (W123 requeue)
             while len(_pbook) > 4096:
                 _pbook.popitem(last=False)
+            Front._note_arrival_price(self, rid, _xp)  # SHORT-FLIP-REPRICE-1024 review SOLL-3: write-once
             # S63 F1: the key of this price, for the re-probe right before a set verdict that flips or assigns P
             Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
                 ids=_probe.ids, spans=tuple(_probe.mm_spans), rows=tuple(_probe.mm_rows), extra_key=_probe.extra_key,
@@ -12958,11 +13086,12 @@ class Front:
         self._arm_client_watch(request, rid, p)  # H102
         _bq_src, _bq_class = Front._batch_queued_basis(self, _xx, remainder, _x_set, bool(p.p_only))
         logger.info("PDFLIP-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d "
-                    "u_src=%s class=%s p_phase_rider=%d) -- remainder is u, the number the class stands on (S105: "
+                    "u_src=%s class=%s p_phase_rider=%d) placed=%s -- remainder is u, the number the class stands on (S105: "
                     "est_prompt is the whole prompt, never the class basis; p_phase_rider=1 = a kurz request in P's "
-                    "phase joins P's batch, P-BATCH-ALL user 02.10. / SOLL R1a, not a flip under X)",
+                    "phase joins P's batch, P-BATCH-ALL user 02.10. / SOLL R1a, not a flip under X; placed= where the "
+                    "entry stands, d_line = D's admission line, never P's queue)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue),
-                    _bq_src, _bq_class, int(bool(_p_phase and short_ok)))
+                    _bq_src, _bq_class, int(bool(_p_phase and short_ok)), Front._arrival_placed(self, p))
         self._maybe_ple_admit_hint(p)  # fnFL2 H43
         try:
             await fut  # leg 1 done and D awake

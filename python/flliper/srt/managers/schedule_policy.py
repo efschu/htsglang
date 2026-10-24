@@ -827,6 +827,23 @@ _PDFLIP_CHUNK_ADMIT: Optional[bool] = None
 _PDFLIP_PARK_ON: Optional[bool] = None
 
 
+def _lifetime_load_back_terms(req) -> Tuple[object, object]:
+    """``(host_hit, load_back)`` for the lifetime refusal stamp (27B 24.10., SOLL R5/R7 reading aid).
+
+    The lifetime price charges ``extend = len(fill) - len(prefix_indices)``: ``prefix_indices`` is the
+    DEVICE prefix. A host-tier hit (handback store, L2, L3) is part of ``extend`` on purpose -- the
+    load-back writes those rows INTO the device pool at admission, so they occupy device KV exactly
+    like computed rows. int4ar ``_1023_223241`` pdflip-30-274: ``price=63008 extend=58911 prefix=0
+    uncached=1`` against ``available=42809`` was read as a mis-price; 58910 of the 58911 rows were a
+    host load-back (front: ``cached_device=0 cached_l2=17966 cached_l3=40529``) and the pool could not
+    take them. The stamp names both terms so ``extend - load_back`` (compute) and ``load_back`` (rows
+    the host read occupies) stand on the line. Observation only; never raises."""
+    try:
+        return int(getattr(req, "host_hit_length", 0) or 0), int(_pp_load_back_extent(req) or 0)
+    except Exception:  # noqa: BLE001 -- an instrument on the gate path never raises
+        return "?", "?"
+
+
 def _pdflip_chunk_admit() -> bool:
     """Punkt 2: per-chunk admission (group P, rides with the park). Read once."""
     global _PDFLIP_CHUNK_ADMIT
@@ -1635,6 +1652,12 @@ class PrefillAdder:
         #: "nothing resident", which is precisely the pass that then mints a
         #: second one.
         self.chunked_req_outstanding = False
+        #: 27B-PP-SKIPOUT-1024: `_add_scheduled_req` minted a forwarded NOT-LAST
+        #: chunk while `chunked_req_outstanding` was True (a follower only, on
+        #: PP0's word that its slot is empty). The scheduler then displaces its
+        #: resident continuation before adopting `new_chunked_req`
+        #: (managers/pp_continuation_seat.py `displace_resident`).
+        self.displaced_resident_continuation = False
         #: H105: on a Form A group the scheduler installs the host-verdict
         #: exchange here (`Scheduler._form_a_admission_follow_fn`); None keeps
         #: every gate in `add_one_req` rank-local exactly as before.
@@ -2724,10 +2747,29 @@ class PrefillAdder:
             # the same geometry rule PP0 applied (the carried verdict said
             # "not last" and the extent ends at the anchor cut of the carried
             # fill), so this rank carries the rid exactly as PP0 does.
+            #
+            # 27B-PP-SKIPOUT-1024 (SOLL R11): "WHY NOT ANNOUNCING LOSES NOTHING"
+            # ABOVE IS WITHDRAWN -- measured false. An unannounced NOT-LAST chunk
+            # takes no `inflight_middle_chunks` increment (the batch builder
+            # counts `scheduler.chunked_req` only), so its skipped output trips
+            # `_validate_pp_skip_output_comm` (27B rc35i4ar3 fe572f3224, boot
+            # ..._1024_063046, PP1 06:36:08, rid pdflip-3-8); its KV is never
+            # stashed, and the merge would hand a half-prefilled request to the
+            # running batch. The state itself is PP0's word that ITS slot is
+            # empty: PP0 mints a continuation only with `chunked_req is None`
+            # (#959 refuses every other mint), so the resident continuation
+            # here is a stale one PP0 already let go (PDFLIP-PARK runs on PP0
+            # only, after a pass that named nothing). The follower therefore
+            # mints the named request as PP0 did and DISPLACES the resident:
+            # the scheduler empties the slot and gives the resident's rows
+            # back (managers/pp_continuation_seat.py). No refusal (the boot-15
+            # livelock stays impossible), no second continuation (one field,
+            # one occupant), nothing unannounced.
             if self._is_anchor_body(req, prefix_len, prefix_len + extend_len):
                 self._mint_anchor_tail(req, "_add_scheduled_req")
             elif self.chunked_req_outstanding:
-                note_second_continuation_refused(req, "_add_scheduled_req")
+                self.displaced_resident_continuation = True
+                self._mint_chunked(req, "_add_scheduled_req/displace")
             else:
                 self._mint_chunked(req, "_add_scheduled_req")
         if not carried_chunk:
@@ -3240,6 +3282,14 @@ class PrefillAdder:
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
         max_new = decode_clip_of(req)
+        # 27B 24.10. (SOLL R5/R7): `prefix_indices` is the DEVICE prefix. A host-tier hit (handback
+        # store / L2 / L3, `host_hit_length`, the load-back extent) stays IN this extend on purpose:
+        # the load-back writes those rows into the device pool at admission. Crediting it would admit
+        # rows the pool does not have (pdflip-30-274: 58910 load-back rows vs available=42809) -- the
+        # KV-OOM direction. The refusal stamp names host_hit/load_back (`_lifetime_load_back_terms`).
+        # #215 (review SOLL 5) is no contradiction: only the LOCKED DEVICE rows of the gap below a mamba-cut
+        # ``last_node`` leave the price (``dev_gap`` below, named in the same stamp) -- they are on the device
+        # already and the load-back maps them; host rows never leave it.
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -3324,11 +3374,12 @@ class PrefillAdder:
                 _gate = AddReqResult.NO_TOKEN
                 self._note_lifetime_refusal(req, total_tokens, _rem_total)
                 _gate_why = "lifetime"
+                _lb_host_hit, _lb_load_back = _lifetime_load_back_terms(req)
                 _gate_nums = dict(
                     price=int(total_tokens), budget=_rem_total,
                     born=int(born_input_tokens), extend=int(cand_extend_input_len),
                     max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
-                    prefix=prefix_len,
+                    prefix=prefix_len, host_hit=_lb_host_hit, load_back=_lb_load_back,
                 )
                 if dev_gap:  # D-PREFIX-PRICE: named only when credited (the line stays byte-identical otherwise)
                     _gate_nums["dev_gap"] = int(dev_gap)
@@ -3382,11 +3433,12 @@ class PrefillAdder:
                     self._note_lifetime_refusal(req, total_tokens, _rem_total)
                     self._pdflip_note_budget_parts(req, total_tokens, _rem_total)
                     _gate_why = "lifetime_locked"
+                    _lb_host_hit, _lb_load_back = _lifetime_load_back_terms(req)
                     _gate_nums = dict(
                         price=int(total_tokens), budget=_rem_total,
                         born=int(born_input_tokens), extend=int(cand_extend_input_len),
                         max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
-                        prefix=prefix_len,
+                        prefix=prefix_len, host_hit=_lb_host_hit, load_back=_lb_load_back,
                     )
                     if dev_gap:  # D-PREFIX-PRICE: named only when credited (the line stays byte-identical otherwise)
                         _gate_nums["dev_gap"] = int(dev_gap)

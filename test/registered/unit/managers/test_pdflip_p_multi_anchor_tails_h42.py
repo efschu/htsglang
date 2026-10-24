@@ -423,11 +423,16 @@ def test_anchor_body_rule():
 
 
 def test_contains_last_is_stock_without_tails():
+    """Stock wherever the chunked request takes a seat (or there is none); 27B-PP-SKIPOUT-1024: a chunked request OUTSIDE
+    the batch no longer turns a fresh request's one-member batch into "no last chunk" (the seat, not the slot)."""
     a, b, c = object(), object(), object()
     for can in ([a], [a, b], [b], [b, c]):
         for chunked in (None, a):
             stock = chunked is None or len(can) != 1
-            assert at.contains_last_prefill_chunk(can, chunked, ()) == stock
+            seated = chunked is None or any(x is chunked for x in can)
+            expect = stock if seated else True
+            assert at.contains_last_prefill_chunk(can, chunked, ()) == expect
+    assert at.contains_last_prefill_chunk([b], a, ()) is True
     assert at.contains_last_prefill_chunk([b], None, (b,)) is False
     assert at.contains_last_prefill_chunk([b, c], None, (b, c)) is True
 

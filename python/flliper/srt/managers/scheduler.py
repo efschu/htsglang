@@ -283,6 +283,7 @@ from flliper.srt.pdflip import p_layer_split_runtime as _pls_rt  # --p-layer-spl
 from flliper.srt.pdflip import dual_share as _pdflip_dual_share  # DUAL-SHARE chunk cap (None = off)
 from flliper.srt.managers import uniform_floor_scope
 from flliper.srt.managers import anchor_tails as _anchor_tails
+from flliper.srt.managers import pp_continuation_seat as _pp_seat  # 27B-PP-SKIPOUT-1024 (SOLL R11)
 from flliper.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
     PPAdmissionCongruenceGuard,
@@ -1639,6 +1640,8 @@ def _pdflip_device_idle(sched) -> bool:
         return False
     if getattr(sched, "enable_overlap", False) and len(getattr(sched, "result_queue", ()) or ()):
         return False
+    if getattr(sched, "__dict__", {}).get(_pp_seat.DISPLACED_ATTR):
+        return False  # 27B-PP-SKIPOUT-1024 review S2: a displaced continuation still holds rows
     return getattr(sched, "chunked_req", None) is None
 
 
@@ -11277,6 +11280,10 @@ class Scheduler(
         is a pure loss. `process_pending_chunked_abort` is the shape; the
         difference is `is_insert=True` and no abort to the tokenizer.
         """
+        # 27B-PP-SKIPOUT-1024 (SOLL R11): first the continuations this stage
+        # displaced from its slot on PP0's word (pp_continuation_seat.py) --
+        # the same give-back as below, once no launched chunk still writes.
+        Scheduler._pp_drain_displaced_continuations(self)
         req = getattr(self, "chunked_req", None)
         if req is None or not getattr(req, "pdflip_pool_parked", False):
             return
@@ -11304,6 +11311,16 @@ class Scheduler(
                 return
         except Exception:  # noqa: BLE001
             return
+        Scheduler._pdflip_give_back_continuation(self, req, lane_park=_lane_park, clear_slot=True)
+
+    def _pdflip_give_back_continuation(self, req, *, lane_park: bool, clear_slot: bool, follower: bool = False) -> bool:
+        """The PDFLIP-PARK give-back of one continuation: its computed span into
+        the tree as an EVICTABLE path (`release_kv_cache(is_insert=True)`: KV
+        rows, the Mamba/GDN checkpoint, the draft rows), the request reset and
+        back at the head of the waiting queue. `clear_slot` = it is still
+        `self.chunked_req` (the park); False for a continuation already
+        displaced from the slot (27B-PP-SKIPOUT-1024, `follower=True` names it
+        in the log). True iff the rows went back."""
         span = int(_len_or_zero(getattr(req, "prefix_indices", None)))
         rid = str(getattr(req, "rid", "?"))
         try:
@@ -11311,23 +11328,50 @@ class Scheduler(
         except Exception:  # noqa: BLE001 -- a failed park must not kill the rank
             logger.warning("PDFLIP-PARK rid=%s: release raised, keeping the in-place park",
                            rid, exc_info=True)
-            return
+            return False
         req.pdflip_pool_parked = False
         req.pdflip_parked_span = max(1, span)
         req.reset_for_retract()
-        self.chunked_req = None
+        if clear_slot:
+            self.chunked_req = None
         self._add_request_to_queue(req, is_retracted=True)
-        if _lane_park:
+        if lane_park:
             # the request keeps `pdflip_lane_parked` (the admission loop skips it while the floor stands above its lane)
             _lanes_p.note_parked(self, req, span=span, total=len(getattr(req, "origin_input_ids", ()) or ()))
-            return
+            return True
         n = getattr(self, "_pdflip_park_n", 0) + 1
         self._pdflip_park_n = n
         logger.info(
-            "PDFLIP-PARK n=%d rid=%s span=%d of %d: rows given back to the tree "
+            "PDFLIP-PARK%s n=%d rid=%s span=%d of %d: rows given back to the tree "
             "(evictable), request back at the head of the queue; resume by "
             "prefix match / load_back, admitted whole",
+            " (follower, displaced)" if follower else "",
             n, rid, span, len(getattr(req, "origin_input_ids", ()) or ()),
+        )
+        return True
+
+    def _pp_drain_displaced_continuations(self) -> int:
+        """27B-PP-SKIPOUT-1024 (SOLL R11): give back the rows of every
+        continuation this stage displaced from its slot (pp_continuation_seat.py
+        `drain_displaced` decides which: none with a launched chunk still
+        writing, none whose chunked abort is pending). No `park_active` /
+        waiter gate: PP0 already gave its rows back, so this is the follower
+        executing that, not a park of its own choosing."""
+        if not self.__dict__.get(_pp_seat.DISPLACED_ATTR):
+            return 0
+        def _requeue(req):  # review S3: a live displaced request without rows -- no release, but back in the queue
+            req.reset_for_retract()
+            self._add_request_to_queue(req, is_retracted=True)
+            return True
+
+        return _pp_seat.drain_displaced(
+            self,
+            lambda req: Scheduler._pdflip_give_back_continuation(
+                self, req, lane_park=getattr(req, "pdflip_lane_parked", False) is True,
+                clear_slot=False, follower=True,
+            ),
+            abort=lambda req: Scheduler._pp_abort_displaced(self, req),
+            requeue=_requeue,
         )
 
     def _pdflip_defer_waiting_abort(self, recv_req) -> bool:
@@ -11431,7 +11475,12 @@ class Scheduler(
         req = self._pending_chunked_abort_req
         if req is None:
             return
-        if self.chunked_req is not req:
+        # 27B-PP-SKIPOUT-1024: a continuation displaced from the slot on PP0's
+        # word (pp_continuation_seat.py) is still a chunked request with rows
+        # and no running-batch seat: its abort is applied here exactly as the
+        # slot's own (the displaced drain leaves it to this path).
+        _displaced_abort = _pp_seat.is_displaced(self, req)
+        if self.chunked_req is not req and not _displaced_abort:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
             if req.finished() or req.req_pool_idx is None:
@@ -11478,6 +11527,30 @@ class Scheduler(
                 else "PP0's forwarded schedule no longer names it",
             )
 
+        Scheduler._pdflip_chunked_abort_release(self, req)
+
+        if _displaced_abort:
+            _pp_seat.forget_displaced(self, req)
+        if self.chunked_req is req:
+            self.chunked_req = None
+        self._pending_chunked_abort_req = None
+        self._pending_chunked_abort_delay = 0
+        # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
+        # every other chunked abort answers as before.
+        _reason = getattr(self, "_pending_chunked_abort_reason", None)
+        self._pending_chunked_abort_reason = None
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(rid=req.rid) if _reason is None else AbortReq(rid=req.rid, finished_reason=_reason), req
+        )
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _pdflip_chunked_abort_release(self, req) -> None:
+        """The chunked-abort teardown of one request (prepare_abort, the store
+        records, its rows WITHOUT a tree insert). One body for the slot's
+        chunked abort and a displaced continuation's (27B-PP-SKIPOUT-1024
+        review A1); the caller clears its own route and answers the tokenizer."""
+        from flliper.srt.pdflip import dual_old_instance as _q695
+
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
@@ -11496,17 +11569,28 @@ class Scheduler(
         ) and not req.kv_committed_freed:
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
-        self._pending_chunked_abort_delay = 0
-        # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
-        # every other chunked abort answers as before.
-        _reason = getattr(self, "_pending_chunked_abort_reason", None)
-        self._pending_chunked_abort_reason = None
+    def _pp_abort_displaced(self, req) -> bool:
+        """27B-PP-SKIPOUT-1024 review A1: apply an abort recorded for a
+        displaced continuation (``pp_continuation_seat.mark_aborts``). PP0 holds
+        the same request in its waiting queue (PDFLIP-PARK) and aborts it there
+        at receipt, so it is never named again: the follower tears it down
+        instead of queueing a zombie. True = done."""
+        marked = getattr(req, _pp_seat.ABORT_ATTR, None) or (None,)
+        try:
+            Scheduler._pdflip_chunked_abort_release(self, req)
+        except Exception:  # noqa: BLE001 -- keep it listed and loud rather than lose it
+            logger.warning("PP-SLOT DISPLACED ABORT rid=%s: teardown raised, retried next step",
+                           getattr(req, "rid", "?"), exc_info=True)
+            return False
+        _reason = marked[0]
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(rid=req.rid) if _reason is None else AbortReq(rid=req.rid, finished_reason=_reason), req
         )
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        logger.info(
+            "PP-SLOT DISPLACED ABORT applied rid=%s pp_rank=%s: rows released without insert, no requeue "
+            "(27B-PP-SKIPOUT-1024 review A1)", req.rid, getattr(getattr(self, "ps", None), "pp_rank", "?"),
+        )
+        return True
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -17120,6 +17204,18 @@ class Scheduler(
             deliverable = (int(_dend) if _dend is not None
                            else deliverable + int(_synced_end) - int(outcome.synced))
             delivered = int(_synced_end)
+        # SHORT-FLIP-REPRICE-1024 (SOLL R2/R7/R11; 27B rc41 D 11:40:21-22, pdflip-21-215): off the END vote the
+        # record is SPAN-RELATIVE (deliverable = len(span), materialized from the span start), while every reader
+        # of the witness takes it as the ABSOLUTE depth. 215 read [53750, 70994) behind its L1.5-retained device
+        # prefix and got 17091: the witness said 17091, D-NORECOMPUTE priced 70999 - 17091 = 53908 > front X and
+        # sent a kurz request (real remainder 158) through P. The span start is added here (0 = the old reading:
+        # END vote, no stamp, a span from 0, or a stamp that cannot be this read's start).
+        from flliper.srt.pdflip import d_norecompute as _dnr_w
+
+        _base = _dnr_w.span_base(req, outcome)
+        if _base:
+            delivered += _base
+            deliverable += _base
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
@@ -17132,8 +17228,9 @@ class Scheduler(
         self._pdflip_store_short_seen = getattr(self, "_pdflip_store_short_seen", 0) + 1
         # DASHBOARD-AUS-IPC (30.09., FEHLT 5): the tokens these incomplete reads
         # delivered and could have delivered, summed (rankstats cache block)
-        self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered
-        self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable
+        # (store tokens: the span start a SHORT-FLIP-REPRICE base added is device-resident, not read)
+        self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered - _base
+        self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable - _base
         n = self._pdflip_store_short_seen
         # S18 (h16v3 1017_224250, pdflip-1-14/-15/-16): the store HELD the whole span (the probe's hit covers the
         # deliverable prefix; TAIL-CONSUME hit=118400) and D's read was cut by its own full arena (PDFLIP-READ-DEPTH
@@ -20051,13 +20148,23 @@ class Scheduler(
             # -- refusing a fresh chunked admission can wedge a request
             # mid-prefill, the #858 shape. The assert stays: it is the honest
             # watcher, and it has now named its own reachability.
+            #
+            # 27B-PP-SKIPOUT-1024 (SOLL R11): a follower told to mint a
+            # continuation while its slot is occupied holds a stale one PP0
+            # already let go; it leaves the slot here, its rows go back at the
+            # head of a later step (`_pp_drain_displaced_continuations`).
+            if getattr(adder, "displaced_resident_continuation", False):
+                _pp_seat.displace_resident(self, adder.new_chunked_req, can_run_list=can_run_list)  # review A2: never a seated one
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
         # LANES FIX 4 (NF metal 5): a continuation the lane floor holds in place is not in this batch -- no chunk of it was launched, so none
         # is counted (the head-of-step park waits for the count to drain; a leaked +1 kept every stage from ever parking it, and made
-        # the final chunk of a resumed one look like a middle chunk). Every other continuation is counted exactly as before.
-        if self.chunked_req is not None and not _lanes_p.held_without_seat(self.chunked_req, can_run_list):
+        # the final chunk of a resumed one look like a middle chunk).
+        # 27B-PP-SKIPOUT-1024: the same holds for EVERY continuation outside the batch, not only a lane-held one -- the #679 in-place
+        # park and the #992 not-named seat collected the same never-decremented +1 (the decrement walks `batch.reqs` only). The count is
+        # taken exactly when a chunk of it runs in this batch (managers/pp_continuation_seat.py `counts_middle_chunk`).
+        if _pp_seat.counts_middle_chunk(self.chunked_req, can_run_list):
             self.chunked_req.inflight_middle_chunks += 1
             # MIXED-D: lifetime-sticky chunk stamp. S50: plus, once, the request's whole uncached amount at its
             # first D chunk -- a BIG one (>= halbX) keeps every chunk unmixed (R6 rest), a SHORT one D only had to
@@ -20081,6 +20188,14 @@ class Scheduler(
                 tails=self.anchor_tails,
                 pp_rank=getattr(self.ps, "pp_rank", 0),
             )
+
+        # 27B-PP-SKIPOUT-1024 review S4: every member running a NOT-LAST chunk is
+        # tracked (chunked_req or an anchor tail) -- the watcher the old slot
+        # question in contains_last_prefill_chunk held by accident, stated (PP only).
+        _pp_seat.assert_no_unannounced_middle_chunk(
+            self, can_run_list, self.chunked_req, getattr(self, "anchor_tails", None) or (),
+            adder._told_last_chunk,
+        )
 
         _wk_t2 = time.perf_counter()  # admission done
         # DUAL-TP3PP3 stage 2 (pdflip/dual_decode_join.py, FLLIPER_PDFLIP_DUAL_DECODE_JOIN,
@@ -25273,6 +25388,13 @@ class Scheduler(
                                 chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
         # fnFL2 H42: an END-ANCHOR tail is finished with abort after its final
         # 1-grain forward (the running-request route), on every rank alike.
+        # 27B-PP-SKIPOUT-1024 review A1: a continuation displaced from the slot
+        # is in no queue, slot or batch -- every scan below misses it, and the
+        # #1180-W hold may return before them. Marked here (before that return),
+        # applied by the displaced drain once no launched chunk still writes.
+        _pp_seat.mark_aborts(
+            self, recv_req.rid, recv_req.abort_all, getattr(recv_req, "finished_reason", None)
+        )
         for _tail in _anchor_tails.abort_targets(
             getattr(self, "anchor_tails", None) or (),
             rid=recv_req.rid,

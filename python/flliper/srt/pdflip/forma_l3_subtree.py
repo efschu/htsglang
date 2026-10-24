@@ -58,7 +58,7 @@ MAX_PASSES = 16
 ANCHOR_SECURE_PER_FLUSH = 4
 
 #: refusals that mean "the leaf is in use or already gone" -- dequeued silently, the peel queues it again if needed
-_SILENT = ("detached", "not_on_device", "backuped", "locked", "not_device_leaf")
+_SILENT = ("detached", "not_on_device", "backuped", "locked", "not_device_leaf", "prefetch_anchor")
 
 
 class _State:
@@ -68,7 +68,7 @@ class _State:
         # worker: (hash, depth) -> passes pending
         self.wpend: Dict[Tuple[str, int], int] = {}
         self.n = {"queued": 0, "dropped": 0, "kept": 0, "anchor_save": 0, "worker_dropped": 0,
-                  "worker_pending": 0, "diverged": 0}
+                  "worker_pending": 0, "diverged": 0, "anchor_skipped": 0, "worker_veto": 0}
 
 
 _ST = _State()
@@ -116,6 +116,28 @@ def _device_locked(node: Any) -> bool:
 
 def _host_locked(node: Any) -> bool:
     return any(int(getattr(cd, "host_lock_ref", 0) or 0) > 0 for cd in node.component_data)
+
+
+def _prefetch_anchor(tree: Any, node: Any) -> bool:
+    """HLEAF-STALE-1024: ``node`` is the anchor (``last_host_node``) of a storage read still in flight on THIS rank.
+
+    METAL (NF rc39 49cfdde0d0, boot ..._1024_074822.D.log, D 08:01:52-08:02:03Z): pdflip-4-108's first read registered
+    on node 310 (matched=125952 = 119552 + 6400, the load-back of pdflip-4-107: a store-backed device leaf, no host
+    copy). The anchor lock the registration takes (``inc_host_lock_ref``) is a NO-OP on such a node --
+    ``full_component.acquire_component_lock(lock_host=True)`` returns on ``host_value is None`` -- so nothing held it:
+    TP0's broadcast dropped it (``S39 L3-DROP FORMA n=30 node=310 children=3``), the workers followed, and the read's
+    completion hung its 192 tokens + anchor under the dead node (``LEAF-SET DETACHED node=310
+    caller=.../check_prefetch_progress/_insert_helper_host``): node 314, unreachable from the root, in
+    ``evictable_host_leaves`` and on the mamba host LRU. TP1/TP2 died at their next idle walk (``H-leaf extra: [314]``
+    / ``1 stale nodes in host_leaves`` / ``mamba host LRU: +S3=set(), +lru={314}``). An in-flight read's anchor is a
+    holder like a lock: the leaf waits until the read has completed (the record leaves ``ongoing_prefetch``)."""
+    for rec in (getattr(tree, "ongoing_prefetch", None) or {}).values():
+        anchor = getattr(rec, "anchor_node", None)
+        if anchor is None and isinstance(rec, tuple) and rec:
+            anchor = rec[0]
+        if anchor is node:
+            return True
+    return False
 
 
 def _aux_device(tree: Any, node: Any) -> bool:
@@ -181,6 +203,8 @@ def _leaf_refusal(tree: Any, node: Any) -> Optional[str]:
         return "backuped"            # the ordinary demotion takes it, no claim needed
     if _device_locked(node):
         return "locked"
+    if _prefetch_anchor(tree, node):
+        return "prefetch_anchor"     # HLEAF-STALE-1024: an in-flight read inserts below it (silent, like a lock)
     if not tree._is_device_leaf(node):
         return "not_device_leaf"
     if not getattr(node, "l3_present", False):
@@ -327,6 +351,11 @@ def note_refused(tree: Any, node: Any, why: str) -> bool:
     its next broadcast, at most the tokens the peel still asked for (``tree._s39_peel`` = [need, queued])."""
     if not on() or _r12().role() != "host":
         return False
+    if _prefetch_anchor(tree, node):
+        # HLEAF-STALE-1024 S1 (review): the anchor of TP0's in-flight read cannot leave at the next broadcast -- not
+        # queued, so room_pending() promises no room S39 will not deliver and the peel pays with the next leaf
+        _ST.n["anchor_skipped"] += 1
+        return False
     key = id(node)
     if key in _ST.queue:
         return True
@@ -354,6 +383,9 @@ def queue_for_room(tree: Any, nodes: List[Any], why: str = "kv_compact") -> int:
     n = 0
     for node in nodes:
         if node is None:
+            continue
+        if _prefetch_anchor(tree, node):
+            _ST.n["anchor_skipped"] += 1     # HLEAF-STALE-1024 S1: see note_refused
             continue
         key = id(node)
         if key not in _ST.queue:
@@ -416,6 +448,20 @@ def flush_at_broadcast(tree: Any = None) -> int:
                     r12.kept_note("s39_l3drop")
                     _kept(t, node, ent, "worker_cannot_delete", " holder=%s" % (getattr(stuck, "id", "?"),))
                     continue
+            # HLEAF-STALE-1024 A1 (review): a worker that could not follow this drop -- its own in-flight read
+            # anchors the leaf or a node below it, or its subtree holds a node on its device / un-backed / with a
+            # live aux state (what its apply_drop answers with DIVERGED) -- publishes the key (``s39``). TP0 leaves
+            # the drop alone, one decision for the group; dequeued (no room promised), the peel asks again.
+            veto = r12.worker_s39_veto_keys(t)
+            if veto:
+                held = next((d for d in [node] + list(order) if r12.node_key(d) in veto), None)
+                if held is not None:
+                    _ST.queue.pop(key, None)
+                    _ST.n["worker_veto"] += 1
+                    _ST.n["dequeued"] = _ST.n.get("dequeued", 0) + 1   # 27B: no KVLEITER census here
+                    _ST.last_dequeue = "worker_veto"
+                    r12.kept_note("s39_worker_veto")
+                    continue
             ok, awhy = _anchor_ready(t, node)
             if not ok:
                 _kept(t, node, ent, awhy)
@@ -462,6 +508,8 @@ def apply_drop(tree: Any, node: Any, key: Tuple[str, int]) -> str:
         return _diverged(node, key, why[0])
     if busy is None and _device_locked(node):
         busy = "locked"
+    if busy is None and _prefetch_anchor(tree, node):
+        busy = "prefetch_anchor"     # HLEAF-STALE-1024: this worker's own read still inserts below it
     if busy is None and _in_flight(tree, node):
         busy = "write_in_flight"
     if busy is not None:

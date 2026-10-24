@@ -431,6 +431,11 @@ def remainder(req, records) -> Optional[int]:
     if delivered is None:
         have = (records or {}).get(str(getattr(req, "rid", "")))
         delivered = int(getattr(have, "materialized", have) or 0) if have is not None else None
+        if delivered is not None:
+            # SHORT-FLIP-REPRICE-1024: an annotated record is span-relative -- its span start makes it a depth
+            from flliper.srt.pdflip.d_norecompute import span_base as _span_base
+
+            delivered += _span_base(req, have)
     ids = getattr(req, "full_untruncated_fill_ids", None)
     total = len(ids) if ids is not None else span
     if not total or delivered is None:

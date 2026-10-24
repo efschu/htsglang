@@ -251,7 +251,7 @@ def test_call_edge_the_stamp_rides_the_counted_chunk_and_runs_before_the_gate():
     t = ast.parse((SRT / "managers/scheduler.py").read_text())
     raw = next(n for n in ast.walk(t) if isinstance(n, ast.FunctionDef) and n.name == "_get_new_batch_prefill_raw")
     src = ast.unparse(raw)
-    i = src.index("if self.chunked_req is not None and (not _lanes_p.held_without_seat(self.chunked_req, can_run_list)):")
+    i = src.index("if _pp_seat.counts_middle_chunk(self.chunked_req, can_run_list):")  # 27B-PP-SKIPOUT-1024
     j = src.index("_mds_stamp.stamp_chunked(self.chunked_req)")
     k = src.index("self._mixed_d_agreed(")
     assert i < j < k
