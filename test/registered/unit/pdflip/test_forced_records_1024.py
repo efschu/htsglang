@@ -385,7 +385,8 @@ class CardSetPick(unittest.TestCase):
 
     def test_the_launcher_reads_all_d_samples_through_the_pick(self):
         src = open(LAUNCHER_SRC, encoding="utf-8").read()
-        self.assertIn('pick_d_residue_record(\n        host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept), cards)', src)
+        self.assertIn('_dc_rows = host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept)\n'
+                      '    _dc_rec_d, _dc_pick = pick_d_residue_record(_dc_rows, cards)', src)
 
 
 class LauncherWiring(unittest.TestCase):

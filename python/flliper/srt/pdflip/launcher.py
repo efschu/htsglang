@@ -26688,8 +26688,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # newest sample alone would hand dual a 2-card duo sample, which dc_residue_from_record refuses card by card
     # (-> the constant, ~1 GiB per card off P). Prefer the newest sample of EXACTLY this boot's card set, then the
     # newest that covers it (the pre-#227 answer), then the newest at all (for the refusal's wording).
-    _dc_rec_d, _dc_pick = pick_d_residue_record(
-        host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept), cards)
+    _dc_rows = host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept)
+    _dc_rec_d, _dc_pick = pick_d_residue_record(_dc_rows, cards)
+    # named only when the pick is NOT the plain newest sample (the pre-#227 line stays byte-identical otherwise)
+    _dc_pick_note = ("" if _dc_rec_d is None or _dc_rec_d is max(_dc_rows, key=lambda e: str(e.get("at", "")))
+                     else f" [#227 card-set pick, {_dc_pick}]")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.pdflip_weight_source)
     # D-EXPECT: group P's measured dormant residue, same calibration identity,
@@ -26702,7 +26705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"in the sidecar -- samples of another checkpoint or form are not this "
             f"boot's residue (PDFLIP-FORM; xsn418 died W19 on fnFL2x144's) -> constant")
     elif calib_sample_accept is not None:
-        _dc_record_prov += f" [{_dc_pick}]"
+        _dc_record_prov += _dc_pick_note
         _dc_record_prov += (
             f" [PDFLIP-FORM calibration identity: {boot_form.model}, "
             f"{' '.join(a + '=' + getattr(boot_form, a) for a in pdflip_form.RESIDUE_AXES)}]")
