@@ -13911,8 +13911,10 @@ class Front:
                 # the fix it sat on D with a seat and D's HOL backfill let the kurz one pass; held in the front it would
                 # otherwise route every younger kurz arrival to P after --drain-deadline-s). The seat order itself stays:
                 # ``_arrival_seat_taken`` still counts the held head as a seat owed.
-                _skip = self.__dict__.get("_d_admit_skip") or {}
-                older = [q for q in older if _skip.get(getattr(q, "rid", None)) != Front.D_LINE_KV_HOLD_NOTE]
+                # Review A1 (R2/R7): the entries BEHIND that head cannot sit before it (law 2) -- they do not hold
+                # the kurz arrival either (``_d_line_behind_kv_hold``)
+                _behind = Front._d_line_behind_kv_hold(self)
+                older = [q for q in older if getattr(q, "rid", None) not in _behind]
             if not older:
                 return
             if not told:
@@ -13978,10 +13980,11 @@ class Front:
         # D-LINE-YIELD -- so it does not count, exactly as the ARRIVAL-SEAT branch below skips a blocked waiter.
         # The admitter's own verdict, recorded per rid (``_d_admit_skip``), never a re-derivation here.
         skipped = self.__dict__.get("_d_admit_skip") or {}
+        _behind = Front._d_line_behind_kv_hold(self)   # HANDOVER-KVFITS review A1: behind a kv-held head, no seat
         for q in list(getattr(self, "_ready_for_d", ()) or ()):
             if getattr(q, "rid", None) == rid or getattr(getattr(q, "fut", None), "done", lambda: True)():
                 continue
-            if getattr(q, "rid", None) in skipped:
+            if getattr(q, "rid", None) in skipped or getattr(q, "rid", None) in _behind:
                 continue
             if Front._sa_key(self, q) < k:
                 return True
@@ -14014,6 +14017,34 @@ class Front:
     # ------------------------------------------------------------------ HANDOVER-KVFITS 1024 (the D line's device KV)
     #: the d_admitter's skip note for a D-line head it holds for D's DEVICE KV (``_d_admit_skip``)
     D_LINE_KV_HOLD_NOTE = "kv_device"
+
+    def _d_line_behind_kv_hold(self) -> set:
+        """HANDOVER-KVFITS review A1 (SOLL R2/R7): the rids of the D line from the oldest head the admitter holds for D's
+        device KV (skip note ``kv_device``) backwards -- that head and every entry behind it by the SA order key. None
+        of them takes a seat before the held head (law 2) except by the admitter's own backfill, so none of them holds a
+        kurz arrival at the short gate (:meth:`_short_gate_wait_by_age`) or a debt's settlement
+        (:meth:`_older_waiter_than`). Empty when no head is held. The admitter's verdict, never a re-derivation."""
+        skip = self.__dict__.get("_d_admit_skip") or {}
+        line = [q for q in list(getattr(self, "_ready_for_d", ()) or ())
+                if not getattr(getattr(q, "fut", None), "done", lambda: True)()]
+        held = [q for q in line if skip.get(getattr(q, "rid", None)) == Front.D_LINE_KV_HOLD_NOTE]
+        if not held:
+            return set()
+        k0 = min(Front._sa_key(self, q) for q in held)
+        return {getattr(q, "rid", None) for q in line if Front._sa_key(self, q) >= k0}
+
+    def _d_line_entry_kurz(self, q: "Pending") -> bool:
+        """HANDOVER-KVFITS review A2 (SOLL R2): a D-line entry D prefills itself as KURZ -- ``d_direct`` (QUEUED-SHORT,
+        SHORT-IN-FLIP, SK, DECODE-COLLECT to-d, D-SHORT-DRAIN, X-IDLE-REGRANT) with u below halbX of its own X
+        (``phase_policy.classify_arrival``). A hand-off after P (leg 1 done) is never kurz here."""
+        if not getattr(q, "d_direct", False):
+            return False
+        try:
+            unc = int(getattr(q, "est_uncached", 0) or 0)
+            x = int(getattr(q, "x_set", 0) or 0) or int(self.tp_prefill_max_tokens)
+            return phase_policy.classify_arrival(unc, x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ
+        except Exception:  # noqa: BLE001 -- no class readable: not kurz (it keeps the bound, as before)
+            return False
 
     def _d_kv_hold_st(self) -> Dict[str, float]:
         """HANDOVER-KVFITS 1024: the D-line heads held for D's device KV -> the time their hold began."""
@@ -14063,7 +14094,10 @@ class Front:
             if not cached:
                 return 0, 0
             t_read = float(cached[0])
-        clip = _asr.default_decode_clip()
+        try:   # review S5: the clip D published with THIS reading (as the need in _arrival_seat_kv), else the default
+            clip = int(basis.get("decode_clip") or 0) or _asr.default_decode_clip()
+        except (TypeError, ValueError):
+            clip = _asr.default_decode_clip()
         tokens, n = 0, 0
         for s in list(getattr(self, "_d_seats_live", ()) or ()):
             r = getattr(s, "rid", None)
@@ -14107,8 +14141,11 @@ class Front:
         holds = Front._d_kv_hold_st(self)
         live = {getattr(q, "rid", None) for q in list(self._ready_for_d)
                 if not getattr(getattr(q, "fut", None), "done", lambda: True)()}
+        first_hold = self.__dict__.setdefault("_d_kv_hold_first", {})
         for r in [r for r in holds if r not in live]:
             holds.pop(r, None)
+        for r in [r for r in first_hold if r not in live]:
+            first_hold.pop(r, None)   # review S1: the backfill clock lives while the entry is in the D line
         if not (getattr(self, "_d_seats_live", None) or ()):
             Front._d_line_kv_hold_end(self, p.rid, "nothing runs on D: no finish can free a row, it is never held")
             return False
@@ -14121,6 +14158,11 @@ class Front:
             return False
         if fits:
             Front._d_line_kv_hold_end(self, p.rid, why)
+            return False
+        if basis.get("running") is not None and not basis.get("running"):
+            # review S3: D runs no decode at all in this reading -- no finish can free a row for it (all seats are
+            # hand-offs D refused or parked): never held, D's own admission decides as before
+            Front._d_line_kv_hold_end(self, p.rid, "D runs no decode: no finish can free a row, it is never held")
             return False
         st = self._asr_st()
         if _asr.age_plan_enabled():
@@ -14138,6 +14180,7 @@ class Front:
         (st.get("dline_claims") or {}).pop(p.rid, None)
         first = p.rid not in holds
         t0 = holds.setdefault(p.rid, now)
+        first_hold.setdefault(p.rid, t0)    # review S1: never reset by a release/re-hold while it stays in the line
         self.counters["d_admit_kv_held"] += 1
         n = self.counters["d_admit_kv_held"]
         if first or n % 200 == 0:
@@ -14164,8 +14207,9 @@ class Front:
         :meth:`_d_line_kv_probe`) is moved to the head and seated; the held head keeps its place for the next pass.
         BOUNDED (``_asr.backfill_allowed``, the ARRIVAL-SEAT rule #246): once the head has waited the wait bound
         (``--d-wait-bound-s``, else ``w_s``; counted from D's phase start at the earliest) no younger hand-off
-        overtakes it -- the rows freed by the next finish stay for it, so it cannot starve behind backfills. A kept
-        SHORT (SK re-price) is never a backfill candidate here. None = nobody backfills."""
+        overtakes it -- the rows freed by the next finish stay for it, so it cannot starve behind backfills. The clock
+        is the head's first hold in the D line (review S1). A KURZ D-direct entry (review A2, R2) is not bound by it;
+        a kept SHORT is re-priced first (SK, as in the SA backfill). None = nobody backfills."""
         from flliper.srt.pdflip import seat_age as _sa
 
         if not _sa.enabled() or len(self._ready_for_d) < 2:
@@ -14173,11 +14217,22 @@ class Front:
         t0 = Front._d_kv_hold_st(self).get(head.rid)
         if t0 is None:
             return None
+        # review S1: the clock is the head's FIRST hold in the D line (a fit-then-re-hold does not restart it)
+        t0 = (self.__dict__.get("_d_kv_hold_first") or {}).get(head.rid, t0)
         bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
-        if not _asr.backfill_allowed(time.time() - max(float(t0), float(getattr(self, "t_awake", 0.0) or 0.0)), bound):
-            return None
+        bound_open = _asr.backfill_allowed(time.time() - max(float(t0), float(getattr(self, "t_awake", 0.0) or 0.0)),
+                                           bound)
         for q in [q for q in list(self._ready_for_d) if q is not head][:7]:
-            if q.fut.done() or getattr(q, "short_kept", False):
+            if q.fut.done():
+                continue
+            # review A2 (SOLL R2): a KURZ D-direct entry passes a kv-held head whenever it fits, past the bound too --
+            # PRIO=ALTER stays with the head's AGE PLAN (it displaces younger decodes); halb/gross keep the bound
+            if not bound_open and not Front._d_line_entry_kurz(self, q):
+                continue
+            if getattr(q, "short_kept", False) and self._sk_admission_reprice(q):
+                # SK (#243 (a)), as in the SA backfill: a kept SHORT is re-priced first; gone presence -> P
+                self._ready_for_d_drop(q)
+                self._sync_batch_gate()
                 continue
             if not self._d_budget_fits(q.est_prompt, reading, q.leg1_prompt_tokens):
                 continue
@@ -16957,6 +17012,7 @@ class Front:
             "running": set(str(r) for r in _rr) if isinstance(_rr, (list, tuple)) else None,
             # NF-C-SITZ 1021: the decodes D can park NOW (spec decode: the batch's back) -- None = an old D
             "displaceable": set(str(r) for r in _dr) if isinstance(_dr, (list, tuple)) else None,
+            "decode_clip": clip,   # HANDOVER-KVFITS review S5: the D-line debit charges D's own clip of this reading
         }
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
