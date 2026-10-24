@@ -251,3 +251,38 @@ def test_the_fix_needs_220s_span_start_on_the_landed_record(monkeypatch):
     _tick(s, r)
     recs = rvp.take_requests(rvp.needs_p_dir())
     assert s.waiting_queue == [] and len(recs) == 1 and recs[0]["d_extent"] == 26844   # (keep_on_d clears the witness)
+
+
+# ------------------------------------------------------------------- Qwen #220 risk 1: the non-collective read's start
+
+
+def test_both_intake_calls_stamp_the_span_start_on_the_record():
+    """Qwen-Nachpruefung #220, Risiko 1: on NF the NON-collective intake (even-TP / symmetric host tier, TP=1) passed no
+    span start -> its record stayed span-relative -> a read behind a device rest (L1.5) under-read the depth (the 215
+    class, 53908 instead of 158). Both calls of ``Scheduler._prefetch_kvcache`` now carry ``_matched_len`` to the
+    operation's stamp (27B: ``key_base``; NF: ``span_start``, a stamp-only argument that never enters the Form A END
+    vote), and the tree stamps whichever the call carried. A caller passing neither (decode_hicache_mixin restores)
+    stays unstamped by name: the old reading, which over-reads the remainder, never under-reads it."""
+    import inspect
+    import re
+
+    from flliper.srt.mem_cache import unified_radix_cache as urc
+
+    src = inspect.getsource(sched_mod.Scheduler._prefetch_kvcache)
+    calls = re.findall(r"self\.tree_cache\.prefetch_from_storage\((.*?)\n\s*\)\n", src, flags=re.S)
+    assert len(calls) == 2, len(calls)
+    for c in calls:
+        assert ("key_base=int(_matched_len)" in c) or ("span_start=int(_matched_len)" in c), c
+    tree = inspect.getsource(urc.UnifiedRadixCache.prefetch_from_storage)
+    assert ("_ss = span_base if span_base is not None else key_base" in tree
+            or "_ss = span_base if span_base is not None else span_start" in tree)
+
+
+def test_mutant_an_unstamped_record_behind_a_device_rest_reads_the_215_class():
+    """Danger direction UNDER-reading the depth (-> a kurz request priced gross, an unneeded flip): the same 215 record
+    without its stamp gives the span-relative witness back (NF non-collective before this commit)."""
+    rec = PrefetchOutcome(0, matched=17091, deliverable=17244, synced=17091)
+    req = types.SimpleNamespace(rid="pdflip-21-215", full_untruncated_fill_ids=list(range(70999)))
+    assert dn.store_read_depth(req, rec) == 17091            # unstamped: relative (70999 - 17091 = 53908)
+    rec.span_start = 53750
+    assert dn.store_read_depth(req, rec) == 70841            # stamped: absolute (70999 - 70841 = 158)
