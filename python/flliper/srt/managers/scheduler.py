@@ -247,6 +247,7 @@ from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
+from flliper.srt.pdflip import r2_kurz_chunk as _pdflip_r2_kurz_chunk  # R2-KURZ-CHUNK 1024 (SOLL R2/R7)
 from flliper.srt.pdflip import mixed_d_short as _mds_stamp  # MIXED-D chunk stamp + S50 total (short-chunked)
 from flliper.srt.pdflip import store_reprobe_epoch as _store_reprobe_epoch  # REPROBE-1023 (SOLL R11)
 from flliper.srt.managers import pdflip_told_ack_early as _pdflip_told_ack_early  # S50 TOLD-ACK-EARLY
@@ -18371,7 +18372,11 @@ class Scheduler(
                                 count,
                             )
                         self.chunked_req.truncate_prefix_to(told)
-                with _lanes_p.chunk_scope(adder, self.chunked_req):
+                # R2-KURZ-CHUNK 1024 (SOLL R2/R7): the waiting kurz requests that fit whole next to the continuation's
+                # floor get their share of this pass's chunk before the continuation takes it (pdflip/r2_kurz_chunk.py).
+                with _lanes_p.chunk_scope(adder, self.chunked_req), _pdflip_r2_kurz_chunk.reserve_scope(
+                    adder, self, self.chunked_req
+                ):
                     self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # #959 THE RESIDENCY FACT, STAMPED WHERE IT IS SETTLED. Both branches
