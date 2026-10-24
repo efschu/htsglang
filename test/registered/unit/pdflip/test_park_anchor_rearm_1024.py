@@ -58,9 +58,9 @@ needs_gcc = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 # ---------------------------------------------------------------------------------------------------------------------
 # a 3-rank collective: threads + a barrier all-reduce (MAX). A rank that skips or adds a collective breaks the barrier.
 class _Group:
-    def __init__(self, n):
+    def __init__(self, n, timeout=20):
         self.n = n
-        self.b = threading.Barrier(n, timeout=20)
+        self.b = threading.Barrier(n, timeout=timeout)
         self.vals = [None] * n
         self.calls = [0] * n
         self.shapes = []
@@ -136,8 +136,10 @@ def test_keys_order_end_first_deeper_first():
 
 
 def _run_all(n, fn):
-    """fn(rank, group_max) on n threads; returns ({rank: result}, {rank: exception}) -- every rank's outcome."""
-    g = _Group(n)
+    """fn(rank, group_max) on n threads; returns ({rank: result}, {rank: exception}) -- every rank's outcome. A rank
+    that leaves early is NOT announced to the others (no barrier abort -- an abort would also break peers that are
+    just waking from a completed collective): they meet the collective's bound (3 s, the analogue of bounded_wait)."""
+    g = _Group(n, timeout=3)
     res, err = {}, {}
 
     def _w(r):
@@ -145,10 +147,6 @@ def _run_all(n, fn):
             res[r] = fn(r, g.max_for(r))
         except BaseException as exc:  # noqa: BLE001
             err[r] = exc
-            try:
-                g.b.abort()
-            except Exception:  # noqa: BLE001
-                pass
 
     th = [threading.Thread(target=_w, args=(r,)) for r in range(n)]
     for t in th:
