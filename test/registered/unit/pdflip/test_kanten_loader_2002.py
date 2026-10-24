@@ -72,9 +72,9 @@ class RealCatalog(unittest.TestCase):
     def test_status_block_counts(self):
         k = self.cat["kanten"]
         self.assertTrue(k["geladen"])
-        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"]), (139, 52, 87))
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"]), (140, 52, 88))
         self.assertEqual(k["edges_without_evidence"], WITHOUT_EVIDENCE)
-        self.assertEqual(k["kanten_belegt"], 139)
+        self.assertEqual(k["kanten_belegt"], 140)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
         self.assertEqual(k["ziel_unbekannt"], ZIEL_UNBEKANNT)
         self.assertEqual(k["wertbedingt"], 25)
