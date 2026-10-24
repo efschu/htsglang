@@ -101,10 +101,13 @@ def _floors(source="MEASURED-D", values=None, store=None):
     return fn
 
 
-def _d_pass(lines, floors, dormant=None):
+def _d_pass(lines, floors, dormant=None, single="0"):
     cards = _cards()
     dc = dict(DORMANT if dormant is None else dormant)
     env = {CG.USER_RESERVE_ENV: json.dumps(RESERVE)}  # a reserve published for the front is in the env
+    # VOTE-LINE-SINGLE (desk/27b-vote-line-single-1024): this file pins the FLOOR-line book (the switch-off path,
+    # FLLIPER_PDFLIP_VOTE_LINE_SINGLE=0, = b130e9dab4); the single line is pinned in test_27b_vote_line_single_1024
+    env[BR.VOTE_LINE_SINGLE_ENV] = single
     with mock.patch.object(CB, "floors_for_cards", floors), mock.patch.dict(os.environ, env):
         kw = dict(L.booked_rest_kwargs(cards, F.PROFILE_QWEN27B, "D", lines.append))
         budgets = L.budgets_from_dc(

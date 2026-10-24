@@ -57,9 +57,10 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         # posts under the P0 torch cache cap, pdflip/budget_rest.py --capped);
         # PDFLIP-EXTEND-CAP 29.09.: the extend's allocated transient per row under the cap
         # PP-POSTEN 29.09.: the measured YaRN x2 stage_fixed increment (a NEW measurement)
+        # VOTE-LINE-SINGLE 24.10.: the extend's measured non-row part above rate x rows (a NEW measurement)
         self.assertEqual(set(row.constants) - {"D_AWAKE_REST_BOOKED_MIB", "D_TORCH_CAP_OTHER_MIB",
                                                "D_AWAKE_REST_CAPPED_MIB", "D_EXTEND_CAP_PER_ROW_MIB",
-                                               "P_PP_STAGE_FIXED_YARN2_DELTA_MIB"},
+                                               "P_PP_STAGE_FIXED_YARN2_DELTA_MIB", "D_EXTEND_VOTE_FIXED_MIB"},
                          set(OLD_27B))
         for n, v in OLD_27B.items():
             got = row.constant(n)
