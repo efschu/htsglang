@@ -140,9 +140,19 @@ class Deliverable(unittest.TestCase):
         i = src.index("def rem_total_tokens(self)")
         blk = src[i:i + 1500]
         # nf-next-1006-01: the adder reads the deliverable count THROUGH the cap-aware wrapper
-        # (deliverable_evictable_or minus the evictable tokens above the engaged residency cap)
+        # (deliverable_evictable_or minus the evictable tokens above the engaged residency cap).
+        # KVOFFSET-1024 review S4 moved the pool terms into the shared module function
+        # ``lifetime_available_and_evictable`` (the one formula D publishes from); the adder calls it
+        # with its tree cache and the hybrid-SSM flag, and that function's hybrid-SSM branch is
+        # the cap-aware wrapper.
+        self.assertIn("lifetime_available_and_evictable(", blk)
+        self.assertIn("self.is_hybrid_ssm_cache", blk)
+        j = src.index("def lifetime_available_and_evictable(")
+        fn = src[j:j + 2500]
+        k = fn.index("if is_hybrid_ssm:")
         self.assertIn(
-            "deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)", blk
+            "deliverable_evictable_cap_aware_or(\n            tree_cache, tree_cache.full_evictable_size)",
+            fn[k:k + 400],
         )
 
 
