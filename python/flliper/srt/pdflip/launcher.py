@@ -411,6 +411,9 @@ DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
 #: the tag has travelled with the exchange since, and P's budget paid for
 #: bytes that are no longer there.
 DC_RECORD_MARGIN_MIB = 256
+#: #227 R1: the named log marker of a boot whose D maximum rests on fewer than this many D sleeps.
+DC_MAX_MIN_SLEEPS = 2
+DC_ONE_SLEEP_MARK = "DC-ONE-SLEEP-BOOT"
 #: ``=0`` prices the xsn14 constant again (the pre-#1444 form).
 DC_RECORD_ENV = "FLLIPER_PDFLIP_DC_D_RECORD"
 
@@ -539,7 +542,13 @@ def dc_residue_max_from_records(rows: Sequence[Dict[str, object]], cards: Sequen
     :data:`DC_RECORD_MARGIN_MIB` (the #1444 form: its later sleeps were never recorded -- measured growth
     +244..+484 MiB, so the bare first sleep would book too little). ``(None, why)`` when no exact-card-set
     boot exists, or when none of the selected boots carries the kind (all legacy: the caller keeps the
-    pre-#227 newest-sample form, byte for byte)."""
+    pre-#227 newest-sample form, byte for byte).
+
+    R1: a measured boot's samples carry ``vram_residue_sleeps`` (how many D sleeps they rest on). A boot with
+    FEWER than :data:`DC_MAX_MIN_SLEEPS` has not reached its maximum yet (it ended early; the growth after the
+    first sleep was measured up to +484 MiB), so it contributes first sleep + :data:`DC_RECORD_MARGIN_MIB` like a
+    legacy boot, named :data:`DC_ONE_SLEEP_MARK`. A measured boot WITHOUT the counter (written by a build
+    between the first #227 head and R1 -- none ran on metal) keeps the kind-based rule: bare."""
     n = P_DORMANT_EXPECT_N if n is None else int(n)
     want = {c.uuid for c in cards}
     by_boot: Dict[str, List[Dict[str, object]]] = {}
@@ -563,11 +572,16 @@ def dc_residue_max_from_records(rows: Sequence[Dict[str, object]], cards: Sequen
     parts = []
     for tag, rs in boots:
         measured = any(x.get("vram_residue_kind") for x in rs)
-        add = 0 if measured else DC_RECORD_MARGIN_MIB
+        counted = [int(x["vram_residue_sleeps"]) for x in rs
+                   if isinstance(x.get("vram_residue_sleeps"), int) and not isinstance(x.get("vram_residue_sleeps"), bool)]
+        one_sleep = bool(measured and counted and max(counted) < DC_MAX_MIN_SLEEPS)
+        add = DC_RECORD_MARGIN_MIB if (not measured or one_sleep) else 0
         for u in want:
             v = max(int(x["vram_residue_mib"][u]) for x in rs) + add
             out[u] = max(out.get(u, 0), v)
         kind = ("max_over_sleeps" if any(x.get("vram_residue_kind") == "max_over_sleeps" for x in rs)
+                else f"{DC_ONE_SLEEP_MARK} first sleep +{DC_RECORD_MARGIN_MIB}: {max(counted)} D sleep seen, "
+                     f"the maximum is not reached yet" if one_sleep
                 else "first_sleep" if measured else f"LEGACY first sleep +{DC_RECORD_MARGIN_MIB}")
         parts.append(f"{tag} [{kind}]")
     return out, (f"MAX over all D sleeps of the newest {len(boots)} of {len(by_boot)} boot(s) of exactly this "
@@ -26810,6 +26824,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{'RECORD' if _dc_from_record is not None else 'CONSTANT'}: {_dc_record_prov}; "
         f"reserve incl. {slack_mib} MiB slack = "
         + ", ".join(f"nvml{c.nvml_index} {dc_expect_d[c.uuid]}" for c in cards) + " MiB")
+    if _dc_from_record is not None and DC_ONE_SLEEP_MARK in _dc_record_prov:
+        log(f"#227 R1 {DC_ONE_SLEEP_MARK}: at least one of the boots behind this D reserve saw fewer than "
+            f"{DC_MAX_MIN_SLEEPS} D sleeps (its maximum is not reached yet) -> its first sleep is booked with "
+            f"the {DC_RECORD_MARGIN_MIB} MiB margin, not bare (boots listed in the DC-RESIDUE line above)")
     refusals.flush(log)         # AP1 1006: the W19 twin borrow (dc_measured_d_mib has no logger); nothing without --force
     if ns.transport == "nccl":
         log(

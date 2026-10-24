@@ -21315,6 +21315,11 @@ class Front:
             # the launcher books the per-boot maximum bare. A sample WITHOUT the kind is a legacy first-sleep
             # value and keeps the #1444 margin (launcher.dc_residue_max_from_records).
             rec["vram_residue_kind"] = "first_sleep"
+            # #227 R1: how many D sleeps this sample rests on (the first sleep = 1); a later sample carries the
+            # count at its writing (_note_d_residue_reading). The launcher books a boot's maximum bare only
+            # when it rests on >= 2 sleeps; a one-sleep boot has not reached its maximum yet (measured growth
+            # +244..+484 MiB) and keeps the first sleep + margin (launcher.dc_residue_max_from_records).
+            rec["vram_residue_sleeps"] = 1
         self.dormant_image[group] = rec
         logger.info("%s", host_ledger.format_dormant_image(rec))
         if persist:
@@ -21331,6 +21336,9 @@ class Front:
           first-sleep record with ``vram_residue_mib`` = the per-card maximum so far and
           ``vram_residue_kind="max_over_sleeps"`` -- so the next boot books what D really held (measured on
           24.10.: int4ar 1258 -> 1600, int8 5090 1762 -> 2246), not the first sleep plus a margin.
+        * R1: every reading counts the boot's D sleeps (``vram_residue_sleeps``); the SECOND sleep writes a sample
+          even when it raised nothing, so a boot that saw two sleeps is told apart from one that saw one (the
+          launcher books only the former bare). Later samples carry the count at their writing.
         The L1.5 hold is stripped exactly as at the first sleep (L15-13c). Returns the appended sample."""
         if src != "D" or not dc or getattr(self, "weights_resident", False):
             return None
@@ -21356,19 +21364,23 @@ class Front:
                     "(a LATER D sleep above what P's budget booked; W19 grades only the first sleep -- no stop "
                     "here, the next boot books this boot's maximum, #227)",
                     int(getattr(self, "epoch", 0)), uuid, w, int(res), w - int(res))
+        # #227 R1: this boot's D sleep count (the first sleep, read by sample_dormant_image, is 1).
+        n_sleeps = int(self.__dict__.get("_d_sleeps_seen", 1)) + 1
+        self.__dict__["_d_sleeps_seen"] = n_sleeps
         cur = self.__dict__.setdefault("_d_residue_max", {u: int(v) for u, v in first["vram_residue_mib"].items()})
         grew = {u: w for u, w in vals.items() if u in cur and w > int(cur[u])}
-        if not grew:
+        if not grew and n_sleeps != 2:
             return None
         cur.update(grew)
         rec = dict(first)
         rec["vram_residue_mib"] = dict(cur)
         rec["vram_residue_kind"] = "max_over_sleeps"
         rec["vram_residue_max_epoch"] = int(getattr(self, "epoch", 0))
+        rec["vram_residue_sleeps"] = n_sleeps
         rec["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.counters["dc_max_sample"] += 1
-        logger.info("PDFLIP-DC-MAX group=D epoch=%d boot maximum now %s MiB (raised: %s) -- max_over_sleeps "
-                    "sample appended for the next boot's D reserve (#227)", rec["vram_residue_max_epoch"],
+        logger.info("PDFLIP-DC-MAX group=D epoch=%d sleeps=%d boot maximum now %s MiB (raised: %s) -- max_over_sleeps "
+                    "sample appended for the next boot's D reserve (#227)", rec["vram_residue_max_epoch"], n_sleeps,
                     {u: v for u, v in sorted(cur.items())}, {u: v for u, v in sorted(grew.items())})
         if getattr(self, "measured_record", None):
             self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)

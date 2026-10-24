@@ -426,6 +426,7 @@ class MaxOverSleeps(Base):
     def first(self, a=1258, b=1258):
         rec = d_sample("int4arA", {self.U[0]: a, self.U[1]: b})
         rec["vram_residue_kind"] = "first_sleep"
+        rec["vram_residue_sleeps"] = 1                                         # #227 R1: the sleep counter
         return rec
 
     def stub(self, reserve=1578):
@@ -435,14 +436,19 @@ class MaxOverSleeps(Base):
 
     def test_a_later_sleep_that_raises_a_card_appends_the_boot_maximum(self):
         st, note = self.stub()
-        self.assertIsNone(note({self.U[0]: 1250, self.U[1]: 1258}))           # nothing new
+        rec2 = note({self.U[0]: 1250, self.U[1]: 1258})                        # nothing new, but the 2nd sleep (R1)
+        self.assertEqual((rec2["vram_residue_mib"], rec2["vram_residue_sleeps"]),
+                         ({self.U[0]: 1258, self.U[1]: 1258}, 2))
         rec = note({self.U[0]: 1400, self.U[1]: 1300})
+        self.assertEqual(rec["vram_residue_sleeps"], 3)
         self.assertEqual(rec["vram_residue_mib"], {self.U[0]: 1400, self.U[1]: 1300})
         self.assertEqual(rec["vram_residue_kind"], "max_over_sleeps")
         rec = note({self.U[0]: 1350, self.U[1]: 1600})
         self.assertEqual(rec["vram_residue_mib"], {self.U[0]: 1400, self.U[1]: 1600})
         self.assertEqual([x["vram_residue_mib"] for x in self.samples()],
-                         [{self.U[0]: 1400, self.U[1]: 1300}, {self.U[0]: 1400, self.U[1]: 1600}])
+                         [{self.U[0]: 1258, self.U[1]: 1258}, {self.U[0]: 1400, self.U[1]: 1300},
+                          {self.U[0]: 1400, self.U[1]: 1600}])
+        self.assertEqual([x["vram_residue_sleeps"] for x in self.samples()], [2, 3, 4])
         self.assertEqual(st.counters["dc_over_reserve"], 1)                    # 1600 > 1578, named, no stop
 
     @unittest.skipUnless(os.path.exists(os.path.join(ROOT, "python", "flliper", "srt", "pdflip", "l15_plan.py")),
@@ -486,7 +492,7 @@ class MaxOverSleeps(Base):
         rows.append(legacy)
         b = dict(self.first(), boot_tag="new", at="2026-10-25T00:00:00Z")
         rows += [b, dict(b, vram_residue_kind="max_over_sleeps", vram_residue_mib={self.U[0]: 1500, self.U[1]: 1400},
-                         at="2026-10-25T01:00:00Z")]
+                         vram_residue_sleeps=3, at="2026-10-25T01:00:00Z")]
         vals, prov = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
         self.assertEqual(vals, {self.U[0]: 1514, self.U[1]: 1514})              # legacy 1258+256 still dominates
         self.assertIn("LEGACY first sleep +256", prov)
@@ -517,6 +523,66 @@ class MaxOverSleeps(Base):
         self.assertIn("self._dc_reading_off_path(src, S.sid, rec, l15_held=", src)
         self.assertIn("self._note_d_residue_reading(src, dc, l15_held)", src)
         self.assertIn('rec["vram_residue_kind"] = "first_sleep"', src)
+        self.assertIn('rec["vram_residue_sleeps"] = 1', src)                    # R1: the first sleep counts 1
+        self.assertIn('rec["vram_residue_sleeps"] = n_sleeps', src)             # R1: later samples carry the count
+        lsrc = open(LAUNCHER_SRC, encoding="utf-8").read()
+        self.assertRegex(lsrc, r"DC_ONE_SLEEP_MARK in _dc_record_prov:\n\s+log\(f\"#227 R1 \{DC_ONE_SLEEP_MARK\}")
+
+    # ---- #227 R1: a boot that saw ONE D sleep has not reached its maximum -> first sleep + 256, named ----
+    def _boot(self, tag, rows_vals, sleeps=None, at="2026-10-25T00:00:00Z", kinds=None):
+        rows = []
+        for i, vals in enumerate(rows_vals):
+            r = dict(d_sample(tag, {self.U[0]: vals[0], self.U[1]: vals[1]}), at=at[:-3] + ":%02dZ" % i)
+            kind = (kinds or ["first_sleep"] + ["max_over_sleeps"] * 9)[i]
+            if kind:
+                r["vram_residue_kind"] = kind
+            if sleeps is not None:
+                r["vram_residue_sleeps"] = sleeps[i]
+            rows.append(r)
+        return rows
+
+    def test_r1_a_one_sleep_boot_books_first_sleep_plus_256_and_says_so(self):
+        rows = self._boot("one", [(1258, 1258)], sleeps=[1])
+        vals, prov = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258 + 256, self.U[1]: 1258 + 256})
+        self.assertIn(L.DC_ONE_SLEEP_MARK, prov)
+
+    def test_r1_a_two_sleep_boot_books_bare(self):
+        rows = self._boot("two", [(1258, 1258), (1258, 1258)], sleeps=[1, 2])      # 2nd sleep raised nothing
+        vals, prov = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258, self.U[1]: 1258})
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
+        rows = self._boot("two", [(1258, 1258), (1600, 1500)], sleeps=[1, 2])
+        vals, _ = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1600, self.U[1]: 1500})
+
+    def test_r1_boots_without_the_counter_keep_their_old_rule(self):
+        # legacy (no kind): first sleep + 256, as before R1
+        legacy = self._boot("old", [(1258, 1258)], kinds=[None])
+        mixed = legacy + self._boot("new", [(1000, 1000), (1100, 1100)], sleeps=[1, 2], at="2026-10-26T00:00:00Z")
+        vals, prov = L.dc_residue_max_from_records(mixed, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258 + 256, self.U[1]: 1258 + 256})
+        self.assertIn("LEGACY first sleep +256", prov)
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
+        # a measured boot without the counter (a build between the first #227 head and R1; none ran on metal)
+        # stays kind-based: bare
+        nocount = self._boot("nocount", [(1258, 1258)])
+        vals, prov = L.dc_residue_max_from_records(nocount, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258, self.U[1]: 1258})
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
+
+    def test_r1_end_to_end_through_the_front_stub_and_the_sidecar(self):
+        # one sleep only: the sidecar holds the first-sleep sample alone -> +256
+        st, note = self.stub()
+        host_ledger.append_measured_record(self.path, st.dormant_image["D"])
+        _r, vals, prov, _n = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258 + 256, self.U[1]: 1258 + 256}, prov)
+        self.assertIn(L.DC_ONE_SLEEP_MARK, prov)
+        # the second sleep arrives (nothing raised) -> the boot is told apart: bare
+        note({self.U[0]: 1250, self.U[1]: 1258})
+        _r, vals, prov, _n = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258, self.U[1]: 1258}, prov)
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
 
 
 class ReviewSoll(Base):
