@@ -100,13 +100,15 @@ def corridor_law_floor_bytes(card_uuid: str = "", group: Optional[str] = None) -
     try:
         from flliper.srt.managers.corridor_guard import (
             corridor_floor_mib,
-            user_reserve_by_card,
+            reserve_for_card,
         )
 
+        # #236 review SOLL: the one rank-side reserve choice (published mapping
+        # first, scalar fallback only without an entry).
         floor = corridor_floor_mib(
             card_uuid,
             group=group,
-            user_reserve_mib=user_reserve_by_card().get(card_uuid, 0),
+            user_reserve_mib=reserve_for_card(card_uuid, 0)[0],
         )
         logger.info("%s %s", LOG_PREFIX, floor.line)
         return int(floor.mib) * MIB

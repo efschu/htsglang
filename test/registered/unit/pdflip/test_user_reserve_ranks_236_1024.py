@@ -425,6 +425,92 @@ class TheRankGetsWhatTheLauncherBooked(unittest.TestCase):
         self.assertNotIn(cg.USER_RESERVE_MASKED_ENV, env)
         self.assertTrue(any("--env-d states" in ln and "STANDS" in ln for ln in lines), lines)
 
+    def _spy_pass(self, run):
+        """Run ``run()`` (a launcher pass) and return what it priced the floors with."""
+        seen = {}
+        real = cb.floors_for_cards
+
+        def spy(cards, grp, reserve=None):
+            floors = real(cards, grp, reserve)
+            seen["reserve"], seen["floors"] = reserve, floors
+            return floors
+
+        with mock.patch.object(cb, "floors_for_cards", spy):
+            run()
+        return seen
+
+    def _assert_rank_equals_launcher(self, seen, ns, group="D"):
+        kw = launcher.rank_reserve_kwargs(group, ns, self.cards, RESERVE)
+        env = launcher.build_env(
+            tree="/tmp/t", venv="/tmp/v", cvd="0", store_dir="/tmp/s", debug_hold=False,
+            tag="probe", group=group, **kw)
+        for c in self.cards:
+            rank = self._rank_floor(c.uuid, group, env)
+            lf = seen["floors"][c.uuid]
+            self.assertEqual(int(rank.mib), int(lf.mib), c.uuid)
+            self.assertEqual(int(rank.reserve_mib), int(lf.reserve_mib), c.uuid)
+        return env
+
+    def test_t20_d_only_launcher_charges_the_reserve_and_so_do_the_ranks(self):
+        """--d-only: ``d_only_solve`` prices D WITHOUT a booked rest (floor + reserve on
+        every card) -- the ranks must carry the reserve too (nachpruefung BUG 1)."""
+        ns = SimpleNamespace(profile=self.PROFILE, env_d="", env_p="", d_only=True,
+                             corridor_budget_sample=None)
+        with mock.patch.object(launcher, "log_d_rank_vram_solve", lambda *a, **k: None):
+            seen = self._spy_pass(lambda: launcher.d_only_solve(
+                ns, self.cards, {c.uuid: 1000 for c in self.cards}, [].append,
+                user_reserve_by_card=dict(RESERVE), p_split=None, chunk_layers=0))
+        self.assertEqual({k: int(v) for k, v in seen["reserve"].items()}, RESERVE)
+        env = self._assert_rank_equals_launcher(seen, ns)
+        self.assertEqual(
+            {k: int(v) for k, v in json.loads(env[cg.USER_RESERVE_ENV]).items()}, RESERVE)
+        self.assertNotIn(cg.USER_RESERVE_MASKED_ENV, env)
+        # the same ns WITHOUT --d-only is the booked path: masked to 0
+        ns2 = SimpleNamespace(profile=self.PROFILE, env_d="", env_p="", d_only=False)
+        env2 = launcher.build_env(
+            tree="/tmp/t", venv="/tmp/v", cvd="0", store_dir="/tmp/s", debug_hold=False,
+            tag="probe", group="D", **launcher.rank_reserve_kwargs("D", ns2, self.cards, RESERVE))
+        self.assertTrue(all(int(v) == 0 for v in json.loads(env2[cg.USER_RESERVE_ENV]).values()))
+
+    def test_t21_mixed_booked_vector_with_an_unbooked_card(self):
+        mixed = [None, 3000, 2000]  # card 0 (ordinal 0) unbooked, the others booked
+        ns = SimpleNamespace(profile=self.PROFILE, env_d="", env_p="")
+        fake = {"booked_rest_mib": mixed, "booked_rest_provenance": "test"}
+        with mock.patch.object(launcher, "booked_rest_kwargs", lambda *a, **k: dict(fake)):
+            seen = self._spy_pass(lambda: launcher.budgets_from_dc(
+                self.cards, {c.uuid: 1000 for c in self.cards}, [].append, "D",
+                user_reserve_by_card=dict(RESERVE), **launcher.booked_rest_kwargs()))
+            env = self._assert_rank_equals_launcher(seen, ns)
+        unbooked = self.cards[0].uuid
+        eff = {k: int(v) for k, v in json.loads(env[cg.USER_RESERVE_ENV]).items()}
+        self.assertEqual(eff[unbooked], RESERVE[unbooked])
+        self.assertTrue(all(eff[c.uuid] == 0 for c in self.cards[1:]))
+        masked = {k: int(v) for k, v in json.loads(env[cg.USER_RESERVE_MASKED_ENV]).items()}
+        self.assertEqual(set(masked), {c.uuid for c in self.cards[1:]})
+
+    def test_t22_capped_branch_uses_the_same_vector_on_both_sides(self):
+        ns = SimpleNamespace(
+            profile=self.PROFILE, env_p="",
+            env_d=f"{launcher.TORCH_CACHE_CAP_ENV}=1")
+        self.assertTrue(launcher.torch_cache_cap_armed(ns))
+        kw = dict(launcher.booked_rest_kwargs(self.cards, self.PROFILE, "D", capped=True))
+        self.assertIsNotNone(kw.get("booked_rest_mib"))
+        seen = self._spy_pass(lambda: launcher.budgets_from_dc(
+            self.cards, {c.uuid: 1000 for c in self.cards}, [].append, "D",
+            user_reserve_by_card=dict(RESERVE), **kw))
+        self.assertTrue(all(int(v) == 0 for v in seen["reserve"].values()))
+        env = self._assert_rank_equals_launcher(seen, ns)
+        self.assertEqual({k: int(v) for k, v in json.loads(env[cg.USER_RESERVE_MASKED_ENV]).items()}, RESERVE)
+
+    def test_t23_the_dial_reads_the_reserve_through_the_one_reader(self):
+        import inspect
+
+        from flliper.srt.managers import vram_dial
+
+        src = inspect.getsource(vram_dial)
+        self.assertIn("reserve_for_card(card_uuid, 0)", src)
+        self.assertNotIn("user_reserve_by_card().get(card_uuid", src)
+
     def test_t17_effective_reserve_function_masks_only_booked_cards(self):
         eff, masked = launcher.effective_reserve_by_card(
             self.cards, RESERVE, [None, 5, None])

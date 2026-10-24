@@ -26156,7 +26156,10 @@ def rank_reserve_kwargs(group: str, ns, cards: Sequence["Card"],
     ``--env-<g>`` value of the variable that stands instead (#236 review SOLL-3).
     """
     booked = None
-    if group == "D":
+    # --d-only: ``d_only_solve`` calls ``budgets_from_dc`` WITHOUT ``booked_rest_mib`` (the
+    # D-solo pass keeps floor + reserve), so the launcher charges the reserve on every card
+    # there and the ranks must carry it too -- one truth (#236 nachpruefung BUG 1).
+    if group == "D" and not bool(getattr(ns, "d_only", False)):
         booked = booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)).get("booked_rest_mib")
     if log is not None:
         eff, masked = effective_reserve_by_card(cards, user_reserve_by_card, booked)
