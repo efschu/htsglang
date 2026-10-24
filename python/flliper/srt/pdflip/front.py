@@ -14485,7 +14485,13 @@ class Front:
             st = None
         if sv.verdict not in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
             if st is not None and not st.get("closed"):
-                st["last_verdict"] = sv.verdict          # R4OVER-1024: no flip verdict now -> nothing decided is held
+                # R4OVER-1024 review: no flip verdict now -> nothing decided is held; the hold ends (void). A kurz grant
+                # made while no flip stood is R2's (not late) and is waited on by the next hold; only grants made while
+                # the flip stood decided stay late (``late`` carries over)
+                st["last_verdict"] = sv.verdict
+                st["closed"] = True
+                st["void"] = True
+                self.counters["r2_kurz_grant_hold_void"] += 1
             return sv
         rids = Front._r2_kurz_grants_open(self, now)
         if st is not None and not st.get("closed"):

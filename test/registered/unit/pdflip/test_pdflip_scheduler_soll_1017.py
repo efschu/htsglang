@@ -448,3 +448,36 @@ def test_r4_arrival_seat_pbound_flip_waits_only_for_grants_open_at_its_start():
         assert f.counters["r2_kurz_grant_hold_late"] == 1
         assert f._r2_pbound_wait(["k2"], [g]) == []                     # k1 over: the P-bound flip goes
         assert not f._r2_flip_held()
+
+
+def test_r4_a_kurz_granted_while_no_flip_stood_is_waited_on_not_late():
+    """R4OVER-1024 review (danger direction R2/R6k): a non-flip verdict between two flip verdicts (one tick of the R6 commit
+    hold) ends the held flip; a kurz granted in that tick was granted while nothing was decided -- it is R2's and the next
+    hold waits for it (never parked mid-prefill), only grants made while the flip stood decided are late."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+    from flliper.srt.pdflip import front as front_mod
+    from flliper.srt.pdflip import phase_policy as _pp
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, _g = _r4over_scene(now)
+        assert f._decode_collect(now) == "hold" and f._flip_decided()
+        real = front_mod.Front._r6_commit_hold
+        with mock.patch.object(front_mod.Front, "_r6_commit_hold",
+                               lambda self, sv: _pp.SetVerdict(_pp.V_COLLECT, "test: R6 commit tick", 0.0, sv.s_tokens,
+                                                               sv.half_x)):
+            assert f._decode_collect(now + 0.05) == "hold"
+            assert not f._flip_decided()                               # nothing decided in this tick: R2 grants on D
+            assert f.counters["r2_kurz_grant_hold_void"] == 1
+        assert front_mod.Front._r6_commit_hold is real
+        _r4over_grant_late(f, now + 0.06, rid="k3", tokens=300)        # granted while no flip stood
+        f._d_pf_book().done(rid="k1")
+        assert f._decode_collect(now + 0.1) == "hold"                  # the new hold waits for k3 (not late)
+        assert f.__dict__["_r2_kurz_hold"]["rids"] == ["k3"] and f.counters["r2_kurz_grant_hold_late"] == 0
+        f._d_pf_book().done(rid="k3")
+        assert f._decode_collect(now + 0.15) == "P"
