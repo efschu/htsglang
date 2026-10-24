@@ -2051,7 +2051,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22966
+      "line": 23000
      }
     }
    },
@@ -6532,7 +6532,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22358
+      "line": 22392
      }
     }
    },
@@ -7101,7 +7101,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22362
+      "line": 22396
      }
     }
    },
@@ -11311,7 +11311,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22414
+      "line": 22448
      }
     }
    },
@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23874
+      "line": 23908
      }
     }
    },
@@ -17659,7 +17659,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22676
+      "line": 22710
      }
     }
    },
@@ -18184,7 +18184,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22971
+      "line": 23005
      }
     }
    },
@@ -18269,7 +18269,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23857
+      "line": 23891
      }
     }
    },
@@ -18973,7 +18973,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23128
+      "line": 23162
      }
     }
    },
@@ -19265,7 +19265,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23504
+      "line": 23538
      }
     }
    },
@@ -26895,7 +26895,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23151
+      "line": 23185
      }
     }
    },
@@ -28445,7 +28445,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22559
+      "line": 22593
      }
     }
    },
@@ -29202,7 +29202,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2893
+      "line": 2897
      }
     }
    },
@@ -34000,7 +34000,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2563,
+    "line": 2567,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38729,7 +38729,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 5278
+      "line": 5317
      }
     }
    },
@@ -38952,7 +38952,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2249
+      "line": 2253
      }
     }
    },
@@ -43311,7 +43311,7 @@
    "id": "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/form_a_host_shadow.py:1736",
+    "mem_cache/form_a_host_shadow.py:1820",
     "mem_cache/hicache_storage.py:3804",
     "pdflip/launcher.py:29748",
     "pdflip/launcher.py:29747",
@@ -43324,7 +43324,7 @@
    "source": {
     "file": "mem_cache/form_a_host_shadow.py",
     "kind": "os.environ",
-    "line": 1736,
+    "line": 1820,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43723,7 +43723,7 @@
      "source": {
       "file": "mem_cache/unified_radix_cache.py",
       "kind": "os.environ",
-      "line": 743
+      "line": 748
      }
     }
    },
@@ -44741,7 +44741,7 @@
    "id": "FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:1101"
+    "mem_cache/unified_radix_cache.py:1106"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ",
@@ -44750,7 +44750,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 1101,
+    "line": 1106,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44773,7 +44773,7 @@
    "id": "FLLIPER_HICACHE_PREFETCH_HIT0_DONE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:1083"
+    "mem_cache/unified_radix_cache.py:1088"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PREFETCH_HIT0_DONE",
@@ -44782,7 +44782,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 1083,
+    "line": 1088,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44960,7 +44960,7 @@
    "id": "FLLIPER_HICACHE_ROUND_TIMING",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:797"
+    "mem_cache/unified_radix_cache.py:802"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ROUND_TIMING",
@@ -44969,7 +44969,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 797,
+    "line": 802,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -47392,7 +47392,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 5279
+      "line": 5318
      }
     }
    },
@@ -47704,7 +47704,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2514
+      "line": 2518
      }
     }
    },
@@ -50517,7 +50517,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4036,
+    "line": 4040,
     "tree": "nf"
    },
    "status": "harvested",
@@ -50545,7 +50545,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4045,
+    "line": 4049,
     "tree": "nf"
    },
    "status": "harvested",
@@ -50573,7 +50573,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4050,
+    "line": 4054,
     "tree": "nf"
    },
    "status": "harvested",
@@ -50601,7 +50601,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4039,
+    "line": 4043,
     "tree": "nf"
    },
    "status": "harvested",
@@ -56554,7 +56554,7 @@
    "id": "FLLIPER_PDFLIP_CUT_L3_COMPLETE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/form_a_host_shadow.py:504"
+    "mem_cache/form_a_host_shadow.py:509"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_CUT_L3_COMPLETE",
@@ -56563,7 +56563,7 @@
    "source": {
     "file": "mem_cache/form_a_host_shadow.py",
     "kind": "os.environ",
-    "line": 504,
+    "line": 509,
     "tree": "27b"
    },
    "status": "harvested",
@@ -56586,7 +56586,7 @@
    "id": "FLLIPER_PDFLIP_CUT_L3_PUBLISH",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/form_a_host_shadow.py:551"
+    "mem_cache/form_a_host_shadow.py:556"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_CUT_L3_PUBLISH",
@@ -56595,7 +56595,7 @@
    "source": {
     "file": "mem_cache/form_a_host_shadow.py",
     "kind": "os.environ",
-    "line": 551,
+    "line": 556,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -56618,7 +56618,7 @@
    "id": "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/form_a_host_shadow.py:605"
+    "mem_cache/form_a_host_shadow.py:610"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES",
@@ -56627,7 +56627,7 @@
    "source": {
     "file": "mem_cache/form_a_host_shadow.py",
     "kind": "os.environ",
-    "line": 605,
+    "line": 610,
     "tree": "27b"
    },
    "status": "harvested",
@@ -61172,6 +61172,146 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_D_EM_GRAPH": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "D-EM-GRAPH (24.10., NF line, deskq/done/nf-dpass-graph-1024.md): one CUDA graph per (MoE layer, token bucket) for the S51 EAGER-DEVICE-EM expert pass of a D extend / mixed forward. Measured on _234711: every D pass with a prefill part pays ~500 ms T-independent (em_ms = 441 + 0.746*T), an eager pass on the 1-wave device step still ~330-440 ms, the graphed decode of the same 48 layers 22-67 ms -- host launch work, ~110 launches per layer in run_pool_em (13 of them Triton). The graph replays the pass in ONE launch per layer. No collective inside the pass, so a rank that falls back to eager moves no collective; the bucket is a pure function of T and these envs (R11). Memory: one private graph pool + one static I/O set at the largest bucket, both under the cuda_graph memory-saver tag (paused with the role graphs on the D->P sleep, no recapture on wake); a rank with the saver on whose graph tag is not armed refuses (a resident pool would sit on P's VRAM). Named VRAM post: see _POOL_MIB below. False = run_pool_em exactly as before (the switch is read once per pass, nothing else runs).",
+   "id": "FLLIPER_PDFLIP_D_EM_GRAPH",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_EM_GRAPH",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4325,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_D_EM_GRAPH_BUCKETS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"64,128,192,256,384,512,768,1024,1280,1536,1728,1856\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "Token buckets (prefill tokens + folded decode rows of the pass). The top two cover the corridor's granted widths 1664 / 1792 plus up to 64 decode rows. A pass above the largest stays eager.",
+   "id": "FLLIPER_PDFLIP_D_EM_GRAPH_BUCKETS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_EM_GRAPH_BUCKETS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4328,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvStr"
+  },
+  "FLLIPER_PDFLIP_D_EM_GRAPH_CHECK": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "The first replay of every (layer, bucket) is compared against the eager pass on the same padded inputs (expert_offload.compare_moe_outputs): MISMATCH serves the eager result and drops that graph for good (the guard against a replay with a stale form / expert mapping). False = no check.",
+   "id": "FLLIPER_PDFLIP_D_EM_GRAPH_CHECK",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_EM_GRAPH_CHECK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4336,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_D_EM_GRAPH_GATE_WAIT_MS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "100.0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "The capture gate (em_graph.CaptureGate) keeps the rank's other threads' capture-unsafe CUDA calls out of a capture. A capture IN SERVING waits at most this long for it, then runs the pass eager and retries the key later (capped backoff, never a refusal); the boot pre-capture waits up to 10 s. Review A2 (24.10.): bounded below the barlink sync deadline (2 s) and T_halb (4.5 s). The gate itself is always on.",
+   "id": "FLLIPER_PDFLIP_D_EM_GRAPH_GATE_WAIT_MS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_EM_GRAPH_GATE_WAIT_MS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4341,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvFloat"
+  },
+  "FLLIPER_PDFLIP_D_EM_GRAPH_POOL_MIB": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "0.0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "The named VRAM post per D rank, MiB (graph pool high water + the static I/O set): buckets whose forecast (em_graph.pool_forecast_mib, geometry only -> the same set on every rank) exceeds it are dropped from the top. 0 = no cap (book the forecast the D-EM-GRAPH budget line prints).",
+   "id": "FLLIPER_PDFLIP_D_EM_GRAPH_POOL_MIB",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_EM_GRAPH_POOL_MIB",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4332,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvFloat"
+  },
   "FLLIPER_PDFLIP_D_EXPECT_P_RECORD": {
    "bare": false,
    "choices": null,
@@ -61252,7 +61392,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4403,
+    "line": 4442,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61280,7 +61420,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2032,
+    "line": 2036,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61759,7 +61899,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4280,
+    "line": 4284,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61816,7 +61956,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4272,
+    "line": 4276,
     "tree": "nf"
    },
    "status": "harvested",
@@ -64819,7 +64959,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/schedule_policy.py:184",
-    "mem_cache/unified_radix_cache.py:823"
+    "mem_cache/unified_radix_cache.py:828"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_END_ANCHOR",
@@ -64880,7 +65020,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7555"
+    "mem_cache/unified_radix_cache.py:7583"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -64889,7 +65029,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7555,
+    "line": 7583,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -65200,6 +65340,34 @@
     "file": "environ.py",
     "kind": "environ",
     "line": 1364,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvStr"
+  },
+  "FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_ROWS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "None",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "VOTE-MEASURED-LINE review A1 (24.10.): per-rank rows of the extend behind that recorded start (CSV, \"0\" = none; profile record D_EXTEND_LEND_RATE_ROWS, NF: 2629,0,0). The vote's measured line holds only up to max(own widest LEND-COST reading, these rows); above it the corridor line stays.",
+   "id": "FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_ROWS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_EXTEND_LEND_RATE_START_ROWS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1368,
     "tree": "nf"
    },
    "status": "harvested",
@@ -65897,8 +66065,8 @@
     "managers/pdflip_d_hostgap.py:92",
     "managers/pdflip_d_hostgap.py:101",
     "managers/pdflip_d_hostgap.py:113",
-    "mem_cache/unified_radix_cache.py:731",
-    "mem_cache/unified_radix_cache.py:771",
+    "mem_cache/unified_radix_cache.py:736",
+    "mem_cache/unified_radix_cache.py:776",
     "pdflip/form.py:1464"
    ],
    "level": "expert",
@@ -70383,8 +70551,8 @@
    "id": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:728",
-    "mem_cache/unified_radix_cache.py:740"
+    "mem_cache/unified_radix_cache.py:733",
+    "mem_cache/unified_radix_cache.py:745"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
@@ -70393,7 +70561,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 728,
+    "line": 733,
     "tree": "27b"
    },
    "status": "harvested",
@@ -71116,7 +71284,7 @@
    "id": "FLLIPER_PDFLIP_ORPHAN_OWN_SLOTS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:862"
+    "mem_cache/unified_radix_cache.py:867"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ORPHAN_OWN_SLOTS",
@@ -71125,7 +71293,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 862,
+    "line": 867,
     "tree": "27b"
    },
    "status": "harvested",
@@ -74658,7 +74826,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2027,
+    "line": 2031,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74976,7 +75144,7 @@
    "id": "FLLIPER_PDFLIP_RELEASE_DRAIN_CAP",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:750"
+    "mem_cache/unified_radix_cache.py:755"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RELEASE_DRAIN_CAP",
@@ -74985,7 +75153,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 750,
+    "line": 755,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -75070,7 +75238,7 @@
    "id": "FLLIPER_PDFLIP_RESET_CENSUS_DEFER_S",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:843"
+    "mem_cache/unified_radix_cache.py:848"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RESET_CENSUS_DEFER_S",
@@ -75079,7 +75247,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 843,
+    "line": 848,
     "tree": "27b"
    },
    "status": "harvested",
@@ -75852,7 +76020,7 @@
    "id": "FLLIPER_PDFLIP_S74B_STORE_ACK_HOLD",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/form_a_host_shadow.py:580"
+    "mem_cache/form_a_host_shadow.py:585"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_S74B_STORE_ACK_HOLD",
@@ -75861,7 +76029,7 @@
    "source": {
     "file": "mem_cache/form_a_host_shadow.py",
     "kind": "os.environ",
-    "line": 580,
+    "line": 585,
     "tree": "27b"
    },
    "status": "harvested",
@@ -75916,7 +76084,7 @@
    "id": "FLLIPER_PDFLIP_S81_HOLE_RESOLVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/form_a_host_shadow.py:716"
+    "mem_cache/form_a_host_shadow.py:721"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_S81_HOLE_RESOLVE",
@@ -75925,7 +76093,7 @@
    "source": {
     "file": "mem_cache/form_a_host_shadow.py",
     "kind": "os.environ",
-    "line": 716,
+    "line": 721,
     "tree": "27b"
    },
    "status": "harvested",
@@ -76393,7 +76561,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1842
+      "line": 1846
      }
     }
    },
@@ -77147,7 +77315,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7841"
+    "mem_cache/unified_radix_cache.py:7869"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -77156,7 +77324,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7841,
+    "line": 7869,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -77271,7 +77439,7 @@
    "id": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1732"
+    "managers/scheduler.py:1735"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
@@ -77280,7 +77448,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1732,
+    "line": 1735,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77494,7 +77662,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1011
+      "line": 1012
      }
     }
    },
@@ -77669,7 +77837,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:10218"
+    "mem_cache/unified_radix_cache.py:10246"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -77678,7 +77846,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 10218,
+    "line": 10246,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -80201,6 +80369,34 @@
     "nf"
    ],
    "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_VOTE_MEASURED_LINE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "VOTE-MEASURED-LINE (24.10., nf-corridor-width-1024): once this rank holds a LEND-COST reading, the #794 width vote funds a chunk down to the 300 MiB HALT line plus the MEASURED fixed part of its own extends (max over readings of cost - vote_rate x rows), not down to the corridor law: the law on NF D is the 27B's 4096-token prefill peak (phase_footprint ...cc0ac5caf91e, 09.09., Qwen3_5ForConditionalGeneration) -- the same transient the rate already prices, a second time. Metal _234711: 162 of 179 cut passes were cut by the vote, 0 by granted_width after the warm-up. Off = the corridor law line byte for byte.",
+   "id": "FLLIPER_PDFLIP_VOTE_MEASURED_LINE",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_VOTE_MEASURED_LINE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4291,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
   },
   "FLLIPER_PDFLIP_VRAM_ACTUAL": {
    "bare": false,
@@ -93536,28 +93732,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2962,
-  "envs": 2083,
+  "entries": 2969,
+  "envs": 2090,
   "explained": 310,
   "flags": 864,
-  "harvested": 1833,
+  "harvested": 1840,
   "trees": {
    "abweichung": 30,
    "beide": 2716,
    "nur_27b": 212,
-   "nur_nf": 16
+   "nur_nf": 23
   },
   "unexplained": 694
  },
- "tree_rev": "27b=74b41072f9+nf=807de14309",
+ "tree_rev": "27b=cde6ba963f+nf=42eef22f3d",
  "trees": {
   "27b": {
    "entries": 2928,
-   "rev": "74b41072f9"
+   "rev": "cde6ba963f"
   },
   "nf": {
-   "entries": 2732,
-   "rev": "807de14309"
+   "entries": 2739,
+   "rev": "42eef22f3d"
   }
  },
  "warnungen": []
