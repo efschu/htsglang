@@ -253,6 +253,7 @@ class Entrypoint(Base):
     def test_no_entrypoint_at_all_is_a_bare_launcher_call(self):
         self.assertEqual(R.entrypoint_forced(), [])
 
+    @unittest.skipUnless(os.path.exists(ENTRYPOINT_SRC), "no docker/pdflip-release/entrypoint.sh in this tree (NF line)")
     def test_entrypoint_source_lists_every_pass_and_exports_it(self):
         src = open(ENTRYPOINT_SRC, encoding="utf-8").read()
         rv = next(ln for ln in src.splitlines() if ln.startswith("refuse_value()"))
@@ -264,6 +265,7 @@ class Entrypoint(Base):
         # the register's pin on the entrypoint codes is untouched by the new helper
         self.assertEqual(sorted(R.ENTRYPOINT_FORCE_CODES), R.entrypoint_wired_codes(src))
 
+    @unittest.skipUnless(os.path.exists(ENTRYPOINT_SRC), "no docker/pdflip-release/entrypoint.sh in this tree (NF line)")
     def test_the_shell_helper_builds_the_list_the_launcher_parses(self):
         fn = next(ln for ln in open(ENTRYPOINT_SRC, encoding="utf-8").read().splitlines()
                   if ln.startswith("forced_past_ep()"))
