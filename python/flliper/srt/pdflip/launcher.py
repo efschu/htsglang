@@ -515,6 +515,18 @@ def pick_d_residue_record(rows: Sequence[Dict[str, object]], cards: Sequence[Car
     return r, f"newest, no sample covers this card set: boot {r.get('boot_tag', '?')}"
 
 
+def d_residue_record_for(path: str, accept: Optional[Callable[[dict], bool]], cards: Sequence[Card]
+                         ) -> Tuple[Optional[Dict[str, object]], str]:
+    """#227: the group-D dormant-image sample of the sidecar at ``path`` that prices this boot's D residue
+    (:func:`pick_d_residue_record` over every D sample through ``accept``), and the provenance note -- empty
+    when the pick is the plain newest sample, so the pre-#227 DC-RESIDUE line stays byte-identical."""
+    rows = host_ledger.read_measured_records(path, "D", accept=accept)
+    rec, how = pick_d_residue_record(rows, cards)
+    if rec is None or rec is max(rows, key=lambda e: str(e.get("at", ""))):
+        return rec, ""
+    return rec, f" [#227 card-set pick, {how}]"
+
+
 P_DORMANT_EXPECT_ENV = "FLLIPER_PDFLIP_D_EXPECT_P_RECORD"
 #: How many of the newest group-P boots (same calibration identity, same weight
 #: form, every card measured) the expectation takes the per-card MAXIMUM over.
@@ -26688,11 +26700,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # newest sample alone would hand dual a 2-card duo sample, which dc_residue_from_record refuses card by card
     # (-> the constant, ~1 GiB per card off P). Prefer the newest sample of EXACTLY this boot's card set, then the
     # newest that covers it (the pre-#227 answer), then the newest at all (for the refusal's wording).
-    _dc_rows = host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept)
-    _dc_rec_d, _dc_pick = pick_d_residue_record(_dc_rows, cards)
-    # named only when the pick is NOT the plain newest sample (the pre-#227 line stays byte-identical otherwise)
-    _dc_pick_note = ("" if _dc_rec_d is None or _dc_rec_d is max(_dc_rows, key=lambda e: str(e.get("at", "")))
-                     else f" [#227 card-set pick, {_dc_pick}]")
+    _dc_rec_d, _dc_pick_note = d_residue_record_for(measured_record_path(), _dc_accept, cards)
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.pdflip_weight_source)
     # D-EXPECT: group P's measured dormant residue, same calibration identity,

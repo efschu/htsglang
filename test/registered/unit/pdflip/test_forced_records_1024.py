@@ -385,8 +385,20 @@ class CardSetPick(unittest.TestCase):
 
     def test_the_launcher_reads_all_d_samples_through_the_pick(self):
         src = open(LAUNCHER_SRC, encoding="utf-8").read()
-        self.assertIn('_dc_rows = host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept)\n'
-                      '    _dc_rec_d, _dc_pick = pick_d_residue_record(_dc_rows, cards)', src)
+        self.assertIn("_dc_rec_d, _dc_pick_note = d_residue_record_for(measured_record_path(), _dc_accept, cards)", src)
+
+    def test_the_sidecar_reader_applies_the_pick_and_names_it_only_when_it_differs(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "rec.json")
+        with open(p, "w") as fh:
+            json.dump({"samples": self.rows()}, fh)
+        dual = self.cards(self.U5, self.UA, self.UB)
+        rec, note = L.d_residue_record_for(p, None, dual)
+        self.assertEqual(rec["boot_tag"], "dual1007")
+        self.assertIn("#227 card-set pick, exact card set: boot dual1007", note)
+        rec, note = L.d_residue_record_for(p, None, self.cards(self.U5, self.UA))
+        self.assertEqual((rec["boot_tag"], note), ("duo1025", ""))     # the newest anyway: line unchanged
+        self.assertEqual(L.d_residue_record_for(os.path.join(d, "absent.json"), None, dual), (None, ""))
 
 
 class LauncherWiring(unittest.TestCase):
