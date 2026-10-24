@@ -24,8 +24,8 @@ rank's L3 LRU) reads uncopied through a warm memo (R1, second ShmArena object on
 (b) the claim's free decision (``verify_candidates`` -> ``secured``) asks the index WITHOUT the memo.
 census(memo) == census(no memo) is held in-process through the orderly transitions; where record and index disagree
 across processes (S109-A1 window; a sister's void + same-generation re-publish under index lag between two censuses
-of this process) the residue is named and the free decision refuses (R2b). ``HiCacheFile.clear`` and the
-``_stat_stems`` strike now void the record (R3, R3s; review SOLL 1). Review tests R1-R4 (review-pphase-gaps-1024.md,
+of this process) the residue is named and the free decision refuses (R2b). ``HiCacheFile.clear`` now voids the record (R3;
+review SOLL 1); the ``_stat_stems`` strike does not (residue, R3b: the free decision refuses). Review tests R1-R4 (review-pphase-gaps-1024.md,
 desk/27b-pphase-gaps-review-1024 @ 74f392b61f) are taken over below.
 """
 from __future__ import annotations
@@ -314,7 +314,7 @@ def test_r2_residue_void_and_republish_between_two_censuses_is_refused_at_the_fr
 
 
 def _clear_backend(tmp_path, a, idx):
-    """A minimal HiCacheFile for the real ``clear`` / ``_stat_stems`` (its own store dir, this arena opened)."""
+    """A minimal HiCacheFile for the real ``clear`` (its own store dir, this arena opened)."""
     store = tmp_path / "store"
     store.mkdir(exist_ok=True)
     (store / "somefile").write_bytes(b"x")
@@ -324,9 +324,6 @@ def _clear_backend(tmp_path, a, idx):
     hb = types.SimpleNamespace(file_path=str(store), _evictor=ev, metadata_cache=None, _arenas={"kv": a},
                                _l3idx=idx)
     hb._l3_index = lambda: idx
-    hb._sharded_path = lambda st: str(store / "nope" / st)
-    hb._flat_layout_present = lambda: False
-    hb._stat_stem = lambda st: None
     return hb
 
 
@@ -343,22 +340,6 @@ def test_r3_store_clear_voids_the_record_and_the_memo(tmp_path, monkeypatch):
     on, off = _both(a, be, monkeypatch)
     assert off.shape[0] == n and np.array_equal(on, off)
     assert int((np.asarray(l3s.arrays(a)[0]) >= 0).sum()) == 0, "the shared record is void"
-
-
-def test_r3s_stat_strike_voids_the_record(tmp_path, monkeypatch):
-    """SOLL 1: the ``_stat_stems`` strike (index names a stem, the disk does not have it) voids the record too."""
-    from flliper.srt.mem_cache import hicache_storage as hs
-
-    n = 64
-    a, be, idx = _arena(tmp_path, n)
-    _REAL_UNSEC(a, be)
-    hb = _clear_backend(tmp_path, a, idx)
-    hb._l3sec_void_stems = types.MethodType(hs.HiCacheFile._l3sec_void_stems, hb)
-    gone = [a.slot_stem(3), a.slot_stem(44)]
-    assert hs.HiCacheFile._stat_stems(hb, gone) == {}
-    on, off = _both(a, be, monkeypatch)
-    assert np.array_equal(on, off)
-    assert {_key_lo(a, 3), _key_lo(a, 44)} <= set(on.tolist())
 
 
 def test_r3b_free_decision_refuses_after_index_clear(tmp_path, monkeypatch):

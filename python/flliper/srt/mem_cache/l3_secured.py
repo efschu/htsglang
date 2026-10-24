@@ -71,9 +71,9 @@ FAST_STATS = {"fast": 0, "fallback": 0}
 #: they disagree and the memo keeps a page OFF the keep list (the clock may pick it; (b) refuses it): S109-A1's own
 #: window (index entry removed, on_evict not yet run); a sister process voiding AND re-publishing the same generation
 #: under index lag between two censuses of THIS process (narrowed: a census that sees the record negative forgets the
-#: slot's memo entry). ``invalidate_stems`` clears this process's memo; ``void_all`` (HiCacheFile.clear) and the
-#: ``_stat_stems`` strike void the record (review SOLL 1, PPHASE-GAPS-1024), so index removals without on_evict no
-#: longer leave a record that says "copied".
+#: slot's memo entry). ``invalidate_stems`` clears this process's memo; ``void_all`` (HiCacheFile.clear) voids the
+#: record of the whole arena (review SOLL 1). Residue: the ``_stat_stems`` strike removes index entries without a
+#: record void (a void there stalled the write-behind's QSA pair gate, test_l3_reuse_after_restart_0928 test_b).
 #: Only positives are remembered: a slot not listed is asked again next time. ``LISTED_MEMO = False`` = ask every slot
 #: (the FLIPTIME-1023 form); no env switch (catalog unchanged).
 LISTED_MEMO = True

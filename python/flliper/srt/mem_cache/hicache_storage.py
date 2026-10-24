@@ -6016,28 +6016,11 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.forget(gone)
             except Exception:  # noqa: BLE001 -- bookkeeping, never a gate on the read
                 pass
-            # PPHASE-GAPS-1024 (review SOLL 1): the struck files are no copy -- void their record (and this process's
-            # census memo) like the LRU's on_evict does; before, the record kept saying "copied" (A5 class)
-            _void = getattr(self, "_l3sec_void_stems", None)   # a stand-in backend without it: as before
-            if callable(_void):
-                _void(gone)
+            # PPHASE-GAPS-1024 (review SOLL 1, NOT done here): voiding the record of the struck stems turned
+            # test_l3_reuse_after_restart_0928 test_b red (write-behind 16 -> 8 pages): the strike also fires for
+            # stems this stat does not see at the sharded/flat path (the QSA sidecars of a pair), and a void there
+            # stalls the KV pair gate. Residue, guarded by the memo-free free decision (verify_candidates).
         return out
-
-    def _l3sec_void_stems(self, stems: List[str]) -> int:
-        """PPHASE-GAPS-1024: ``l3_secured.invalidate_stems`` on every arena this backend opened (memory only, never a
-        gate on the caller). Returns the slots voided."""
-        if not stems:
-            return 0
-        n = 0
-        try:
-            from flliper.srt.mem_cache import l3_secured as _l3s
-
-            for arena in list((getattr(self, "_arenas", None) or {}).values()):
-                if arena is not None:
-                    n += int(_l3s.invalidate_stems(arena, list(stems)) or 0)
-        except Exception as exc:  # noqa: BLE001 -- named; the record then stays as it was (the free decision re-asks)
-            logger.warning("PPHASE-GAPS-1024 L3SEC-VOID of %d stem(s) failed: %r", len(stems), exc)
-        return n
 
     def _arena_kv_present_prefix(self, keys: List[str]) -> Optional[int]:
         """#1439: how many LEADING KV pages are COMPLETE in the L2 arena, from
