@@ -12,6 +12,7 @@ import weakref
 from flliper.srt.mem_cache import pdflip_backup_guard as _k12_guard
 from flliper.srt.managers.pdflip_pass_timer import timed as _pass_timed
 from flliper.srt.managers import pdflip_p_overlap as _pdflip_p_overlap
+from flliper.srt.managers import discard_named as _discard_named  # #221 Fix A: discarded reads are named
 from array import array
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -2642,6 +2643,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # deliberate: walking the records here would be a second terminate
         # pass over the same operations, and the controller's view is the one
         # the join bound depends on.
+        # #221 Fix A (site reset_join): the records dropped here are named by the controller's
+        # `reset()` below, next to the operations its join observed -- SNAPSHOT before the clear,
+        # handed to the controller only right before `cache_controller.reset()` (review SOLL-2: a
+        # raise in between must not leave stale records for the next reset to name).
+        _dn_records = _discard_named.snapshot_records(getattr(self, "ongoing_prefetch", None))
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         # #939: prefetch records displaced by a RE-ISSUE of the same req_id.
         # They are terminated but NOT freed here -- see `_retire_ongoing_prefetch`.
@@ -2675,6 +2681,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # took -- given back here, before it has no holder at all.
             self._pdflip_release_queued_refs_before_reset()
             _mk("queued_refs")
+            self.cache_controller._discard_named_records = _dn_records  # #221 SOLL-2: right before reset()
             self.cache_controller.reset()
             _mk("controller_reset")
             self.cache_controller.mem_pool_host.clear()
