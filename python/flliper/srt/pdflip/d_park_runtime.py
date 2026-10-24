@@ -1732,15 +1732,31 @@ def _req_kv_tokens(r) -> int:
     return _n(getattr(r, "origin_input_ids", None)) + _n(getattr(r, "output_ids", None))
 
 
-def _leaving_rows(sched, reqs) -> dict:
-    """KVD-1024 (front KV class D, SOLL R7): the rows each of ``reqs`` is GUARANTEED to give back when it is
-    displaced (``d_leaving_rows.leaving_rows``: the seat minus the path rows other holders keep locked, the rows
-    already evictable and the rows an aux lock keeps unpeelable) -- not its seat length. 27B ``_1024_003732``
-    01:02:45: 18-189 was sized 54190, its displacement freed 36043 (the 18137-token shared system prompt stayed locked
-    by three other decodes), and the older 18-188 was refused 181 times behind it."""
-    from flliper.srt.pdflip.d_leaving_rows import leaving_rows_by_rid
+def _leaving_rows(sched, reqs) -> list:
+    """KVD-1024 (front KV class D, SOLL R7): what each of ``reqs`` (youngest first, the displacement order) adds to the
+    rows the k youngest are GUARANTEED to give back when they leave together (``d_leaving_rows.joint_leaving_rows``,
+    as increments: their prefix sums are the joint release) -- not the seat length. 27B ``_1024_003732`` 01:02:45:
+    18-189 was sized 54190, its displacement freed 36043 (the 18137-token shared system prompt stayed locked by three
+    other decodes) and the older 18-188 was refused 181 times behind it. Joint (review MUSS 2): rows only the k
+    youngest hold between them come free with the k-th -- the sum of single bounds would never count them."""
+    from flliper.srt.pdflip.d_leaving_rows import joint_leaving_rows, marginals
 
-    return leaving_rows_by_rid(getattr(sched, "tree_cache", None), reqs)
+    return marginals(joint_leaving_rows(getattr(sched, "tree_cache", None), reqs))
+
+
+def youngest_first(reqs) -> list:
+    """The displacement order (PRIO-AS-AGE 1014 order key, youngest first) -- the one ``kv_displace_would_fit`` walks
+    and D publishes its joint release in (``pdflip_kv.leaving_rows_joint``)."""
+    from flliper.srt.pdflip import seat_age as _sa
+
+    _on = _pa.enabled()
+    return sorted(list(reqs or ()), key=lambda r: _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on),
+                  reverse=True)
+
+
+#: KVD review SOLL 2: KV-trigger verdicts with younger running seats that said "nobody leaves" (per rank, cumulative;
+#: published as ``pdflip_kv.displace_nobody_leaves`` -- a front AGE PLAN grant D then does not serve shows here)
+NOBODY_LEAVES_ATTR = "_pdflip_sa_nobody_leaves"
 
 
 #: Q-702: the scheduler attribute that carries the adder's own refusal numbers
@@ -1907,9 +1923,8 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     # PRIO-AS-AGE 1014: "younger than the older one" and "youngest first" by the order key
     _on = _pa.enabled()
     _k_old = _pa.key(_pa.lane_of_req(older), _sa.rid_age(str(older_rid)), on=_on)
-    young = sorted((r for r in running
-                    if _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on) > _k_old),
-                   key=lambda r: _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on), reverse=True)
+    young = youngest_first(r for r in running
+                           if _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on) > _k_old)
     basis = "legacy"
     # PW: under the backup wall a victim's retained KV goes back to the tree and
     # is as unpayable as the rest -- only its decode reserve comes free.
@@ -1922,7 +1937,7 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
             avail += now - int(then)
         reserve = view.get("reserve") or {}
         rows = _leaving_rows(sched, young)
-        sizes = [(0 if wall else rows[str(r.rid)]) + int(reserve.get(str(r.rid), 0)) for r in young]
+        sizes = [(0 if wall else rows[i]) + int(reserve.get(str(r.rid), 0)) for i, r in enumerate(young)]
         basis = "adder"
     else:
         need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
@@ -1935,7 +1950,7 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
         except Exception:  # noqa: BLE001
             pass
         rows = _leaving_rows(sched, young)
-        sizes = [0 if wall else rows[str(r.rid)] for r in young]
+        sizes = [0 if wall else rows[i] for i in range(len(young))]
     if wall:
         basis += "+wall"
     k = victims_needed(need, avail, sizes)
@@ -1951,14 +1966,16 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     if (k != 1 or basis.startswith("adder")) and (n <= 8 or (n & (n - 1)) == 0):
         # KVD-1024: where a victim's guaranteed rows are below its seat, the line names them (rid:rows/seat, youngest
         # first); otherwise it stays the base's line byte for byte
-        short = [r for r in young if rows[str(r.rid)] != _req_kv_tokens(r)]
+        short = [r for i, r in enumerate(young) if rows[i] != _req_kv_tokens(r)]
         logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d basis=%s -> %s (n=%d)%s",
                     "SEAT" if seat else "KV", str(older_rid), need, avail, len(young), basis,
                     "fits free, nobody leaves" if k == 0 else
                     "not even with all younger seats: nobody leaves, backfill stays" if k is None else
                     "%d youngest must leave (one per pass)" % k, n,
-                    (" leaving=" + ",".join("%s:%d/%d" % (str(r.rid), rows[str(r.rid)], _req_kv_tokens(r))
-                                            for r in young[:6])) if short else "")
+                    (" leaving=" + ",".join("%s:%d/%d" % (str(r.rid), rows[i], _req_kv_tokens(r))
+                                            for i, r in enumerate(young[:6]))) if short else "")
+    if not seat and k is None and young:
+        setattr(sched, NOBODY_LEAVES_ATTR, int(getattr(sched, NOBODY_LEAVES_ATTR, 0) or 0) + 1)
     return bool(k)
 
 

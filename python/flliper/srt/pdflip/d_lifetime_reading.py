@@ -146,6 +146,28 @@ def _leaving_by_rid(tree, running) -> Dict[str, int]:
     return dict(list(leaving_rows_by_rid(tree, running).items())[:64])
 
 
+def _leaving_joint(sched, tree, running):
+    """KVD review MUSS 2: ``[[rid, cumulative joint rows], ...]`` over the decodes D can displace now, youngest first
+    (``d_park_runtime.displaceable`` / ``youngest_first`` -- the set and order its SEAT-AGE walks)."""
+    import os
+
+    from flliper.srt.pdflip import d_park_runtime as _dpr
+    from flliper.srt.pdflip.d_leaving_rows import joint_leaving_rows
+
+    pool = running
+    if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() != "1":
+        pool = _dpr.displaceable(getattr(sched, "running_batch", None))
+    live = {id(r) for r in running}
+    order = _dpr.youngest_first([r for r in pool if id(r) in live])[:64]
+    return [[str(r.rid), int(c)] for r, c in zip(order, joint_leaving_rows(tree, order))]
+
+
+def _leaving_fallbacks() -> Dict[str, int]:
+    from flliper.srt.pdflip.d_leaving_rows import FALLBACKS
+
+    return dict(FALLBACKS)
+
+
 def lifetime_reading(sched) -> Dict[str, Any]:
     """The fields above, from THIS scheduler (TP0 when served on ``/server_info``). Raises on a missing pool -- the
     caller (``get_internal_state``) catches, an instrument never breaks the info route."""
@@ -196,6 +218,12 @@ def lifetime_reading(sched) -> Dict[str, Any]:
         # KVD-1024 (front KV class D): the rows each running decode is GUARANTEED to give back when it is displaced
         # (pdflip/d_leaving_rows.py) -- the front's AGE PLAN prices a victim by this, not by its seat length
         "leaving_rows_by_rid": _leaving_by_rid(tree, running),
+        # review MUSS 2: the JOINT release of the k youngest displaceable decodes, in D's displacement order
+        # ([[rid, cumulative rows], ...]: rows only they hold between them come free with the k-th)
+        "leaving_rows_joint": _leaving_joint(sched, tree, running),
+        # review MUSS 3 / SOLL 2: the bound's fallbacks by kind and the KV verdicts that said "nobody leaves"
+        "leaving_fallbacks": _leaving_fallbacks(),
+        "displace_nobody_leaves": int(getattr(sched, "_pdflip_sa_nobody_leaves", 0) or 0),
         "admitted_rids": admitted[:64],
         "ledger_outstanding": ledger_out,
         "ledger_rids": [str(r) for r in ledger_rids][:64],

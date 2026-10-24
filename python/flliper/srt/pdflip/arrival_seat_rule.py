@@ -333,7 +333,7 @@ def _younger(head_arrival: float, running: Iterable[str], arrival_of: Mapping[st
 def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
                        arrival_of: Mapping[str, float], tokens_of: Mapping[str, int],
                        deficit: int, lane_of: Optional[Mapping[str, int]] = None,
-                       head_lane: int = 0) -> Optional[str]:
+                       head_lane: int = 0, freed_of=None) -> Optional[str]:
     """NF-STAU-KV (user rule #246, 27.09.: "strikte Ankunftsreihenfolge +
     KV-Backfill, Ältester rückt nach und verdrängt Jüngere"): the head's KV
     does not fit a free seat -> the running decode that ARRIVED last, and
@@ -352,7 +352,10 @@ def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
     younger = _younger(head_arrival, running, arrival_of, lane_of, head_lane)
     if not younger:
         return None
-    if sum(max(0, int(tokens_of.get(r, 0) or 0)) for _, r in younger) < int(deficit):
+    total = sum(max(0, int(tokens_of.get(r, 0) or 0)) for _, r in younger)
+    if freed_of is not None:   # KVD review MUSS 2: what all younger ones give back together
+        total = max(total, int(freed_of([r for _, r in sorted(younger, reverse=True)])))
+    if total < int(deficit):
         return None
     return max(younger)[1]
 
@@ -384,6 +387,31 @@ def victim_release(seat_tokens: Mapping[str, int], basis: Optional[Mapping]) -> 
     return out
 
 
+def joint_release(victims, basis: Optional[Mapping], seat_tokens: Mapping[str, int],
+                  tokens_of: Mapping[str, int]) -> int:
+    """KVD review MUSS 2: what displacing ``victims`` TOGETHER is guaranteed to give back -- D's joint release
+    (``pdflip_kv.leaving_rows_joint``: cumulative rows of the k youngest in D's displacement order; rows only they hold
+    between them, e.g. the system prompt once no older request holds it, come free with the k-th) when the set is
+    exactly D's first k, never above their seats, plus their reserve shares; else (another set, an old D, the backup
+    wall) the sum of the single prices ``tokens_of`` (:func:`victim_release`). Never below that sum."""
+    vs = [str(v) for v in victims]
+    indiv = sum(max(0, int(tokens_of.get(v, 0) or 0)) for v in vs)
+    b = basis or {}
+    joint = b.get("leaving_joint")
+    if b.get("wall") or not vs or not isinstance(joint, (list, tuple)) or len(joint) < len(vs):
+        return indiv
+    try:
+        head = [str(e[0]) for e in joint[:len(vs)]]
+        rows = int(joint[len(vs) - 1][1])
+    except (TypeError, ValueError, IndexError):
+        return indiv
+    if set(head) != set(vs):
+        return indiv
+    rows = min(rows, sum(max(0, int(seat_tokens.get(v, 0) or 0)) for v in vs))
+    rb = b.get("reserve_by_rid") or {}
+    return max(indiv, rows + sum(max(0, int(rb.get(v, 0) or 0)) for v in vs))
+
+
 def age_plan_enabled(env=None) -> bool:
     """AGE PLAN switch (default on) -- acts only with the rule itself on."""
     if env is not None:
@@ -397,7 +425,7 @@ def age_plan_enabled(env=None) -> bool:
 def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: int,
                   running: Iterable[str], arrival_of: Mapping[str, float],
                   tokens_of: Mapping[str, int], lane_of: Optional[Mapping[str, int]] = None,
-                  head_lane: int = 0) -> Optional[List[str]]:
+                  head_lane: int = 0, freed_of=None) -> Optional[List[str]]:
     """AGE PLAN (Nutzer 30.09. ~14:40Z: "der ältere ist immer bevorzugt ...
     sobald keine ältesten mehr da sind die den kv für den mittleren
     blockieren, wird der mittlere auf die karten gezogen und verdrängt ggf.
@@ -415,7 +443,8 @@ def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: in
     head to D); the displacement itself is D's alone
     (``d_park_runtime.displace_for_age`` / ``victims_needed`` on D's real KV).
     A rid without an arrival stamp counts as old.  PRIO-AS-AGE 1014: "arrived after the head" and "youngest
-    first" are the order key (``lane_of`` / ``head_lane``)."""
+    first" are the order key (``lane_of`` / ``head_lane``). KVD review MUSS 2: ``freed_of(victims)`` -- what the
+    set gives back TOGETHER (:func:`joint_release`; default the sum of ``tokens_of``)."""
     if head_arrival is None:
         return None
     need_seat = 0 if seat_is_free else 1
@@ -428,7 +457,8 @@ def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: in
     for _t, r in younger:
         out.append(r)
         freed += max(0, int(tokens_of.get(r, 0) or 0))
-        if len(out) >= need_seat and freed >= deficit:
+        got = max(freed, int(freed_of(list(out)))) if freed_of is not None else freed
+        if len(out) >= need_seat and got >= deficit:
             return out
     return None
 
