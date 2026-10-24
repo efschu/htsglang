@@ -2051,7 +2051,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22892
+      "line": 22966
      }
     }
    },
@@ -6532,7 +6532,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22284
+      "line": 22358
      }
     }
    },
@@ -7101,7 +7101,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22288
+      "line": 22362
      }
     }
    },
@@ -11311,7 +11311,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22340
+      "line": 22414
      }
     }
    },
@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23800
+      "line": 23874
      }
     }
    },
@@ -17659,7 +17659,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22602
+      "line": 22676
      }
     }
    },
@@ -18184,7 +18184,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22897
+      "line": 22971
      }
     }
    },
@@ -18269,7 +18269,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23783
+      "line": 23857
      }
     }
    },
@@ -18973,7 +18973,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23054
+      "line": 23128
      }
     }
    },
@@ -19265,7 +19265,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23430
+      "line": 23504
      }
     }
    },
@@ -26895,7 +26895,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23077
+      "line": 23151
      }
     }
    },
@@ -28445,7 +28445,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22485
+      "line": 22559
      }
     }
    },
@@ -37207,7 +37207,7 @@
    "id": "FLLIPER_DP_RANK",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:25725"
+    "managers/scheduler.py:25738"
    ],
    "level": "expert",
    "name": "FLLIPER_DP_RANK",
@@ -37216,7 +37216,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 25725,
+    "line": 25738,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -42773,7 +42773,7 @@
    "id": "FLLIPER_GIL_SWITCH_INTERVAL_MS",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:25932"
+    "managers/scheduler.py:25945"
    ],
    "level": "expert",
    "name": "FLLIPER_GIL_SWITCH_INTERVAL_MS",
@@ -42782,7 +42782,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 25932,
+    "line": 25945,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43144,7 +43144,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:3746",
     "pdflip/decode_warm_handoff.py:46",
-    "pdflip/front.py:7666",
+    "pdflip/front.py:7702",
     "pdflip/handoff.py:30",
     "pdflip/tail_handoff.py:480"
    ],
@@ -43179,7 +43179,7 @@
    "kind": "env",
    "lesestellen": [
     "mem_cache/hicache_storage.py:3800",
-    "mem_cache/pool_host/arena_pool.py:1266",
+    "mem_cache/pool_host/arena_pool.py:1270",
     "pdflip/launcher.py:27590"
    ],
    "level": "expert",
@@ -43213,7 +43213,7 @@
    "kind": "env",
    "lesestellen": [
     "server_args.py:9069",
-    "mem_cache/pool_host/arena_pool.py:1242",
+    "mem_cache/pool_host/arena_pool.py:1246",
     "mem_cache/pool_host/mha.py:1463",
     "pdflip/launcher.py:14140"
    ],
@@ -43247,7 +43247,7 @@
    "id": "FLLIPER_HICACHE_ARENA_KV_PAGE_BYTES",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1269"
+    "mem_cache/pool_host/arena_pool.py:1273"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_KV_PAGE_BYTES",
@@ -43256,7 +43256,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1269,
+    "line": 1273,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43279,7 +43279,7 @@
    "id": "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1234"
+    "mem_cache/pool_host/arena_pool.py:1238"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA",
@@ -43288,7 +43288,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1234,
+    "line": 1238,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43348,7 +43348,7 @@
    "kind": "env",
    "lesestellen": [
     "mem_cache/pool_host/arena_mamba_pool.py:307",
-    "mem_cache/pool_host/arena_pool.py:1628"
+    "mem_cache/pool_host/arena_pool.py:1632"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_PREPIN",
@@ -43445,7 +43445,7 @@
    "kind": "env",
    "lesestellen": [
     "server_args.py:9071",
-    "mem_cache/pool_host/arena_pool.py:1376"
+    "mem_cache/pool_host/arena_pool.py:1380"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_STAGING_GB",
@@ -43477,7 +43477,7 @@
    "id": "FLLIPER_HICACHE_BIGRAM_KEYS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:7670"
+    "pdflip/front.py:7706"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_BIGRAM_KEYS",
@@ -43486,7 +43486,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 7670,
+    "line": 7706,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44002,8 +44002,8 @@
    "id": "FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:22481",
-    "managers/scheduler.py:23502"
+    "managers/scheduler.py:22487",
+    "managers/scheduler.py:23515"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP",
@@ -44012,7 +44012,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 22481,
+    "line": 22487,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44500,7 +44500,7 @@
    "id": "FLLIPER_HICACHE_LOAD_ASYNC_INDEX",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1300"
+    "mem_cache/pool_host/arena_pool.py:1304"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_LOAD_ASYNC_INDEX",
@@ -44509,7 +44509,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1300,
+    "line": 1304,
     "tree": "27b"
    },
    "status": "explained",
@@ -54817,7 +54817,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1031"
+    "mem_cache/pool_host/arena_pool.py:1035"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD",
@@ -54826,7 +54826,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1031,
+    "line": 1035,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -54849,8 +54849,8 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_BLOCK",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1172",
-    "mem_cache/pool_host/arena_pool.py:2087"
+    "mem_cache/pool_host/arena_pool.py:1176",
+    "mem_cache/pool_host/arena_pool.py:2091"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_BLOCK",
@@ -54859,7 +54859,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1172,
+    "line": 1176,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -54882,7 +54882,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1060"
+    "mem_cache/pool_host/arena_pool.py:1064"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE",
@@ -54891,7 +54891,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1060,
+    "line": 1064,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -54914,7 +54914,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_TIMING",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1155"
+    "mem_cache/pool_host/arena_pool.py:1159"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_PAGE_LOAD_TIMING",
@@ -54923,7 +54923,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1155,
+    "line": 1159,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55010,7 +55010,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_STAGE_VIEW",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/pool_host/arena_pool.py:1189"
+    "mem_cache/pool_host/arena_pool.py:1193"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_STAGE_VIEW",
@@ -55019,7 +55019,7 @@
    "source": {
     "file": "mem_cache/pool_host/arena_pool.py",
     "kind": "os.environ",
-    "line": 1189,
+    "line": 1193,
     "tree": "27b"
    },
    "status": "harvested",
@@ -56464,7 +56464,7 @@
    "id": "FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:4773"
+    "pdflip/front.py:4809"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP",
@@ -56473,7 +56473,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 4773,
+    "line": 4809,
     "tree": "27b"
    },
    "status": "explained",
@@ -56682,8 +56682,8 @@
    "id": "FLLIPER_PDFLIP_DC_IMAGE_OFF_FLIP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:4765",
-    "pdflip/front.py:10368"
+    "pdflip/front.py:4801",
+    "pdflip/front.py:10404"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DC_IMAGE_OFF_FLIP",
@@ -56692,7 +56692,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 4765,
+    "line": 4801,
     "tree": "27b"
    },
    "status": "harvested",
@@ -56763,7 +56763,7 @@
    "id": "FLLIPER_PDFLIP_DC_SNAPSHOT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:25890",
+    "managers/scheduler.py:25903",
     "managers/scheduler_components/weight_updater.py:2014"
    ],
    "level": "expert",
@@ -56773,7 +56773,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 25890,
+    "line": 25903,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -57381,8 +57381,8 @@
    "id": "FLLIPER_PDFLIP_DORMANT_ADMIT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1516",
-    "pdflip/front.py:5110"
+    "managers/scheduler.py:1518",
+    "pdflip/front.py:5146"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DORMANT_ADMIT",
@@ -57391,7 +57391,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1516,
+    "line": 1518,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -57537,7 +57537,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/front.py",
       "row_note": 17185,
-      "zeile": 24378
+      "zeile": 24611
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -58189,7 +58189,7 @@
    "id": "FLLIPER_PDFLIP_DUAL_D_AIR_TOKENS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:22789"
+    "pdflip/front.py:23022"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_D_AIR_TOKENS",
@@ -58198,7 +58198,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 22789,
+    "line": 23022,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -59476,9 +59476,9 @@
     "managers/pdflip_store_told.py:1579",
     "managers/pdflip_store_told.py:1826",
     "managers/pdflip_told_fallback.py:1501",
-    "managers/scheduler.py:1081",
-    "managers/scheduler.py:1853",
-    "managers/scheduler.py:16115"
+    "managers/scheduler.py:1083",
+    "managers/scheduler.py:1855",
+    "managers/scheduler.py:16117"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_LAYOUT",
@@ -60505,7 +60505,7 @@
    "id": "FLLIPER_PDFLIP_DUAL_STORE_SHORT_MAX_CYCLES",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1082"
+    "managers/scheduler.py:1084"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_STORE_SHORT_MAX_CYCLES",
@@ -60514,7 +60514,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1082,
+    "line": 1084,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -60868,7 +60868,7 @@
    "id": "FLLIPER_PDFLIP_D_DECODE_GAP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/d_decode_gap.py:125"
+    "pdflip/d_decode_gap.py:130"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_D_DECODE_GAP",
@@ -60877,7 +60877,7 @@
    "source": {
     "file": "pdflip/d_decode_gap.py",
     "kind": "os.environ",
-    "line": 125,
+    "line": 130,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -60900,7 +60900,7 @@
    "id": "FLLIPER_PDFLIP_D_DECODE_GAP_CENSUS_S",
    "kind": "env",
    "lesestellen": [
-    "pdflip/d_decode_gap.py:277"
+    "pdflip/d_decode_gap.py:286"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_D_DECODE_GAP_CENSUS_S",
@@ -60909,7 +60909,7 @@
    "source": {
     "file": "pdflip/d_decode_gap.py",
     "kind": "os.environ",
-    "line": 277,
+    "line": 286,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -60932,7 +60932,7 @@
    "id": "FLLIPER_PDFLIP_D_DECODE_GAP_MS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/d_decode_gap.py:277"
+    "pdflip/d_decode_gap.py:286"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_D_DECODE_GAP_MS",
@@ -60941,7 +60941,7 @@
    "source": {
     "file": "pdflip/d_decode_gap.py",
     "kind": "os.environ",
-    "line": 277,
+    "line": 286,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -64852,7 +64852,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7529"
+    "mem_cache/unified_radix_cache.py:7535"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -64861,7 +64861,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7529,
+    "line": 7535,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -66700,7 +66700,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/front.py",
       "row_note": 17210,
-      "zeile": 24405
+      "zeile": 24638
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -67757,7 +67757,7 @@
    "id": "FLLIPER_PDFLIP_L15_ALIGN_PROBE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:23106"
+    "managers/scheduler.py:23119"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L15_ALIGN_PROBE",
@@ -67766,7 +67766,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 23106,
+    "line": 23119,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67819,9 +67819,9 @@
    "id": "FLLIPER_PDFLIP_L15_DEPOSIT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:9113",
+    "managers/scheduler.py:9115",
     "managers/scheduler_components/weight_updater.py:12611",
-    "pdflip/front.py:18233",
+    "pdflip/front.py:18442",
     "pdflip/l15_deposit_hook.py:42",
     "pdflip/l15_plan.py:476"
    ],
@@ -67832,7 +67832,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 9113,
+    "line": 9115,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67916,13 +67916,13 @@
    "id": "FLLIPER_PDFLIP_L15_HOT_SHARE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:9098",
-    "managers/scheduler.py:23311",
+    "managers/scheduler.py:9100",
+    "managers/scheduler.py:23324",
     "managers/scheduler_components/weight_updater.py:12730",
-    "pdflip/front.py:18194",
-    "pdflip/front.py:9092",
-    "pdflip/front.py:20845",
-    "pdflip/front.py:9081"
+    "pdflip/front.py:18403",
+    "pdflip/front.py:9128",
+    "pdflip/front.py:21054",
+    "pdflip/front.py:9117"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L15_HOT_SHARE",
@@ -67931,7 +67931,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 9098,
+    "line": 9100,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -70896,6 +70896,38 @@
    ],
    "type": "EnvInt"
   },
+  "FLLIPER_PDFLIP_MIXED_CHUNK_PAGE_FLOOR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "R2/R7 PAGE FLOOR (switch ``FLLIPER_PDFLIP_MIXED_CHUNK_PAGE_FLOOR``, default ON; ``0`` = the old subtraction).",
+   "id": "FLLIPER_PDFLIP_MIXED_CHUNK_PAGE_FLOOR",
+   "kind": "env",
+   "lesestellen": [
+    "managers/schedule_policy.py:1350"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_MIXED_CHUNK_PAGE_FLOOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/schedule_policy.py",
+    "kind": "os.environ",
+    "line": 1350,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_MIXED_D_CENSUS_N": {
    "bare": false,
    "choices": null,
@@ -70995,7 +71027,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:7494"
+    "pdflip/front.py:7530"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -71004,7 +71036,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 7494,
+    "line": 7530,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -72593,7 +72625,7 @@
    "id": "FLLIPER_PDFLIP_PREFETCH_FROM_ANCHOR",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1816"
+    "managers/scheduler.py:1818"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFETCH_FROM_ANCHOR",
@@ -72602,7 +72634,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1816,
+    "line": 1818,
     "tree": "27b"
    },
    "status": "harvested",
@@ -72654,7 +72686,7 @@
    "id": "FLLIPER_PDFLIP_PREFETCH_STALL_PASSES",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:10013"
+    "managers/scheduler.py:10015"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFETCH_STALL_PASSES",
@@ -72663,7 +72695,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 10013,
+    "line": 10015,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -72686,7 +72718,7 @@
    "id": "FLLIPER_PDFLIP_PREFETCH_STALL_S",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:857"
+    "managers/scheduler.py:859"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFETCH_STALL_S",
@@ -72695,7 +72727,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 857,
+    "line": 859,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -72875,7 +72907,7 @@
    "id": "FLLIPER_PDFLIP_PREFIX_FP_PATH",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:18375"
+    "pdflip/front.py:18584"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFIX_FP_PATH",
@@ -72884,7 +72916,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 18375,
+    "line": 18584,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -73408,7 +73440,7 @@
    "id": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3767"
+    "pdflip/front.py:3803"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
@@ -73417,7 +73449,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3767,
+    "line": 3803,
     "tree": "27b"
    },
    "status": "harvested",
@@ -73791,7 +73823,7 @@
    "id": "FLLIPER_PDFLIP_P_QUEUE_AHEAD",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:23614"
+    "pdflip/front.py:23847"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_QUEUE_AHEAD",
@@ -73800,7 +73832,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 23614,
+    "line": 23847,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -74306,6 +74338,38 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "QUIESCE-BUSY-1023 env gate (27B port 1024, closes the SCHNITT5 review RISK \"abort only by code change\"): default ON; ``0``/false/no/off restores the old both-busy reading (``witness_verdict`` agreement -> the sleep legs run).",
+   "id": "FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/front.py:3025",
+    "pdflip/front.py:21277"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/front.py",
+    "kind": "os.environ",
+    "line": 3025,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_QUIESCE_EMPTY_CACHE": {
    "bare": false,
    "choices": null,
@@ -74318,8 +74382,8 @@
    "id": "FLLIPER_PDFLIP_QUIESCE_EMPTY_CACHE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1992",
-    "managers/scheduler.py:1996"
+    "managers/scheduler.py:1994",
+    "managers/scheduler.py:1998"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_QUIESCE_EMPTY_CACHE",
@@ -74328,7 +74392,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1992,
+    "line": 1994,
     "tree": "27b"
    },
    "status": "harvested",
@@ -74397,6 +74461,38 @@
    ],
    "type": "EnvInt"
   },
+  "FLLIPER_PDFLIP_QUIESCE_LOADBACK_DRAIN": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_QUIESCE_LOADBACK_DRAIN",
+   "kind": "env",
+   "lesestellen": [
+    "managers/pdflip_quiesce_loadback.py:55"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_QUIESCE_LOADBACK_DRAIN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/pdflip_quiesce_loadback.py",
+    "kind": "os.environ",
+    "line": 55,
+    "tree": "27b"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_QUIESCE_PENDING_POLL_MS": {
    "bare": false,
    "choices": null,
@@ -74425,6 +74521,37 @@
     "nf"
    ],
    "type": "EnvInt"
+  },
+  "FLLIPER_PDFLIP_R2_KURZ_CHUNK_RESERVE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "R2-KURZ-CHUNK 1024 (SCHEDULER-SOLL R2/R7, 27B D): default ON; the waiting kurz requests that fit whole next to the carried continuation get their share of the pass chunk before it (no wait behind a longer D prefill); ``0``/false/off/no restores the old continuation-first budget (kurz refused ``trunc_len_zero`` until it ends).",
+   "id": "FLLIPER_PDFLIP_R2_KURZ_CHUNK_RESERVE",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/r2_kurz_chunk.py:77"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_R2_KURZ_CHUNK_RESERVE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/r2_kurz_chunk.py",
+    "kind": "os.environ",
+    "line": 77,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "os.environ"
   },
   "FLLIPER_PDFLIP_R2_KURZ_GRANT_HOLD": {
    "bare": false,
@@ -74822,8 +74949,8 @@
    "id": "FLLIPER_PDFLIP_RELEASE_FLUSH_DEDUP",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:2049",
-    "managers/scheduler.py:2090"
+    "managers/scheduler.py:2051",
+    "managers/scheduler.py:2092"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RELEASE_FLUSH_DEDUP",
@@ -74832,7 +74959,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 2049,
+    "line": 2051,
     "tree": "27b"
    },
    "status": "harvested",
@@ -75538,7 +75665,7 @@
    "id": "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:754"
+    "managers/scheduler.py:756"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH",
@@ -75547,7 +75674,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 754,
+    "line": 756,
     "tree": "27b"
    },
    "status": "harvested",
@@ -76930,7 +77057,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7815"
+    "mem_cache/unified_radix_cache.py:7821"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -76939,7 +77066,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7815,
+    "line": 7821,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -77054,7 +77181,7 @@
    "id": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1731"
+    "managers/scheduler.py:1732"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
@@ -77063,7 +77190,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1731,
+    "line": 1732,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77240,7 +77367,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1057"
+    "managers/scheduler.py:1059"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
@@ -77249,7 +77376,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1057,
+    "line": 1059,
     "tree": "27b"
    },
    "status": "harvested",
@@ -77268,7 +77395,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1080
+      "line": 1082
      }
     },
     "nf": {
@@ -77277,7 +77404,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1010
+      "line": 1011
      }
     }
    },
@@ -77292,7 +77419,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_MAX_CYCLES",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1080"
+    "managers/scheduler.py:1082"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_MAX_CYCLES",
@@ -77301,7 +77428,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1080,
+    "line": 1082,
     "tree": "27b"
    },
    "status": "harvested",
@@ -77353,7 +77480,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_TAIL_X",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1020",
+    "managers/scheduler.py:1022",
     "pdflip/launcher.py:4220"
    ],
    "level": "expert",
@@ -77363,7 +77490,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1020,
+    "line": 1022,
     "tree": "27b"
    },
    "status": "harvested",
@@ -77452,7 +77579,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:10166"
+    "mem_cache/unified_radix_cache.py:10198"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -77461,7 +77588,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 10166,
+    "line": 10198,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -79582,7 +79709,7 @@
    "id": "FLLIPER_PDFLIP_VISION",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:5347",
+    "managers/scheduler.py:5349",
     "managers/tokenizer_manager.py:515",
     "pdflip/vision_stage_service.py:832"
    ],
@@ -79593,7 +79720,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 5347,
+    "line": 5349,
     "tree": "27b"
    },
    "status": "harvested",
@@ -79735,7 +79862,7 @@
    "id": "FLLIPER_PDFLIP_VISION_FLIP_URGENT",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:4954",
+    "pdflip/front.py:4990",
     "pdflip/front.py:1154"
    ],
    "level": "expert",
@@ -79745,7 +79872,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 4954,
+    "line": 4990,
     "tree": "27b"
    },
    "status": "harvested",
@@ -80520,7 +80647,7 @@
    "id": "FLLIPER_PDFLIP_WAKE_DEFER_BELOW_MIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3285"
+    "pdflip/front.py:3321"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_WAKE_DEFER_BELOW_MIB",
@@ -80529,7 +80656,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3285,
+    "line": 3321,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -80981,7 +81108,7 @@
    "id": "FLLIPER_PDFLIP_WAKE_SHORT_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1131"
+    "managers/scheduler.py:1133"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_WAKE_SHORT_DECIDE",
@@ -80990,7 +81117,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1131,
+    "line": 1133,
     "tree": "27b"
    },
    "status": "harvested",
@@ -90458,7 +90585,7 @@
    "id": "FLLIPER_TP_HEAD_CONGRUENCE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:12418"
+    "managers/scheduler.py:12420"
    ],
    "level": "expert",
    "name": "FLLIPER_TP_HEAD_CONGRUENCE",
@@ -90467,7 +90594,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 12418,
+    "line": 12420,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -93319,28 +93446,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2955,
-  "envs": 2076,
+  "entries": 2959,
+  "envs": 2080,
   "explained": 310,
   "flags": 864,
-  "harvested": 1827,
+  "harvested": 1830,
   "trees": {
    "abweichung": 30,
-   "beide": 2714,
-   "nur_27b": 208,
+   "beide": 2716,
+   "nur_27b": 210,
    "nur_nf": 15
   },
-  "unexplained": 693
+  "unexplained": 694
  },
- "tree_rev": "27b=941bdabe0a+nf=8964fc35c6",
+ "tree_rev": "27b=80edc22844+nf=49cfdde0d0",
  "trees": {
   "27b": {
-   "entries": 2922,
-   "rev": "941bdabe0a"
+   "entries": 2926,
+   "rev": "80edc22844"
   },
   "nf": {
-   "entries": 2729,
-   "rev": "8964fc35c6"
+   "entries": 2731,
+   "rev": "49cfdde0d0"
   }
  },
  "warnungen": []
