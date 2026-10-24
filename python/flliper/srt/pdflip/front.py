@@ -1372,7 +1372,7 @@ def common_prefix_len(a: str, b: str) -> int:
     n = min(len(a), len(b))
     if n == 0 or a[0] != b[0]:
         return 0
-    lo, step = 0, _LCP_GALLOP0
+    lo, step = 0, max(1, int(_LCP_GALLOP0))  # >= 1: lo must advance
     while True:
         hi = min(n, lo + step)
         if a[lo:hi] == b[lo:hi]:

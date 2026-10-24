@@ -86,8 +86,10 @@ def test_edges_equal_reference():
 
 def test_random_pairs_equal_reference():
     rng = random.Random(7)
-    for _ in range(1500):
-        s = _text(rng, rng.randint(0, 40000))
+    pool = _text(rng, 60000)
+    for _ in range(600):
+        st = rng.randint(0, 20000)
+        s = pool[st:st + rng.randint(0, 40000)]
         k = rng.randint(0, len(s))
         t = s[:k] + rng.choice(["", "x", "—", "\U0001F600", "ä"]) + _text(rng, rng.randint(0, 300))
         assert common_prefix_len(s, t) == _reference(s, t)
@@ -109,8 +111,10 @@ def _agent_lru(rng: random.Random, sessions: int = 6, turns: int = 30):
             texts.append(sess[s])
             ct = int(len(sess[s]) / 3.1) - rng.randint(0, 200)
             lru.record_presence(sess[s], ct, prompt_tokens=int(len(sess[s]) / 3.1), held_epoch=t % 3)
-            if rng.random() < 0.3:
-                lru.record_presence(sess[s] + "x", 0, prompt_tokens=10, resumable_depth=0)
+            if rng.random() < 0.4:
+                # #59: a positive resumable depth caps the entry -> known_prefix_depth reads it
+                lru.record_presence(sess[s] + "x", ct, prompt_tokens=ct + 10,
+                                    resumable_depth=max(1, ct - rng.randint(0, 5000)))
     return lru, sess, head
 
 
@@ -119,11 +123,21 @@ def test_spanlru_prices_unchanged(monkeypatch):
     lru, sess, head = _agent_lru(rng)
     probes = [s + _text(rng, 1500) for s in sess]
     probes += [head[:12345] + "Q" + _text(rng, 999), _text(rng, 5000), sess[0][:F._LCP_GALLOP0 * 3]]
-    new = [(lru.uncached_tokens(p, int(len(p) / 3) + 1, e), lru.last_src, lru.known_prefix_depth(p))
-           for p in probes for e in (None, 0, 1, 2)]
+    assert lru.depth_caps, "the pin must reach known_prefix_depth's scan (review 1024 finding 1)"
+    legacy = SpanLRU(agent_span=False)
+    for k in list(lru.entries)[:60]:
+        etext, ct, _pt, _h = lru.entries[k]
+        legacy.record_presence(etext, ct)
+
+    def prices():
+        return ([(lru.uncached_tokens(p, int(len(p) / 3) + 1, e), lru.last_src, lru.known_prefix_depth(p))
+                 for p in probes for e in (None, 0, 1, 2)]
+                + [(legacy.span_tokens(p), legacy.uncached_tokens(p, int(len(p) / 3) + 1)) for p in probes])
+
+    new = prices()
+    assert any(d > 0 for (_u, _s, d) in new[: 4 * len(probes)]), "known_prefix_depth never credited"
     monkeypatch.setattr(F, "common_prefix_len", _reference)
-    old = [(lru.uncached_tokens(p, int(len(p) / 3) + 1, e), lru.last_src, lru.known_prefix_depth(p))
-           for p in probes for e in (None, 0, 1, 2)]
+    old = prices()
     assert new == old
 
 
@@ -161,7 +175,7 @@ def m(a, b):
     n = min(len(a), len(b))
     if n == 0 or a[0] != b[0]:
         return 0
-    lo, step = 0, G
+    lo, step = 0, max(1, int(G))
     while True:
         hi = min(n, lo + step)
         if a[lo:hi] == b[lo:hi]:
@@ -208,7 +222,7 @@ def test_unmutated_copy_passes_the_edge_check():
     import inspect
     live = inspect.getsource(F.common_prefix_len)
     # the copy above IS the live body (minus docstring/comments): keep them in step
-    for line in ("hi -= 1", "if a[lo:mid] == b[lo:mid]:", "if a[lo:hi] == b[lo:hi]:", "if n == 0 or a[0] != b[0]:"):
+    for line in ("hi -= 1", "if a[lo:mid] == b[lo:mid]:", "if a[lo:hi] == b[lo:hi]:", "if n == 0 or a[0] != b[0]:", "max(1, int(_LCP_GALLOP0))"):
         assert line in live
     assert _edge_check(_build(_SRC))
 
