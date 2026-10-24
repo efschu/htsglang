@@ -126,8 +126,11 @@ def test_solve_amortises_the_round_trip_over_the_backlog():
     # D's marginal token not dearer than P's: no crossing. D is the cheaper
     # route for every size while its fixed cost stays under the price share
     # (inf -> the ceiling), P for every size otherwise (0 -> the floor)
+    # LIVE-X-FWDCOST 1024: D pays a per forward of n_hi (4096) and each chunk reads
+    # the deeper prefix of the one before, so a crossing exists -- ~455k tokens,
+    # far past the ceiling, which decides exactly as it did for inf
     x, why = pp.solve_x_cost_line(price_s=7.866, k=1.0, line=line, r_p=500.0, prefix_tokens=0)
-    assert x == float("inf") and why.startswith("d-never-dearer")
+    assert x > 12288 and (why == "ok" or why.startswith("d-never-dearer"))
     x, why = pp.solve_x_cost_line(price_s=7.866, k=6.0, line=line, r_p=500.0, prefix_tokens=0)
     assert x == 0.0 and why.startswith("p-always-cheaper")
     # a price share below D's fixed cost: 0 -- the caller's floor decides
