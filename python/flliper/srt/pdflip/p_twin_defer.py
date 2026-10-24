@@ -928,14 +928,15 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
                 _say_ungranted(st, rid, ungr, len(w.sources), "release")
                 if not w.sources:
                     st.waits.pop(rid, None)
-                    logger.info(
-                        "#TW TWIN-RELEASE rid=%s reason=%s waited_s=%.2f shared=%d "
-                        "pending_sources=0 ungranted=%s (n=%d): every remaining source "
-                        "waits for its own P card grant -- registered as an ordinary "
-                        "request",
-                        rid[:12], REL_SOURCE_UNGRANTED, now - w.since, w.shared,
-                        [_rid(s)[:12] for s in ungr], st.n_source_ungranted,
-                    )
+                    if _say(st.n_source_ungranted):  # #DPJ-S8: on the shared log curve
+                        logger.info(
+                            "#TW TWIN-RELEASE rid=%s reason=%s waited_s=%.2f shared=%d "
+                            "pending_sources=0 ungranted=%s (n=%d): every remaining source "
+                            "waits for its own P card grant -- registered as an ordinary "
+                            "request",
+                            rid[:12], REL_SOURCE_UNGRANTED, now - w.since, w.shared,
+                            [_rid(s)[:12] for s in ungr], st.n_source_ungranted,
+                        )
                     out.append((w.req, False))
                     older.append(w.req)
                     continue

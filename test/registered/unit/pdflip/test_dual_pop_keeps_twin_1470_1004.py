@@ -143,8 +143,8 @@ def test_b9b_pop_keeps_instance_2_and_its_told(row_auth, caplog):
 def test_default_off_is_unchanged_old_pop_takes_both():
     """No env: the old rid-wide pop (the B9b death shape) byte for byte, no record written."""
     with mock.patch.dict(os.environ, DUAL_P_ENV), mock.patch.object(p_row_authority, "applies", lambda s: True):
-        os.environ.pop(ENV_ON, None)
-        os.environ.pop(Q698, None)
+        os.environ[ENV_ON] = "0"  # #DPJ-S1: default ON now, OFF is explicit
+        os.environ[Q698] = "0"
         f, inst1 = _held()
         inst2 = _b9b(f)
         assert f.waiting_queue == []                     # instance 2 gone with instance 1: the bug, unchanged
@@ -156,7 +156,7 @@ def test_default_off_is_unchanged_old_pop_takes_both():
 def test_mutant_env_ignored_would_spare_twin_when_off():
     """MUTANT: if the env gate were ignored the OFF scenario would diverge -- the default-off test is sensitive."""
     with mock.patch.dict(os.environ, DUAL_P_ENV), mock.patch.object(p_row_authority, "applies", lambda s: True):
-        os.environ.pop(ENV_ON, None)
+        os.environ[ENV_ON] = "0"  # #DPJ-S1: default ON now, OFF is explicit
         with mock.patch.object(DU, "pop_keeps_twin_on", lambda env=None: True):
             f, inst1 = _held()
             inst2 = _b9b(f)

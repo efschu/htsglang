@@ -831,12 +831,14 @@ class Envs:
     # #1430q LATER-TOLD DROPS HELD ZOMBIE (B9 14:49:55Z, pdflip-0-103): dual P followers only. DEFAULT OFF = the old
     # code path byte for byte. On: a told verdict of a later PP0 list than a held (#1180-W) waiting-queue abort takes
     # that abort's unadmitted instance (a zombie; the told belongs to the rid's NEW instance) out of the queue, object-exact.
-    FLLIPER_PDFLIP_DUAL_LATER_TOLD_DROP = EnvBool(False)
+    # #DPJ-S1 24.10.: DEFAULT ON (user order 14.10.); =0 = the old code path.
+    FLLIPER_PDFLIP_DUAL_LATER_TOLD_DROP = EnvBool(True)
     # #1470 POP KEEPS TWIN (B9b 15:45:30Z, pdflip-0-89): dual P followers only. DEFAULT OFF = the old code path byte for byte.
     # On: the #1180-W 'pop' verdict (PP0 popped the aborted request at receipt) takes out only the objects the hold was
     # made for when a newer instance of the same rid is queued, instead of AbortReq(rid) (prefix: both instances + the
     # new instance's told).
-    FLLIPER_PDFLIP_DUAL_POP_KEEPS_TWIN = EnvBool(False)
+    # #DPJ-S1 24.10.: DEFAULT ON (user order 14.10.); =0 = the old code path.
+    FLLIPER_PDFLIP_DUAL_POP_KEEPS_TWIN = EnvBool(True)
     # #1480 LEND-RESUME-GATE (B9c 17:02:28Z): dual FRONT only (the P-stage ladder). DEFAULT ON (user order 14.10.: new
     # features on; 27B dual 21.10. 22:57:17Z the same class again: PP0's reclaim refused, 939524096 B lent, P resumed
     # 200 ms later, the 5090 ran to driver_free 2.7 MiB at 23:10:19Z); =0 = the old code path byte for byte. On: the front's resume 'from=lend' needs every P stage file at lent==0. The front read the stage files under

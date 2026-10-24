@@ -234,9 +234,16 @@ HOLDS_ATTR = "_q1430q_holds"
 _TRUE = ("1", "true", "yes", "on")
 
 
+def _default_on(e, name: str) -> bool:
+    """#DPJ-S1 (24.10., user order 14.10. "neue Features immer an"): unset / empty = ON; only an
+    explicit value decides (``0`` / ``false`` / ``off`` = the old code path byte for byte)."""
+    v = str(e.get(name, "") or "").strip().lower()
+    return True if not v else v in _TRUE
+
+
 def later_told_drop_on(env=None) -> bool:
     e = os.environ if env is None else env
-    return str(e.get(LATER_TOLD_ENV, "")).strip().lower() in _TRUE
+    return _default_on(e, LATER_TOLD_ENV)
 
 
 def _gate(env=None) -> bool:
@@ -261,7 +268,7 @@ MARK_POP_TWIN = "#1470 POP-KEEPS-TWIN"
 
 def pop_keeps_twin_on(env=None) -> bool:
     e = os.environ if env is None else env
-    return str(e.get(POP_TWIN_ENV, "")).strip().lower() in _TRUE
+    return _default_on(e, POP_TWIN_ENV)
 
 
 def _pop_gate(env=None) -> bool:

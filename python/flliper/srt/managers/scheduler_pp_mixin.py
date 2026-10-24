@@ -6983,13 +6983,20 @@ class SchedulerPPMixin:
             _dgreen = getattr(self, "_dual_green", None)
             if _dgreen is not None and self.pp_group.is_first_rank:
                 _wire_reqs, _ = _dgreen.pp0_stamp(_wire_reqs)
-                # K14: PP0's group verdict on each forwarded abort (does a
-                # frame it sent name the rid?) rides the AbortReq itself --
-                # stamped here, before the send and before PP0 applies it.
-                if any(type(r).__name__ == "AbortReq" for r in (_wire_reqs or ())):
-                    from flliper.srt.pdflip import pp_abort as _pp_abort_k14
+            # K14: PP0's group verdict on each forwarded abort (does a
+            # frame it sent name the rid?) rides the AbortReq itself --
+            # stamped here, before the send and before PP0 applies it.
+            # #DPJ-S2 (24.10.): EVERY layout, as on the NF line (42eef22f3d, under
+            # the PP0 flush-verdict block). The F0-H port 8de7f55b3b had moved it
+            # under `_dgreen is not None` -- off dual-green no abort was stamped and
+            # K14 (and every follower rule that reads the stamp) was dead there.
+            # pp0_stamp_aborts itself stamps nothing off the row authority.
+            if self.pp_group.is_first_rank and any(
+                type(r).__name__ == "AbortReq" for r in (_wire_reqs or ())
+            ):
+                from flliper.srt.pdflip import pp_abort as _pp_abort_k14
 
-                    _wire_reqs = _pp_abort_k14.pp0_stamp_aborts(self, _wire_reqs)
+                _wire_reqs = _pp_abort_k14.pp0_stamp_aborts(self, _wire_reqs)
             # PR (pdflip/pp_room_vote.py): R_m rides list m; nothing without one.
             if self.pp_group.is_first_rank and self.__dict__.get("_pdflip_pr_verdict") is not None:
                 from flliper.srt.pdflip import pp_room_vote as _pr

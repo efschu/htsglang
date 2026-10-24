@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import dataclasses
 import faulthandler
 import logging
@@ -7069,7 +7070,7 @@ class Scheduler(
         abort_all = bool(getattr(recv_req, "abort_all", False))
         keep, gone = [], []
         for req in hold:
-            if abort_all or str(req.rid).startswith(rid):
+            if abort_all or _abort_rid_hit(req.rid, rid):
                 gone.append(req)
             else:
                 keep.append(req)
@@ -11365,7 +11366,7 @@ class Scheduler(
 
         if row_authority_of(self) is False:
             return False  # pass-aligned request wire: applied at receipt (#791C-NF)
-        held = [r for r in self.waiting_queue if str(r.rid).startswith(rid)]
+        held = [r for r in self.waiting_queue if _abort_rid_hit(r.rid, rid)]
         if not held:
             return False
         # #DPJ-W (24.10., 27B NVFP4 dual rc39a b9cddabda1, P log ..._1024_085659):
@@ -25310,7 +25311,7 @@ class Scheduler(
             except Exception:  # noqa: BLE001 -- bookkeeping never blocks an abort
                 logger.warning("PDFLIP-INTAKE-STALL watch.forget raised", exc_info=True)
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or _abort_rid_hit(chunked_req.rid, recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
                 self._pending_chunked_abort_reason = getattr(recv_req, "finished_reason", None)
                 from flliper.srt.pdflip.pp_abort import chunked_abort_delay, row_authority_of
@@ -25364,7 +25365,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or _abort_rid_hit(req.rid, recv_req.rid):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -25425,7 +25426,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.abort_all or _abort_rid_hit(req.rid, recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(req.rid)
@@ -25435,7 +25436,7 @@ class Scheduler(
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.abort_all or _abort_rid_hit(req.rid, recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -25443,13 +25444,13 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.abort_all or _abort_rid_hit(decode_req.req.rid, recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.abort_all or _abort_rid_hit(decode_req.req.rid, recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
@@ -25457,7 +25458,7 @@ class Scheduler(
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                    if recv_req.abort_all or _abort_rid_hit(decode_req.rid, recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
                         self.ipc_channels.send_to_tokenizer.send_output(
@@ -25480,7 +25481,7 @@ class Scheduler(
         inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
         for req in inflight_reqs:
             if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                recv_req.abort_all or _abort_rid_hit(req.rid, recv_req.rid)
             ):
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.

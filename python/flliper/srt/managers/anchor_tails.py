@@ -43,6 +43,7 @@ the scheduler; the scheduler threads results back onto its own fields.
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
@@ -230,7 +231,7 @@ def abort_targets(tails: Iterable[Any], *, rid: str, abort_all: bool) -> List[An
     return [
         t
         for t in tails
-        if abort_all or str(getattr(t, "rid", "")).startswith(str(rid))
+        if abort_all or _abort_rid_hit(getattr(t, "rid", ""), rid)
     ]
 
 
