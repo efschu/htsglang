@@ -14168,7 +14168,7 @@ class Front:
         counted: Dict[str, int] = {}
         self.__dict__["_r6_counted"] = counted
         self.__dict__["_r6_in_flight"] = {}
-        self.__dict__["_r6_commit_now"] = set()
+        self.__dict__["_r6_commit_now"] = {}  # #200: rid -> D's rest (the most a pending commit can add to S)
 
         def _tok(rid: str, t_grant: float, _granted: int) -> int:
             if not box:
@@ -14263,14 +14263,14 @@ class Front:
                                "within %.1f s (D's loop stopped between recv and launch?): counted as nothing P can get, the "
                                "verdict no longer waits for it", rid, now - t0, self.epoch, Front.R6_COMMIT_STALE_S)
             return True  # stale: no hold (not in ``_r6_commit_now``), and the caller counts nothing of it
-        self.__dict__.setdefault("_r6_commit_now", set()).add(str(rid))
+        self.__dict__.setdefault("_r6_commit_now", {})[str(rid)] = max(0, int(rest))  # #200: free <= rest bounds what it adds
         return True
 
     def _r6_commit_hold(self, sv: "phase_policy.SetVerdict") -> "phase_policy.SetVerdict":
         """NF-RC30-R6STALE review A1 (SOLL R6/R7): a final set verdict (flip, reroute, park, D) made while a counted D prefill's
         next chunk is COMMITTED and its exact free not yet reported waits one controller tick: the free can only ADD to S (a D
         verdict could become R6) and a reroute must carry it. COLLECT stands. Bounded by D's own record (one D iteration)."""
-        pend = self.__dict__.get("_r6_commit_now") or set()
+        pend = self.__dict__.get("_r6_commit_now") or {}
         if not pend or sv.verdict == phase_policy.V_COLLECT:
             return sv
         self.counters["set_r6_commit_hold"] += 1
@@ -14278,6 +14278,53 @@ class Front:
             phase_policy.V_COLLECT,
             "R6 commit pending: D fixed the next chunk of %s, its exact rest follows with that chunk's start record (was %s: "
             "%s)" % (",".join(sorted(pend)[:4]), sv.verdict, sv.why), sv.left_s, sv.s_tokens, sv.half_x)
+
+    def _r6_hold_d_free(self, sv: "phase_policy.SetVerdict", x_tok: int, site: str) -> bool:
+        """#200 (SOLL R3 + R8 against R6/R6k, R11): True = a D verdict (``D_AFTER_TIMER``) is final AT ONCE although an R6 piece is
+        pending (a COMMITTED chunk, ``_r6_commit_hold``; an R6 stop D has not applied, ``_r6_halt_hold``), because even the MOST
+        those pieces can still add cannot lift S to X.
+
+        R3 "Läuft T_halb ab mit S < X: das Set wird auf D prefillt. Kein Flip." / R8 "D bei S < X" -- the hold exists only for R6
+        "wächst S (inkl. des laufenden Rests) über X": a pending piece's exact rest is unknown, so a D verdict could hide an R6
+        case. Its upper bound IS known (no estimate, user 19.10. "NICHTS SCHÄTZEN"): a COMMITTED chunk adds at most D's rest
+        (free <= rest), a stopped prefill at most the free it was counted with at the stop (D can only launch more, never take a
+        launch back; R1u's shared piece only lowers it). S + sum(bounds) < X -> no outcome of D's record makes S >= X: R6 cannot
+        apply, holding the set is waiting R3 forbids (live risk: up to ``R6_HALT_STALE_S`` = 30 s when D writes no halt record).
+        S + sum(bounds) >= X (or no X / a bound not known) -> R6 may still apply: the holds stand as before. A pending stop is
+        not released by this (it goes back to D on D's own record: ``_r6_halt_tick`` / ``_r6_halt_settle``, R7). Only D verdicts:
+        a flip verdict is never changed here (R1a/R6 carry rules unchanged)."""
+        if sv.verdict != phase_policy.V_D_AFTER_TIMER:
+            return False
+        commit = self.__dict__.get("_r6_commit_now") or {}
+        pend = self.__dict__.get("_r6_halt_pending") or set()
+        if not commit and not pend:
+            return False                      # nothing would hold
+        try:
+            x = int(x_tok)
+            if not isinstance(commit, dict):
+                return False                  # no per-piece rest known: the hold stands
+            halts = self.__dict__.get("_r6_halt") or {}
+            b_commit = sum(max(0, int(v)) for v in commit.values())
+            b_halt = 0
+            for rid in pend:
+                c = (halts.get(rid) or {}).get("counted")
+                if c is None:
+                    return False              # a stop without its counted free: the hold stands
+                b_halt += max(0, int(c))
+            s = int(sv.s_tokens)
+        except (TypeError, ValueError):
+            return False
+        if x <= 0 or s + b_commit + b_halt >= x:
+            return False                      # R6 may still apply: the holds decide as before
+        self.counters["set_r6_hold_d_free"] += 1
+        key = (self.epoch, s, x, tuple(sorted(commit)), tuple(sorted(pend)))
+        if self.__dict__.get("_r6_hold_d_free_last") != key:
+            self.__dict__["_r6_hold_d_free_last"] = key
+            logger.info("PDFLIP R6-HOLD-D-FREE site=%s S=%d commit_bound=%d halt_bound=%d X=%d commit=%s halt=%s epoch=%d -- the most "
+                        "the pending R6 piece(s) can still add cannot lift S to X: R6 cannot apply, the D verdict is final now "
+                        "(SOLL R3/R8 \"S < X: das Set wird auf D prefillt\"; R6 bound = D's rest / the counted free)", site, s,
+                        b_commit, b_halt, x, ",".join(sorted(commit)[:4]) or "-", ",".join(sorted(pend)[:4]) or "-", self.epoch)
+        return True
 
     def _r6k_clear_class(self, rid: str) -> None:
         """SOLL R6k (review K1): forget the class of ``rid`` (a D refusal): unknown -> R6 as before, named."""
@@ -14755,7 +14802,7 @@ class Front:
         ``_d_carried_tokens`` (the X-SUM price of the kurz path) is unchanged: it prices every granted row."""
         self.__dict__["_r6_counted"] = {}  # S56: only this reading's counted rows may be redirected
         self.__dict__["_r6_in_flight"] = {}
-        self.__dict__["_r6_commit_now"] = set()
+        self.__dict__["_r6_commit_now"] = {}  # #200: rid -> D's rest (the most a pending commit can add to S)
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
         # S56: a started row counts D's REAL rest, and only when the front redirects it to P (``_r6_tokens_of``)
@@ -15795,7 +15842,8 @@ class Front:
         # R4OVER-1024 review A3: the R2 hold sees the POLICY verdict; the one-tick R6 commit hold (it can only ADD to S, never
         # turn a flip into a non-flip) sits behind it and never voids a held flip
         sv = Front._r2_kurz_grant_hold(self, sv, now, members=members)  # FLIPTIME-1023 SOLL R2 (+R4OVER-1024 frozen wait)
-        sv = Front._r6_commit_hold(self, sv)  # review A1: no final verdict while a counted prefill's next chunk is COMMITTED
+        if not Front._r6_hold_d_free(self, sv, x_tok, "set"):  # #200 (SOLL R3/R8): a D verdict R6 cannot reach is not held
+            sv = Front._r6_commit_hold(self, sv)  # review A1: no final verdict while a counted prefill's next chunk is COMMITTED
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
@@ -16302,7 +16350,8 @@ class Front:
                                       d_prefill_running_uncached=_run, new_since_last=0,
                                       class_x_tokens=x_cls)
         sv = Front._r2_kurz_grant_hold(self, sv, now, members=members)  # FLIPTIME-1023 SOLL R2 (+R4OVER-1024)
-        sv = Front._r6_commit_hold(self, sv)  # review A1 (behind the R2 hold, R4OVER-1024 review A3)
+        if not Front._r6_hold_d_free(self, sv, x_tok, "queue-sum"):  # #200 (SOLL R3/R8)
+            sv = Front._r6_commit_hold(self, sv)  # review A1 (behind the R2 hold, R4OVER-1024 review A3)
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1
