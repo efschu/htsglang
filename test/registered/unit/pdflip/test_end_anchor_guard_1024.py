@@ -21,7 +21,7 @@ WHAT MUST HOLD.
 (5) Danger (c), host memory: at most one K15 claim per node and pass; a held node claims nothing.
 (6) Gap 2: an unprotected backed leaf gets the K15 save before its demotion (outcome does not change the demotion).
 (7) The interior branch (#1481 gap): a BACKED END anchor without a copy is held in pass 1, tombstoned in pass 2.
-(8) Switch off / dual layout / Form A worker: the old path.
+(8) Switch off / dual layout: the old path. Form A (host and worker): no hold, TP0 saves first (round 3, MUSS-4).
 
 REVIEW 24.10. (review-endanchor-guard-1024.md, JA MIT AUFLAGEN) -- red on 2fb3bbd61b, green after:
 MUSS-1 (SOLL R11) on a pure TP group sharing the mamba slot the hold reads the turn-end REGISTRY (filed at the turn-end
@@ -357,13 +357,17 @@ def test_single_rank_saves_first_and_demotes_with_the_copy():
     assert t.saves[0] == "X" and t.demoted[0] == "X" and t.lost == []
 
 
-def test_form_a_worker_never_holds(monkeypatch):
+@pytest.mark.parametrize("role", ["host", "worker"])
+def test_form_a_holds_nothing_on_host_or_worker(monkeypatch, role):
+    """Nachpruefung MUSS-4 (replaces ``test_form_a_worker_never_holds``, which pinned the asymmetry): on a Form A group
+    neither the host (TP0) nor a worker holds -- both demote X; only TP0 tries the K15 save first."""
     from flliper.srt.pdflip import end_anchor_guard as EAG
 
-    monkeypatch.setattr(EAG, "_role", lambda: "worker")
-    t, _ = _metal()
+    monkeypatch.setattr(EAG, "_role", lambda: role)
+    t, _ = _metal(tp=3)
     _peel(t, 5000)
-    assert t.demoted[0] == "X" and t.saves == []
+    assert t.demoted == ["X"]
+    assert t.saves == (["X"] if role == "host" else [])
 
 
 def _rearm_world():
