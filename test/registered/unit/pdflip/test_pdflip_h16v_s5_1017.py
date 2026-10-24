@@ -69,9 +69,14 @@ def test_f1_the_log_case_of_15_36_s_is_counted_once_at_the_front_edge(monkeypatc
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         f._decode_collect(t0 + 1.5)
     (line,) = _verdicts(caplog)
-    # SOLL R1u (user decision 20.10.): S is the union figure 5396 + 1502 = 6898; the own sum 10930 is reported only
-    assert "S=6898 " in line and "members=pdflip-80-912:5396,pdflip-80-913:5534" in line, line
-    assert "classes=halb,halb" in line and "prefix-shared=4032" in line and "S_own=10930" in line, line
+    # SIBLING-U-1024 (planner decision 24.10., SOLL R2 "kurzer Rest loest keinen Flip/Reroute aus" + R3): 913's rest 1502 <
+    # halbX 3092 behind 912 is KURZ -- a rider, its rest is not in S. Was: S = R1u union 6898 >= X -> R3 flip; now S = 5396 < X
+    # -> R3 collects (T_halb runs); the own sum 10930 is reported only
+    assert "S=5396 " in line and "verdict=COLLECT" in line, line
+    assert "members=pdflip-80-912:5396,pdflip-80-913:5534" in line and "sibling-rider=pdflip-80-913:1502" in line, line
+    # SIBLING-U-1024 (SOLL section 2 "u = was wirklich prefillt werden muss", R2/R4): 913 stands behind its anchor 912 in the
+    # set and is classed on its rest 1502 < halbX 3092 -- kurz (a rider), no longer halb on its own 5534
+    assert "classes=halb,kurz" in line and "prefix-shared=4032" in line and "S_own=10930" in line, line
 
 
 def test_f1_a_shared_prefix_is_counted_once_in_the_deciding_s_r1u(monkeypatch, caplog):
@@ -88,9 +93,10 @@ def test_f1_a_shared_prefix_is_counted_once_in_the_deciding_s_r1u(monkeypatch, c
     st["shorts"]["a"] = (t0, 4000, 6185)
     st["shorts"]["b"] = (t0 + 0.5, 4100, 6185)
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._decode_collect(t0 + 0.6) == "hold"      # R1u: S = 6100 < X, the shared 2000 count once (was A5: 8100 flips)
+        assert f._decode_collect(t0 + 0.6) == "hold"      # R1u: the shared 2000 count once (was A5: 8100 flips)
     (line,) = _verdicts(caplog)
-    assert "S=6100 " in line, line
+    # SIBLING-U-1024 (planner 24.10., SOLL R2/R3): b's rest 2100 < halbX 3092 behind a is kurz -- a rider, not in S (was 6100)
+    assert "S=4000 " in line and "classes=halb,kurz" in line, line
     # another session: no shared prefix, S = 8100 >= X -> flip
     f2 = _fx()
     f2.tp_prefill_max_tokens = 6185
@@ -314,7 +320,9 @@ def test_f4_a_semaphore_wait_after_the_grant_is_named_too(monkeypatch, caplog):
 # ------------------------------------------------------------------------- the user case 15:36Z with S6's curves
 
 def test_user_case_15_36z_is_reroute_p_by_the_soll_not_by_a_moved_threshold(monkeypatch, caplog):
-    """NF h16u2 15:36:19-25 with the h16v curve file S6 measured from that boot: pdflip-80-912 (u=5396) and pdflip-80-913
+    """SIBLING-U-1024 (planner decision 24.10., SOLL R2/R3): the verdict is NO LONGER REROUTE_P -- 913's rest 1502 is kurz behind
+    912 and a kurz rest triggers no flip/reroute (see the asserts); the name keeps the history.
+    NF h16u2 15:36:19-25 with the h16v curve file S6 measured from that boot: pdflip-80-912 (u=5396) and pdflip-80-913
     (u=5534, same session, common prefix 24064 of the 20032 credit) + the running D prefill of 177 tokens (pdflip-80-910).
     H16V review A2: X(k) is no threshold; the verdict is decided against the real X of the members (curve X(k=1) 5586
     at that depth). The log summed S=11107 > X -> REROUTE_P (R6); with the shared prefix counted once (S_P = 5396 +
@@ -342,12 +350,17 @@ def test_user_case_15_36z_is_reroute_p_by_the_soll_not_by_a_moved_threshold(monk
     st = f._set_st()
     st["shorts"]["pdflip-80-912"] = (t0, 5396, x1)
     st["shorts"]["pdflip-80-913"] = (t0 + 1.5, 5534, x1)
+    # SIBLING-U-1024 (planner decision 24.10., SOLL R2 "u < halbX ... nie ein Flip fuer einen kurzen Request" + R3): 913 stands
+    # behind its anchor 912 in the set and its REST 1502 < halbX (~2793) is kurz -- a rider, its rest is not in S. Was: S =
+    # 5396 + 1502 + 177 = 7075 > X -> REROUTE_P; now S = 5396 + 177 = 5573 < X -> no reroute, the set collects (R3). R2: a
+    # kurz rest triggers neither a flip nor a reroute. 913 rides any flip decided on other grounds (R1a).
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._decode_collect(t0 + 1.6) == "P"
+        assert f._decode_collect(t0 + 1.6) == "hold"
     (line,) = _verdicts(caplog)
     m = re.search(r"S=(\d+) X=(\d+) ", line)
-    assert m and int(m.group(1)) == 5396 + 1502 + 177 and int(m.group(2)) == x1, line   # R1u: union S; X = the members' own X
-    assert "verdict=REROUTE_P" in line and "S_own=11107" in line, line
+    assert m and int(m.group(1)) == 5396 + 177 and int(m.group(2)) == x1, line   # rider rest out of S; X = the members' own X
+    assert int(m.group(1)) < x1 and "verdict=COLLECT" in line and "S_own=11107" in line, line
+    assert "classes=halb,kurz" in line and "sibling-rider=pdflip-80-913:1502" in line, line
     assert re.search(r"xk=7[56]\d\d", line), line   # X(k=2) ~7620 is reported, never decided on
     # F1 alone: with only the deduplicated S_P = 7075 against the same real X the SOLL gives REROUTE_P as well
     assert pp.set_verdict([M("a", 5396, 0.0), M("b", 1502, 1.5)], x_tokens=x1, half_frac=0.5, t_half_s=4.5, now=1.6,

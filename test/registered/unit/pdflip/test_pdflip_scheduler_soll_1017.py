@@ -1098,3 +1098,185 @@ def test_r2_kurz_h2_tries_restart_behind_a_new_continuation_or_a_new_pricing():
     kurz._pdflip_xgate_priced = (120, 4097)
     assert k.plan_for_pass(_k_adder(), sched, _k_cont()).reserve == 121
 
+
+
+# ------------------------------------------------------------------------------------------- SIBLING-U-1024 (R2 / R4 / R1a)
+# SOLL §2: "u = uncached Tokens eines Requests (was wirklich prefillt werden muss)". R2: u < halbX -> kurz, nie ein Flip fuer
+# einen kurzen Request. R4: gross wartet T_halb, Flip erst bei einem weiteren HALB/GROSS-Request oder T_halb-Ablauf. R1a: ein
+# beschlossener Flip nimmt alles mit. Metall (duo rc42 c07b574410, Boot ..._1024_134919, front.log, X=4096, halbX=2048):
+#   e16 14:00:15 pdflip-16-111 u 4518 (gross) + pdflip-16-112 own 4677 / Rest 163 (gemeinsames Praefix 69282 mit 111, beide
+#   Kredit 64768) -> FLIP_P "R4 a big member and company" nach 1,5 s statt T_halb: 112 wurde nach own 4677 "gross" eingestuft.
+#   e22 14:06:26 pdflip-22-181 5177 + pdflip-22-182 own 5336 / Rest 163 -> dasselbe nach 0,8 s.
+# Das Geschwister ist auf seinem Rest KURZ: kein R4-Mitfahrer-Ausloeser, es faehrt mit dem Verdikt (R1a). Planer-Entscheid 24.10.
+# (R2 + R3: ein kurzer ist kein S-zaehlendes Set-Mitglied): sein Rest zaehlt NICHT in S -- dieselbe member_class-Entscheidung, die
+# ihn kurz macht, nimmt ihn aus S (eine Wahrheit). R1u-Dedup bleibt fuer halb/gross.
+
+SX, SHALF = 4096, 2048
+
+
+def _sib(rid, own, rest, t, anchor):
+    return pp.SetMember(rid=rid, uncached=rest, t_arrive=t, own_uncached=own, anchor=anchor)
+
+
+def _sv(members, *, now, t_open=0.0, d_decoding=True, seats_free=4, running=0):
+    return pp.set_verdict(members, x_tokens=SX, half_frac=HALF, t_half_s=T_HALF, now=now, t_open=t_open,
+                          d_decoding=d_decoding, seats_free=seats_free, d_prefill_running_uncached=running, new_since_last=1)
+
+
+def test_sibling_r2_r4_e16_the_rest_163_is_kurz_no_company_no_flip_before_t_half():
+    """e16: 111 gross (4518) + Geschwister 112 (own 4677, Rest 163 hinter 111). Vor T_halb: COLLECT (R4 wartet), 112 ist
+    kurz auf dem Rest, kein Ausloeser; S = 4518 (Rest 163 nicht in S, R2/R3). Nach T_halb: FLIP_P, 112 faehrt mit (R1a)."""
+    m111 = pp.SetMember(rid="pdflip-16-111", uncached=4518, t_arrive=0.0)
+    m112 = _sib("pdflip-16-112", 4677, 163, 1.23, "pdflip-16-111")
+    assert pp.member_class(m112, SX, HALF, {"pdflip-16-111", "pdflip-16-112"}) == pp.CLASS_KURZ
+    assert pp.sibling_riders([m111, m112], SX, HALF) == {"pdflip-16-112"}
+    early = _sv([m111, m112], now=1.5)
+    assert early.verdict == "COLLECT" and early.why.startswith("R4 big member waits"), early
+    assert early.s_tokens == 4518, early
+    late = _sv([m111, m112], now=4.6)
+    assert late.verdict == "FLIP_P" and "T_halb over" in late.why, late
+    d = pp.decide("set", members=[m111, m112], x_tokens=SX, half_frac=HALF, t_half_s=T_HALF, now=4.6, t_open=0.0,
+                  d_decoding=True, seats_free=4, new_since_last=0)
+    assert d.in_set == ("pdflip-16-111", "pdflip-16-112") and d.kurz_left_out == () and d.classes == ("gross", "kurz")
+    assert d.verdict.verdict == "FLIP_P"
+
+
+def test_sibling_r2_r4_e22_rest_163_behind_5177_waits_t_half():
+    """e22: 181 (5177) + 182 (own 5336, Rest 163) -- waited_s 0,8 -> heute FLIP_P; nach SOLL: COLLECT bis T_halb."""
+    m181 = pp.SetMember(rid="pdflip-22-181", uncached=5177, t_arrive=0.0)
+    m182 = _sib("pdflip-22-182", 5336, 163, 0.4, "pdflip-22-181")
+    assert _sv([m181, m182], now=0.8).verdict == "COLLECT"
+    assert _sv([m181, m182], now=4.5).verdict == "FLIP_P"
+
+
+def test_sibling_r4_a_real_second_big_request_is_still_company():
+    """Gegenrichtung: ein Geschwister, dessen REST selbst halb/gross ist, ist echter Mitfahrer-Ausloeser (R4); ein fremder
+    grosser Request ebenso. Nur der kurze Rest faehrt still mit."""
+    m1 = pp.SetMember(rid="a", uncached=4518, t_arrive=0.0)
+    halb_rest = _sib("b", 6000, 2500, 0.5, "a")
+    assert pp.member_class(halb_rest, SX, HALF, {"a", "b"}) == pp.CLASS_HALB
+    v = _sv([m1, halb_rest], now=1.0)
+    assert v.verdict == "FLIP_P" and "company" in v.why and v.s_tokens == 4518 + 2500
+    other = pp.SetMember(rid="c", uncached=4677, t_arrive=0.5)
+    assert _sv([m1, other], now=1.0).verdict == "FLIP_P"
+
+
+def test_sibling_danger_a_anchor_gone_the_own_figure_classes_again():
+    """Gefahrenrichtung (a): faellt das Erstmitglied weg (abgebrochen, client_gone, nach D verdiktet), ist das Geschwister
+    NICHT mehr hinter einem Anker im Set -> Einstufung auf seinem eigenen u (gross), S = own. Hier wie bei der Front:
+    der Rabatt wird je Auswertung aus den anwesenden Mitgliedern neu gerechnet; ein stehen gebliebener Anker-Name ohne
+    Anker im Set klassiert trotzdem nach own."""
+    stale = _sib("pdflip-16-112", 4677, 163, 1.23, "pdflip-16-111")
+    assert pp.member_class(stale, SX, HALF, {"pdflip-16-112"}) == pp.CLASS_GROSS
+    assert pp.sibling_riders([stale], SX, HALF) == frozenset()
+    v = _sv([pp.SetMember(rid="pdflip-16-112", uncached=4677, t_arrive=1.23)], now=1.5, t_open=1.23)
+    assert v.verdict == "COLLECT" and v.s_tokens == 4677
+    # R8: decodet D nicht, entscheidet das Set sofort -- mit Anker flippt der Grosse, das Geschwister faehrt mit
+    m111 = pp.SetMember(rid="pdflip-16-111", uncached=4518, t_arrive=0.0)
+    r8 = _sv([m111, stale], now=0.1, d_decoding=False)
+    assert r8.verdict == "FLIP_P" and r8.s_tokens == 4518
+
+
+def test_sibling_discount_names_its_anchor():
+    common = lambda a, b: {("pdflip-16-111", "pdflip-16-112"): 69282}.get((a, b), 0)  # noqa: E731
+    got = pp.shared_prefix_discount_anchored(
+        [("pdflip-16-111", 4518, 64768, 0.0, "09c6f64aa8"), ("pdflip-16-112", 4677, 64768, 1.23, "09c6f64aa8")], common)
+    assert got == {"pdflip-16-111": (4518, ""), "pdflip-16-112": (163, "pdflip-16-111")}
+    # unchanged figures for the old entry point
+    assert pp.shared_prefix_discount(
+        [("pdflip-16-111", 4518, 64768, 0.0, "s"), ("pdflip-16-112", 4677, 64768, 1.23, "s")], common) == {
+        "pdflip-16-111": 4518, "pdflip-16-112": 163}
+
+
+def _sib_front(monkeypatch, t_first):
+    import numpy as _np
+
+    from test_pdflip_arrival_seat_rule_0929 import _pending
+    from test_pdflip_set_scheduler_1017 import _fx, _on
+
+    _on(monkeypatch)
+    f = _fx()
+    f.tp_prefill_max_tokens = SX
+    ids111 = list(range(69286))
+    ids112 = list(range(69282)) + [-i - 1 for i in range(69445 - 69282)]
+    for rid, ids in (("pdflip-16-111", ids111), ("pdflip-16-112", ids112)):
+        f.__dict__.setdefault("_sess_by_rid", {})[rid] = "09c6f64aa8"
+        f.__dict__.setdefault("_set_ids", {})[rid] = _np.asarray(ids, dtype=_np.int32)
+        f.__dict__.setdefault("_set_depth", {})[rid] = 64768
+    f.queue = [_pending("pdflip-16-111", 4518, t_first, est_prompt=69286),
+               _pending("pdflip-16-112", 4677, t_first + 1.23, est_prompt=69445)]
+    return f
+
+
+def test_sibling_r2_r4_metal_repro_e16_at_the_front_edge(monkeypatch, caplog):
+    """Metall-Repro an der Front-Kante (Front._decode_collect, R11: die Front entscheidet): 1,5 s nach 111 haelt das Set
+    (heute: "P" mit "R4 a big member and company"), nach T_halb flippt es und BEIDE sind committed (R1a)."""
+    import logging
+    import time as _time
+
+    t0 = _time.time()
+    f = _sib_front(monkeypatch, t0 - 1.5)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(t0) == "hold"
+    lines = [r.getMessage() for r in caplog.records if "PDFLIP SET-VERDICT" in r.getMessage()]
+    (line,) = lines
+    assert "verdict=COLLECT" in line and "classes=gross,kurz" in line and "S=4518 " in line, line
+    assert "sibling-rider=pdflip-16-112:163" in line and "S_own=9195" in line, line
+    f2 = _sib_front(monkeypatch, t0 - 4.6)
+    assert f2._decode_collect(t0) == "P"
+    assert {"pdflip-16-111", "pdflip-16-112"} <= set(f2._set_st()["go_p"])
+
+
+def test_sibling_mutant_own_figure_class_flips_early(monkeypatch):
+    """Mutant (u_gesamt statt u_Rest): klassiert member_class nach own, ist 112 gross -> R4-Kompanie -> FLIP_P nach 1,5 s
+    (das Metallbild). Der Test haelt fest, dass der Mutant genau den Befund reproduziert."""
+    m111 = pp.SetMember(rid="pdflip-16-111", uncached=4518, t_arrive=0.0)
+    m112 = _sib("pdflip-16-112", 4677, 163, 1.23, "pdflip-16-111")
+    own_class = lambda m, x, f, present=(): pp.classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or x, f, m.p_only)  # noqa: E731
+    monkeypatch.setattr(pp, "member_class", own_class)
+    monkeypatch.setattr(pp, "sibling_riders", lambda members, x, f: frozenset())
+    v = _sv([m111, m112], now=1.5)
+    assert v.verdict == "FLIP_P" and "company" in v.why
+
+
+def test_sibling_one_truth_class_and_s_share_come_from_the_r1u_rest(monkeypatch):
+    """Eine Wahrheit (Bote 24.10., e22 182: prefix-shared 5173 einmal in S, Klasse aber nach own 5336): die Klasse des
+    Geschwisters und sein S-Beitrag kommen aus DERSELBEN Groesse -- dem R1u-Rest, den die Front in ``_set_members``
+    (shared_prefix_discount) bildet; nichts wird neu gerechnet. Rest kurz (163): Klasse kurz -> S-Beitrag 0 (R2/R3, Planer
+    24.10.: dieselbe Klassenentscheidung schliesst ihn aus S aus); Rest halb (gleiche Stelle, 2500): Klasse halb, S-Beitrag 2500."""
+    import time as _time
+
+    t0 = _time.time()
+    f = _sib_front(monkeypatch, t0 - 1.5)
+    st = f._set_st()
+    members = f._set_members(t0, list(f.queue), st)
+    m111, m112 = members
+    assert (m112.uncached, m112.own_uncached, m112.anchor) == (163, 4677, "pdflip-16-111")
+    assert m112.own_uncached - m112.uncached == 69282 - 64768        # the R1u shared piece, once
+    present = {m.rid for m in members}
+    assert pp.member_class(m112, SX, HALF, present) == pp.classify_arrival(m112.uncached, SX, HALF, False) == pp.CLASS_KURZ
+    v = _sv(members, now=1.5)
+    assert v.s_tokens == m111.uncached == 4518                        # the kurz rest is no S share (R2/R3)
+    assert v.verdict == "COLLECT"                                      # ... and no R4 company (R2/R4)
+    halb = pp.SetMember(rid="pdflip-16-112", uncached=2500, t_arrive=1.23, own_uncached=4677, anchor="pdflip-16-111")
+    assert pp.member_class(halb, SX, HALF, present) == pp.classify_arrival(halb.uncached, SX, HALF, False) == pp.CLASS_HALB
+    assert _sv([m111, halb], now=1.5).s_tokens == m111.uncached + halb.uncached
+
+
+def test_sibling_r1_r2_r3_a_kurz_rest_never_tips_s_over_x_metal_10_33_42():
+    """Planer-Entscheid 24.10. zu Risiko 1 (R1/R2/R3/R1a): duo 1008 1ecda02a58 10:33:42 pdflip-40-179 halb 3950 + Geschwister
+    40-180 own 4108 / Rest 162 (X 4096, halbX 2048). Heute S = 4112 >= X -> sofortiger R3-Flip durch 162 kurze Token. SOLL:
+    der kurze Rest zaehlt nicht in S -> S = 3950 < X, COLLECT bis T_halb, danach D (R3), kein Flip; ein beschlossener Flip
+    aus anderem Grund nimmt 40-180 mit (R1a). Mutant ``Mitfahrer-Rest in S`` -> rot."""
+    m179 = pp.SetMember(rid="pdflip-40-179", uncached=3950, t_arrive=0.0)
+    m180 = _sib("pdflip-40-180", 4108, 162, 0.5, "pdflip-40-179")
+    assert pp.sibling_riders([m179, m180], SX, HALF) == {"pdflip-40-180"}
+    v = _sv([m179, m180], now=2.7)
+    assert v.s_tokens == 3950 and v.verdict == "COLLECT" and v.why.startswith("R3 S=3950 < X=4096"), v
+    after = _sv([m179, m180], now=4.6)
+    assert after.verdict == "D_AFTER_TIMER", after
+    # R1a: a third, halb member makes S >= X on its own merits -> flip, and the rider rides (it stays in the set)
+    m181 = pp.SetMember(rid="c", uncached=2100, t_arrive=1.0)
+    d = pp.decide("set", members=[m179, m180, m181], x_tokens=SX, half_frac=HALF, t_half_s=T_HALF, now=1.2, t_open=0.0,
+                  d_decoding=True, seats_free=4, new_since_last=1)
+    assert d.verdict.verdict == "FLIP_P" and d.verdict.s_tokens == 3950 + 2100 and "pdflip-40-180" in d.in_set
