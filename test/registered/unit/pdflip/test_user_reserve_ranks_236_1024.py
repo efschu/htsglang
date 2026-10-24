@@ -28,7 +28,10 @@ import unittest
 from dataclasses import dataclass
 from unittest import mock
 
+from types import SimpleNamespace
+
 from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.pdflip import form as pdflip_form
 from flliper.srt.pdflip import corridor_budget as cb
 from flliper.srt.pdflip import launcher
 from flliper.srt.registry import nvml as registry_nvml
@@ -109,10 +112,12 @@ class GroupEnvCarriesTheReserve(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 3)
         for ln in calls:
             self.assertIn(
-                "user_reserve_by_card=user_reserve_by_card",
+                "**rank_reserve_kwargs(",
                 ln,
                 f"a launch site does not hand the reserve to its group: {ln.strip()[:120]}",
             )
+            self.assertIn('group="P"' if 'group="P"' in ln else 'group="D"', ln)
+            self.assertIn('rank_reserve_kwargs("P"' if 'group="P"' in ln else 'rank_reserve_kwargs("D"', ln)
 
     def test_t4_without_a_stated_reserve_nothing_is_published(self):
         baseline = {g: _env(g) for g in ("P", "D", "")}
@@ -263,6 +268,201 @@ class TheRankSaysWhereItReadTheReserve(unittest.TestCase):
         self.assertEqual(len(card_lines), 1, cm.output)
         self.assertIn("reserve_mib=1400", card_lines[0])
         self.assertIn("source=env-by-card", card_lines[0])
+
+
+class TheRankGetsWhatTheLauncherBooked(unittest.TestCase):
+    """#236 review MUSS-1: per group and card the rank gets the EFFECTIVE reserve the
+    launcher booked -- D's booked-rest cards 0 (stated value only named), P the
+    operator's value. Driven through ``budgets_from_dc``'s booked path, not through
+    ``floors_for_cards`` directly."""
+
+    PROFILE = pdflip_form.PROFILE_QWEN27B
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.dict(
+            os.environ,
+            {cg.FLOOR_DIGEST_FILE_ENV: "/nonexistent/flliper-236-floor-digest.json"},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for k in (cg.LAW_ENV, cg.USER_RESERVE_ENV, cg.USER_RESERVE_MASKED_ENV):
+            os.environ.pop(k, None)
+        cg._RESERVE_READ_NOTED.clear()
+        self.addCleanup(cg._RESERVE_READ_NOTED.clear)
+        self.cards = launcher.order_cards([
+            launcher.Card(nvml_index=0, uuid=C3080A, name="3080", total_mib=20480, reserved_mib=425),
+            launcher.Card(nvml_index=1, uuid=C5090, name="5090", total_mib=32607, reserved_mib=518),
+            launcher.Card(nvml_index=2, uuid=C3080B, name="3080", total_mib=20480, reserved_mib=425),
+        ])
+        self.ns = SimpleNamespace(profile=self.PROFILE, env_d="", env_p="")
+
+    def _launcher_pass(self, group):
+        """Run the REAL ``budgets_from_dc`` pass of ``group``; return the reserve it
+        priced the floors with and the floors it derived."""
+        seen = {}
+        real = cb.floors_for_cards
+
+        def spy(cards, grp, reserve=None):
+            floors = real(cards, grp, reserve)
+            seen["reserve"], seen["floors"] = reserve, floors
+            return floors
+
+        kw = {}
+        if group == "D":
+            kw = dict(launcher.booked_rest_kwargs(self.cards, self.PROFILE, "D"))
+            self.assertIsNotNone(kw.get("booked_rest_mib"), "the 27B profile must book D's rest")
+        with mock.patch.object(cb, "floors_for_cards", spy):
+            launcher.budgets_from_dc(
+                self.cards, {c.uuid: 1000 for c in self.cards}, [].append, group,
+                user_reserve_by_card=dict(RESERVE), **kw)
+        return seen
+
+    def _rank_floor(self, uuid, group, env):
+        rank_env = {k: v for k, v in env.items() if k in (cg.USER_RESERVE_ENV, cg.USER_RESERVE_MASKED_ENV)}
+        with mock.patch.dict(os.environ, rank_env), mock.patch.object(
+            registry_nvml, "current_device_uuid", lambda: uuid
+        ):
+            return cg.corridor_floor_for_current_device(group=group)
+
+    def _env(self, group, **extra):
+        return launcher.build_env(
+            tree="/tmp/t", venv="/tmp/v", cvd="0", store_dir="/tmp/s", debug_hold=False,
+            tag="probe", group=group,
+            **launcher.rank_reserve_kwargs(group, self.ns, self.cards, RESERVE), **extra)
+
+    def _check_d_rank_equals_launcher(self):
+        seen = self._launcher_pass("D")
+        env = self._env("D")
+        for c in self.cards:
+            rank = self._rank_floor(c.uuid, "D", env)
+            lf = seen["floors"][c.uuid]
+            assert int(rank.mib) == int(lf.mib), (c.uuid, int(rank.mib), int(lf.mib))
+            assert int(rank.reserve_mib) == int(lf.reserve_mib) == 0, (c.uuid, rank.reserve_mib, lf.reserve_mib)
+
+    def test_t10_d_booked_cards_rank_floor_equals_launcher_floor_equals_transient_plus_zero(self):
+        seen = self._launcher_pass("D")
+        self.assertTrue(all(v == 0 for v in seen["reserve"].values()), seen["reserve"])
+        env = self._env("D")
+        self.assertEqual(
+            {k: int(v) for k, v in json.loads(env[cg.USER_RESERVE_ENV]).items()},
+            {c.uuid: 0 for c in self.cards},
+        )
+        self.assertEqual(
+            {k: int(v) for k, v in json.loads(env[cg.USER_RESERVE_MASKED_ENV]).items()}, RESERVE
+        )
+        self._check_d_rank_equals_launcher()
+
+    def test_t11_p_unbooked_rank_floor_equals_launcher_floor_equals_transient_plus_reserve(self):
+        seen = self._launcher_pass("P")
+        self.assertEqual({k: int(v) for k, v in seen["reserve"].items()}, RESERVE)
+        env = self._env("P")
+        self.assertNotIn(cg.USER_RESERVE_MASKED_ENV, env)
+        self.assertEqual({k: int(v) for k, v in json.loads(env[cg.USER_RESERVE_ENV]).items()}, RESERVE)
+        for c in self.cards:
+            rank = self._rank_floor(c.uuid, "P", env)
+            lf = seen["floors"][c.uuid]
+            self.assertEqual(int(rank.mib), int(lf.mib))
+            self.assertEqual(int(rank.reserve_mib), RESERVE[c.uuid])
+            self.assertEqual(int(rank.mib), int(rank.transient_mib) + RESERVE[c.uuid])
+
+    def test_t12_the_launcher_and_the_rank_env_use_one_function(self):
+        import inspect
+
+        self.assertIn("effective_reserve_by_card(cards, user_reserve_by_card, booked)", inspect.getsource(launcher.budgets_from_dc))
+        self.assertIn("effective_reserve_by_card(cards, user_reserve_by_card, booked_rest_mib)", inspect.getsource(launcher.user_reserve_rank_env))
+
+    def test_t13_mutant_d_gets_the_users_reserve_is_red(self):
+        """Mutant: D's ranks are handed the stated reserve although the launcher booked 0."""
+        self._check_d_rank_equals_launcher()  # green on the real code
+
+        real = launcher.rank_reserve_kwargs
+
+        def mutant(group, ns, cards, urc, log=None):
+            kw = real(group, ns, cards, urc, log)
+            kw["reserve_booked_rest_mib"] = None  # D "unbooked": publishes the stated value
+            return kw
+
+        with mock.patch.object(launcher, "rank_reserve_kwargs", mutant):
+            with self.assertRaises(AssertionError):
+                self._check_d_rank_equals_launcher()
+
+    def test_t14_all_masked_still_publishes_an_explicit_zero_and_names_the_mask(self):
+        cg._RESERVE_READ_NOTED.clear()
+        env = self._env("D")
+        with mock.patch.dict(
+            os.environ,
+            {k: env[k] for k in (cg.USER_RESERVE_ENV, cg.USER_RESERVE_MASKED_ENV)},
+        ), mock.patch.object(registry_nvml, "current_device_uuid", lambda: C5090):
+            with self.assertLogs(cg.logger, level=logging.INFO) as cm:
+                cg.corridor_floor_for_current_device(group="D")
+        text = "\n".join(cm.output)
+        self.assertIn("source=masked-by-booked-rest stated_mib=1800", text)
+        self.assertIn("reserve_mib=0", text)
+        self.assertIn("masked_by_booked_rest=", text)
+
+    def test_t15_a_launcher_log_line_names_stated_effective_and_mask(self):
+        lines = []
+        launcher.rank_reserve_kwargs("D", self.ns, self.cards, RESERVE, lines.append)
+        joined = "\n".join(lines)
+        self.assertIn("PDFLIP-USER-RESERVE-RANK-ENV group=D", joined)
+        self.assertIn("stated=1800 effective=0 (masked: booked awake rest", joined)
+        lines.clear()
+        launcher.rank_reserve_kwargs("P", self.ns, self.cards, RESERVE, lines.append)
+        self.assertIn("stated=1800 effective=1800", "\n".join(lines))
+        self.assertNotIn("masked", "\n".join(lines))
+
+    def test_t16_an_operator_env_value_is_respected_and_named(self):
+        operator = '{"GPU-operator": 7}'
+        ns = SimpleNamespace(profile=self.PROFILE, env_d=f"{cg.USER_RESERVE_ENV}={operator}", env_p="")
+        lines = []
+        kw = launcher.rank_reserve_kwargs("D", ns, self.cards, RESERVE, lines.append)
+        env = launcher.build_env(
+            tree="/tmp/t", venv="/tmp/v", cvd="0", store_dir="/tmp/s", debug_hold=False,
+            tag="probe", group="D", group_env_extra={cg.USER_RESERVE_ENV: operator}, **kw)
+        self.assertEqual(env[cg.USER_RESERVE_ENV], operator)
+        self.assertNotIn(cg.USER_RESERVE_MASKED_ENV, env)
+        self.assertTrue(any("--env-d states" in ln and "STANDS" in ln for ln in lines), lines)
+
+    def test_t17_effective_reserve_function_masks_only_booked_cards(self):
+        eff, masked = launcher.effective_reserve_by_card(
+            self.cards, RESERVE, [None, 5, None])
+        self.assertEqual(eff[self.cards[1].uuid], 0)
+        self.assertEqual(masked, {self.cards[1].uuid: RESERVE[self.cards[1].uuid]})
+        self.assertEqual(eff[self.cards[0].uuid], RESERVE[self.cards[0].uuid])
+        with self.assertRaises(launcher.PdFlipLaunchRefused):
+            launcher.effective_reserve_by_card(self.cards, RESERVE, [None])
+
+
+class OneRankSideReserveChoice(unittest.TestCase):
+    """#236 review SOLL-2: weight_updater and the floor door resolve one card the same way."""
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for k in (cg.USER_RESERVE_ENV, cg.USER_RESERVE_MASKED_ENV):
+            os.environ.pop(k, None)
+
+    def test_t18_mapping_first_scalar_only_without_an_entry(self):
+        self.assertEqual(cg.reserve_for_card(C5090, 512), (512, "fallback-scalar"))
+        self.assertEqual(cg.reserve_for_card(C5090, 0), (0, "none"))
+        os.environ[cg.USER_RESERVE_ENV] = json.dumps({C5090: 1800})
+        self.assertEqual(cg.reserve_for_card(C5090, 512), (1800, "env-by-card"))
+        self.assertEqual(cg.reserve_for_card(C3080A, 512), (512, "fallback-scalar"))
+        os.environ[cg.USER_RESERVE_ENV] = json.dumps({C5090: 0})
+        os.environ[cg.USER_RESERVE_MASKED_ENV] = json.dumps({C5090: 1800})
+        self.assertEqual(cg.reserve_for_card(C5090, 512), (0, "masked-by-booked-rest"))
+
+    def test_t19_the_credit_floor_reader_uses_that_one_function(self):
+        import pathlib
+
+        import flliper.srt.managers.scheduler_components.weight_updater as wu
+
+        src = pathlib.Path(wu.__file__).read_text()
+        self.assertIn("reserve_for_card(", src)
+        self.assertNotIn("user_reserve_by_card().get(uuid_key)", src)
 
 
 if __name__ == "__main__":

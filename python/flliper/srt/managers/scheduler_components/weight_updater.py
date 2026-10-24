@@ -9845,7 +9845,7 @@ class SchedulerWeightUpdaterManager:
         try:
             from flliper.srt.managers.corridor_guard import (
                 corridor_floor_mib,
-                user_reserve_by_card,
+                reserve_for_card,
             )
 
             # weg2xsn271 (18.09.): `corridor_floor_mib` returns a CorridorFloor
@@ -9856,11 +9856,17 @@ class SchedulerWeightUpdaterManager:
             # had MEASURED-D 3567 MiB (767 transient + 2800 reserve) for the
             # 5090. TP0 then entered resume(weights_4) with 8 MiB to spare
             # and the memory saver's cu_mem_create exit(1)'d the rank.
-            reserve = user_reserve_by_card().get(uuid_key)
+            # #236 review SOLL-2: the ONE rank-side reserve choice (published
+            # mapping first, the ServerArgs scalar only where it has no entry),
+            # the same function ``corridor_floor_for_current_device`` uses.
+            _scalar = getattr(getattr(self, "server_args", None), "user_reserve_mib_scalar", None)
+            reserve, _reserve_source = reserve_for_card(
+                uuid_key, int(_scalar()) if callable(_scalar) else 0
+            )
             floor = corridor_floor_mib(
                 uuid_key,
                 group=self._pdflip_group_name(),
-                user_reserve_mib=0 if reserve is None else int(reserve),
+                user_reserve_mib=int(reserve),
             )
             if floor is None:
                 return None
@@ -9869,12 +9875,13 @@ class SchedulerWeightUpdaterManager:
                 self._pdflip_floor_noted = True
                 logger.info(
                     "PDFLIP-CREDIT-FLOOR card=%s group=%s floor_mib=%d "
-                    "(transient=%s reserve=%s source=%s) -- the credit wait "
+                    "(transient=%s reserve=%s source=%s reserve_source=%s) -- the credit wait "
                     "grades free VRAM against need + this floor",
                     uuid_key, self._pdflip_group_name(), mib,
                     getattr(floor, "transient_mib", "?"),
                     getattr(floor, "reserve_mib", "?"),
                     getattr(floor, "source", "?"),
+                    _reserve_source,
                 )
             return mib * 1024 * 1024
         except Exception as exc:  # noqa: BLE001 -- an absent authority is an absence

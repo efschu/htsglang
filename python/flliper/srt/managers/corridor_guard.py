@@ -550,11 +550,55 @@ GROUP_ENV = "FLLIPER_PDFLIP_GROUP"
 #: (front, ranks) cannot drift apart through two copies of a string.
 USER_RESERVE_ENV = "FLLIPER_PDFLIP_USER_RESERVE_MIB_BY_CARD"
 
+#: #236 review MUSS-1: ``{card_uuid: stated MiB}`` of the cards whose operator
+#: reserve the launcher did NOT book for this group because that card's awake
+#: rest is a measured, booked record (``budgets_from_dc``: "the reserve was
+#: never free VRAM -- the awake D consumed it"). The value in
+#: :data:`USER_RESERVE_ENV` for such a card is the EFFECTIVE one (0); this
+#: variable only lets the rank NAME why (log source ``masked-by-booked-rest``),
+#: it never feeds a floor.
+USER_RESERVE_MASKED_ENV = "FLLIPER_PDFLIP_USER_RESERVE_MASKED_MIB_BY_CARD"
+
 
 #: #236: raw values of :data:`USER_RESERVE_ENV` already reported by this process
 #: (``None`` = the variable was absent). One line per distinct value, not one
 #: per call -- the floor readers run on every credit wait and every dial.
 _RESERVE_READ_NOTED: set = set()
+
+
+def user_reserve_masked_by_card() -> Dict[str, int]:
+    """``{card_uuid: stated MiB}`` the launcher masked to 0 for this group (booked
+    awake rest); ``{}`` when absent or unreadable. Diagnostic only."""
+    raw = os.environ.get(USER_RESERVE_MASKED_ENV)
+    if not raw:
+        return {}
+    try:
+        import json
+
+        return {str(k): max(0, int(v)) for k, v in json.loads(raw).items()}
+    except Exception:  # noqa: BLE001 - a malformed hint is no hint
+        return {}
+
+
+def reserve_for_card(uuid: str, fallback_reserve_mib: int = 0) -> Tuple[int, str]:
+    """THE rank-side choice of one card's reserve: ``(MiB, source)``.
+
+    The published per-card mapping first (``env-by-card``, or
+    ``masked-by-booked-rest`` when the launcher booked the card's awake rest and
+    therefore charged no reserve), the caller's scalar only where the mapping has
+    no entry (``fallback-scalar``), else ``none``. ONE function for every rank
+    reader of the floor (``corridor_floor_for_current_device``,
+    ``weight_updater._pdflip_corridor_floor_bytes``), so two readers cannot
+    resolve the same card differently (#236 review SOLL-2).
+    """
+    reserve = user_reserve_by_card().get(uuid)
+    if reserve is not None:
+        masked = user_reserve_masked_by_card()
+        if uuid in masked:
+            return int(reserve), "masked-by-booked-rest"
+        return int(reserve), "env-by-card"
+    scalar = max(0, int(fallback_reserve_mib or 0))
+    return scalar, ("fallback-scalar" if scalar else "none")
 
 
 def _note_reserve_read(raw: Optional[str], parsed: Dict[str, int]) -> None:
@@ -578,10 +622,13 @@ def _note_reserve_read(raw: Optional[str], parsed: Dict[str, int]) -> None:
             os.getpid(),
         )
         return
+    masked = user_reserve_masked_by_card()
     logger.info(
-        "PDFLIP-USER-RESERVE-READ source=env:%s value=%s pid=%d",
+        "PDFLIP-USER-RESERVE-READ source=env:%s value=%s (effective, as the launcher "
+        "booked it for this group) masked_by_booked_rest=%s pid=%d",
         USER_RESERVE_ENV,
         dict(sorted(parsed.items())),
+        dict(sorted(masked.items())),
         os.getpid(),
     )
 
@@ -1141,12 +1188,7 @@ def corridor_floor_for_current_device(
     # operator's ``--rank-user-reserve-mib`` -- the one knob the user
     # explicitly kept ("das feature muss aber erhalten bleiben"). The fallback
     # is still rank-uniform: it is one CLI value shared by every rank.
-    by_card = user_reserve_by_card()
-    reserve = by_card.get(uuid)
-    reserve_source = "env-by-card"
-    if reserve is None:
-        reserve = max(0, int(fallback_reserve_mib or 0))
-        reserve_source = "fallback-scalar" if reserve else "none"
+    reserve, reserve_source = reserve_for_card(uuid, fallback_reserve_mib)
     # #236: the card this rank resolved and the reserve it will add, once per
     # (card, value, source) -- the rank-side half of the launcher's
     # PDFLIP-USER-RESERVE PROVENANCE line.
@@ -1154,10 +1196,12 @@ def corridor_floor_for_current_device(
     if _note_key not in _RESERVE_READ_NOTED:
         _RESERVE_READ_NOTED.add(_note_key)
         logger.info(
-            "PDFLIP-USER-RESERVE-READ card=%s reserve_mib=%d source=%s group=%s pid=%d",
+            "PDFLIP-USER-RESERVE-READ card=%s reserve_mib=%d source=%s%s group=%s pid=%d",
             uuid or "?",
             int(reserve),
             reserve_source,
+            (f" stated_mib={user_reserve_masked_by_card().get(uuid)}"
+             if reserve_source == "masked-by-booked-rest" else ""),
             group,
             os.getpid(),
         )
