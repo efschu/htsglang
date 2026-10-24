@@ -1067,3 +1067,60 @@ def test_real_tree_serves_the_mamba_slots_with_held_anchors(monkeypatch, tp):
     assert res.mamba_num_evicted == 3, res
     assert pool.mamba_allocator.available_size() == m0 + 3
     assert pool.mamba_allocator.alloc(3) is not None
+
+
+# ---------------------------------------------------------------------------------------------------- re-arm mutants
+def _rearm_mutant(old, new):
+    from flliper.srt.pdflip import park_anchor_rearm as par
+
+    src = open(par.__file__, encoding="utf-8").read()
+    assert src.count(old) == 1, old
+    mod = types.ModuleType("park_anchor_rearm_eag_mutant")
+    mod.__file__ = par.__file__
+    exec(compile(src.replace(old, new), par.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+def test_rearm_mutant_ignoring_the_incomplete_flag_marks_a_needed_anchor_secured():
+    """MUTANT (danger: false 'secured' lifts the hold while a rank still lacks the copy): the incomplete flag ignored
+    -- the ranks read "not in the union" as "nobody needs it" although rank 1's list did not fit its segment."""
+    R = _rearm_world()
+    from flliper.srt.pdflip import park_anchor_rearm as par
+
+    mut = _rearm_mutant("    if not any_incomplete:\n", "    if True:\n")
+    big = list(range(100, 100 + par.K_PER_RANK + 1))
+    ops = {0: _MarkOps([5]), 1: _MarkOps(big), 2: _MarkOps([])}
+    R._run_ranks(3, lambda r, gm: mut.run_pass(ops[r], gm, r, 3))
+    assert all(o.unneeded for o in ops.values()), "the mutant changed nothing -- the incomplete test is not load-bearing"
+
+
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
+def test_rearm_mutant_without_the_turn_end_class_starves_the_park_end(tmp_path, monkeypatch):
+    """MUTANT (SOLL-3): turn-end keys without their own class bit -- the deeper turn-end anchors fill the 8-key window
+    and the park END is not issued (the green test above is load-bearing)."""
+    R = _rearm_world()
+    from flliper.srt.mem_cache import form_a_host_shadow as _r12
+    from flliper.srt.mem_cache import l3_secured as _l3s
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    EAG = _eag()
+    mut = _rearm_mutant("    return target_key(0, depth, last_hash) | TURN_END_BIT\n",
+                        "    return target_key(0, depth, last_hash)\n")
+    monkeypatch.setattr(_r12, "role", lambda: None)
+    monkeypatch.setenv("FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT", "0")
+    monkeypatch.delenv("FLLIPER_PDFLIP_PARK_ANCHOR_REARM", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP", raising=False)
+    monkeypatch.setattr(UnifiedRadixCache, "_spill_tp_skip_n", 0, raising=False)
+    monkeypatch.setattr(_l3s, "secured", lambda arena, slots, backend=None, evicting_ok=False:
+                        __import__("numpy").ones(len(list(slots)), dtype=bool))
+    tes = [f"T{i}" for i in range(9)]
+    W = R._World(tmp_path, 2 + 12, off=2, chain=("END",) + tuple(tes))
+    for r, rk in enumerate(W.ranks):
+        end = W.nodes["END"][r]
+        end.pdflip_park_end = True
+        rk.cache._pdflip_park_end_nodes = [end]
+        for h in tes:
+            EAG.register_end(rk.cache, W.nodes[h][r])
+    res, err = W.run_pass(ops_cls=mut.TreeOps, mod=mut)
+    assert err == {}, err
+    assert W.anchor_on("END") == [False, False, False], "the mutant still issued the park END"
