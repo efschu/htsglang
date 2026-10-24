@@ -137,11 +137,25 @@ class SpeculativeAlgorithm(Enum):
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
 
-        Upstream PR #36933 (EAGLE, EAGLE3, DFLASH, DSPARK). This fork admits the EAGLE family only: the
-        DFLASH / DSPARK workers here diverge from upstream's and are not exercised; ngram cannot join as
-        is: its overlap relay skips output_tokens_buf, which the mixed input resolve reads.
+        Upstream PR #36933 (EAGLE, EAGLE3, DFLASH, DSPARK). This fork admits the EAGLE family and DFLASH;
+        DSPARK is not run here; ngram cannot join as is: its overlap relay skips output_tokens_buf, which the
+        mixed input resolve reads.
+
+        27B-MIXEDD-DFLASH-1024 (SCHEDULER-SOLL R2, user 18.10. "mixed chunk fuer kurze D-Prefills wieder an"):
+        the 27B D group runs DFLASH; the EAGLE-only list (S32, written for NF's EAGLE D) kept MIXED-D disarmed
+        on every 27B boot, so D's decode halted for each short D prefill. The fork's DFlashWorkerV2 takes a
+        MIXED batch through its extend branch (ForwardMode.is_extend includes MIXED; new_seq_lens and the
+        next draft input read batch.seq_lens, which resolve_mixed_spec_tails rebuilds for the tail rows) --
+        the same shape as upstream's DFLASH hunk. Only group D arms it (scheduler ``_mixed_d_short``); the
+        explicit ``--enable-mixed-chunk`` stays forced off by ``speculative_hook._handle_dflash``.
+        Rollback: ``FLLIPER_PDFLIP_MIXED_D_SHORT=0``. GPU-only risks (window pool with 1-token tail rows,
+        DCP, mamba extra_buffer tracking of tails): named in deskq/done/27b-r2kurz-rc40-1024.md.
         """
-        return self in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+        return self in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+        )
 
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
