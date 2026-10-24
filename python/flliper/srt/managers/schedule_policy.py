@@ -1353,6 +1353,87 @@ def _chunk_after_mixed_decode(rem_chunk: int, mixed_decode_tokens: int, page_siz
     return after
 
 
+# ---------------------------------------------------------------------------
+# KVOFFSET-1024 (SOLL v2 R5/R7/R11): ONE formula for D's lifetime gate, read by every party that prices against it.
+#
+# 27B int4ar _1023_223241 / _1024_003732: the front's ARRIVAL-SEAT / D-line KV test (``arrival_seat_rule.kv_fits``)
+# read D's ``available + evictable`` and passed four after_p hand-offs that only D's DECODE RESERVE refused
+# (``rem_total_token_offset``: pdflip-25-238 87 refusals in 23.4 s); D's own pressure-park resume
+# (``d_seats.admission_gate``) tested ``avail >= context`` while the gate charged ``extend + clip + page`` against
+# ``available + deliverable - offset`` (pdflip-34-283: ``PRESSURE-RESUME avail=108507 need=104951``, then
+# ``price=109048 budget=107704.184`` -- 568 refusals in 174.1 s). The terms below are the ones ``add_one_req`` /
+# ``rem_total_tokens`` use, factored out so the publisher (``Scheduler.get_internal_state`` -> ``pdflip_kv``), the
+# resume test and the adder itself compute the same number. No new term, no reserve: each function is the adder's
+# own arithmetic, moved here verbatim.
+# ---------------------------------------------------------------------------
+
+
+def decode_clip_of(req) -> int:
+    """The decode term a NEW request is charged at admission: ``min(max(max_new - out, 0), CLIP)``
+    (``add_one_req``'s ``max_new``)."""
+    return min(
+        max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+        CLIP_MAX_NEW_TOKENS,
+    )
+
+
+def running_request_reserve(req, new_token_ratio: float) -> float:
+    """The decode reserve a RUNNING request holds in the lifetime budget (``rem_total_token_offset``):
+    ``min(max_new - out, CLIP) * new_token_ratio`` -- the adder's
+    ``_get_running_request_total_token_offset``, byte for byte (no clamp at 0, as upstream)."""
+    return (
+        min(
+            (req.sampling_params.max_new_tokens - len(req.output_ids)),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        * new_token_ratio
+    )
+
+
+def running_decode_reserve(reqs, new_token_ratio: float, num_mixed_decode_tokens: int = 0) -> float:
+    """``rem_total_token_offset`` at the start of a pass: the mixed decode rows plus every running request's
+    reserve (``PrefillAdder.__init__``)."""
+    return num_mixed_decode_tokens + sum(
+        running_request_reserve(r, new_token_ratio) for r in (reqs or ())
+    )
+
+
+def lifetime_price(extend_tokens: int, req, page_size: int, mamba_gap: int = 0) -> int:
+    """What the lifetime gate charges a new request: ``extend + decode clip + one page + mamba gap``
+    (``add_one_req``'s ``total_tokens`` before the chunk-admit rewrite, which a parked request never takes)."""
+    return int(extend_tokens) + decode_clip_of(req) + int(page_size) + int(mamba_gap)
+
+
+def mamba_slot_full_token_cost(allocator) -> int:
+    """The shared-gap cost a new Mamba state adds to the price (``PrefillAdder._mamba_slot_cost``): non-zero only on
+    the unified Mamba pool."""
+    if isinstance(allocator, UnifiedMambaTokenToKVPoolAllocator):
+        return int(allocator.mamba_slot_full_token_cost())
+    return 0
+
+
+def lifetime_available_and_evictable(allocator, tree_cache) -> Tuple[int, int]:
+    """``(available, evictable)`` exactly as ``rem_total_tokens`` reads them, per pool kind (all-SWA, hybrid SWA,
+    hybrid SSM with the peel's DELIVERABLE evictable -- not the reported count --, plain)."""
+    if isinstance(allocator, PureSWATokenToKVPoolAllocator):
+        return int(allocator.swa_available_size()), int(tree_cache.swa_evictable_size())
+    if isinstance(allocator, (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator)):
+        return int(allocator.full_available_size()), int(tree_cache.full_evictable_size())
+    _sm = getattr(tree_cache, "supports_mamba", None)
+    if callable(_sm) and _sm():
+        return int(allocator.available_size()), int(
+            deliverable_evictable_cap_aware_or(tree_cache, tree_cache.full_evictable_size))
+    return int(allocator.available_size()), int(tree_cache.evictable_size())
+
+
+def lifetime_budget(available: int, evictable: int, offset: float, dcp_deficit: int = 0,
+                    fundable_floor: Optional[int] = None, ledger_outstanding: int = 0) -> float:
+    """``rem_total_tokens`` from its terms: ``min(A + E - offset - dcp, floor - offset) - ledger``."""
+    local = int(available) + int(evictable) - offset - int(dcp_deficit or 0)
+    budget = local if fundable_floor is None else min(local, int(fundable_floor) - offset)
+    return budget - int(ledger_outstanding or 0)
+
+
 class PrefillAdder:
     # PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): written by `lanes_p.configure_adder` only when the rank holds lane state
     # (an RPC or a stamp arrived with FLLIPER_PDFLIP_LANES=1); these class defaults ARE the switch-off behaviour.
@@ -1755,13 +1836,8 @@ class PrefillAdder:
         return int(self._get_running_request_total_token_offset(req))
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * self.new_token_ratio
-        )
+        # KVOFFSET-1024: the one formula D also publishes (``pdflip_kv.decode_reserve``) and its resume test reads
+        return running_request_reserve(req, self.new_token_ratio)
 
     @property
     def rem_total_tokens(self):
@@ -3174,14 +3250,12 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
+        max_new = decode_clip_of(req)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        # KVOFFSET-1024: the one price formula (D's pressure-park resume test reads the same, d_seats.admission_gate)
+        total_tokens = lifetime_price(cand_extend_input_len, req, self.page_size)
         # Upstream #36415: read the request's mamba debits BEFORE
         # `init_load_back` below -- a host load-back binds `req.mamba_pool_idx`
         # (MambaComponent.build_hicache_transfers), after which both helpers

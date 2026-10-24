@@ -289,7 +289,9 @@ def test_the_reading_is_the_group_min_of_free_plus_evictable(monkeypatch):
                                   uniform_min_avail=lambda: FREE)
     sched._pdflip_group_min_ints = lambda vals: (seen.append(list(vals)), [vals[0] - 1000, vals[1]])[1]
     read = dpr._resume_fit_reading(sched)
-    assert read() == FREE + EVICT - 1000 and seen == [[FREE + EVICT, 1]]
+    # KVOFFSET-1024 (class E): the reading is this rank's LIFETIME budget as the largest price the gate admits
+    # (``ceil(rem_total_tokens) - 1``: the gate refuses at price >= budget); nothing runs here, so no reserve
+    assert read() == FREE + EVICT - 1 - 1000 and seen == [[FREE + EVICT - 1, 1]]
     monkeypatch.setenv(dpr.RESUME_FIT_EVICTABLE_ENV, "0")
     assert dpr._resume_fit_reading(sched)() == FREE, "switch off: the free ids, as before"
 
@@ -319,7 +321,7 @@ def test_2_1_a_rank_without_a_reading_still_enters_the_min_exactly_once(monkeypa
     """3 ranks, rank 1's allocator raises. Each rank must enter the group MIN once (its peers do);
     the fake collective answers every rank with the element-wise MIN of all three payloads."""
     monkeypatch.delenv(dpr.RESUME_FIT_EVICTABLE_ENV, raising=False)
-    payloads = {0: [FREE + EVICT, 1], 1: [0, 0], 2: [FREE + EVICT, 1]}
+    payloads = {0: [FREE + EVICT - 1, 1], 1: [0, 0], 2: [FREE + EVICT - 1, 1]}   # KVOFFSET-1024: largest price
     group_min = [min(col) for col in zip(*payloads.values())]
     entered, sent = {0: 0, 1: 0, 2: 0}, {}
 

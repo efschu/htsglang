@@ -229,20 +229,76 @@ def payable_room(kv_reading: Optional[Mapping]) -> Optional[int]:
         return None
 
 
-def kv_free(kv_reading: Optional[Mapping]) -> Optional[int]:
-    """The free tokens :func:`kv_fits` tests against (the larger of D's stage
-    reading and its ladder room), or None without a reading. S94: under D's backup wall never more than D's
-    payable room (:func:`payable_room`)."""
+def lifetime_room(kv_reading: Optional[Mapping], ladder: Optional[Tuple[int, int, int]] = None) -> Optional[int]:
+    """KVOFFSET-1024 (SOLL R5/R7/R11): the largest price D's lifetime gate admits now, from D's own terms
+    (``pdflip_kv.lifetime_budget``, ``pdflip/d_lifetime_reading.py``: available + DELIVERABLE evictable - decode
+    reserve - dcp deficit, the group floor, - ledger). With the KV ladder D grows its stage at the admission and the
+    gate then reads the grown stage minus the SAME reserve and ledger -- so the ladder room carries them too (the
+    larger of the two decides, as for the free count). None from an old D without the field: nothing changes."""
     if not kv_reading:
         return None
     try:
-        free = int(kv_reading.get("available", 0) or 0) + int(kv_reading.get("evictable", 0) or 0)
+        lb = kv_reading.get("lifetime_budget")
+        if lb is None:
+            return None
+        room = int(lb)
+        if ladder is not None:
+            terms = int(kv_reading.get("decode_reserve", 0) or 0) + int(kv_reading.get("ledger_outstanding", 0) or 0)
+            room = max(room, int(ladder[0]) - terms - 1)
+        return room
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def _kv_room(kv_reading: Optional[Mapping]) -> Tuple[Optional[int], str]:
+    """``(free, tail)``: the ONE room :func:`kv_free` and :func:`kv_fits` test against -- the larger of D's stage
+    reading and its ladder room, under D's backup wall never more than its payable room (S94), and never more than
+    the largest price D's lifetime gate admits (KVOFFSET-1024, :func:`lifetime_room`). None without a reading."""
+    if not kv_reading:
+        return None, ""
+    try:
+        free = int(kv_reading.get("available", 0) or 0) + int(kv_reading.get("evictable", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return None, ""
     lad = ladder_free(kv_reading)
-    free = max(free, lad[0]) if lad is not None else free
+    tail = ""
+    if lad is not None:
+        tail = f" (ladder {lad[1]}-{lad[2]}={lad[0]}, stage free {free})"
+        free = max(free, lad[0])
     room = payable_room(kv_reading)
-    return min(free, room) if room is not None else free
+    if room is not None and room < free:
+        # S94: D's backup wall stands -- the reported evictable rows are not D's to give (rc19 07:15:57 D-WALL-HEAD
+        # available=13568 reported_evictable=305024 payable_evictable=0 while the front read free=312036)
+        # S94 review A1 (transition until D exports its group MIN): the three numbers are D TP0's; D's admission binds
+        # per rank, so this room is an UPPER bound of what the group can begin -- the line says so (room=TP0)
+        tail += f" [S94 backup wall: payable room {room} = available {int(kv_reading.get('available', 0) or 0)} + " \
+                f"payable {int(kv_reading.get('payable_evictable', 0) or 0)}, room=TP0]"
+        free = room
+    life = lifetime_room(kv_reading, lad)
+    if life is not None and life < free:
+        # KVOFFSET-1024: D's gate subtracts its decode reserve (pdflip-25-238: 87 refusals in 23.4 s on offset alone)
+        # and counts only the DELIVERABLE evictable (hybrid SSM) -- the front prices against what D admits
+        tail += (f" [D lifetime room {life}: deliverable {kv_reading.get('deliverable_evictable', '-')} - reserve "
+                 f"{kv_reading.get('decode_reserve', '-')}@{kv_reading.get('decode_reserve_scope', '-')} - ledger "
+                 f"{kv_reading.get('ledger_outstanding', '-')}]")
+        free = max(0, life)
+    return free, tail
+
+
+def kv_free(kv_reading: Optional[Mapping]) -> Optional[int]:
+    """The free tokens :func:`kv_fits` tests against (the larger of D's stage
+    reading and its ladder room), or None without a reading. S94: under D's backup wall never more than D's
+    payable room (:func:`payable_room`). KVOFFSET-1024: never more than D's lifetime room (:func:`lifetime_room`)."""
+    return _kv_room(kv_reading)[0]
+
+
+def price_extra(kv_reading: Optional[Mapping]) -> int:
+    """KVOFFSET-1024: what D's gate adds to a new request's ``extend + decode clip`` (one page + the shared-gap Mamba
+    cost, ``pdflip_kv.price_extra``); 0 from an old D."""
+    try:
+        return max(0, int((kv_reading or {}).get("price_extra", 0) or 0))
+    except (TypeError, ValueError, AttributeError):
+        return 0
 
 
 def _younger(head_arrival: float, running: Iterable[str], arrival_of: Mapping[str, float],
@@ -369,33 +425,21 @@ def ladder_free(kv_reading: Optional[Mapping]) -> Optional[Tuple[int, int, int]]
     return max(0, ceiling - used), ceiling, used
 
 
-def kv_fits(need: int, kv_reading: Optional[Mapping]) -> Tuple[bool, str]:
+def kv_fits(need: int, kv_reading: Optional[Mapping], debit: int = 0) -> Tuple[bool, str]:
     """``(fits, why)`` against D's reading ``{"available", "evictable"}`` (TP0's
     ``/server_info`` ``pdflip_kv``) -- and, when D publishes its KV ladder, against
     the ladder's ceiling (:func:`ladder_free`): the larger of the two decides.
     No reading (an old D, a failed read): the seat plan alone decides --
     H95c's phase seats are KV-derived already -- and the verdict says so
-    (``kv=unread``)."""
+    (``kv=unread``). KVOFFSET-1024: the room is :func:`kv_free`'s (D's lifetime room included); ``debit`` = the rows
+    the front promised to requests D does not run yet in this reading (the burst debit) comes off it."""
     if not kv_reading:
         return True, "kv=unread"
-    try:
-        free = int(kv_reading.get("available", 0) or 0) + int(kv_reading.get("evictable", 0) or 0)
-    except (TypeError, ValueError, AttributeError):
+    free, tail = _kv_room(kv_reading)
+    if free is None:
         return True, "kv=unreadable"
-    lad = ladder_free(kv_reading)
-    tail = ""
-    if lad is not None:
-        tail = f" (ladder {lad[1]}-{lad[2]}={lad[0]}, stage free {free})"
-        free = max(free, lad[0])
-    room = payable_room(kv_reading)
-    if room is not None and room < free:
-        # S94: D's backup wall stands -- the reported evictable rows are not D's to give (rc19 07:15:57 D-WALL-HEAD
-        # available=13568 reported_evictable=305024 payable_evictable=0 while the front read free=312036)
-        # S94 review A1 (transition until D exports its group MIN): the three numbers are D TP0's; D's admission binds
-        # per rank, so this room is an UPPER bound of what the group can begin -- the line says so (room=TP0)
-        tail += f" [S94 backup wall: payable room {room} = available {int(kv_reading.get('available', 0) or 0)} + " \
-                f"payable {int(kv_reading.get('payable_evictable', 0) or 0)}, room=TP0]"
-        free = room
+    if int(debit or 0) > 0:
+        free = free - int(debit)    # the caller names the debit (front: ``D-line debit ...``)
     if int(need) <= free:
         return True, f"kv need={int(need)} free={free}{tail}"
     return False, f"kv need={int(need)} > free={free}{tail}"

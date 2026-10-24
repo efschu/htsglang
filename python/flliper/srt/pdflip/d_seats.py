@@ -574,8 +574,14 @@ def admission_gate(
     seat_cap: Optional[int] = None,
     env: Optional[Mapping[str, str]] = None,
     seats: Optional[int] = None,
+    need_of: Optional[Callable[[object], int]] = None,
 ) -> AdmissionGate:
     """The stage-1 rule, per pass.
+
+    KVOFFSET-1024 (SOLL R5/R7): ``need_of`` prices a pressure-parked request for the early resume test the way D's
+    lifetime gate will (``d_lifetime_reading.resume_price``: context + decode clip + page + Mamba gap), against the
+    gate's own budget (``avail_tokens`` = the group MIN of ``d_lifetime_reading.resume_budget``). None: the context
+    alone, as before (desk callers).
 
     * A FLIP-parked request resumes as soon as it fits (oldest first; the
       adder's own NO_TOKEN stops the pass).
@@ -632,9 +638,8 @@ def admission_gate(
             continue
         seen_avail, need = None, None
         if resume_book is not None and avail_tokens is not None:
-            need = len(getattr(r, "origin_input_ids", None) or ()) + len(
-                getattr(r, "output_ids", None) or ()
-            )
+            need = (int(need_of(r)) if need_of is not None else
+                    len(getattr(r, "origin_input_ids", None) or ()) + len(getattr(r, "output_ids", None) or ()))
             seen_avail = _avail()
             if seen_avail is not None and resume_book.early_ok(
                     str(r.rid), avail_tokens=int(seen_avail), need_tokens=need):

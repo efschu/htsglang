@@ -229,7 +229,7 @@ def test_d2_the_ratio_rides_the_per_iteration_reduce_negated_and_is_read_back_by
 
     src = inspect.getsource(sch.Scheduler._update_uniform_pool_budget)
     assert "_ratio_at = len(vals)" in src
-    assert "vals = vals + [-_dlr.ratio_ppm(self.new_token_ratio_tracker.current)]" in src
+    assert "vals = vals + [-_dlr.ratio_ppm(_dlr.local_ratio(self))]" in src
     assert "self._kvoffset_group_ratio = _dlr.ratio_from_ppm(-int(t[_ratio_at]))" in src
     # before the tail-indexed ballot, after the S42 hold pair
     assert src.index("_s42_hold_at = len(vals)") < src.index("_ratio_at = len(vals)") < src.index("_ballot_rids = [")
@@ -463,7 +463,7 @@ def test_o_a_seat_is_charged_the_need_its_verdict_priced_not_its_prompt():
     asyncio.run(body())
 
 
-def test_p_s3_d_runs_none_of_the_seated_rids_the_head_is_never_held():
+def test_p_s3_d_runs_no_decode_with_the_burst_debit_the_head_is_still_never_held():
     async def body():
         kv = {"available": 1000, "evictable": 0, "decode_clip": 4096, "running_rids": [], "displaceable_rids": []}
         f = _front({"kv": kv})
@@ -472,8 +472,8 @@ def test_p_s3_d_runs_none_of_the_seated_rids_the_head_is_never_held():
         head = F.Pending("pdflip-30-274", "/generate", {"max_tokens": 64000}, "x", time.time(), fut,
                          est_prompt=58911, est_uncached=415, leg1_prompt_tokens=58911, d_eligible=True)
         f._ready_for_d.append(head)
-        assert await Front._d_line_kv_holds(f, head) is False
-        assert f.counters["d_admit_kv_nothing_runs"] == 1
+        assert await Front._d_line_kv_holds(f, head) is False     # review S3 (the handover author's rule) holds
+        assert f.counters["d_admit_kv_held"] == 0
 
     asyncio.run(body())
 

@@ -2041,12 +2041,16 @@ def admission(sched, running_batch):
         pending = [r for r in pending if not d_lane.below_floor(sched, r)]
     # 27B port 20.10.: the dual D keeps its reading byte for byte (user 20.10.: the
     # ported scheduler parts never act in the dual layout); S75's fit reading on the flip form
+    need_of = None
     if book.margin_tokens < 0:
         avail = None
     elif str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "")).strip() == "1":   # rank-uniform env
         avail = sched.uniform_min_avail()
     else:
-        avail = _resume_fit_reading(sched)
+        avail = _resume_fit_reading(sched, running_batch)
+        if resume_fit_evictable_on():
+            # KVOFFSET-1024 (class E): the resume test prices like the lifetime gate it hands the request to
+            need_of = _resume_need_of(sched)
     # #1989 (dual D, default off): the seat cap for d_seats' OLDER-LIVE-FREE room --
     # the same replicated cap displace_for_age reads. Off: None, the gate as before.
     cap = None
@@ -2063,6 +2067,7 @@ def admission(sched, running_batch):
         decode_first=decode_first_facts(sched, running_batch),
         seat_cap=cap,
         seats=_phase_seat_n(sched),  # SB (#1210): replicated from the wake request
+        need_of=need_of,
     )
     if gate.deferred:
         _note_decode_first(sched, gate)
@@ -2114,12 +2119,34 @@ def resume_fit_evictable_on(env=None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def _resume_fit_reading(sched):
+def _resume_need_of(sched):
+    """KVOFFSET-1024 (class E): the resume test's price of a parked request -- the lifetime gate's
+    (``d_lifetime_reading.resume_price``)."""
+    from flliper.srt.pdflip import d_lifetime_reading as _dlr
+
+    def _need(req):
+        return _dlr.resume_price(req, sched)
+
+    return _need
+
+
+def _resume_fit_reading(sched, running_batch=None):
     """S75: the lazy reading the pressure-park early resume compares ``need``
     against -- a zero-argument callable (``d_seats.admission_gate`` calls it at
-    most once per pass, and only when a pressure-parked request asks)."""
+    most once per pass, and only when a pressure-parked request asks).
+
+    KVOFFSET-1024 (class E, SOLL R5/R7; 27B _1023_223241 pdflip-34-283, D TP0 23:16:40: ``PRESSURE-RESUME
+    avail=108507 need=104951`` -- free + evictable against the bare context -- and in the same pass ``D-ADMIT-REFUSED
+    gate=lifetime price=109048 budget=107704.184 ... offset=802``, then 568 refusals in 174.1 s): two formulas for one
+    question. The reading is now THIS rank's lifetime budget (``d_lifetime_reading.resume_budget``: available +
+    deliverable evictable - its own decode reserve - dcp deficit - ledger, floor-capped; the budget the pass's adder
+    builds) and the need is the gate's price (``_resume_need_of``). Each rank sends its OWN budget into the one MIN
+    collective: the group admits only when every rank admits (tp_admission_agree), so the MIN of the ranks' own
+    budgets is exactly the binding one -- rank-local ratios included."""
     if not resume_fit_evictable_on():
         return sched.uniform_min_avail
+    if running_batch is None:
+        running_batch = getattr(sched, "running_batch", None)
 
     def _read():
         # review S75 2.1 (raenge-nie-uneins): EVERY path enters the group MIN exactly once.
@@ -2127,7 +2154,9 @@ def _resume_fit_reading(sched):
         # the same MIN instead of returning early -- an early return left its peers alone
         # in the collective (gloo hang, W17 class). The group then refuses the early
         # resume by name on every rank (None: no early resume this pass).
-        have = _pool_reading(sched)
+        from flliper.srt.pdflip import d_lifetime_reading as _dlr
+
+        have = _dlr.resume_budget(sched, list(getattr(running_batch, "reqs", None) or ()))
         ok = 0 if have is None else 1
         vals = [int(have or 0), ok]
         gm = getattr(sched, "_pdflip_group_min_ints", None)
@@ -2164,7 +2193,7 @@ def _note_resume_held(sched, gate) -> None:
                 "%s rid=%s gate=%s older=%s avail=%s need=%s measure=%s passes=%d -- %s",
                 RESUME_HELD_MARK, rid, why, older, "-" if avail is None else avail,
                 "-" if need is None else need,
-                "free+evictable" if resume_fit_evictable_on() else "free",
+                "lifetime" if resume_fit_evictable_on() else "free",
                 n,
                 "the older request it was displaced for still waits (Q-698)" if why == "held_for_older"
                 else "an older request is live and the early resume does not hold (avail - need < 0, "
