@@ -43757,7 +43757,7 @@
      "source": {
       "file": "mem_cache/unified_radix_cache.py",
       "kind": "os.environ",
-      "line": 750
+      "line": 752
      }
     }
    },
@@ -44803,7 +44803,7 @@
    "id": "FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:1108"
+    "mem_cache/unified_radix_cache.py:1110"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ",
@@ -44812,7 +44812,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 1108,
+    "line": 1110,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44835,7 +44835,7 @@
    "id": "FLLIPER_HICACHE_PREFETCH_HIT0_DONE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:1090"
+    "mem_cache/unified_radix_cache.py:1092"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PREFETCH_HIT0_DONE",
@@ -44844,7 +44844,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 1090,
+    "line": 1092,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -45022,7 +45022,7 @@
    "id": "FLLIPER_HICACHE_ROUND_TIMING",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:804"
+    "mem_cache/unified_radix_cache.py:806"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ROUND_TIMING",
@@ -45031,7 +45031,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 804,
+    "line": 806,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -48087,6 +48087,38 @@
     "nf"
    ],
    "type": "EnvStr"
+  },
+  "FLLIPER_MAMBA_EVICT_PROBE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_MAMBA_EVICT_PROBE",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/mamba_evict_probe.py:113"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_MAMBA_EVICT_PROBE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/mamba_evict_probe.py",
+    "kind": "os.environ",
+    "line": 113,
+    "tree": "27b"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
   },
   "FLLIPER_MAMBA_LRU_REFRESH_USED_ONLY": {
    "bare": false,
@@ -65416,7 +65448,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/schedule_policy.py:184",
-    "mem_cache/unified_radix_cache.py:830"
+    "mem_cache/unified_radix_cache.py:832"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_END_ANCHOR",
@@ -65426,6 +65458,71 @@
     "file": "managers/schedule_policy.py",
     "kind": "os.environ",
     "line": 184,
+    "tree": "27b"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_END_ANCHOR_GUARD": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_END_ANCHOR_GUARD",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/end_anchor_guard.py:154"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_END_ANCHOR_GUARD",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/end_anchor_guard.py",
+    "kind": "os.environ",
+    "line": 154,
+    "tree": "27b"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_END_ANCHOR_GUARD_MAX_HELD": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_END_ANCHOR_GUARD_MAX_HELD",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/end_anchor_guard.py:161",
+    "pdflip/end_anchor_guard.py:455"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_END_ANCHOR_GUARD_MAX_HELD",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/end_anchor_guard.py",
+    "kind": "os.environ",
+    "line": 161,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -65477,7 +65574,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7614"
+    "mem_cache/unified_radix_cache.py:7636"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -65486,7 +65583,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7614,
+    "line": 7636,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -66615,8 +66712,8 @@
     "managers/pdflip_d_hostgap.py:92",
     "managers/pdflip_d_hostgap.py:101",
     "managers/pdflip_d_hostgap.py:113",
-    "mem_cache/unified_radix_cache.py:738",
-    "mem_cache/unified_radix_cache.py:778",
+    "mem_cache/unified_radix_cache.py:740",
+    "mem_cache/unified_radix_cache.py:780",
     "pdflip/form.py:1464"
    ],
    "level": "expert",
@@ -71101,8 +71198,8 @@
    "id": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:735",
-    "mem_cache/unified_radix_cache.py:747"
+    "mem_cache/unified_radix_cache.py:737",
+    "mem_cache/unified_radix_cache.py:749"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
@@ -71111,7 +71208,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 735,
+    "line": 737,
     "tree": "27b"
    },
    "status": "harvested",
@@ -71928,7 +72025,7 @@
    "id": "FLLIPER_PDFLIP_ORPHAN_OWN_SLOTS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:869"
+    "mem_cache/unified_radix_cache.py:871"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ORPHAN_OWN_SLOTS",
@@ -71937,7 +72034,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 869,
+    "line": 871,
     "tree": "27b"
    },
    "status": "harvested",
@@ -75837,7 +75934,7 @@
    "id": "FLLIPER_PDFLIP_RELEASE_DRAIN_CAP",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:757"
+    "mem_cache/unified_radix_cache.py:759"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RELEASE_DRAIN_CAP",
@@ -75846,7 +75943,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 757,
+    "line": 759,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -75931,7 +76028,7 @@
    "id": "FLLIPER_PDFLIP_RESET_CENSUS_DEFER_S",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:850"
+    "mem_cache/unified_radix_cache.py:852"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RESET_CENSUS_DEFER_S",
@@ -75940,7 +76037,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 850,
+    "line": 852,
     "tree": "27b"
    },
    "status": "harvested",
@@ -78069,7 +78166,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8003"
+    "mem_cache/unified_radix_cache.py:8026"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -78078,7 +78175,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8003,
+    "line": 8026,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -78591,7 +78688,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:10446"
+    "mem_cache/unified_radix_cache.py:10483"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -78600,7 +78697,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 10446,
+    "line": 10483,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -94719,28 +94816,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 3000,
-  "envs": 2121,
+  "entries": 3003,
+  "envs": 2124,
   "explained": 310,
   "flags": 864,
   "harvested": 1857,
   "trees": {
    "abweichung": 31,
-   "beide": 2723,
+   "beide": 2726,
    "nur_27b": 235,
    "nur_nf": 24
   },
-  "unexplained": 708
+  "unexplained": 711
  },
- "tree_rev": "27b=ec7368e073+nf=c1d86ea06b",
+ "tree_rev": "27b=7040ea0461+nf=34ec60c978",
  "trees": {
   "27b": {
-   "entries": 2958,
-   "rev": "ec7368e073"
+   "entries": 2961,
+   "rev": "7040ea0461"
   },
   "nf": {
-   "entries": 2747,
-   "rev": "c1d86ea06b"
+   "entries": 2750,
+   "rev": "34ec60c978"
   }
  },
  "warnungen": []
