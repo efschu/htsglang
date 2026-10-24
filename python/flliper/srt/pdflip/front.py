@@ -1348,12 +1348,44 @@ def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
     return str(p)
 
 
+#: FRONT-LCP-1024: the first segment the galloping prefix compare tries (chars).
+_LCP_GALLOP0 = 4096
+
+
 def common_prefix_len(a: str, b: str) -> int:
+    """Length of the longest common character prefix of ``a`` and ``b``.
+
+    FRONT-LCP-1024 (NF boot ..._1023_234711, front log): every arrival runs
+    :meth:`SpanLRU.uncached_tokens` -- this function against EACH of up to
+    ``SPAN_LRU`` (512) served texts of 100-600k chars -- on the event loop
+    before the exact count starts. The old binary search copied ``a[:mid]``
+    and ``b[:mid]`` on all ~19 steps (O(n log n) bytes per entry), so the
+    SESSION -> exact-count gap grew with the LRU from p50 12-45 ms (first
+    requests) to 220-359 ms (last third); the tokenizer's own count_ms
+    stayed 8-90 ms.
+
+    Same answer, O(cp) copies: the invariant ``a[:lo] == b[:lo]`` lets every
+    compare touch only the NEW segment ``[lo, hi)``. A gallop (4096, 8192,
+    ... chars) brackets the first mismatch, then a binary search inside the
+    bracket, again on new segments only. The boundary step is exact: a
+    mismatch inside ``[lo, hi)`` means the answer is in ``[lo, hi - 1]``."""
     n = min(len(a), len(b))
-    lo, hi = 0, n
+    if n == 0 or a[0] != b[0]:
+        return 0
+    lo, step = 0, _LCP_GALLOP0
+    while True:
+        hi = min(n, lo + step)
+        if a[lo:hi] == b[lo:hi]:
+            lo = hi
+            if lo == n:
+                return n
+            step *= 2
+        else:
+            break
+    hi -= 1  # a[:hi] may still match: the first mismatch lies in [lo, hi)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if a[:mid] == b[:mid]:
+        if a[lo:mid] == b[lo:mid]:
             lo = mid
         else:
             hi = mid - 1
