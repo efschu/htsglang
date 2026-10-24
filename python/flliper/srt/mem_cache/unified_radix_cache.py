@@ -9936,18 +9936,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # sweep, so a memo left by a sweep that raised is never read by the next one
         self._pdflip_sweep_room_memo = _sweep_room_memo()
         queue = list(first or []) + ([] if chain_only else [self.root_node])   # xsn344: the retain's own chain first
-        # SWEEPCENSUS-1023: a chain node is queued from ``first`` AND as its parent's child, so a chain walk visited
-        # node k k times (S108 TURN-END-L2 rid=pdflip-50-349 chain=88 unbacked=1965, issue_ms=43985 cpu 43819, D TP0
-        # 23:30-23:35Z) -- each visit of a refused node asked the room again. One walk per node; the membership test
-        # is a set (it was a list scan per pop).
-        _first_ids = {id(n) for n in (first or [])} if chain_only else None
-        _walked_ids = set() if chain_only else None
+        # KVLEITER-1022 SWEEP (NF 60e1181e27 + review S-A 276a8f7bf6, ported SWEEPCENSUS-1023): a chain node is in
+        # ``first`` AND a child of the chain node before it, so it was queued again at every visit of its parent --
+        # the node at depth k was visited k+1 times (27B int4ar 1023_223241 D TP0: S108 TURN-END-L2 rid=pdflip-50-349
+        # chain=88 unbacked=1965 issue_ms=43985 cpu 43819 -- every visit of a refused node asked the room again).
+        # Every node is now visited ONCE, at its first queue entry (the first-visit order is the old one), membership
+        # by identity in a set (UnifiedTreeNode has no __eq__: ``in first`` was identity already).
+        _first_ids = {id(x) for x in (first or [])}
+        _seen: set = set()
         while queue:
             node = queue.pop(0)
-            if chain_only and node is not self.root_node:
-                if id(node) not in _first_ids or id(node) in _walked_ids:
-                    continue   # xsn347: the chunk sweep walks the chain only (the BFS cost 109 ms per chunk)
-                _walked_ids.add(id(node))
+            if chain_only and node is not self.root_node and id(node) not in _first_ids:
+                continue   # xsn347: the chunk sweep walks the chain only (the BFS cost 109 ms per chunk)
+            if id(node) in _seen:
+                continue   # KVLEITER-1022: a later queue entry of a node already visited
+            _seen.add(id(node))
             # xsn342: a bounded sweep -- wall budget (retain) and a full mamba
             # arena end it; the remaining nodes stay unbacked for the next one.
             if clock is not None and clock.expired():
@@ -10021,6 +10024,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _w > 0 and len(node.key) > _w:
                 _tail = self._pdflip_split_for_publish(node, _w)
                 if _tail is not None:
+                    # KVLEITER-1022 review S-A: the split's re-queue of the anchored tail (the ORIGINAL node object,
+                    # marked visited above) is intentional -- clear its mark so the tail gets its own backup now
+                    _seen.discard(id(_tail))
                     queue.append(_tail)
                     node = _tail.parent
             # write_back at the flip (user order 2026-09-15: "die eviction ist
