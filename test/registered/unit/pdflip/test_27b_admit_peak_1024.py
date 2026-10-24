@@ -50,7 +50,7 @@ FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "admi
                    "stage_lines_D.json.gz")
 MIB = 1 << 20
 INT4AR_ROW = 39223296          # int4ar mamba state row per rank (PDFLIP-ARENA-STATE-LOAD own_bytes / slots)
-DUO_ROW = 53932032             # NVFP4 duo TP1, the largest row of the three forms
+DUO_ROW = 53932032             # NVFP4 duo TP0, the largest row of the three forms
 
 
 def _fixture():
@@ -276,6 +276,30 @@ class TestMambaStateStage(CustomTestCase):
             self.assertIsNone(pool._state_split_vec(stacked, comp, row + 1))
 
 
+class TestM1GpuScript(CustomTestCase):
+    def test_the_m1_gpu_split_check_runs_and_passes_on_the_desk_cpu(self):
+        """review #217 M1: the window script itself is proven here (device "cpu"); in the window it runs on cuda:0."""
+        import importlib.util
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "manual", "pdflip",
+                            "check_217_mamba_split_gpu.py")
+        spec = importlib.util.spec_from_file_location("check_217_mamba_split_gpu", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(mod.main("cpu"), 0)
+        # a wrong split is caught: the temporal half lands in a copy, not in the device pool
+        real = AMP.ArenaMambaPoolHost._state_split_vec
+
+        def broken(self_, dp, comp, row):
+            v = real(self_, dp, comp, row)
+            if v is None:
+                return None
+            t_u8, c_u8, per_layer, ln_t, ln_c = v
+            return t_u8.clone(), c_u8, per_layer, ln_t, ln_c
+        with mock.patch.object(AMP.ArenaMambaPoolHost, "_state_split_vec", broken):
+            self.assertNotEqual(mod.main("cpu"), 0)
+
+
 # ---- the record -----------------------------------------------------------------------------------------------------
 
 def _line_page(block, mode="kernel", pages=20000, page=32768):
@@ -313,6 +337,31 @@ class TestRecordStaysMeasured(CustomTestCase):
         # an owner-lane line (NF) is not the whole-page stage and never counts as one
         lane = BR.admit_stage_basis(_line_page(2048).replace("mode=kernel", "mode=dma lane_dma=2d"))
         self.assertEqual(lane.kv_stage_mib, ())
+
+    def test_review_s1_fallback_cpu_lines_sleeps_and_missing_logs_answer_no(self):
+        good = [_line_page(2048), _line_state(1)]
+        row = INT4AR_ROW / MIB
+        sleep_ok = f"[2026-10-25 01:01:00 TP1] PDFLIP-SLEEP-STAGING freed {row:.1f} MiB (mamba_state_stage {row:.1f})"
+        sleep_big = (f"[2026-10-25 01:01:00 TP1] PDFLIP-SLEEP-STAGING freed {6 * row:.1f} MiB "
+                     f"(mamba_state_stage {6 * row:.1f})")
+        fallback = ("[2026-10-25 01:02:00 TP1] PDFLIP-ARENA-PAGE-LOAD kernel mode failed (RuntimeError: x); "
+                    "cpu mode from now on")
+        fallback_dma = fallback.replace("kernel mode", "dma mode")
+        self.assertTrue(BR.admit_record_may_replace([("a", BR.admit_stage_basis("\n".join(good + [sleep_ok])))])[0])
+        for extra in (sleep_big, fallback, fallback_dma, _line_state(6, mode="cpu")):
+            b = BR.admit_stage_basis("\n".join(good + [extra]))
+            ok, lines = BR.admit_record_may_replace([("a", b)])
+            self.assertFalse(ok, extra)
+            self.assertIn("NOT the #217 stages", lines[0])
+        missing = BR.AdmitStageBasis((), (), (), missing=True)
+        ok, lines = BR.admit_record_may_replace([("a", BR.admit_stage_basis("\n".join(good))), ("gone.D.log", missing)])
+        self.assertFalse(ok)
+        self.assertIn("D log missing", lines[1])
+        # the census CLI names a missing D log instead of skipping it
+        src = open(BR.__file__).read()
+        i = src.index("stage_paths = [")
+        self.assertIn("missing=True", src[i:i + 600])
+        self.assertNotIn("for p in stage_paths if os.path.exists(p)", src[i:i + 600])
 
     def test_the_projection_is_a_hochrechnung_and_never_booked(self):
         a, need, label = BR.admit_peak_projection()

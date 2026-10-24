@@ -34,6 +34,7 @@ from flliper.srt.mem_cache.pool_host.arena_pool import (
     PLACEHOLDERS,
     ArenaMHAHostPool,
     _arena_page_load_mode,
+    _arena_page_load_timing,
     admit_peak_stages_on,
     _select_rows_async,
     index_to_device_async,
@@ -76,7 +77,7 @@ def _state_load_block_rows(row_bytes: int, dma: bool, env=None) -> int:
     MEASURED (PDFLIP-SLEEP-STAGING ``mamba_state_stage``, unsampled, at every
     sleep): the stage reached 224.4 MiB on int4ar (6 x 37.4, rc42 _1024_125438
     8 of 17 sleeps), 187 MiB on INT8 drei TP1/TP2 (10 x 18.7), 205.7 / 233.8 MiB
-    on NVFP4 duo TP1 / TP0 -- ``256 MiB // row`` slots. The sleep drops it
+    on NVFP4 duo TP0 / TP1 -- ``256 MiB // row`` slots. The sleep drops it
     (sleep_staging, +254 MiB fix (a)), so the FIRST load after every wake -- the
     handback admission -- allocates it again: A - released of that pass is 154
     (4 slots) and 226-232 MiB (>= 6 slots), the part of the admission peak
@@ -923,6 +924,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
         t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
         L = int(lay["L"])
         vec = self._state_split_vec(device_pool, comp, row_bytes) if state_split_vec_on() else None
+        # review #217 S6: the split's DEVICE time under FLLIPER_PDFLIP_ARENA_PAGE_LOAD_TIMING=1 (events around each
+        # block's split, one sync at the end) -> START-LOADING components ``mamba.split_dev``; host time stays ``split``
+        _sev = [] if (dev.type == "cuda" and _arena_page_load_timing()) else None
         for start in range(0, n, B):
             b = min(B, n - start)
             sl = slots_cpu[start:start + b]
@@ -938,6 +942,8 @@ class ArenaMambaPoolHost(MambaPoolHost):
             _tc = time.perf_counter()
             _sub["issue"] = _sub.get("issue", 0.0) + (_tc - _tb) * 1000.0
             d_b = didx[start:start + b]
+            if _sev is not None:
+                _se0 = torch.cuda.Event(enable_timing=True); _se0.record()
             if vec is not None:
                 # #217: all layers in two strided index_copy_ (no per-layer
                 # temporaries); the stage row is (L, per_layer) = [temporal |
@@ -962,10 +968,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
                         ch0 += n_j
                     dst_c.index_copy_(0, d_b, row)
             _sub["split"] = _sub.get("split", 0.0) + (time.perf_counter() - _tc) * 1000.0
+            if _sev is not None:
+                _se1 = torch.cuda.Event(enable_timing=True); _se1.record()
+                _sev.append((_se0, _se1))
             if _pin and not dma and start + b < n:
                 _td = time.perf_counter()
                 torch.cuda.current_stream(dev).synchronize()  # the stage is reused by the next block
                 _sub["sync"] = _sub.get("sync", 0.0) + (time.perf_counter() - _td) * 1000.0
+        if _sev:
+            torch.cuda.current_stream(dev).synchronize()
+            _sub["split_dev"] = _sub.get("split_dev", 0.0) + sum(e0.elapsed_time(e1) for e0, e1 in _sev)
         global _STATE_LOAD_N
         _STATE_LOAD_N += 1
         if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
