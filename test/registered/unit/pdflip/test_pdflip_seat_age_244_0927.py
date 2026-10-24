@@ -268,7 +268,7 @@ class Wiring(unittest.TestCase):
     def test_admitter_orders_by_age_and_backfills(self):
         src = open(F.__file__).read()
         i = src.index("    async def d_admitter(self)")
-        blk = src[i:i + 9000]
+        blk = src[i:i + 12000]   # HANDOVER-KVFITS 1024: the D-line device-KV hold before the seat grew the method
         # PRIO-AS-AGE 1014: the D line is ordered by the order key (priority desc, front arrival asc)
         self.assertIn("_ordered = _sa.by_age(self._ready_for_d, lane_of=lambda q: Front._prio_lane(self, q))", blk)
         self.assertIn("PDFLIP SEAT-AGE BACKFILL", blk)
