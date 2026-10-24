@@ -44276,7 +44276,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "WAKE-OUTLIERS-1024 (27B int8 boot ..._1024_080355): the T lines of a KV page come from EVERY TP rank of a group, and those ranks read the identical page set (D TP0/TP1/TP2 PDFLIP-READ-STAGES: 8776008 pages each) -- three identical lines per page. P PP0 parsed and applied 0.1-3.4 M journal lines per wake (95 % T), 0.4-6.8 s of GIL-bound Python beside PP0's first P forwards. On (default False = deduplicated): a non-owner rank at the owner's pp/cp position (a pure TP peer) leaves the T line of a canonical KV page to the owner; component pages (.mamba/.draft/.qsa_indexer) and every PP stage keep theirs. True = every rank journals its read hits again.",
+   "help": "WAKE-OUTLIERS-1024 (27B int8 boot ..._1024_080355): the T lines of a KV page come from EVERY TP rank of a group, and those ranks read the identical page set (D TP0/TP1/TP2 PDFLIP-READ-STAGES: 8776008 pages each) -- three identical lines per page. P PP0 parsed and applied 0.1-3.4 M journal lines per wake (95 % T), 0.4-6.8 s of GIL-bound Python beside PP0's first P forwards. On (default False = deduplicated): a non-owner rank at the owner's pp/cp position (a pure TP peer) leaves the T line of a plain KV page under the GROUP-WIDE KV suffix to the owner; every other key (components, per-rank suffixes), every PP stage, the dcp owner form, DP attention and ranks outside a Weg-2 group keep theirs. True = every rank journals its read hits again.",
    "id": "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS",
    "kind": "env",
    "level": "expert",
@@ -44286,7 +44286,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4001,
+    "line": 4002,
     "tree": "27b"
    },
    "status": "harvested",
@@ -93795,11 +93795,11 @@
   },
   "unexplained": 695
  },
- "tree_rev": "27b=060d4e3eaf+nf=42eef22f3d",
+ "tree_rev": "27b=cc2fe8c9aa+nf=42eef22f3d",
  "trees": {
   "27b": {
    "entries": 2930,
-   "rev": "060d4e3eaf"
+   "rev": "cc2fe8c9aa"
   },
   "nf": {
    "entries": 2739,
