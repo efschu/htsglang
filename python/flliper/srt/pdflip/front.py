@@ -18810,7 +18810,9 @@ class Front:
         try:
             # H91 part C: under part A an admissible request WAITS in P's
             # queue instead of drawing a 503, so the leg is bounded here.
-            status, body = await self._leg1_bounded(p, _post())
+            # S7b P-RESTART: a leg that died with P is marked dual_pause -- the dual pass's own pause branch
+            # requeues it at the head (never failed to the client, never handed to D half-prefilled)
+            status, body = await _s7b.leg1_rpc(self, p, self._leg1_bounded(p, _post()))
             if status != 200:
                 raise RuntimeError(f"leg1 on P returned {status}: {body[:300]!r}")
             p.leg1_ran = True  # SK-X: the W35 premise "after a full P prefill"
@@ -23685,6 +23687,8 @@ class Front:
         it. Metal dual23: the running pass took the requeued B again 134 ms later
         with pressure unchanged at 360710144 -> a second pause; the pump's own
         gates (before a NEW pass) never saw it -- 0 RESUME-WAIT lines."""
+        if _s7b.p_absent(self):
+            return True  # S7b P-RESTART: no new leg 1 while P is absent (dead / restarting / joining / failed)
         if _dual_p_pressure(self.dual_kv_ledgers) > 0:
             return True
         if self._dual_p_held_by_stage():
@@ -24286,8 +24290,6 @@ class Front:
                         if is_intake_stall(e) and not is_too_large(e):
                             await self._requeue_intake_stalled(p, e)
                             return p
-                        if not is_too_large(e) and _s7b.requeue_failed_leg(self, p, e):
-                            return p  # S7b: P died under this leg -- back at the head, never failed to the client
                         if is_too_large(e):
                             # weg2xsn291: larger than P's whole pool -- no
                             # flip can make room; refused by name, never
@@ -24363,8 +24365,7 @@ class Front:
                 self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
                 lambda: (self.state == "serving" and not self._p_intake_stalled
                          and not (self.dual_layout and self.dual_kv_ledgers
-                                  and self._dual_dispatch_held())
-                         and not _s7b.p_absent(self)),  # S7b: no new P leg while P is absent
+                                  and self._dual_dispatch_held())),
                 # H91 part C rule 1: at most p_phase_max_requests leave the
                 # queue in this P phase, overlapping only as far as their
                 # est_prompt fits P's unified pool (0 = off, law 1 as before).

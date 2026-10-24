@@ -116,7 +116,8 @@ class OnPDead(unittest.TestCase):
             with self.assertLogs(S.logger, "ERROR") as cm:
                 self.assertTrue(S.on_p_dead(f, "W17 PdFlipGroupDead group P"))
             self.assertEqual(S.state_of(f).state, S.DEAD)
-            self.assertTrue(leg.s7b_p_dead)
+            self.assertTrue(leg.dual_pause)                                   # the dual pass requeues it
+            self.assertTrue(any("S7B P-LEG-ABORTED rid=pdflip-0-6" in m for m in cm.output))
             self.assertEqual(S.state_of(f).old_sid, P_SID)
             self.assertTrue(any("S7B P-DEAD why=W17 PdFlipGroupDead group P" in m for m in cm.output))
             self.assertTrue(S.p_absent(f))
@@ -136,8 +137,8 @@ class OnPDead(unittest.TestCase):
             # no restart armed: the P-bound ones are answered by name at once
             self.assertEqual(list(f.queue), [])
             for p in (big, vis):
-                self.assertIsInstance(p.fut.exception(), S.PdFlipPDead)
-                self.assertIn("P-ABSENT-NO-RESTART", str(p.fut.exception()))
+                self.assertIsInstance(p.fut.exception(timeout=0), S.PdFlipPDead)
+                self.assertIn("P-ABSENT-NO-RESTART", str(p.fut.exception(timeout=0)))
             for p in (short, halb, edge):
                 self.assertFalse(p.fut.done())
             self.assertFalse(f._batch_gate.is_set())                         # the gate follows the deque
@@ -156,40 +157,73 @@ class OnPDead(unittest.TestCase):
             S.tick(f, 1000.0 + S.DEFAULT_WAIT_S - 1)
             self.assertFalse(big.fut.done())                                  # waits for P
             S.tick(f, 1000.0 + S.DEFAULT_WAIT_S + 1)
-            self.assertIn("P-WAIT-EXPIRED", str(big.fut.exception()))
+            self.assertIn("P-WAIT-EXPIRED", str(big.fut.exception(timeout=0)))
 
 
-class RequeueFailedLeg(unittest.TestCase):
-    def test_a_leg_of_a_dead_p_goes_back_to_the_head(self):
+class LegAbort(unittest.TestCase):
+    def _f(self):
+        f = _front()
+        f.dual_kv_ledgers = ["/dev/shm/wkv-test"]
+        return f
+
+    def test_a_leg_of_a_dead_p_goes_back_to_the_head_through_the_pause_path(self):
         with _Env():
-            f = _front()
+            f = self._f()
             S.on_p_dead(f, "x")
-            other = _p("q", 70000)
-            f.queue.append(other)
+            f.queue.append(_p("q", 70000))
             leg = _p("pdflip-0-6", 120000)
+            leg.intake_stalled = False
             with self.assertLogs(S.logger, "ERROR") as cm:
-                self.assertTrue(S.requeue_failed_leg(f, leg, ConnectionResetError("peer gone")))
+                self.assertTrue(S.mark_failed_leg(f, leg, ConnectionResetError("peer gone")))
+            self.assertTrue(leg.dual_pause)
+            self.assertTrue(any("S7B P-LEG-ABORTED rid=pdflip-0-6" in m for m in cm.output))
+            # what the (pinned, unchanged) dual pass does with a dual_pause leg: its own pause requeue
+            front_mod.Front._dual_requeue_paused(f, leg)
             self.assertIs(f.queue[0], leg)
-            self.assertTrue(leg.dual_requeued)                                 # on_done never hands it to D
             self.assertFalse(leg.leg1_done)
             self.assertFalse(leg.fut.done())
-            self.assertTrue(any("S7B P-LEG-ABORTED rid=pdflip-0-6" in m for m in cm.output))
+            self.assertTrue(front_mod.Front._dual_skip_after_requeue(f, leg))   # on_done never hands it to D
 
     def test_the_leg_detects_the_death_before_the_poller(self):
         with _Env():
-            f = _front()
+            f = self._f()
             leg = _p("pdflip-0-7", 120000)
-            self.assertTrue(S.requeue_failed_leg(f, leg, RuntimeError("500"), p_looks_dead=lambda fr: True))
+            self.assertTrue(S.mark_failed_leg(f, leg, RuntimeError("500"), p_looks_dead=lambda fr: True))
             self.assertEqual(S.state_of(f).state, S.DEAD)
-            self.assertIs(f.queue[0], leg)
+            self.assertTrue(leg.dual_pause)
 
-    def test_a_live_p_or_the_flip_form_keeps_the_old_failure(self):
+    def test_a_live_p_the_flip_form_or_no_ledger_keep_the_old_failure(self):
         with _Env():
-            f = _front()
-            self.assertFalse(S.requeue_failed_leg(f, _p("a", 1), RuntimeError("x"), p_looks_dead=lambda fr: False))
+            f = self._f()
+            leg = _p("a", 1)
+            self.assertFalse(S.mark_failed_leg(f, leg, RuntimeError("x"), p_looks_dead=lambda fr: False))
+            self.assertFalse(getattr(leg, "dual_pause", False))
             self.assertEqual(S.state_of(f).state, S.SERVING)
             g = _front(dual=False)
-            self.assertFalse(S.requeue_failed_leg(g, _p("b", 1), RuntimeError("x"), p_looks_dead=lambda fr: True))
+            g.dual_kv_ledgers = ["x"]
+            self.assertFalse(S.mark_failed_leg(g, _p("b", 1), RuntimeError("x"), p_looks_dead=lambda fr: True))
+            h = _front()                                                      # dual without ledgers: no gate
+            h.dual_kv_ledgers = []
+            self.assertFalse(S.mark_failed_leg(h, _p("c", 1), RuntimeError("x"), p_looks_dead=lambda fr: True))
+
+    def test_leg1_rpc_marks_a_transport_failure_and_a_non_200(self):
+        async def boom():
+            raise ConnectionResetError("P gone")
+
+        async def code(c):
+            return c, b"x"
+
+        with _Env():
+            f = self._f()
+            S.on_p_dead(f, "x")
+            a, b, c = _p("a", 9), _p("b", 9), _p("c", 9)
+            with self.assertRaises(ConnectionResetError):
+                asyncio.run(S.leg1_rpc(f, a, boom()))
+            self.assertTrue(a.dual_pause)
+            self.assertEqual(asyncio.run(S.leg1_rpc(f, b, code(500))), (500, b"x"))
+            self.assertTrue(b.dual_pause)
+            self.assertEqual(asyncio.run(S.leg1_rpc(f, c, code(200))), (200, b"x"))
+            self.assertFalse(getattr(c, "dual_pause", False))
 
     def test_the_poller_fact_is_a_dead_p(self):
         f = _front()
@@ -265,10 +299,18 @@ class FrontWiring(unittest.TestCase):
         src = inspect.getsource(front_mod.Front.controller)
         dual = src[src.index("if self.dual_layout:\n                    if _s7b.p_absent(self)"):]
         self.assertLess(dual.index("_s7b.tick(self"), dual.index("self._dual_pump(_p_drain_pass_dual)"))
-        self.assertIn("and not _s7b.p_absent(self)),", src)                    # the running pass stops dispatching
         one = src[src.index("async def _p_drain_pass_dual"):src.index("async def _p_drain_pass()")]
-        self.assertLess(one.index("_s7b.requeue_failed_leg(self, p, e)"), one.index('self.counters["leg1_failures"]'))
+        self.assertNotIn("_s7b", one)                                          # the pinned 27B pass stays byte-identical
+        self.assertIn("self._dual_dispatch_held()", one)                       # ... and reads the gate below per leg
+        self.assertIn("_s7b.leg1_rpc(self, p, self._leg1_bounded(p, _post()))", inspect.getsource(front_mod.Front.leg1))
         self.assertEqual(len(re.findall(r"_s7b\.on_p_dead\(", inspect.getsource(front_mod.Front.health_poll_once))), 1)
+
+    def test_the_running_pass_dispatches_no_leg_while_p_is_absent(self):
+        with _Env():
+            f = _front()
+            f.dual_kv_ledgers = ["/dev/shm/wkv-none-s7b"]
+            S.on_p_dead(f, "x")
+            self.assertTrue(front_mod.Front._dual_dispatch_held(f))
 
     def test_state_block(self):
         with _Env():
@@ -377,7 +419,7 @@ class RestartDriver(unittest.TestCase):
         with self.assertLogs(S.logger, "ERROR") as cm:
             self.assertEqual(_drive(f, io), S.FAILED)
         self.assertNotIn("spawn", [c[0] for c in io.calls])
-        self.assertIn("P-RESTART-FAILED", str(big.fut.exception()))
+        self.assertIn("P-RESTART-FAILED", str(big.fut.exception(timeout=0)))
         self.assertTrue(any("S7B P-RESTART FAILED" in m for m in cm.output))
         self.assertEqual(f.state, "serving")                                   # D serves on
 

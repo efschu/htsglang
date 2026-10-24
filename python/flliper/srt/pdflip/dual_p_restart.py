@@ -10,9 +10,14 @@ STAGE 1 (this module + four call sites in front.py, dual layout only):
   * ``on_p_dead(front, why)`` -- every site that would have stopped the boot for P calls it first; True = taken
     over, the caller does NOT stop. P is marked absent (state ``dead``), no P leg is dispatched any more (the dual
     pump is not run, the running pass's ``may_dispatch`` turns False), one named line ``S7B P-DEAD``.
-  * in-flight P legs end at P's transport failure (bounded by P's own death: the server's crash-diagnose window and
-    ``kill_process_tree``, 38-67 s on the specimens) and come back through ``requeue_failed_leg``: named line
-    ``S7B P-LEG-ABORTED``, the request goes back to the head of the queue, never to D half-prefilled.
+  * in-flight P legs (``_dual_inflight``) are marked ``dual_pause`` with one named line each (``S7B P-LEG-ABORTED``);
+    they end at P's transport failure (bounded by P's own death: the server's crash-diagnose window and
+    ``kill_process_tree``, 38-67 s on the specimens) and the dual pass's OWN pause branch requeues them at the head
+    (``_dual_requeue_paused``: never failed to the client, never handed to D half-prefilled). A leg that fails before
+    the poller saw the death marks itself through ``leg1_rpc`` when P's session is gone or the poller holds a
+    dead/held fact. The 27B drain pass body stays byte-identical (test_27b_port_dual_unchanged_1020 pins it); the new
+    leg gate sits in ``Front._dual_dispatch_held``, which that pass reads before every new leg. Dual boots without
+    card ledgers keep the old per-request failure (no dispatch gate there, a requeue would loop).
   * ``tick(front, now)`` (the controller, every loop while P is absent): every queued request D may take
     (SK-kept SHORT, or u <= X and not p_only) goes to D's admission line (``S7B TO-D``); D never prefills over X
     (Phasen-Gesetz, user veto 10.09.). A request u > X (or p_only, R9) waits for P -- no flip/P phase without P --
@@ -219,11 +224,6 @@ def on_p_dead(front, why: str, *, now: Optional[float] = None, env=None,
     st.old_sid = int(getattr(P, "sid", 0) or 0)
     st.deaths += 1
     inflight = dict(getattr(front, "_dual_inflight", None) or {})
-    for p in inflight.values():
-        try:
-            p.s7b_p_dead = True
-        except Exception:  # noqa: BLE001 -- a partial Pending: its leg's own error path still requeues
-            pass
     outstanding = len(getattr(P, "outstanding", {}) or {})
     queue = list(getattr(front, "queue", ()) or ())
     live = [p for p in queue if not getattr(getattr(p, "fut", None), "done", lambda: False)()]
@@ -233,10 +233,15 @@ def on_p_dead(front, why: str, *, now: Optional[float] = None, env=None,
     logger.error(
         "%s P-DEAD why=%s p_sid=%s inflight_legs=%d p_outstanding=%d queue=%d d_capable=%d p_bound=%d X=%d "
         "restart=%s -- D serves on (no STOP); no P leg is dispatched; in-flight P legs end at P's transport "
-        "failure and are requeued (%s P-LEG-ABORTED); requests u<=X go to D's admission line, u>X / p_only wait "
+        "failure and are requeued through the dual pause path (%s P-LEG-ABORTED); requests u<=X go to D's admission line, u>X / p_only wait "
         "for P (no P phase without P, D never prefills over X)",
         MARK, str(why)[:300], st.old_sid, len(inflight), outstanding, len(live), n_d, len(live) - n_d, _x(front),
         "armed" if rearm else "off (P-bound requests are answered at once)", MARK)
+    for p in inflight.values():
+        try:
+            _mark_leg(front, p, "in flight at the death (%s)" % str(why)[:120])
+        except Exception:  # noqa: BLE001 -- a partial Pending: its leg's own failure path still marks it
+            pass
     hand_to_d(front)
     if rearm:
         st.state = RESTARTING
@@ -326,40 +331,56 @@ def answer_p_bound(front, name: str, detail: str) -> int:
     return n
 
 
-def requeue_failed_leg(front, p, exc: BaseException, *, env=None, p_looks_dead=None) -> bool:
-    """``one``'s failure branch: a P leg that failed because P died goes back to the head of the queue
-    (``S7B P-LEG-ABORTED``) instead of failing its request. True = requeued (the caller returns ``p``)."""
-    if not armed(front, env):
-        return False
-    st = state_of(front)
-    if st.state not in ABSENT_STATES:
-        dead = bool(getattr(p, "s7b_p_dead", False))
-        if not dead:
-            probe = p_looks_dead if p_looks_dead is not None else _p_looks_dead
-            try:
-                dead = bool(probe(front))
-            except Exception:  # noqa: BLE001 -- no verdict = the old path (fail the request)
-                dead = False
-        if not dead:
-            return False
-        if not on_p_dead(front, "leg1 rid=%s failed (%s: %s) and P's group is dead" % (
-                getattr(p, "rid", "?"), type(exc).__name__, str(exc)[:200]), env=env):
-            return False
-    p.leg1_done = False
-    p.dual_requeued = True   # the pool's on_done must not hand it to D (the dual23 guard reads it)
+def _mark_leg(front, p, why: str) -> None:
+    if getattr(p, "dual_pause", False):
+        return
+    p.dual_pause = True       # the dual pass's pause branch requeues it at the head (_dual_requeue_paused)
     p.s7b_requeues = int(getattr(p, "s7b_requeues", 0) or 0) + 1
-    try:
-        p.s7b_p_dead = False
-    except Exception:  # noqa: BLE001
-        pass
-    front.queue.appendleft(p)
+    st = state_of(front)
     st.legs_aborted += 1
     front.counters["s7b_legs_aborted"] += 1
-    logger.error("%s P-LEG-ABORTED rid=%s why=%s exc=%s: %s -- back at the head of the queue (u=%s X=%d -> %s); "
-                 "never handed to D half-prefilled", MARK, getattr(p, "rid", "?"), st.why[:160],
-                 type(exc).__name__, str(exc)[:200], getattr(p, "est_uncached", "?"), _x(front),
+    logger.error("%s P-LEG-ABORTED rid=%s why=%s: P is dead -- the leg ends at P's transport failure and goes back "
+                 "to the head of the queue through the dual pause path (u=%s X=%d -> %s); never failed to the "
+                 "client, never handed to D half-prefilled", MARK, getattr(p, "rid", "?"), str(why)[:200],
+                 getattr(p, "est_uncached", "?"), _x(front),
                  "D's admission line" if d_capable(front, p) else "waits for P")
+
+
+def mark_failed_leg(front, p, exc: BaseException, *, env=None, p_looks_dead=None) -> bool:
+    """A P leg failed: if P is dead (marked, or its session gone / the poller holds a dead or held fact), mark the
+    leg for the dual pass's pause requeue. True = marked. Needs the card ledgers (the dispatch gate)."""
+    if not armed(front, env) or not getattr(front, "dual_kv_ledgers", None):
+        return False
+    if getattr(p, "dual_pause", False):
+        return True
+    st = state_of(front)
+    if st.state not in ABSENT_STATES:
+        probe = p_looks_dead if p_looks_dead is not None else _p_looks_dead
+        try:
+            dead = bool(probe(front))
+        except Exception:  # noqa: BLE001 -- no verdict = the old path (fail the request)
+            dead = False
+        if not dead:
+            return False
+        on_p_dead(front, "leg1 rid=%s failed (%s: %s) and P's group is dead" % (
+            getattr(p, "rid", "?"), type(exc).__name__, str(exc)[:200]), env=env)
+    _mark_leg(front, p, "%s: %s" % (type(exc).__name__, str(exc)[:160]))
     return True
+
+
+async def leg1_rpc(front, p, coro, *, env=None):
+    """``Front.leg1``'s RPC: await it; a transport failure or a non-200 while P is dead marks the leg (see
+    ``mark_failed_leg``) before the caller raises as before."""
+    try:
+        status, body = await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- marked, then re-raised unchanged
+        mark_failed_leg(front, p, e, env=env)
+        raise
+    if status != 200 and getattr(front, "dual_layout", False):
+        mark_failed_leg(front, p, RuntimeError("leg1 on P returned %s" % status), env=env)
+    return status, body
 
 
 def _p_looks_dead(front) -> bool:
