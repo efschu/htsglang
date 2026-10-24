@@ -529,3 +529,14 @@ def test_default_is_on():
     assert EAG.on({}) is True
     assert EAG.on({GUARD_ENV: "0"}) is False
     assert EAG.max_held({}) == EAG.DEFAULT_MAX_HELD
+
+
+def test_probe_names_the_reason_through_the_two_pass_frames():
+    """#228b's site rule skips the drives' own frames: the 22-194 chain through the full peel and through the mamba
+    drive's pass still names the caller (``alloc_token_slots`` / ``_alloc_mamba_slot``), not the new frames."""
+    from flliper.srt.mem_cache import mamba_evict_probe as MEP
+
+    assert MEP.classify(["_cascade_evict", "_evict_to_host", "_evict_device_leaf", "_peel_heap", "_peel",
+                         "drive_eviction", "evict", "alloc_token_slots"]) == ("alloc", "alloc_token_slots")
+    assert MEP.classify(["_cascade_evict", "_tombstone_interior", "_drive_eviction_pass", "drive_eviction", "evict",
+                         "_alloc_mamba_slot"]) == ("alloc", "_alloc_mamba_slot")

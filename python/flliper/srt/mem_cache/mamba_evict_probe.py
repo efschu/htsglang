@@ -71,6 +71,8 @@ ALT_WALK_CAP = 4096
 MECHANISM = frozenset({
     "note_device_evict", "_evict_component_and_detach_lru", "evict_component", "_cascade_evict",
     "_evict_to_host", "_evict_device_leaf", "drive_eviction", "evict", "_evict_impl",
+    # END-ANCHOR-GUARD-1024 (#231): the two-pass drives' own frames (mamba drive pass / interior tombstone, full peel)
+    "_drive_eviction_pass", "_tombstone_interior", "_peel", "_peel_heap",
     "_iteratively_delete_tombstone_leaf", "_evict_host_leaf", "_for_each_component_lru", "wrapper",
     "inner", "_wrapped", "timed", "__call__", "<lambda>", "<listcomp>", "<genexpr>",
 })
