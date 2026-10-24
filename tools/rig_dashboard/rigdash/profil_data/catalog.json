@@ -44268,6 +44268,34 @@
    ],
    "type": "EnvFloat"
   },
+  "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "WAKE-OUTLIERS-1024 (27B int8 boot ..._1024_080355): the T lines of a KV page come from EVERY TP rank of a group, and those ranks read the identical page set (D TP0/TP1/TP2 PDFLIP-READ-STAGES: 8776008 pages each) -- three identical lines per page. P PP0 parsed and applied 0.1-3.4 M journal lines per wake (95 % T), 0.4-6.8 s of GIL-bound Python beside PP0's first P forwards. On (default False = deduplicated): a non-owner rank at the owner's pp/cp position (a pure TP peer) leaves the T line of a canonical KV page to the owner; component pages (.mamba/.draft/.qsa_indexer) and every PP stage keep theirs. True = every rank journals its read hits again.",
+   "id": "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4001,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_HICACHE_L3_READ_MT": {
    "bare": false,
    "choices": null,
@@ -80984,6 +81012,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_WAKE_DEFER_LAUNCH_MAX_MS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_WAKE_DEFER_LAUNCH_MAX_MS",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/wake_cpu_defer.py:94"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_WAKE_DEFER_LAUNCH_MAX_MS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/wake_cpu_defer.py",
+    "kind": "os.environ",
+    "line": 94,
+    "tree": "27b"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "27b"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_WAKE_DEFER_MAX_MS": {
    "bare": false,
    "choices": null,
@@ -93665,35 +93724,26 @@
  },
  "kanten": {
   "beleg_aufloesung": {
-   "problem": [
-    "K57"
-   ],
+   "problem": [],
    "status": {
-    "eindeutig": 123,
-    "mehrdeutig": 1,
+    "eindeutig": 124,
     "nah": 10,
     "other_line": 5
    }
   },
   "beleg_aufloesung_baeume": {
    "27b": {
-    "problem": [
-     "K57"
-    ],
+    "problem": [],
     "status": {
-     "eindeutig": 123,
-     "mehrdeutig": 1,
+     "eindeutig": 124,
      "nah": 10,
      "other_line": 5
     }
    },
    "nf": {
-    "problem": [
-     "K57"
-    ],
+    "problem": [],
     "status": {
-     "eindeutig": 85,
-     "mehrdeutig": 1,
+     "eindeutig": 86,
      "nah": 8,
      "other_line": 45
     }
@@ -93732,24 +93782,24 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2969,
-  "envs": 2090,
+  "entries": 2971,
+  "envs": 2092,
   "explained": 310,
   "flags": 864,
-  "harvested": 1840,
+  "harvested": 1841,
   "trees": {
    "abweichung": 30,
    "beide": 2716,
-   "nur_27b": 212,
+   "nur_27b": 214,
    "nur_nf": 23
   },
-  "unexplained": 694
+  "unexplained": 695
  },
- "tree_rev": "27b=cde6ba963f+nf=42eef22f3d",
+ "tree_rev": "27b=060d4e3eaf+nf=42eef22f3d",
  "trees": {
   "27b": {
-   "entries": 2928,
-   "rev": "cde6ba963f"
+   "entries": 2930,
+   "rev": "060d4e3eaf"
   },
   "nf": {
    "entries": 2739,
