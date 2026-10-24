@@ -79,9 +79,17 @@ def test_v3_an_old_d_without_the_field_prices_as_before():
 
 
 def test_o2_locked_rows_past_the_priced_covered_depth_are_not_credited():
-    # a locked node past what the store/tree covers: nothing loads back there -- D computes those rows
+    # a locked node reaching past what the store/tree covers: no continuation past it, D computes those rows (review
+    # SOLL 2: only spans that END before covered are credited -- there the load-back maps them)
     xp = _price([(0, SHARED), (STORE - 100, STORE + 50)], store=STORE)
-    assert xp.device_locked == SHARED + 100
+    assert xp.device_locked == SHARED
+
+
+def test_o2b_first_turn_of_a_new_session_whose_cache_is_just_the_locked_prompt_gets_no_credit():
+    """Review SOLL 2: the cached part is only the shared prompt (store depth = its end): D has no state at the split
+    node and no host tail to load back -- it recomputes the prompt (#215 credits 0 without a load-back extent)."""
+    assert _price([(0, SHARED)], store=SHARED).device_locked == 0
+    assert _price([(0, SHARED)], store=SHARED + 64).device_locked == SHARED
 
 
 # ------------------------------------------------------------------------------------------------ front harness
@@ -192,12 +200,22 @@ def test_o1_unlocked_device_rows_are_not_reported():
 
 
 def test_o4_ranks_that_disagree_give_no_number_and_are_named(caplog):
-    from flliper.srt.managers.scheduler import _dmp_locked_agreed
-
-    assert _dmp_locked_agreed([(0, 20)], 1, 20, 20, HEAD) == [[0, 20]]
+    agreed = dmp.locked_agreed
+    assert agreed([(0, 20)], 1, 20, 20, HEAD, 20, 20) == [[0, 20]]
     n0 = dmp.LOCKED_FALLBACKS["disagree"]
     dmp._locked_last_log.clear()
     with caplog.at_level("WARNING"):
-        assert _dmp_locked_agreed([(0, 20)], 1, 12, 20, HEAD) is None
+        assert agreed([(0, 20)], 1, 12, 20, HEAD, 20, 20) is None
     assert dmp.LOCKED_FALLBACKS["disagree"] == n0 + 1 and "D-PROBE-LOCKED-FALLBACK kind=disagree" in caplog.text
-    assert _dmp_locked_agreed([(0, 20)], 0, 20, 20, HEAD) is None   # a rank could not read it
+    assert agreed([(0, 20)], 0, 20, 20, HEAD, 20, 20) is None     # a rank could not read it
+    # review SOLL 3: the same row count at different places ([0,20) vs [10,30)) -- the span-end fingerprint differs
+    assert agreed([(0, 20)], 1, 20, 20, HEAD, 20, 30) is None
+
+
+def test_o5_the_locked_credit_never_exceeds_the_prompt():
+    """Review NIT 2: a prompt shorter than the locked rows (the probe's ids against a shorter front estimate) is
+    credited at most its own length."""
+    f, _now = _front(_reading())
+    f.__dict__["_probe_price"] = {HEAD: _price([(0, SHARED)])}
+    asyncio.run(f._arrival_seat_kv(10000, 64000, HEAD, 0))
+    assert Front._asr_kv_basis(f)["locked_credit"] == 10000
