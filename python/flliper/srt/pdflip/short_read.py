@@ -22,14 +22,17 @@ settle's group MIN on "due".
 from __future__ import annotations
 
 import logging
-from typing import Dict
+import time
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 MARK = "PDFLIP-SHORT-READ HELD"
 #: rids remembered (a reap without a later settle leaves one entry behind)
 KEEP = 64
-_HELD: Dict[str, bool] = {}
+#: rid -> monotonic time of the reap that found the span held (REPRICE-REST-1024 review SOLL-1: the finding is
+#: bound to its reap, so a later wake cannot act on a stale one)
+_HELD: Dict[str, float] = {}
 _N = [0]
 PROGRESS_ATTR = "_pdflip_short_read_have"
 
@@ -87,7 +90,7 @@ def note_reap(rid: str, requested_pages: int, hit_pages: int, completed_tokens: 
     short = int(completed_tokens) < int(requested_pages) * max(1, int(page_size))
     held = short and int(requested_pages) > 0 and int(hit_pages) >= int(requested_pages)
     if held:
-        _HELD[rid] = True
+        _HELD[rid] = time.monotonic()
         while len(_HELD) > KEEP:
             _HELD.pop(next(iter(_HELD)))
         _N[0] += 1
@@ -98,6 +101,22 @@ def note_reap(rid: str, requested_pages: int, hit_pages: int, completed_tokens: 
                         int(requested_pages), int(hit_pages), _N[0])
     else:
         _HELD.pop(rid, None)
+
+
+def span_held(rid, since: Optional[float] = None) -> bool:
+    """The last read of ``rid`` was reaped short while the probe held its WHOLE span. REPRICE-REST-1024 (#224): the
+    settle bound waits for such a read's re-read (settle_writer.held_read_holds_lapse).
+
+    Review SOLL-1: the finding belongs to its reap -- ``since`` (the settle episode's start, monotonic) excludes a reap
+    from before it (a read that ended without a reap -- revoke, abort, a reset of ``ongoing_prefetch`` -- left the old
+    entry standing). Review SOLL-2: the inputs of :func:`note_reap` are the group-MIN reduced hit/completed on a
+    symmetric group, but under HP1 / the Form A END vote they are unpacked against each rank's OWN span base -- there
+    the finding can differ per rank. Its consumer is therefore only ever a HOLD whose release flag goes through the
+    group MIN (an OR over the ranks' holds, never a desync)."""
+    t = _HELD.get(str(rid))
+    if t is None:
+        return False
+    return since is None or float(t) >= float(since)
 
 
 def reread_now(req, have: int) -> bool:

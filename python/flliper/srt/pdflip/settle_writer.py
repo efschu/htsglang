@@ -228,6 +228,7 @@ def settle_since_for_wake(req, now: float) -> float:
     re-stamped for ever. Every other request starts the bound at this wake,
     as before."""
     since = getattr(req, "_1471_since", None)
+    setattr(req, WAKE_T_ATTR, float(now))  # REPRICE-REST-1024 review MUSS-1/SOLL-1: this wake's own time
     carry = getattr(req, CARRY_ATTR, None)
     setattr(req, CARRY_ATTR, None)
     setattr(req, CARRIED_ATTR, False)
@@ -299,8 +300,109 @@ def reset_for_wake(req) -> None:
     """A new wake follows a P phase in which P may have written this rid again
     (RESUME-VIA-P publishes the same tail files anew): the writer view of the
     previous wake -- state, spent ack -- does not carry over."""
-    for attr in ("_1471w_state", "_1471w_ack", "_1471w_t", WHY_ATTR):
+    for attr in ("_1471w_state", "_1471w_ack", "_1471w_t", WHY_ATTR, HELD_N_ATTR, "_1471h_said", "_1471h_cap_said"):
         setattr(req, attr, None)
+
+
+# ---------------------------------------------------------------------------
+# REPRICE-REST-1024 (#224, SOLL R2/R7; 27B nvfp4duo 93eae72472, boot ..._1024_012625, D TP0, pdflip-26-232): the
+# settle bound released a parked decode on a SUPERSEDED record while the re-read that would replace it was in flight.
+#
+#   02:05:59  #248 WAKE-READ issued=1 ['pdflip-26-232']             (the wake; the #1471 settle clock starts ~02:06:00.7)
+#   02:06:20  #1157 PREFETCH REAPED ... requested_pages=146176 hit_pages=146176 completed=119552 elapsed=21.30s
+#             PDFLIP-SHORT-READ HELD ... completed=119552 of 146176 pages hit=146176 -- the store holds the span
+#             #1324 STORE READ HELD-CUT delivered=119552 deliverable=146176 hit_tokens=146176 cut_cause=late_complete
+#             #1456 HOLD-REFETCH rid=pdflip-26-232 n=1 reason=deferred verdict=issued
+#   02:06:21  #1471 SETTLE-RELEASE rid=pdflip-28-250 state=reading lapsed=True held_after_wake_s=20.5   (same tick)
+#             PDFLIP W50-REROUTE rid=pdflip-26-232 d_extent=26844 X=12288 reason=store_short_after_flip
+#             PDFLIP D-NORECOMPUTE rid=pdflip-26-232 would_compute=26844 -> RESUME-VIA-P
+#   02:06:42  PDFLIP-READ-STAGES req=pdflip-26-232 pages=26624 ...   (the re-read landed the whole rest)
+#   front     RESUME-VIA-P CLASS u=26844 class=gross -> SET-VERDICT FLIP_P R4 -> PARK-RUNNING 3 decodes
+#             PDFLIP-USAGE-TRUE rid=pdflip-26-232 prompt=146395 p_computed=220
+#
+# The read had been slow (L3 fill 17.7 s), not short of a writer: the store held all 146176 pages. The 20 s bound
+# lapsed one second after the re-read was issued, and D-NORECOMPUTE priced 146396 - 119552 = 26844 off the first
+# read's record -- a number the in-flight read was about to supersede (146396 - 146176 = 220, under the front's halbX:
+# D-RESUME-EXTEND, SOLL R2/R7). A whole D->P->D flip pair and three parked decodes for 220 tokens.
+#
+# The law: a read reaped short with its WHOLE span HELD by the store (short_read.span_held, the group-MIN hit) is a
+# read that will complete, not a missing writer -- the bound waits for the re-read in flight, ONCE (the hold is spent
+# the moment that read answers, i.e. when a further re-issue counts past it), like the SC carry above. The read
+# itself is bounded by the prefetch reaper -- and, review MUSS-1, by a NAMED cap of its own: under policy=timeout the
+# reaper lets a whole-span re-read (146176 pages) run up to issue + 2 x 144.75 s, under wait_complete never ends it,
+# and while the request sits in the settle NF admits no newcomer (d_park_runtime parked_outside, d_seats) and both
+# lines hold the seat re-plan (d_seat_rewake wake_settle). FLLIPER_PDFLIP_SETTLE_HELD_READ_MAX_S (default 30 s, a
+# fixed number -- SOLL R10: no computed flip price) caps every hold past the bound (this one AND the SC carry above,
+# which had the same missing clock; the two share one cap, so they cannot add up), counted from the moment the bound
+# could first lapse in this wake: max(_1471_since + bound, this wake's time). At the cap the lapse releases as before,
+# named once: ``#1471h SETTLE-HELD-READ CAP``. The bound's release on a superseded record itself is an arithmetic
+# defect (the price of a read about to be replaced), so the hold has no on/off switch -- only its cap is a number.
+# ---------------------------------------------------------------------------
+
+#: the cap of every settle hold past the #1471 bound, seconds (default 30: the metal re-read of 26-232 took 21 s)
+HOLD_MAX_ENV = "FLLIPER_PDFLIP_SETTLE_HELD_READ_MAX_S"
+HOLD_MAX_DEFAULT_S = 30.0
+#: monotonic time of this wake (settle_since_for_wake): the hold cap's reference for a carried clock
+WAKE_T_ATTR = "_1471_wake_t"
+
+#: the #1456 re-issue count at which the held-read hold was armed (the read it waits for)
+HELD_N_ATTR = "_1471h_n"
+#: the settle states in which a re-read is in flight on this rank (the tick's own re-issue included)
+IN_FLIGHT = frozenset({"reading", "reissued"})
+
+
+def held_read_holds_lapse(req, state: str) -> bool:
+    """True while the lapsed settle bound must wait for ``req``'s in-flight re-read: the last read was reaped short
+    with its whole span held by the store, and the re-read issued for it (the #1456 count at the first hold) has not
+    answered yet. Once a later re-issue counts past it, the hold is spent for this wake (reset_for_wake re-arms it).
+    The held finding must come from a reap of this settle episode (review SOLL-1). It is group-uniform on a symmetric
+    group and may differ per rank under HP1 / Form A (review SOLL-2, see short_read.span_held): the release flags go
+    through the group MIN, so a hold on any rank holds the group -- an OR, never a desync. The caller caps every hold
+    with :func:`hold_capped` (review MUSS-1)."""
+    if state not in IN_FLIGHT:
+        return False
+    from flliper.srt.pdflip import short_read as _sr
+
+    if not _sr.span_held(getattr(req, "rid", None), since=_episode_start(req)):
+        return False
+    n_now = int(getattr(req, "_1456_n", 0) or 0)
+    armed = getattr(req, HELD_N_ATTR, None)
+    if armed is None:
+        setattr(req, HELD_N_ATTR, n_now)
+        return True
+    return n_now <= int(armed)
+
+
+def _episode_start(req) -> Optional[float]:
+    """The start of this settle episode: this wake's time when stamped, else the settle clock (None = unknown)."""
+    wt = getattr(req, WAKE_T_ATTR, None)
+    if wt is not None:
+        return float(wt)
+    since = getattr(req, "_1471_since", None)
+    return None if since is None else float(since)
+
+
+def hold_max_s(env=None) -> float:
+    """Review MUSS-1: the cap of a settle hold past the bound (``FLLIPER_PDFLIP_SETTLE_HELD_READ_MAX_S``, default 30;
+    0 = no hold past the bound; unreadable or negative = the default)."""
+    e = os.environ if env is None else env
+    try:
+        v = float(str(e.get(HOLD_MAX_ENV, "")).strip() or HOLD_MAX_DEFAULT_S)
+    except (TypeError, ValueError):
+        return HOLD_MAX_DEFAULT_S
+    return v if v >= 0.0 else HOLD_MAX_DEFAULT_S
+
+
+def hold_capped(req, now: float, bound_s: float) -> bool:
+    """True once a hold past the #1471 bound (held re-read or SC carry) has lasted ``hold_max_s`` -- counted from the
+    moment the bound could first lapse in this wake, ``max(_1471_since + bound, this wake's time)`` (a carried clock
+    lapses at the wake itself). Shared by both holds, so a carry followed by a held re-read stays within one cap."""
+    since = getattr(req, "_1471_since", None)
+    ref = (float(now) if since is None else float(since)) + float(bound_s)
+    wt = getattr(req, WAKE_T_ATTR, None)
+    if wt is not None:
+        ref = max(ref, float(wt))
+    return float(now) - ref >= hold_max_s()
 
 
 def _tail_facts(rid: str) -> Tuple[str, bool]:
