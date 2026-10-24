@@ -81,7 +81,7 @@ def test_red_a_text_request_like_pdflip_14_69_is_short_without_the_store_credit(
     price, _ = pp.excursion_price_s(DP, PD, (), FIRST)
     x_star = _x(price, 1.0)                           # undivided
     # LIVE-X-FWDCOST 1024: 3 D forwards of <= 3367 (a=155 ms each) -> 9495, was 10071 with a once
-    assert x_star > UNCACHED_14_69 and 9300 < x_star < 10600
+    assert x_star > UNCACHED_14_69 and abs(x_star - 9495) < 15   # the old formula's 10071 fails
     x, _limited = pp.x_step_limited(min(x_star, 12288), X_PREV, envs.FLLIPER_PDFLIP_X_COST_MAX_STEP.get())
     assert x > UNCACHED_14_69                         # even the first hysteresis step admits it
 
@@ -208,8 +208,8 @@ def test_n4p_text_only_samples_still_make_7691_short():
     price, src = pp.excursion_price_s(text_dp, text_pd, (), FIRST)
     assert price is None and "dp n=0" in src
     x_star = _x(5.27, 1.0)
-    # LIVE-X-FWDCOST 1024: 3 D forwards of <= 3367 -> 7771 (8.3k with a once), still > 7691
-    assert 7700 < x_star < 8450 and x_star > UNCACHED_14_69
+    # LIVE-X-FWDCOST 1024: 3 D forwards of <= 3367 -> 7771 (8317 with a once), still > 7691
+    assert abs(x_star - 7771) < 15 and x_star > UNCACHED_14_69   # the old formula's 8317 fails
 
 
 def test_red_the_cost_line_resolve_never_waits_for_the_launcher_import(monkeypatch):

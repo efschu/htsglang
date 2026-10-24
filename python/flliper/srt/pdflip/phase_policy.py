@@ -1194,9 +1194,14 @@ def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: Optional[flo
     ``line_p`` (P's own cost line on its bottleneck stage PP0, same
     instrument) replaces the drain rate ``r_p`` when given: P's side is then
     ``a_P + (b_P + c_P*p) * n`` -- compute-honest, where the drain rate also
-    counts P's waits (27B 09290020: drain 1437 tok/s, PP0 9180). P prefills a
-    request in ONE forward (its chunk is wider than the ceiling: NF P forwards
-    up to 16384 against the 12288 ceiling), so ``a_P`` is paid once.
+    counts P's waits (27B 09290020: drain 1437 tok/s, PP0 9180). ``a_P`` is
+    paid ONCE per request: right on NF, whose P chunk is wider than the
+    ceiling (P forwards up to 16384 against the 12288 ceiling). NOT on 27B:
+    its P chunk is 4096 (``--chunked-prefill-size 4096``, 126 full 4096-token
+    forwards in boot 1024_003732), so above 4096 P pays ``a_P`` per forward
+    too and this side under-prices P -- X comes out too LOW (N4p a_P=53 ms:
+    1-2 %), the safe direction for R7 (more flips, never D over X). Pricing
+    P per forward (P's chunk / its line's n_hi) is a follow-up, not done here.
 
     LIVE-X-FWDCOST 1024 (SOLL v2 R7 / KEIN-D-PREFILL-UEBER-X: X is the size
     up to which D is the cheaper route, so an X priced too cheap for D lets D
