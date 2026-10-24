@@ -11,7 +11,8 @@ Fix: the hand-off takes no D seat while D's device KV cannot hold it -- the same
 parked in the front at its age (R5), and goes when a running request ends (the Seat release asks D's reading at once).
 
 Danger directions, one test group each:
-  * Uebergabe trotz vollem Device-KV  -- a, h (recheck after the seat wait), l (the load-back counts)
+  * Uebergabe trotz vollem Device-KV  -- a, h (recheck after the seat wait), l (the load-back counts), m (a burst of
+                                          hand-offs is not priced against the same free rows)
   * Request verhungert in der Front    -- b, c (released at the finish), d (nothing runs: never held), e (no number:
                                           never a first hold), g (backfill stops at the bound), i (kurz arrivals are not
                                           held behind it)
@@ -37,6 +38,8 @@ YOUNG = "pdflip-30-280"
 # D TP0's pdflip_kv at 23:10:59 (available=42809 evictable=0) with 30-264 running; and after it finished
 FULL = {"available": 42809, "evictable": 0, "decode_clip": 4096, "running_rids": [OLD], "displaceable_rids": [OLD]}
 ROOM = {"available": 150000, "evictable": 0, "decode_clip": 4096, "running_rids": [], "displaceable_rids": []}
+# room while 30-264 still runs (its seat is live and D runs it: no debit for it)
+ROOM_OLD = dict(ROOM, running_rids=[OLD], displaceable_rids=[OLD])
 
 
 @pytest.fixture(autouse=True)
@@ -107,6 +110,7 @@ def test_a_b_handover_waits_in_the_front_while_device_kv_is_full_and_goes_when_t
             assert f.counters["d_admit_kv_held"] >= 1
             assert (f.__dict__.get("_d_admit_skip") or {}).get(HEAD) == "kv_device"
             assert f._d_seat._value == f.d_bs - 1, "a permit was taken for the held hand-off"
+            assert f.counters["d_admit_kv_held_after_seat"] == 0, "held only after taking a permit (permit churn)"
             assert list(f._ready_for_d) == [head], "the held head must stay parked in the front at its age"
             assert "D-ADMIT-KV-WAIT rid=%s" % HEAD in caplog.text
             assert "need=63007" in caplog.text        # l: prompt 58911 + clip 4096 -- the load-back is device need
@@ -214,8 +218,9 @@ def test_e_no_reading_gives_no_first_hold_but_a_held_head_keeps_its_hold():
         box["kv"] = None                                          # D inside a long pass: no number this time
         assert await Front._d_line_kv_holds(f, head) is True, "an absent reading released a held head (fail-open)"
         assert f.counters["d_admit_kv_held_unread"] == 1
-        box["kv"] = ROOM
+        box["kv"] = ROOM_OLD
         assert await Front._d_line_kv_holds(f, head) is False
+        assert f.counters["d_admit_kv_released"] == 1
 
     asyncio.run(body())
 
@@ -263,6 +268,7 @@ def _g_run(bound):
         f = _front({"kv": FULL})
         f.d_wait_bound_s = bound
         now = time.time()
+        f.t_awake = now - 100.0                                   # D's phase began long before the hold
         _stamp(f, OLD, now - 200.0)
         _stamp(f, HEAD, now - 30.0)
         _stamp(f, YOUNG, now - 20.0)
@@ -292,7 +298,7 @@ def test_g2_past_the_bound_no_younger_hand_off_overtakes_the_held_head():
 # ------------------------------------------------------------------------- h: the seat wait changes D's KV
 def test_h_kv_rechecked_after_the_seat_wait_the_permit_goes_back():
     async def body():
-        box = {"kv": ROOM}
+        box = {"kv": ROOM_OLD}
         f = _front(box)
         now = time.time()
         _stamp(f, OLD, now - 200.0)
@@ -348,6 +354,35 @@ def test_k_rule_off_the_hand_off_takes_its_seat_as_before(monkeypatch):
         adm = asyncio.ensure_future(f.d_admitter())
         try:
             await asyncio.wait_for(asyncio.shield(head.fut), 2.0)
+        finally:
+            await _drop(adm)
+
+    asyncio.run(body())
+
+
+# ------------------------------------------------------------------------- m: the burst on one reading
+def test_m_two_hand_offs_are_not_priced_against_the_same_free_rows(caplog):
+    caplog.set_level(logging.INFO)
+
+    async def body():
+        kv = {"available": 100000, "evictable": 0, "decode_clip": 4096, "running_rids": [OLD],
+              "displaceable_rids": [OLD]}
+        f = _front({"kv": kv})
+        now = time.time()
+        _stamp(f, OLD, now - 200.0)
+        _stamp(f, "pdflip-30-273", now - 40.0)
+        _stamp(f, HEAD, now - 30.0)
+        await _running(f, OLD)
+        first = _pending("pdflip-30-273", prompt=59090)          # need 63186 <= 100000: it fits
+        head = _pending(HEAD)                                     # need 63007: fits 100000, not 100000 - 63186
+        f._ready_for_d.extend([first, head])
+        adm = asyncio.ensure_future(f.d_admitter())
+        try:
+            await asyncio.wait_for(asyncio.shield(first.fut), 2.0)
+            first.posted_evt.set()                                # its leg 2 POSTed: the admitter goes on
+            await asyncio.sleep(0.4)
+            assert not head.fut.done(), "the second hand-off was priced against rows the first already took"
+            assert "D-line debit 63186 of 1 seat(s)" in caplog.text
         finally:
             await _drop(adm)
 

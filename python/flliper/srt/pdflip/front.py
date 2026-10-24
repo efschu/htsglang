@@ -4408,6 +4408,10 @@ class Seat:
         self.front.counters["d_seat_released"] += 1
         if freed_by == "leg2_finished":
             self.front.counters["d_seat_done"] += 1  # D PRIORITY: a seat that DECODED to its end
+        if self.front.__dict__.get("_d_kv_hold"):
+            # HANDOVER-KVFITS 1024 (SOLL R5): a D-line head waits for D's DEVICE KV, and a request leaving D is the event
+            # it waits for -- D's reading is asked NOW, not at the next background refresh (one read, never awaited here)
+            Front._kv_fetch_kick(self.front, "seat_release_kv_hold")
         # L3: the "wenn ein slot frei wird, wird nachgezogen" instrument.
         logger.info(
             "PDFLIP D-REFILL rid=%s freed_by=%s seats_free=%d queued_d=%d",
@@ -13869,6 +13873,14 @@ class Front:
         told = False
         while True:
             older = Front._d_line_older_than(self, rid)
+            if older:
+                # HANDOVER-KVFITS 1024 (SOLL R2/R5): a hand-off the admitter HOLDS for D's device KV (its own verdict,
+                # ``_d_admit_skip`` = kv_device) takes no seat now -- it does not hold a kurz arrival at this gate (before
+                # the fix it sat on D with a seat and D's HOL backfill let the kurz one pass; held in the front it would
+                # otherwise route every younger kurz arrival to P after --drain-deadline-s). The seat order itself stays:
+                # ``_arrival_seat_taken`` still counts the held head as a seat owed.
+                _skip = self.__dict__.get("_d_admit_skip") or {}
+                older = [q for q in older if _skip.get(getattr(q, "rid", None)) != Front.D_LINE_KV_HOLD_NOTE]
             if not older:
                 return
             if not told:
@@ -13966,6 +13978,190 @@ class Front:
             live = {getattr(q, "rid", None) for q in (getattr(self, "_ready_for_d", ()) or ())}
             for r in [r for r in d if r not in live]:
                 d.pop(r, None)
+
+    # ------------------------------------------------------------------ HANDOVER-KVFITS 1024 (the D line's device KV)
+    #: the d_admitter's skip note for a D-line head it holds for D's DEVICE KV (``_d_admit_skip``)
+    D_LINE_KV_HOLD_NOTE = "kv_device"
+
+    def _d_kv_hold_st(self) -> Dict[str, float]:
+        """HANDOVER-KVFITS 1024: the D-line heads held for D's device KV -> the time their hold began."""
+        return self.__dict__.setdefault("_d_kv_hold", {})
+
+    async def _d_line_kv_probe(self, p: "Pending") -> Tuple[bool, str, int, Dict[str, Any]]:
+        """HANDOVER-KVFITS 1024 (SOLL R5): ARRIVAL-SEAT's KV test (:meth:`_arrival_seat_kv` -> ``_asr.kv_fits``) for a
+        D-line entry -- the same need against the same reading of D's DEVICE pool (available + evictable, the KV
+        ladder, S94's payable room). The need is the whole prompt minus the prefix a RUNNING turn of its session locks on
+        D, plus D's decode clip: a hand-off after P holds d_prefix 0 on D and LOADS its N-1 rows back from L2/L3 into
+        D's device pool, so the load-back is device need exactly like computed rows (27b-lifetime-gate-1024: 30-274
+        uncached=1 but extend=58911). The prompt is the REALISED one once leg 1 answered (:func:`d_seat_need`, the
+        number the Seat is charged with). ``(fits, why, deficit, basis)``; no counter, no line, no hold."""
+        est = d_seat_need(int(getattr(p, "est_prompt", 0) or 0), int(getattr(p, "leg1_prompt_tokens", 0) or 0))[0]
+        fits, why, deficit = await self._arrival_seat_kv(
+            est, _asr.max_tokens_of(getattr(p, "payload", None)), p.rid, int(getattr(p, "est_uncached", 0) or 0))
+        # no await from here on: the basis, the terms and the free room are THIS test's (S94 review A2)
+        st = self._asr_st()
+        basis = Front._asr_kv_basis(self)
+        terms = st.pop("need_terms", None)         # an ARRIVAL-SEAT grant's counter input, never the D line's
+        free = st.get("last_kv_free")
+        debit, n_debit = Front._d_line_kv_debit(self, basis, p.rid)
+        if debit > 0 and not basis.get("unread") and free is not None and terms:
+            # THE BURST (27B 23:10:49-52: 30-273, 30-274, 30-275 handed to D within 3 s, 59k each): seats the front gave
+            # to requests D does not run yet are rows D's reading does not contain -- charged like _d_charged_since
+            # charges the host pool, so two hand-offs are never priced against the same free rows
+            need = max(0, est - int(terms[0])) + int(terms[1])
+            room = int(free) - int(debit)
+            fits = need <= room
+            deficit = 0 if fits else need - max(0, room)
+            why = "%s [D-line debit %d of %d seat(s) D does not run yet: room %d]" % (why, debit, n_debit, room)
+        return bool(fits), str(why), int(deficit or 0), basis
+
+    def _d_line_kv_debit(self, basis: Dict[str, Any], exclude_rid: str) -> Tuple[int, int]:
+        """HANDOVER-KVFITS 1024: ``(tokens, seats)`` -- the device KV of requests holding a live front seat that D does
+        NOT run in the reading just taken (``basis["running"]``, D's ``pdflip_kv.running_rids``): handed over, not yet
+        admitted on D, so D's available/evictable cannot contain them. Each is charged its Seat tokens (the realised
+        prompt) plus D's decode clip, as D will price it. Rids the front knows parked keep their span in D's tree and
+        resume by D's own SEAT-AGE -- not charged. An old D without ``running_rids``: the seats taken after the
+        reading's time (``_asr_state["kv"]``), else nothing (named by the 0)."""
+        running = basis.get("running")
+        st = self._asr_st()
+        parked = set((st.get("parked") or {}).keys()) | set((getattr(self, "_d_parked", None) or {}).keys())
+        t_read = None
+        if running is None:
+            cached = st.get("kv")
+            if not cached:
+                return 0, 0
+            t_read = float(cached[0])
+        clip = _asr.default_decode_clip()
+        tokens, n = 0, 0
+        for s in list(getattr(self, "_d_seats_live", ()) or ()):
+            r = getattr(s, "rid", None)
+            if r == exclude_rid or r in parked:
+                continue
+            if running is not None:
+                if r in running:
+                    continue
+            elif float(getattr(s, "t_taken", 0.0) or 0.0) <= t_read:
+                continue
+            tokens += max(0, int(getattr(s, "tokens", 0) or 0)) + clip
+            n += 1
+        return tokens, n
+
+    async def _d_line_kv_holds(self, p: "Pending") -> bool:
+        """HANDOVER-KVFITS 1024 (SOLL R5, R11): True = the D line's head ``p`` takes no D seat now -- D's DEVICE KV
+        cannot hold it -- and stays parked in the front at its age.
+
+        27B int4ar _1023_223241 pdflip-30-274 (kurz u=415, prompt 58911): ARRIVAL-SEAT ``wait_seat why=kv need=63007 >
+        free=43101``, RIDE_P (R1a), P leg 1 23:10:50, and the same second ``D-ADMIT seat=5/6 source=batch``: this
+        admitter tested D's HOST pool only (#915 ``_d_budget_terms``). D's device pool held the running 98k/115k decodes
+        (available=42809 evictable=0); D refused it by gate=lifetime 1293 times for 190.5 s until 30-264 finished
+        (all 51 lifetime cases of the two nights resolved 0-4 s after a running request ended). R5: without room on D
+        it waits for its seat; it holds no seat D cannot serve and no pass of D's.
+
+        * The rule's tool: only with ARRIVAL-SEAT on (``_asr.enabled``); off = the path before.
+        * Nothing runs on D (no live front seat): never held -- no finish can free a row for it, the truly oversized
+          case is D's own admission (as :meth:`_d_token_budget_blocks`: a sole request is never starved by a bound its
+          own size).
+        * No number from D (``kv=unread``/absent, EZ-S1 A10): a head NOT yet held goes as before (ARRIVAL-SEAT's
+          kv=unread, D's admission stays the guard); a head already held keeps its hold -- an absent reading is no number,
+          it neither admits nor refuses.
+        * Fits: goes (the hold, if any, ends with ``D-ADMIT-KV-FITS``).
+        * Does not fit, AGE PLAN on: an older head whose KV deficit displacing YOUNGER running decodes covers goes to D
+          -- D's SEAT-AGE KV trigger decides the displacement on its real KV (PRIO=ALTER; held in the front, D would
+          never see it and the older one would wait for the younger ones' end). Its victims are claimed while it waits
+          in the D line (``dline_claims``, :meth:`_age_claim_live`).
+        * Else held: ``D-ADMIT-KV-WAIT`` once per held rid and every 200th pass, ``held_passes`` on the line."""
+        if not _asr.enabled():
+            return False
+        holds = Front._d_kv_hold_st(self)
+        live = {getattr(q, "rid", None) for q in list(self._ready_for_d)
+                if not getattr(getattr(q, "fut", None), "done", lambda: True)()}
+        for r in [r for r in holds if r not in live]:
+            holds.pop(r, None)
+        if not (getattr(self, "_d_seats_live", None) or ()):
+            Front._d_line_kv_hold_end(self, p.rid, "nothing runs on D: no finish can free a row, it is never held")
+            return False
+        fits, why, deficit, basis = await Front._d_line_kv_probe(self, p)
+        now = time.time()
+        if basis.get("unread"):
+            if p.rid in holds:
+                self.counters["d_admit_kv_held_unread"] += 1
+                return True
+            return False
+        if fits:
+            Front._d_line_kv_hold_end(self, p.rid, why)
+            return False
+        st = self._asr_st()
+        if _asr.age_plan_enabled():
+            plan = self._arrival_seat_age_verdict(p.rid, self._asr_arrival_of(p.rid) or float(p.t_arrive), True,
+                                                  deficit, basis=basis)
+            if plan:
+                st.setdefault("age_victims", {})[p.rid] = list(plan)
+                st.setdefault("dline_claims", {})[p.rid] = now
+                holds.pop(p.rid, None)
+                self.counters["d_admit_kv_age_to_d"] += 1
+                logger.info("PDFLIP D-ADMIT-KV-AGE rid=%s victims=%s %s (HANDOVER-KVFITS + AGE PLAN, PRIO=ALTER: the "
+                            "older hand-off goes to D, D's SEAT-AGE displaces the younger decodes for it on its real "
+                            "KV)", p.rid, list(plan), why)
+                return False
+        (st.get("dline_claims") or {}).pop(p.rid, None)
+        first = p.rid not in holds
+        t0 = holds.setdefault(p.rid, now)
+        self.counters["d_admit_kv_held"] += 1
+        n = self.counters["d_admit_kv_held"]
+        if first or n % 200 == 0:
+            logger.info("PDFLIP D-ADMIT-KV-WAIT rid=%s held_s=%.1f %s seats_live=%d queued_d=%d held_passes=%d "
+                        "(HANDOVER-KVFITS, SOLL R5: D's device KV cannot hold this hand-off -- it takes no D seat and "
+                        "stays parked in the front at its age; it goes when a running request ends. Before, it took "
+                        "the seat and D refused it by gate=lifetime every pass)", p.rid, now - t0, why,
+                        len(getattr(self, "_d_seats_live", ()) or ()), len(self._ready_for_d), n)
+        return True
+
+    def _d_line_kv_hold_end(self, rid: str, why: str) -> None:
+        """HANDOVER-KVFITS 1024: ``rid``'s device-KV hold ends (it fits, or nothing runs on D any more) -- one
+        ``D-ADMIT-KV-FITS`` line with the time it was held; nothing when it was not held."""
+        t0 = Front._d_kv_hold_st(self).pop(rid, None)
+        if t0 is None:
+            return
+        self.counters["d_admit_kv_released"] += 1
+        logger.info("PDFLIP D-ADMIT-KV-FITS rid=%s held_s=%.1f %s (HANDOVER-KVFITS, SOLL R5: the hand-off's device-KV "
+                    "hold ends -- it takes the next D seat)", rid, time.time() - float(t0), why)
+
+    async def _d_line_kv_backfill(self, head: "Pending", reading: Optional[Dict[str, Any]]) -> Optional["Pending"]:
+        """HANDOVER-KVFITS 1024: the SA backfill (#244/#246, no idle capacity) past a head held for D's device KV --
+        the first YOUNGER D-line entry that fits D's host pool (the pure #915 probe) AND D's device KV (the same
+        :meth:`_d_line_kv_probe`) is moved to the head and seated; the held head keeps its place for the next pass.
+        BOUNDED (``_asr.backfill_allowed``, the ARRIVAL-SEAT rule #246): once the head has waited the wait bound
+        (``--d-wait-bound-s``, else ``w_s``; counted from D's phase start at the earliest) no younger hand-off
+        overtakes it -- the rows freed by the next finish stay for it, so it cannot starve behind backfills. A kept
+        SHORT (SK re-price) is never a backfill candidate here. None = nobody backfills."""
+        from flliper.srt.pdflip import seat_age as _sa
+
+        if not _sa.enabled() or len(self._ready_for_d) < 2:
+            return None
+        t0 = Front._d_kv_hold_st(self).get(head.rid)
+        if t0 is None:
+            return None
+        bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
+        if not _asr.backfill_allowed(time.time() - max(float(t0), float(getattr(self, "t_awake", 0.0) or 0.0)), bound):
+            return None
+        for q in [q for q in list(self._ready_for_d) if q is not head][:7]:
+            if q.fut.done() or getattr(q, "short_kept", False):
+                continue
+            if not self._d_budget_fits(q.est_prompt, reading, q.leg1_prompt_tokens):
+                continue
+            fits, why, _deficit, basis = await Front._d_line_kv_probe(self, q)
+            if basis.get("unread") or not fits:
+                continue
+            if q.fut.done() or not any(r is q for r in self._ready_for_d):
+                return None   # the line changed during the read: the next pass picks again
+            self._ready_for_d_drop(q)
+            self._ready_for_d.appendleft(q)
+            self.counters["d_line_kv_backfill"] += 1
+            logger.info("PDFLIP D-LINE-KV-BACKFILL rid_in=%s older_held=%s %s (HANDOVER-KVFITS: the older hand-off "
+                        "waits for D's device KV; the younger one fits and runs -- bounded by the wait bound)",
+                        q.rid, head.rid, why)
+            return q
+        return None
 
     def _seat_leg_unseated(self, outstanding, rvp) -> List[str]:
         """S87 SEAT-LEG-UNSEATED, the invariant: every leg 2 D holds (``D.outstanding`` minus the RESUME-VIA-P holds,
@@ -16814,6 +17010,14 @@ class Front:
         Seat and so the claim. The victim leaving D's running set needs no extra rule: it is then no candidate."""
         if head in (st.get("granted") or {}):
             return True
+        _dl = st.get("dline_claims") or {}
+        if head in _dl:
+            # HANDOVER-KVFITS 1024: a D-line head the admitter let go to D on an AGE PLAN (``_d_line_kv_holds``) speaks
+            # for its victims while it is still in the D line (at the seat semaphore); its Seat carries the claim on
+            if any(getattr(q, "rid", None) == head and not getattr(getattr(q, "fut", None), "done", lambda: True)()
+                   for q in list(getattr(self, "_ready_for_d", ()) or ())):
+                return True
+            _dl.pop(head, None)
         return any(getattr(s, "rid", None) == head for s in (getattr(self, "_d_seats_live", ()) or ()))
 
     def _age_claim_head_ran(self, rid: str) -> None:
@@ -18231,6 +18435,18 @@ class Front:
                     # request that would fit cannot be admitted past it.
                     Front._d_admit_skip_note(self, p.rid, "token_budget")   # S87r A4
                     continue
+                if await Front._d_line_kv_holds(self, p):
+                    # HANDOVER-KVFITS 1024 (SOLL R5): D's DEVICE KV cannot hold this hand-off -- no seat, no D pass
+                    # spent on refusing it; the head STAYS the head (law 2) and goes when a running request ends.
+                    # A younger entry that fits both pools may backfill, bounded (``_d_line_kv_backfill``).
+                    Front._d_admit_skip_note(self, p.rid, Front.D_LINE_KV_HOLD_NOTE)
+                    _bf = await Front._d_line_kv_backfill(self, p, _reading)
+                    if _bf is None:
+                        continue
+                    p = _bf
+                    if self._d_token_budget_blocks(p.rid, p.est_prompt, _reading, p.leg1_prompt_tokens):
+                        Front._d_admit_skip_note(self, p.rid, "token_budget")   # the ONE gate call prices the seated one
+                        continue
                 if Front._dormant_hold_for_older(self, p):
                     Front._d_admit_skip_note(self, p.rid, "s46_f4_hold")   # S87r A4
                     continue   # S46 F4: an older request is still on P -- D is asleep, the seat waits for it
@@ -18249,6 +18465,15 @@ class Front:
                 if Front._d_line_older_newcomer(self, p, _line_seen):
                     # S46 F2: an OLDER hand-off joined the line while this admitter waited for the seat (the order
                     # above was taken before the wait) -- the seat goes back, the next pass picks by age
+                    self._d_seat.release()
+                    continue
+                if await Front._d_line_kv_holds(self, p):
+                    # HANDOVER-KVFITS 1024: the seat wait is the long part (a running decode's whole life) and D's
+                    # device KV moved during it -- the verdict before the wait is stale. Read again with the permit in
+                    # hand: no room now -> the permit goes back, the head stays the head (the checks below run after
+                    # this await).
+                    Front._d_admit_skip_note(self, p.rid, Front.D_LINE_KV_HOLD_NOTE)
+                    self.counters["d_admit_kv_held_after_seat"] += 1
                     self._d_seat.release()
                     continue
                 if not (self._d_accepts_leg2() and self.admit_d):
