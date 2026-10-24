@@ -112,29 +112,38 @@ class RefLedger:
         went with the old generation), so a release there is refused and the
         stale count dropped instead of taking a reference the next owner's
         readers hold."""
+        import numpy as np
         import torch
 
-        t = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
+        # FLIPCOST-1024: the same multiset arithmetic in numpy. The torch form ended in a CPU
+        # ``torch.repeat_interleave``, which opens an intra-op parallel region on EVERY call (grain 1): 8-19 ms per
+        # call for 278 slots under 16 intra-op threads against 0.03 ms on one (desk, torch 2.11) -- S86 calls this
+        # once per released node (282 nodes: 2.27 s of a 3.20 s release in the desk profile). numpy has no parallel
+        # region; the ledger's tensors are read and written through their shared-memory numpy views.
+        t = np.asarray(torch.as_tensor(slots, dtype=torch.int64).reshape(-1).numpy(), dtype=np.int64)
         keep = t >= 0
         t = t[keep]
-        if t.numel() == 0:
-            return t
+        if t.shape[0] == 0:
+            return torch.from_numpy(t.copy())
         with self.lock:
-            uq, inv, cnt = torch.unique(t, return_inverse=True, return_counts=True)
-            have = self.held[uq]
+            held = self.held.numpy()
+            gen = self.gen.numpy()
+            uq, inv, cnt = np.unique(t, return_inverse=True, return_counts=True)
+            have = held[uq].copy()
             if gens is not None:
-                g = torch.as_tensor(gens, dtype=torch.int64).reshape(-1)[keep]
-                gu = torch.empty_like(uq).scatter_(0, inv, g)
-                moved = (self.gen[uq] >= 0) & (self.gen[uq] != gu)
+                g = np.asarray(torch.as_tensor(gens, dtype=torch.int64).reshape(-1).numpy(), dtype=np.int64)[keep]
+                gu = np.empty_like(uq)
+                gu[inv.reshape(-1)] = g          # torch scatter_ form: the last write per slot wins
+                moved = (gen[uq] >= 0) & (gen[uq] != gu)
                 if bool(moved.any()):
                     self.gen_reset += int(have[moved].sum())
                     self.refused_gen += int(cnt[moved].sum())
-                    self.held[uq[moved]] = 0
-                    have = torch.where(moved, torch.zeros_like(have), have)
-            allow = torch.minimum(cnt.to(torch.int32), have)
-            self.held[uq] = have - allow
+                    held[uq[moved]] = 0
+                    have = np.where(moved, 0, have).astype(have.dtype)
+            allow = np.minimum(cnt.astype(np.int32), have)
+            held[uq] = have - allow
             self.refused += int((cnt - allow).sum())
-        return torch.repeat_interleave(uq, allow.to(torch.int64))
+        return torch.from_numpy(np.repeat(uq, allow.astype(np.int64)))
 
 
 _LEDGERS: dict = {}

@@ -2612,19 +2612,28 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # W3 host-leaf round). An on-disk file of the same stem does not make it secured either.
         # No switch (review A1/A4 16.10.: a switch back onto a proven wrong-KV path is no feature);
         # an arena without the header read is fail-closed (nothing provably complete).
-        slot_list = [int(s) for s in slots.tolist()]
+        import numpy as _np_s109
         out["incomplete"] = 0
+        # FLIPCOST-1024: the header states as one array read (``slot_states_np``) where the arena has it -- the same
+        # header word ``slot_states`` reads, without a Python int per slot; an arena without it keeps the list form
+        _sl_all = _np_s109.asarray(slots.numpy() if torch.is_tensor(slots) else slots, dtype=_np_s109.int64).reshape(-1)
+        states_np_fn = getattr(arena, "slot_states_np", None)
         states_fn = getattr(arena, "slot_states", None)
         try:
-            states = states_fn(slot_list) if callable(states_fn) else [-1] * len(slot_list)
+            if callable(states_np_fn):
+                _st = _np_s109.asarray(states_np_fn(_sl_all), dtype=_np_s109.int64).reshape(-1)
+            elif callable(states_fn):
+                _st = _np_s109.asarray([int(x) for x in states_fn([int(s) for s in _sl_all.tolist()])],
+                                       dtype=_np_s109.int64)
+            else:
+                _st = _np_s109.full(_sl_all.shape, -1, dtype=_np_s109.int64)
         except Exception:  # noqa: BLE001 - unreadable header = not provably complete
-            states = [-1] * len(slot_list)
-        keep = [s for s, st in zip(slot_list, states) if int(st) == 2]
-        out["incomplete"] = len(slot_list) - len(keep)
+            _st = _np_s109.full(_sl_all.shape, -1, dtype=_np_s109.int64)
+        _keep = _sl_all[_st == 2]
+        out["incomplete"] = int(_sl_all.shape[0] - _keep.shape[0])
         if out["incomplete"]:
-            _l3_complete_note(out["incomplete"], len(slot_list))
-        slot_list = keep
-        if not slot_list:
+            _l3_complete_note(out["incomplete"], int(_sl_all.shape[0]))
+        if not _keep.shape[0]:
             out["lost"] = out["incomplete"]
             return out
         # key 0/0: arena_secure_to_disk names the page by the slot header's
@@ -2636,8 +2645,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # ``incomplete`` AND ``lost`` (every caller keeps such a node, as for a page not COMPLETE: no loss, asked again)
         from flliper.srt.mem_cache import l3_secured as _l3s
 
-        import numpy as _np_s109
-        _sl = _np_s109.asarray(slot_list, dtype=_np_s109.int64)
+        _sl = _np_s109.ascontiguousarray(_keep, dtype=_np_s109.int64)
         _ok = _l3s.secured(arena, _sl, getattr(self, "_backend", None))
         _pending = _sl[~_ok]
         if _pending.shape[0]:
