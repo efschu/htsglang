@@ -6018,7 +6018,9 @@ class HiCacheFile(HiCacheStorage):
                 pass
             # PPHASE-GAPS-1024 (review SOLL 1): the struck files are no copy -- void their record (and this process's
             # census memo) like the LRU's on_evict does; before, the record kept saying "copied" (A5 class)
-            self._l3sec_void_stems(gone)
+            _void = getattr(self, "_l3sec_void_stems", None)   # a stand-in backend without it: as before
+            if callable(_void):
+                _void(gone)
         return out
 
     def _l3sec_void_stems(self, stems: List[str]) -> int:
