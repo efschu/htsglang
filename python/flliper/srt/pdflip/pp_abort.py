@@ -34,6 +34,7 @@ the followers follow PP0's forwarded schedule (``follower_row_verdict``).
 """
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,7 @@ HELD_ATTR = "_pdflip_pp_held_waiting_aborts"
 
 
 def _matches(rid, target: str, abort_all: bool) -> bool:
-    return bool(abort_all) or str(rid or "").startswith(str(target or ""))
+    return bool(abort_all) or _abort_rid_hit(rid or "", target or "")
 
 
 def pp0_inflight_reqs(scheduler):

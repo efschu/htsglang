@@ -63,6 +63,7 @@ governs there). Kill switch: ``FLLIPER_PDFLIP_STORE_TOLD=0``.
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 import os
 import time
@@ -1000,6 +1001,8 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
             req._dual_kv_wait = True
             held[rid] = req
             return "declined:dual_kv_wait"
+        if getattr(req, "_dual_kv_wait", False):
+            req._dual_kv_wait = False  # #DPJ-S9: granted at intake -- a stale True would void it as a twin source
         if _twin.intake_defer(scheduler, req):
             # TW: a fork twin of a request in flight on P -- held WITHOUT a
             # store read until that sibling finished (pp0_publish releases).
@@ -3523,7 +3526,7 @@ def forget_aborted(scheduler, rid, abort_all: bool = False) -> Dict[str, Dict[st
         return {}
 
     def _hit(key) -> bool:
-        return bool(abort_all) or str(key).startswith(rid)
+        return bool(abort_all) or _abort_rid_hit(key, rid)
 
     dropped: Dict[str, Dict[str, Any]] = {}
     for attr, short in TOLD_LEDGERS:

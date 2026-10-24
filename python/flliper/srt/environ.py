@@ -831,12 +831,14 @@ class Envs:
     # #1430q LATER-TOLD DROPS HELD ZOMBIE (B9 14:49:55Z, pdflip-0-103): dual P followers only. DEFAULT OFF = the old
     # code path byte for byte. On: a told verdict of a later PP0 list than a held (#1180-W) waiting-queue abort takes
     # that abort's unadmitted instance (a zombie; the told belongs to the rid's NEW instance) out of the queue, object-exact.
-    FLLIPER_PDFLIP_DUAL_LATER_TOLD_DROP = EnvBool(False)
+    # #DPJ-S1 24.10.: DEFAULT ON (user order 14.10.); =0 = the old code path.
+    FLLIPER_PDFLIP_DUAL_LATER_TOLD_DROP = EnvBool(True)
     # #1470 POP KEEPS TWIN (B9b 15:45:30Z, pdflip-0-89): dual P followers only. DEFAULT OFF = the old code path byte for byte.
     # On: the #1180-W 'pop' verdict (PP0 popped the aborted request at receipt) takes out only the objects the hold was
     # made for when a newer instance of the same rid is queued, instead of AbortReq(rid) (prefix: both instances + the
     # new instance's told).
-    FLLIPER_PDFLIP_DUAL_POP_KEEPS_TWIN = EnvBool(False)
+    # #DPJ-S1 24.10.: DEFAULT ON (user order 14.10.); =0 = the old code path.
+    FLLIPER_PDFLIP_DUAL_POP_KEEPS_TWIN = EnvBool(True)
     # #1480 LEND-RESUME-GATE (B9c 17:02:28Z): dual FRONT only (the P-stage ladder). DEFAULT ON (user order 14.10.: new
     # features on; 27B dual 21.10. 22:57:17Z the same class again: PP0's reclaim refused, 939524096 B lent, P resumed
     # 200 ms later, the 5090 ran to driver_free 2.7 MiB at 23:10:19Z); =0 = the old code path byte for byte. On: the front's resume 'from=lend' needs every P stage file at lent==0. The front read the stage files under
@@ -5418,6 +5420,10 @@ class Envs:
     # D decoded it to 09:13:55, ~13.8k tokens, ~133k KV tokens and a D running slot for nobody). The front aborts
     # it on D at the park (R11: the front decides). 0 = it is only named in the PARK-RUNNING line, as before.
     FLLIPER_PDFLIP_D_ORPHAN_ABORT = EnvBool(True)
+    # #1580 ABORT-EXACT-RID (pdflip/abort_match.py, 24.10.): an abort of a front rid ``pdflip-<e>-<n>`` hits that rid or a
+    # non-digit continuation (n>1 child ``{rid}_{i}``), not ``pdflip-<e>-<n>x``. DEFAULT ON (user order 14.10.); =0 = the
+    # upstream prefix rule. Boot constant, read once per process by abort_match.exact_armed (rank-uniform, R11).
+    FLLIPER_PDFLIP_ABORT_EXACT_RID = EnvBool(True)
     # S46 F2-F4 (NF 18.10., SA #244 / PRIO=ALTER 14.10.): the seat ORDER of requests that rode a flip to P. F2: the D
     # line re-picks by age when an older hand-off joined it during the seat wait; F3: a BATCH fall-through is queued
     # at its age position (not behind younger ones); F4: while P is awake a younger hand-off does not take a seat

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 import time
 from concurrent import futures
@@ -108,7 +109,7 @@ class GrammarManager:
 
     def abort_requests(self, recv_req: AbortReq):
         for req in self.grammar_queue:
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or _abort_rid_hit(req.rid, recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()

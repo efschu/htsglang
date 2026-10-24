@@ -23,6 +23,7 @@ from flliper.srt.managers import pdflip_store_told as ST  # noqa: E402
 from flliper.srt.pdflip import dual_untold_abort as DU  # noqa: E402
 from flliper.srt.pdflip import p_row_authority  # noqa: E402
 from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit  # noqa: E402  (#1580: the doubles follow the real rule)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -59,10 +60,10 @@ class _Follower:
     def _abort_request_now(self, recv_req):
         if SC.Scheduler._pdflip_defer_waiting_abort(self, recv_req):
             return
-        left = [r for r in self.waiting_queue if r.rid.startswith(recv_req.rid)]
+        left = [r for r in self.waiting_queue if _abort_rid_hit(r.rid, recv_req.rid)]
         if left:
             self.aborted.append(recv_req.rid)
-        self.waiting_queue = [r for r in self.waiting_queue if not r.rid.startswith(recv_req.rid)]
+        self.waiting_queue = [r for r in self.waiting_queue if not _abort_rid_hit(r.rid, recv_req.rid)]
         for r in left:
             ST.forget_left_queue(self, r, "abort")
 
@@ -127,7 +128,8 @@ def test_zombie_case_later_told_drops_zombie_keeps_instance_2(row_auth, caplog):
 def test_default_off_is_unchanged():
     """No env: zombie stays, no record written (old behaviour byte for byte)."""
     with mock.patch.dict(os.environ, DUAL_P_ENV), mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop(ENV_ON, None)
+        os.environ[ENV_ON] = "0"  # #DPJ-S1: default ON now, OFF is explicit
+        os.environ[DU.POP_TWIN_ENV] = "0"  # #1470 records holds too (default ON since #DPJ-S1)
         with mock.patch.object(p_row_authority, "applies", lambda s: True):
             f, zombie, inst2 = _held_zombie()
             _run_to_later_told(f)
@@ -139,7 +141,7 @@ def test_default_off_is_unchanged():
 def test_mutant_env_ignored_would_drop_when_off():
     """MUTANT: if the env gate were ignored the OFF scenario would drop -- the default-off test above is sensitive."""
     with mock.patch.dict(os.environ, DUAL_P_ENV), mock.patch.object(p_row_authority, "applies", lambda s: True):
-        os.environ.pop(ENV_ON, None)
+        os.environ[ENV_ON] = "0"  # #DPJ-S1: default ON now, OFF is explicit
         with mock.patch.object(DU, "later_told_drop_on", lambda env=None: True):
             f, zombie, inst2 = _held_zombie()
             _run_to_later_told(f)

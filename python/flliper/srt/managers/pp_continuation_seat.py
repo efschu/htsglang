@@ -44,6 +44,7 @@ THE FIX keeps the assert (the invariant is right) and corrects the three paths:
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 from typing import Any, Callable, Iterable, List, Optional
 
@@ -166,7 +167,7 @@ def mark_aborts(sched: Any, rid: Any, abort_all: bool, finished_reason: Any = No
     for req in sched.__dict__.get(DISPLACED_ATTR) or ():
         if req is slot:
             continue
-        if abort_all or (want and str(getattr(req, "rid", "")).startswith(want)):
+        if abort_all or (want and _abort_rid_hit(getattr(req, "rid", ""), want)):
             setattr(req, ABORT_ATTR, (finished_reason,))
             out.append(req)
             logger.info(

@@ -23,6 +23,7 @@ from flliper.srt.managers import pdflip_store_told as ST  # noqa: E402
 from flliper.srt.pdflip import dual_untold_abort as DU  # noqa: E402
 from flliper.srt.pdflip import p_row_authority  # noqa: E402
 from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit  # noqa: E402  (#1580: the doubles follow the real rule)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -65,10 +66,10 @@ class _Follower:
     def _abort_request_now(self, recv_req):
         if SC.Scheduler._pdflip_defer_waiting_abort(self, recv_req):
             return
-        left = [r for r in self.waiting_queue if r.rid.startswith(recv_req.rid)]
+        left = [r for r in self.waiting_queue if _abort_rid_hit(r.rid, recv_req.rid)]
         if left:
             self.aborted.append(recv_req.rid)
-        self.waiting_queue = [r for r in self.waiting_queue if not r.rid.startswith(recv_req.rid)]
+        self.waiting_queue = [r for r in self.waiting_queue if not _abort_rid_hit(r.rid, recv_req.rid)]
         for r in left:
             ST.forget_left_queue(self, r, "abort")
 
@@ -143,8 +144,8 @@ def test_b9b_pop_keeps_instance_2_and_its_told(row_auth, caplog):
 def test_default_off_is_unchanged_old_pop_takes_both():
     """No env: the old rid-wide pop (the B9b death shape) byte for byte, no record written."""
     with mock.patch.dict(os.environ, DUAL_P_ENV), mock.patch.object(p_row_authority, "applies", lambda s: True):
-        os.environ.pop(ENV_ON, None)
-        os.environ.pop(Q698, None)
+        os.environ[ENV_ON] = "0"  # #DPJ-S1: default ON now, OFF is explicit
+        os.environ[Q698] = "0"
         f, inst1 = _held()
         inst2 = _b9b(f)
         assert f.waiting_queue == []                     # instance 2 gone with instance 1: the bug, unchanged
@@ -156,7 +157,7 @@ def test_default_off_is_unchanged_old_pop_takes_both():
 def test_mutant_env_ignored_would_spare_twin_when_off():
     """MUTANT: if the env gate were ignored the OFF scenario would diverge -- the default-off test is sensitive."""
     with mock.patch.dict(os.environ, DUAL_P_ENV), mock.patch.object(p_row_authority, "applies", lambda s: True):
-        os.environ.pop(ENV_ON, None)
+        os.environ[ENV_ON] = "0"  # #DPJ-S1: default ON now, OFF is explicit
         with mock.patch.object(DU, "pop_keeps_twin_on", lambda env=None: True):
             f, inst1 = _held()
             inst2 = _b9b(f)

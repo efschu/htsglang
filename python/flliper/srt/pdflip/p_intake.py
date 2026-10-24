@@ -42,6 +42,7 @@ Bookkeeping and reads only; nothing here allocates.
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Optional
@@ -575,7 +576,7 @@ def forget(scheduler, rid: Optional[str]) -> None:
         if rid is None:
             deferred.clear()
         else:
-            for r in [r for r in deferred if str(r).startswith(str(rid))]:
+            for r in [r for r in deferred if _abort_rid_hit(r, rid)]:
                 deferred.pop(r, None)
     named = getattr(scheduler, "_h91_intake_named", None)
     if not named:
@@ -583,7 +584,7 @@ def forget(scheduler, rid: Optional[str]) -> None:
     if rid is None:
         named.clear()
         return
-    for r in [r for r in named if str(r).startswith(str(rid))]:
+    for r in [r for r in named if _abort_rid_hit(r, rid)]:
         named.discard(r)
 
 

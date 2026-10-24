@@ -44,6 +44,7 @@ V1 simplifications, each declared (also in the launcher's deviation list):
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import argparse
 import asyncio
 import collections
@@ -6806,17 +6807,19 @@ class Front:
         held = Front._d_orphan_front_holds(self)
         orphans = [r for r in rids if str(r).startswith("pdflip-") and r not in held]
         if orphans:
-            # S60r A1: D aborts by PREFIX (``park_abort`` and ``_abort_request_now``: ``rid.startswith(abort.rid)``).
+            # S60r A1: D's abort match (pdflip/abort_match.rid_hit, #1580). Under the old PREFIX rule
+            # (FLLIPER_PDFLIP_ABORT_EXACT_RID=0: ``rid.startswith(abort.rid)``) the following holds; under the exact rule
+            # (default) an orphan shadows only its own non-digit children, so this skip names nothing.
             # The rid counter is global and the epoch repeats, so one epoch holds ``pdflip-2-6`` and ``pdflip-2-60``
             # .. ``-69`` (measured: 4 of the 8 boots 18./19.10. carry such pairs). The abort of the orphan
             # ``pdflip-2-6`` would drop the live ``pdflip-2-60`` with it -- a user's request lost. An orphan whose rid
             # prefixes any other rid the front or this park knows is not aborted (named; the next park asks again).
             names = held | {str(r) for r in rids}
-            shadowed = [o for o in orphans if any(n != o and n.startswith(o) for n in names)]
+            shadowed = [o for o in orphans if any(n != o and _abort_rid_hit(n, o) for n in names)]  # D's abort rule (#1580)
             if shadowed:
                 self.counters["d_orphan_abort_prefix_skip"] += len(shadowed)
-                logger.warning("PDFLIP D-ORPHAN-ABORT-SKIP rids=%s epoch=%d -- D aborts by rid PREFIX and another "
-                               "live rid starts with each of these: aborting would drop it too (S60r A1; the next "
+                logger.warning("PDFLIP D-ORPHAN-ABORT-SKIP rids=%s epoch=%d -- D's abort rule (abort_match.rid_hit) would also "
+                               "hit another live rid for each of these: aborting would drop it too (S60r A1; the next "
                                "park names them again)", shadowed[:8], self.epoch)
                 orphans = [o for o in orphans if o not in shadowed]
         if not orphans:

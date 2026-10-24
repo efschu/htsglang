@@ -29,6 +29,7 @@ rows stays queued and is admitted in order (pdflip/p_intake.py).
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 from typing import Any, Optional
 
 #: The refusal's name; the front matches on it in the leg-1 error text.
@@ -159,8 +160,8 @@ class IntakeStallWatch:
             self.reset()
             return
         rid = str(rid)
-        self._reported = {r for r in self._reported if not str(r).startswith(rid)}
-        if self._rid is not None and str(self._rid).startswith(rid):
+        self._reported = {r for r in self._reported if not _abort_rid_hit(r, rid)}
+        if self._rid is not None and _abort_rid_hit(self._rid, rid):
             self._rid = None
             self._since = 0.0
 

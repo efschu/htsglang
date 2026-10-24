@@ -47,6 +47,7 @@ forward at all (pdflip/tail_adopt.py, "SKIP").
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 from array import array
 import contextlib
 import glob
@@ -1510,7 +1511,7 @@ def remove_parks_aborted(rid: str, abort_all: bool = False) -> int:
     removed."""
     n = 0
     for owner, p in _park_files():
-        if abort_all or (rid and owner.startswith(rid)):
+        if abort_all or (rid and _abort_rid_hit(owner, rid)):
             try:
                 os.remove(p)
                 n += 1

@@ -111,6 +111,7 @@ fall back uniformly is the pre-write one inside the vote.
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 import math
 import os
@@ -765,7 +766,7 @@ def drop_aborted(rid: str, abort_all: bool = False) -> int:
     scheduler's own matching: ``startswith``, or all). Returns the count."""
     rid = str(rid or "")
     gone = [r for r in set(_JOBS) | set(_AGREED) | set(_CONSUME_DEFERRED)
-            if abort_all or (rid and r.startswith(rid))]
+            if abort_all or (rid and _abort_rid_hit(r, rid))]
     for r in gone:
         drop(r)
     return len(gone)

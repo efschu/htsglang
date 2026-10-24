@@ -37,6 +37,7 @@ from flliper.srt.pdflip import dual_untold_abort as DU  # noqa: E402
 from flliper.srt.pdflip import p_intake  # noqa: E402
 from flliper.srt.pdflip import p_row_authority  # noqa: E402
 from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit  # noqa: E402  (#1580: the doubles follow the real rule)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -74,10 +75,10 @@ class _Follower:
     def _abort_request_now(self, recv_req):
         if SC.Scheduler._pdflip_defer_waiting_abort(self, recv_req):
             return
-        left = [r for r in self.waiting_queue if r.rid.startswith(recv_req.rid)]
+        left = [r for r in self.waiting_queue if _abort_rid_hit(r.rid, recv_req.rid)]
         if left:                                         # an abort of a rid not queued here changes nothing
             self.aborted.append(recv_req.rid)
-        self.waiting_queue = [r for r in self.waiting_queue if not r.rid.startswith(recv_req.rid)]
+        self.waiting_queue = [r for r in self.waiting_queue if not _abort_rid_hit(r.rid, recv_req.rid)]
         for r in left:                                   # the abort path's Q-580 forget
             ST.forget_left_queue(self, r, "abort")
 

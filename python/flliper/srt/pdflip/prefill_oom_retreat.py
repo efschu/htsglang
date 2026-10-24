@@ -72,6 +72,7 @@ Switch ``FLLIPER_PDFLIP_PREFILL_OOM_RETREAT`` (default on; ``0`` = the raise of 
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 import os
 import time
@@ -179,11 +180,11 @@ class RetreatLedger:
             self.abort_pending.clear()
             return
         rid = str(rid)
-        for k in [k for k in self.counts if k.startswith(rid)]:
+        for k in [k for k in self.counts if _abort_rid_hit(k, rid)]:
             del self.counts[k]
             self.first_t.pop(k, None)
             self.last_t.pop(k, None)
-        self.abort_pending = {k for k in self.abort_pending if not k.startswith(rid)}
+        self.abort_pending = {k for k in self.abort_pending if not _abort_rid_hit(k, rid)}
 
 
 def verdict(*, count: int, retries: int, remaining_need: int, free: int, paid: int,

@@ -103,9 +103,12 @@ def test_agree_and_abort_end_the_staging(rig):
     with envs.FLLIPER_PDFLIP_TAIL_STAGE_WORKER.override(True):
         for rid in RIDS:
             ta.stage(rid, tree)
-    assert ta.drop_aborted("pdflip-4-2") == 2  # pdflip-4-20, pdflip-4-21 (the scheduler's prefix match)
+    # #1580 ABORT-EXACT-RID (default on): pdflip-4-2 is another request than pdflip-4-20/-21 -- the
+    # scheduler's abort match is exact for front rids now, and so is this one (it mirrors it).
+    assert ta.drop_aborted("pdflip-4-2") == 0
+    assert ta.drop_aborted("pdflip-4-20") == 1
     assert "pdflip-4-20" not in ta._JOBS and "pdflip-4-20" not in ta._T_FIRST
-    assert ta.drop_aborted("", abort_all=True) == len(RIDS) - 2
+    assert ta.drop_aborted("", abort_all=True) == len(RIDS) - 1
     assert not ta._JOBS
 
 

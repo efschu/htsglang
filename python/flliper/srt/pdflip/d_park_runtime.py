@@ -30,6 +30,7 @@ saved before the flip park's retraction, dropped with an abort.
 """
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import logging
 import os
 import time
@@ -2340,7 +2341,7 @@ def park_abort(sched, recv_req) -> int:
     parked = getattr(sched, "pdflip_d_parked", None)
     if not parked:
         return 0
-    gone = [r for r in parked if abort_all or str(r.rid).startswith(rid)]
+    gone = [r for r in parked if abort_all or _abort_rid_hit(r.rid, rid)]
     if not gone:
         return 0
     ids = {id(r) for r in gone}
