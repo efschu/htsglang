@@ -269,9 +269,10 @@ def test_a_new_epoch_ends_every_wait(monkeypatch):
 # ------------------------------------------------------------------------------------------ SOLL-2: one presence set
 
 def test_soll2_the_line_classes_against_the_same_members_as_decide(monkeypatch, caplog):
-    """A SHORT anchor whose exact u is kurz (1500 < halbX 3092) is no member (R2, ``decide``'s own-figure filter): the
-    sibling behind it is NOT anchored in the set -- classed on its own 4000 (halb), its share counted in S. The line must say
-    the same (classes=kurz,halb, no sibling-rider), not ``kurz,kurz [... not in S]`` next to an S that counts it."""
+    """A SHORT anchor whose exact u is kurz (1500 < halbX 3092) is no member (R2, ``decide``'s own-figure filter). The line
+    must class against the same presence as ``decide``. Section 10 (planner 24.10.): the sibling behind that KURZ non-member
+    anchor (own 4000 halb, rest 2500 kurz) is a RIDER -- the line and ``decide`` both say ``kurz``, S=0 (no S share), D now
+    (R2 riders only); before section 10 both said halb with S=2500 (the rest priced against an anchor D had not computed)."""
     _on(monkeypatch)
     f = _fx()
     f.tp_prefill_max_tokens = 6185
@@ -281,17 +282,17 @@ def test_soll2_the_line_classes_against_the_same_members_as_decide(monkeypatch, 
     st = f._set_st()
     st["shorts"]["a"] = (t0, 1500, 6185)
     st["shorts"]["b"] = (t0 + 0.2, 4000, 6185)
-    with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._decode_collect(t0 + 0.3) == "hold"
-    (line,) = _verdicts(caplog)
-    # b is no rider (its anchor is no member): classed on its own 4000 (halb), its R1u share 2500 counts in S
-    assert "S=2500 " in line and "classes=kurz,halb" in line and "sibling-rider" not in line, line
     members = f._set_members(t0 + 0.3, [], st)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(t0 + 0.3) == "D"
+    (line,) = _verdicts(caplog)
+    assert "S=0 " in line and "classes=kurz,kurz" in line and "sibling-rider=b:2500" in line and "kurz-anchor=a" in line, line
     keep, out = pp.set_keep(members, 6185, 0.5)
     assert out == ["a"] and [m.rid for m in keep] == ["b"]
     d = pp.decide("set", members=members, x_tokens=6185, half_frac=0.5, t_half_s=4.5, now=0.3, t_open=0.0,
                   d_decoding=True, seats_free=4, new_since_last=0)
-    assert d.classes == ("halb",) and d.in_set == ("b",) and d.verdict.s_tokens == 2500
+    assert d.classes == ("kurz",) and d.in_set == ("b",) and d.verdict.s_tokens == 0
+    assert d.verdict.verdict == "D_AFTER_TIMER" and "R2 riders only" in d.verdict.why, d
 
 
 # ------------------------------------------------------------------------------------------ SOLL-3: presence at the front
@@ -384,3 +385,141 @@ def test_soll4_r6_reroute_p_takes_the_rider(monkeypatch, caplog):
                   x_tokens=4096, half_frac=0.5, t_half_s=4.5, now=0.6, t_open=0.0, d_decoding=True, seats_free=4,
                   d_prefill_running_uncached=300, new_since_last=0)
     assert d.verdict.verdict == "REROUTE_P" and R180 in d.in_set and d.verdict.s_tokens == 4250
+
+
+# ------------------------------------------------------------------------------- section 10: a rider behind a KURZ non-member anchor
+# Planner decision 24.10. (binding, same logic as MUSS-1 variant (a); SOLL R1/R2/R3/R7/R11): a rider is kurz on its rest only
+# once its anchor is computed -- whether the anchor is a set member or a kurz request D prefills at once by R2. Before that it
+# waits behind the D anchor (rider_hold_step, FLLIPER_PDFLIP_SIBLING_RIDER_WAIT, PDFLIP SIBLING-RIDER-WAIT), then the S63
+# re-probe reads its real rest; anchor gone or bound T_halb over -> its own figure (R3/R4). The kurz anchor stays R2: D at once.
+# Danger direction / mutant: "the wait only behind a MEMBER anchor" -> the rider goes to D in the kurz anchor's tick with its
+# own figure uncounted (S=its rest or 0, D computes anchor + own figure: R1/R7).
+
+A10, B10 = "pdflip-90-a10", "pdflip-90-b10"
+
+
+def _pair_s10(monkeypatch, t0, running=("dec",)):
+    """X 6185 / halbX 3092: anchor A10 = a SHORT whose exact u is KURZ (1500, no member, R2); B10 = a halb SHORT own 4000 of
+    the same session whose rest behind A10 is 2500 (kurz)."""
+    _on(monkeypatch)
+    f = _fx(running=running)
+    f.tp_prefill_max_tokens = 6185
+    _session(f, A10, "s10", list(range(21500)), 20000)
+    _session(f, B10, "s10", list(range(23000)) + [-i - 1 for i in range(1000)], 20000)
+    st = f._set_st()
+    st["shorts"][A10] = (t0, 1500, 6185)
+    st["shorts"][B10] = (t0 + 0.2, 4000, 6185)
+    return f, st
+
+
+def test_s10_r1_r2_r7_rider_behind_a_kurz_nonmember_anchor_is_not_released_with_it(monkeypatch, caplog):
+    """The repro (R8, nothing decodes on D): before section 10 the set {B10} (A10 left out as kurz) was decided D at once on
+    S=2500 (B10's rest) and A10 and B10 went to D in the SAME tick -- D computes 1500 + 4000 with S=2500 (R1/R7). Now B10 is a
+    rider behind its kurz D anchor: A10 goes to D (R2), B10 is NOT released; after A10's D prefill the re-probe reads its rest
+    -> kurz -> R2 D."""
+    t0 = time.time()
+    f, st = _pair_s10(monkeypatch, t0, running=())
+    calls = _reprobe_stub(monkeypatch, apply=lambda r: st["shorts"].__setitem__(r, (t0 + 0.2, 2500, 6185)))
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        route = f._decode_collect(t0 + 0.3)
+        lines = list(_verdicts(caplog))
+        assert route == "D", (route, lines)
+        line = lines[-1]
+        assert ("verdict=D_AFTER_TIMER" in line and "S=0 " in line and "classes=kurz,kurz" in line
+                and "sibling-rider=%s:2500" % B10 in line and "kurz-anchor=%s" % A10 in line), line
+        assert st["released"].get(A10) == "D"                                     # R2: the kurz anchor goes at once
+        assert B10 not in st["released"], st["released"]                          # not in the anchor's tick
+        assert st["rider_hold"][B10]["anchor"] == A10 and B10 in st["shorts"]
+        (begin,) = _waits(caplog)
+        assert "begin rid=%s anchor=%s own=4000 rest=2500 where=short" % (B10, A10) in begin, begin
+        assert f._decode_collect(t0 + 0.4) is None                                # anchor still on D: no member, no verdict
+        assert B10 not in st["released"] and not calls
+        _anchor_done(f, st, A10)
+        assert f._decode_collect(t0 + 0.8) == "D"
+    assert calls == [((B10,), "sibling-rider", "RIDER_RELEASE")], calls
+    assert st["released"].get(B10) == "D" and B10 not in st.get("rider_hold", {})
+    assert "R2 kurz only" in _verdicts(caplog)[-1]
+    assert any("outcome=release_rest" in w for w in _waits(caplog)), _waits(caplog)
+
+
+def test_s10_r2_the_kurz_anchor_goes_at_once_while_d_decodes(monkeypatch, caplog):
+    """D decodes: before section 10 B10 (halb on its own figure) opened a set and the kurz anchor A10 waited with it on the seat
+    path up to T_halb, then both went to D in one tick. Now the set has riders only (R2): D at once -- A10 without a wait, B10
+    waits behind it."""
+    t0 = time.time()
+    f, st = _pair_s10(monkeypatch, t0)
+    _reprobe_stub(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        route = f._decode_collect(t0 + 0.3)
+    assert route == "D", (route, _verdicts(caplog))
+    assert "R2 riders only" in _verdicts(caplog)[-1], _verdicts(caplog)
+    assert st["released"].get(A10) == "D" and B10 not in st["released"] and B10 in st["rider_hold"]
+
+
+def test_s10_anchor_gone_rider_is_classed_on_its_own_figure(monkeypatch, caplog):
+    """The kurz anchor leaves D (abort / client gone): the rider is classed on its own 4000 (halb, R3) at once -- a set member
+    again, S=4000, no re-probe wait."""
+    t0 = time.time()
+    f, st = _pair_s10(monkeypatch, t0)
+    calls = _reprobe_stub(monkeypatch)
+    assert f._decode_collect(t0 + 0.3) == "D" and B10 in st["rider_hold"]
+    _anchor_gone(f, st, A10)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(t0 + 0.5) == "hold"
+    line = _verdicts(caplog)[-1]
+    assert "members=%s:4000" % B10 in line and "classes=halb" in line and "S=4000 " in line and "verdict=COLLECT" in line, line
+    assert not [c for c in calls if c[1] == "sibling-rider"], calls
+    assert any("outcome=release_own" in w and "anchor gone" in w for w in _waits(caplog)), _waits(caplog)
+
+
+def test_s10_the_wait_is_bounded_by_t_half(monkeypatch, caplog):
+    """The kurz anchor stays on D: the rider waits at most T_halb, then its own figure classes it (R8 here: S=4000 < X -> D,
+    priced on its own figure) -- never a hang."""
+    t0 = time.time()
+    f, st = _pair_s10(monkeypatch, t0, running=())
+    _reprobe_stub(monkeypatch)
+    assert f._decode_collect(t0 + 0.3) == "D" and B10 in st["rider_hold"]
+    assert f._decode_collect(t0 + 4.7) is None and B10 in st["rider_hold"]          # inside the bound
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(t0 + 4.9) == "D"
+    line = _verdicts(caplog)[-1]
+    assert "members=%s:4000" % B10 in line and "classes=halb" in line and "S=4000 " in line, line
+    assert st["released"].get(B10) == "D" and B10 not in st.get("rider_hold", {})
+    assert any("outcome=release_own" in w and "bound 4.5 s over" in w for w in _waits(caplog)), _waits(caplog)
+
+
+def test_s10_r1u_a_non_rider_behind_a_kurz_anchor_counts_its_own_figure():
+    """R1u "zaehlt dieses Stueck EINMAL" + one truth: behind a KURZ non-member anchor (never in S, R2/R6k) a member whose rest
+    is NOT kurz is no rider; it is classed AND counted on its own figure (6000), not on the rest (4800) -- otherwise the shared
+    piece is in nobody's S share while D computes it."""
+    a = pp.SetMember(rid="a", uncached=1000, t_arrive=0.0)
+    b = pp.SetMember(rid="b", uncached=4800, t_arrive=0.5, own_uncached=6000, anchor="a")
+    kw = dict(x_tokens=6185, half_frac=0.5, t_half_s=4.5, now=1.0, t_open=0.0, d_decoding=True, seats_free=4,
+              new_since_last=0)
+    d = pp.decide("set", members=[a, b], **kw)
+    assert d.in_set == ("b",) and d.kurz_left_out == ("a",) and d.classes == ("halb",)
+    assert d.verdict.s_tokens == 6000 and d.verdict.verdict == "COLLECT", d
+    assert pp.sibling_riders([b], 6185, 0.5, {"a"}) == frozenset()
+    # the rider case of the same anchor, pure: kurz rest -> rider, S=0, riders only -> D now (R2)
+    r = pp.SetMember(rid="r", uncached=2500, t_arrive=0.5, own_uncached=4000, anchor="a")
+    dr = pp.decide("set", members=[a, r], **kw)
+    assert dr.classes == ("kurz",) and dr.verdict.s_tokens == 0 and dr.verdict.verdict == "D_AFTER_TIMER", dr
+    # section-4 compatibility: no kurz anchor named -> exactly the member-anchor behaviour (anchor absent: own figure)
+    assert pp.member_class(r, 6185, 0.5, {"r"}) == pp.CLASS_HALB
+    assert pp.sibling_riders([r], 6185, 0.5) == frozenset()
+
+
+def test_s10_reverse_the_anchor_rides_a_flip_to_p_and_the_rider_with_it_r1a(monkeypatch, caplog):
+    """The reverse case (R1a): a flip is decided by a real trigger (big C10, R8) -- the kurz anchor A10 and the rider B10 both
+    ride it to P (P matches the shared prefix once there), nobody waits behind a D anchor. The rider adds nothing to S
+    (S = 9000, before section 10 S = 9000 + 2500). The rest is never used for D: on P both are prefilled together."""
+    t0 = time.time()
+    f, st = _pair_s10(monkeypatch, t0, running=())
+    f.queue = [_pending("pdflip-90-c10", 9000, t0 + 0.1, est_prompt=50000)]
+    _reprobe_stub(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(t0 + 0.3) == "P"
+    line = _verdicts(caplog)[-1]
+    assert "verdict=FLIP_P" in line and "S=9000 " in line and "sibling-rider=%s:2500" % B10 in line, line
+    assert st["released"].get(A10) == "P" and st["released"].get(B10) == "P"
+    assert "pdflip-90-c10" in st["go_p"] and B10 in st["go_p"] and not st.get("rider_hold")
