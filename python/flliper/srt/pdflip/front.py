@@ -171,6 +171,7 @@ from flliper.srt.registry import nvml as nvml_registry
 from flliper.srt.pdflip import DEFAULT_D_BS, DEFAULT_P_BS
 from flliper.srt.pdflip import admin_key as admin_key_mod
 from flliper.srt.pdflip import dual_share as _dual_share_mod  # DUAL-SHARE (dual layout only)
+from flliper.srt.pdflip import dual_p_restart as _s7b  # S7b P-RESTART (dual layout only): a dead P ends no boot
 from flliper.srt.pdflip import host_ledger
 from flliper.srt.pdflip import l15_plan  # L15-13c: D's residue record excludes the hold
 from flliper.srt.pdflip import idle_clock as _idle_clock_mod  # #55 F2: idle clock lock
@@ -11732,7 +11733,14 @@ class Front:
         results: dict = {}
         facts_out: dict = {}
         unhealthy: dict = {}
+        _p_absent = _s7b.p_absent(self)
         for g in self.groups.values():
+            if g.name == "P" and _p_absent:
+                # S7b: D serves while P is away -- the front is healthy; the P column names the state
+                _st7 = _s7b.state_of(self)
+                results[g.name] = "absent: %s %s" % (_s7b.MARK, _st7.state)
+                facts_out[g.name] = {"source": "s7b", "state": _st7.state, "why": _st7.why[:200]}
+                continue
             f = g.health_facts
             if f is None or now - f.t > _fh.STALE_S:
                 ok = await self._probe_group_health(g, _fh.PROBE_TIMEOUT_S)
@@ -11861,6 +11869,8 @@ class Front:
                 last=self._x_curve_last)),
             # PRIORITY LANES 1008 (L1): only with FLLIPER_PDFLIP_LANES=1 (the live state stays byte-identical off).
             **Front._lane_block(self),
+            # S7b P-RESTART: only under --dual-layout (the flip form's state stays byte-identical).
+            **_s7b.state_block(self),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -23577,6 +23587,9 @@ class Front:
                                             {"tags": tags, "epoch": credit_epoch(self.boot_epoch, "dps%d" % n)},
                                             RPC_TIMEOUT_S)
             if code != 200:
+                if _s7b.on_p_dead(self, f"W-DUAL-P-SLEEP PdFlipDualPSleepRefused: P's sleep leg {n} failed HTTP "
+                                        f"{code}: {body[:300]!r} -- P's VRAM state undefined, D's untouched"):
+                    return  # S7b
                 self.do_stop("W-DUAL-P-SLEEP PdFlipDualPSleepRefused",
                              f"P's sleep leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
                 return
@@ -23598,6 +23611,9 @@ class Front:
                     st.p_state = "stopped"
                     st.sleep_leg_done = True
                 return
+            if _s7b.on_p_dead(self, f"W-DUAL-P-SLEEP PdFlipDualPSleepRefused: P's sleep leg raised after the "
+                                    f"release was sent: {type(exc).__name__}: {str(exc)[:300]}"):
+                return  # S7b
             self.do_stop("W-DUAL-P-SLEEP PdFlipDualPSleepRefused",
                          f"P's sleep leg raised after the release was sent: {type(exc).__name__}: "
                          f"{str(exc)[:300]} -- VRAM state undefined")
@@ -23624,6 +23640,9 @@ class Front:
                                         {"tags": tags, "epoch": credit_epoch(self.boot_epoch, "dpw%d" % n)},
                                         RPC_TIMEOUT_S)
         if code != 200:
+            if _s7b.on_p_dead(self, f"W-DUAL-P-WAKE PdFlipDualPWakeRefused: P's wake leg {n} failed HTTP {code}: "
+                                    f"{body[:300]!r} -- P's VRAM state undefined, D's untouched"):
+                return  # S7b: P is absent from here on (stage 2 ends its session before the respawn)
             self.do_stop("W-DUAL-P-WAKE PdFlipDualPWakeRefused",
                          f"P's wake leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
             return
@@ -24267,6 +24286,8 @@ class Front:
                         if is_intake_stall(e) and not is_too_large(e):
                             await self._requeue_intake_stalled(p, e)
                             return p
+                        if not is_too_large(e) and _s7b.requeue_failed_leg(self, p, e):
+                            return p  # S7b: P died under this leg -- back at the head, never failed to the client
                         if is_too_large(e):
                             # weg2xsn291: larger than P's whole pool -- no
                             # flip can make room; refused by name, never
@@ -24342,7 +24363,8 @@ class Front:
                 self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
                 lambda: (self.state == "serving" and not self._p_intake_stalled
                          and not (self.dual_layout and self.dual_kv_ledgers
-                                  and self._dual_dispatch_held())),
+                                  and self._dual_dispatch_held())
+                         and not _s7b.p_absent(self)),  # S7b: no new P leg while P is absent
                 # H91 part C rule 1: at most p_phase_max_requests leave the
                 # queue in this P phase, overlapping only as far as their
                 # est_prompt fits P's unified pool (0 = off, law 1 as before).
@@ -24706,6 +24728,10 @@ class Front:
                 self._hl_sweep()  # #243 seam: lost hand-offs of waiting rids -> P
                 self._rvp_take()
                 if self.dual_layout:
+                    if _s7b.p_absent(self):
+                        # S7b: P is absent -- no pump, no stage leg to P; D's line takes u <= X, the rest waits
+                        _s7b.tick(self, time.time())
+                        continue
                     # DUAL-TP3PP3: no flip, no park, no economics -- P drains
                     # while D decodes. The D branch below is never reached.
                     self._dual_pump(_p_drain_pass_dual)
@@ -25097,9 +25123,15 @@ class Front:
                     "-" if hold is None else f"pid={hold.pid} exception={hold.exception!r} dump={hold.path}",
                     _mem,
                 )
+            if g.name == "P" and _s7b.p_absent(self):
+                continue  # S7b: P is absent (dead / restarting / joining) -- its facts are kept, no W17
             if self.group_dead_should_stop(
                 state=self.state, ok=ok, alive=alive, streak=n, hold=hold is not None,
             ):
+                if g.name == "P" and _s7b.on_p_dead(
+                        self, "W17 PdFlipGroupDead group P: http_ok=%s process_alive=%s streak=%d hold=%s"
+                        % (ok, alive, n, "-" if hold is None else f"pid={hold.pid} {hold.exception}")):
+                    continue  # S7b: D serves on, no STOP
                 if hold is not None:
                     self.do_stop(
                         "W17 PdFlipGroupDead",
@@ -25130,10 +25162,16 @@ class Front:
                     continue
                 g.health_fail_streak += 1
                 logger.warning("PDFLIP-HEALTH group=%s http_ok=%s process_alive=%s streak=%d", g.name, ok, alive, g.health_fail_streak)
+                if g.name == "P" and _s7b.p_absent(self):
+                    continue  # S7b: P is absent, no W17
                 if self.group_dead_should_stop(
                     state=self.state, ok=ok, alive=alive,
                     streak=g.health_fail_streak,
                 ):
+                    if g.name == "P" and _s7b.on_p_dead(
+                            self, "W17 PdFlipGroupDead group P: http_ok=%s process_alive=%s streak=%d"
+                            % (ok, alive, g.health_fail_streak)):
+                        continue  # S7b: D serves on, no STOP
                     self.do_stop("W17 PdFlipGroupDead", f"group {g.name}: /health failed {g.health_fail_streak}x and process_alive={alive} (a 200 alone is a transport fact)" + _w17_mem_suffix())
 
     def corridor_sample(self) -> Optional[str]:
