@@ -70,6 +70,14 @@ def _arena_with_index(tmp_path, n, missing=(), stale_gen=(), sb=256, cap=1 << 16
     return a, be, np.asarray(sl, dtype=np.int64)
 
 
+@pytest.fixture(autouse=True)
+def _no_listed_memo(monkeypatch):
+    """PPHASE-GAPS-1024: these tests characterise the index LOOKUP form (per-slot vs array) -- with the census memo on,
+    a repeated census asks nothing at all and both forms read as free. The memo has its own equality/cost tests
+    (test_pphase_gaps_listed_memo_1024.py); here it is off."""
+    monkeypatch.setattr(l3s, "LISTED_MEMO", False, raising=False)
+
+
 @pytest.fixture
 def stem_ptrs(monkeypatch):
     def _set(on):

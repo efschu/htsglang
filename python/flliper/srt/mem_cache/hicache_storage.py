@@ -6016,6 +6016,10 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.forget(gone)
             except Exception:  # noqa: BLE001 -- bookkeeping, never a gate on the read
                 pass
+            # PPHASE-GAPS-1024 (review SOLL 1, NOT done here): voiding the record of the struck stems turned
+            # test_l3_reuse_after_restart_0928 test_b red (write-behind 16 -> 8 pages): the strike also fires for
+            # stems this stat does not see at the sharded/flat path (the QSA sidecars of a pair), and a void there
+            # stalls the KV pair gate. Residue, guarded by the memo-free free decision (verify_candidates).
         return out
 
     def _arena_kv_present_prefix(self, keys: List[str]) -> Optional[int]:
@@ -7118,6 +7122,17 @@ class HiCacheFile(HiCacheStorage):
             self._evictor.clear()
             if self.metadata_cache is not None:
                 self.metadata_cache.clear()
+            # PPHASE-GAPS-1024 (review SOLL 1): every file is gone -- the shared record of every arena this backend
+            # opened says so too (before, it kept saying "copied": A5 class, and a warm census memo then read the
+            # whole arena as secured)
+            try:
+                from flliper.srt.mem_cache import l3_secured as _l3s
+
+                for _arena in list((getattr(self, "_arenas", None) or {}).values()):
+                    if _arena is not None:
+                        _l3s.void_all(_arena)
+            except Exception as exc:  # noqa: BLE001 -- named; the free decision re-asks the (empty) index anyway
+                logger.warning("PPHASE-GAPS-1024 L3SEC-VOID-ALL at clear failed: %r", exc)
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
         except Exception as e:

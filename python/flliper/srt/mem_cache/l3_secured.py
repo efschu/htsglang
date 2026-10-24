@@ -48,6 +48,90 @@ STEM_PTRS_ENV = "FLLIPER_L3SEC_STEM_PTRS"
 #: FLIPTIME-1023: lookups that fell back to the per-slot form although the switch is on (an arena or backend without
 #: the array form, or the array form raised) -- counted, the first ones named
 FAST_STATS = {"fast": 0, "fallback": 0}
+#: PPHASE-GAPS-1024 (27B rc39a P, boot dkr27bbar1drei10240803_b9cddabda1_1024_080355): every chunk or retain publish
+#: whose claim had to make room in the 720896-slot KV arena (``#1427 ARENA-DROP slot_bytes=32768``) cost PP0's
+#: scheduler thread 430-1148 ms (int8) / 1326-1863 ms (duo 1024_070103), mean of its publishes; a publish whose claim
+#: dropped only in the 112-slot mamba arena cost 20-66 ms, one without a drop 15-23 ms. The arena-size term is this
+#: module's census (``unsecured_keys_lo``, called by ``ArenaMHAHostPool._evict_for_claim`` for EVERY claim that needs
+#: room): it asks the #1459 index again for every COMPLETE slot the record calls copied -- ~0.5 M C lookups per claim
+#: on 27B (page_size 1: one 32 KiB page per token), the FLIPTIME-1023 characterisation's 128-143 ms per 262144 slots,
+#: x2.75 for the KV arena, more under the write-behind's GIL. In the P phases that was 29.8 s (int8) / 41.3 s (duo)
+#: of card idle on PP0 between forwards (deskq/done/pphase-gaps-1024.md).
+#:
+#: THE MEMO: per arena, the generation at which a slot's stem was last FOUND in the index. A slot whose record names
+#: that same generation is not asked again; only slots the record newly calls copied (or whose generation moved) are.
+#: The memo is PROCESS-LOCAL (an attribute of this process's ShmArena object); the record (``<arena>.l3sec``) and the
+#: #1459 index are SHARED by every rank of both groups. Safety rests on exactly two things, both cross-process:
+#:   (a) the RECORD GATE -- the record is read for EVERY slot on EVERY census and the memo is consulted ONLY for slots
+#:       the record calls copied at their current generation; a file any process's L3 LRU took voids the shared record
+#:       (``invalidate_stems`` from its on_evict), so the slot reads uncopied here whatever this process's memo holds;
+#:   (b) the claim's free decision ``verify_candidates`` -> ``secured`` asks the index for every candidate WITHOUT the
+#:       memo, so no page leaves L2 without its copy (an unlisted candidate is handed over, S109-A3).
+#: ``census(memo) == census(no memo)`` therefore holds only where the record and the index agree. Named rests where
+#: they disagree and the memo keeps a page OFF the keep list (the clock may pick it; (b) refuses it): S109-A1's own
+#: window (index entry removed, on_evict not yet run); a sister process voiding AND re-publishing the same generation
+#: under index lag between two censuses of THIS process (narrowed: a census that sees the record negative forgets the
+#: slot's memo entry). ``invalidate_stems`` clears this process's memo; ``void_all`` (HiCacheFile.clear) voids the
+#: record of the whole arena (review SOLL 1). Residue: the ``_stat_stems`` strike removes index entries without a
+#: record void (a void there stalled the write-behind's QSA pair gate, test_l3_reuse_after_restart_0928 test_b).
+#: Only positives are remembered: a slot not listed is asked again next time. ``LISTED_MEMO = False`` = ask every slot
+#: (the FLIPTIME-1023 form); no env switch (catalog unchanged).
+LISTED_MEMO = True
+_MEMO_ATTR = "_l3sec_listed_gen"
+#: lookups asked / answered from the memo by ``unsecured_keys_lo`` (instrument + tests)
+MEMO_STATS = {"asked": 0, "memo": 0}
+
+
+def _listed_memo(arena: Any, backend: Any) -> Optional[np.ndarray]:
+    """The memo array of ``arena`` for ``backend`` (int64 per slot, -1 = not known listed), created on first use; a new
+    backend (another index) starts a fresh memo. None when off or the arena has no slot count."""
+    if not LISTED_MEMO:
+        return None
+    n = int(getattr(arena, "slots", 0) or 0)
+    if n <= 0:
+        return None
+    cur = getattr(arena, _MEMO_ATTR, None)
+    if cur is not None and cur[0] is backend and cur[1].shape[0] == n:
+        return cur[1]
+    memo = np.full(n, -1, dtype=np.int64)
+    try:
+        setattr(arena, _MEMO_ATTR, (backend, memo))
+    except Exception:  # noqa: BLE001 -- an arena that takes no attribute: no memo (every slot asked, as before)
+        return None
+    return memo
+
+
+def void_all(arena: Any) -> int:
+    """PPHASE-GAPS-1024 (review SOLL 1): the whole store was cleared (``HiCacheFile.clear``: the #1459 index emptied,
+    every file unlinked, no on_evict) -- every slot's record, this process's write-behind baseline and memo are void,
+    so no census or spill reads a page as copied whose file is gone, and the write-behind sees every page as new
+    again. Memory only. Returns the slots voided (0 = no record attached here)."""
+    n = 0
+    sec = arrays(arena, create=False)
+    if sec is not None:
+        sec[0][:] = -1
+        n = int(sec[0].shape[0])
+    base = getattr(arena, "_l3wb_sec", None)
+    if base is not None:
+        try:
+            base[0][:] = -1
+        except Exception:  # noqa: BLE001 -- a baseline of another shape: the shared record already says "not copied"
+            pass
+    cur = getattr(arena, _MEMO_ATTR, None)
+    if cur is not None:
+        cur[1][:] = -1
+    return n
+
+
+def _forget_listed(arena: Any, slots) -> None:
+    """``invalidate_stems``: these slots' files left L3 -- the memo must not answer for them any more."""
+    cur = getattr(arena, _MEMO_ATTR, None)
+    if cur is None:
+        return
+    s = np.asarray(slots, dtype=np.int64)
+    s = s[(s >= 0) & (s < cur[1].shape[0])]
+    if s.shape[0]:
+        cur[1][s] = -1
 
 
 def stem_ptrs_on() -> bool:
@@ -192,7 +276,7 @@ def queue_unsecured_all(why: str = "quiesce") -> int:
     """S109-A7 (re-review 20.10.): at a quiesce's entrance (flip or sleep) every COMPLETE slot without an L3 copy is
     queued for the write-behind and the write-behind is woken -- the whole quiesce (53-410 ms, median 98 ms) is its
     time before the S86 veto. Only where the write-behind runs (the store's LRU owner: D TP0 / P PP0); one C census
-    plus memory reads per arena (``unsecured_keys_lo``, ~5 ms CPU), never I/O, never a wait. Returns the slots queued."""
+    plus memory reads per arena (``unsecured_keys_lo``: ~5 ms CPU on a small arena, O(slots) -- see PPHASE-GAPS-1024), never I/O, never a wait. Returns the slots queued."""
     with _LOCK:
         reg = list(_REG)
     n = 0
@@ -270,6 +354,7 @@ def invalidate_stems(arena: Any, stems) -> int:
         if found:
             _f = np.asarray(found, dtype=np.int64)
             sec[0][_f] = -1
+            _forget_listed(arena, _f)   # PPHASE-GAPS-1024: the memo never answers for a file the LRU took
             # S109-A5 (re-review R11): this process's write-behind visit baseline forgets them too (the pass also
             # compares against the shared record, which covers the sister group's writer)
             base = getattr(arena, "_l3wb_sec", None)
@@ -284,7 +369,7 @@ def invalidate_stems(arena: Any, stems) -> int:
 def request(arena: Any, slots) -> int:
     """Queue ``slots`` for the owner's next write-behind pass (visited first) and wake it (S109-A4). Never I/O, never
     a wait."""
-    vals = [int(x) for x in np.asarray(slots, dtype=np.int64).tolist()]
+    vals = np.asarray(slots, dtype=np.int64).tolist()   # PPHASE-GAPS-1024: tolist() already yields Python ints
     if not vals:
         return 0
     with _LOCK:
@@ -409,14 +494,32 @@ def unsecured_keys_lo(arena: Any, backend: Any = None, keys: bool = True):
     # S109-A1: record AND index (a file the L3 LRU took is no copy)
     cand = np.nonzero(mine)[0]
     listed = getattr(backend, "l3_listed", None) if backend is not None else None
+    memo = _listed_memo(arena, backend) if callable(listed) else None
+    if memo is not None and cand.shape[0] < slots.shape[0]:
+        # PPHASE-GAPS-1024 (review SOLL 2): the record says "not copied" -- whatever this process remembered of the
+        # slot is void (a later re-publish of the same generation must be asked again)
+        memo[slots[~mine]] = -1
     if callable(listed) and cand.shape[0]:
-        fast = _listed_mask(arena, backend, slots[cand])
-        if fast is not None:
-            mine[cand] = fast
+        # PPHASE-GAPS-1024: a slot found listed at THIS generation before is not asked again (module note above).
+        # The memo is consulted ONLY for record-positive slots (the record gate, (a) above).
+        gens_np = np.asarray(gens, dtype=np.int64)
+        if memo is not None:
+            ask = cand[memo[slots[cand]] != gens_np[cand]]
+            MEMO_STATS["memo"] += int(cand.shape[0] - ask.shape[0])
         else:
-            stems = [arena.slot_stem(int(x)) or "" for x in slots[cand].tolist()]
-            has = listed(stems)
-            mine[cand] = np.asarray([bool(st) and bool(h) for st, h in zip(stems, has)], dtype=bool)
+            ask = cand
+        MEMO_STATS["asked"] += int(ask.shape[0])
+        if ask.shape[0]:
+            fast = _listed_mask(arena, backend, slots[ask])
+            if fast is not None:
+                mine[ask] = fast
+            else:
+                stems = [arena.slot_stem(int(x)) or "" for x in slots[ask].tolist()]
+                has = listed(stems)
+                mine[ask] = np.asarray([bool(st) and bool(h) for st, h in zip(stems, has)], dtype=bool)
+            if memo is not None:
+                hit = ask[mine[ask]]
+                memo[slots[hit]] = gens_np[hit]
     un = ~mine
     if un.any():
         request(arena, slots[un])
