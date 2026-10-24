@@ -290,17 +290,21 @@ def test_o4_credit_is_clipped_to_the_load_back_extent():
 def test_o5_a_path_that_never_meets_last_node_gives_nothing():
     root, _prompt, host = _path()
     req = _req(root, host)
+    n0 = dpp.FALLBACKS["broken"]
     req.last_node = _unode(root, 5, lock=1)      # not an ancestor of best_match_node
     assert dpp.locked_device_gap(SimpleNamespace(root_node=root), req, EXTENT) == 0
     host.parent = None                           # broken chain
     req.last_node = root
     assert dpp.locked_device_gap(SimpleNamespace(root_node=root), req, EXTENT) == 0
+    assert dpp.FALLBACKS["broken"] == n0 + 2     # counted, never silent
 
 
 def test_o6_unreadable_nodes_give_nothing_and_fast():
     req = SimpleNamespace(last_node=MagicMock(), best_match_node=MagicMock())
+    n0 = dpp.FALLBACKS["unreadable"]
     t0 = time.perf_counter()
     assert dpp.locked_device_gap(MagicMock(), req, EXTENT) == 0
+    assert dpp.FALLBACKS["unreadable"] == n0 + 1
     assert time.perf_counter() - t0 < 0.5         # stops at the first node, never walks MagicMock parents
 
 
