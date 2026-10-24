@@ -22730,7 +22730,7 @@ class Scheduler(
             # refused -- every rank of the group, here, in the same pass (the idle verdict below posts its own
             # collective at the same point under the same gate); the tree's gate (switch, pure TP sharing the slot,
             # PP off) is rank-uniform. Never raises.
-            _prr = getattr(self.tree_cache, "pdflip_park_rearm_group", None)
+            _prr = getattr(getattr(self, "tree_cache", None), "pdflip_park_rearm_group", None)
             _pp1 = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1) <= 1
             if callable(_prr) and _pp1:
                 try:

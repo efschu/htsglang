@@ -7635,18 +7635,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         the group's claim: a single rank, or the Form A host (its workers hold no anchor bytes, S104). On a pure TP
         group sharing the slot (the W65 class) only the group-agreed pass re-arms (:meth:`pdflip_park_rearm_group`):
         a rank-local re-arm there would back the node on some ranks only."""
-        if not _park_rearm.armed() or UnifiedRadixCache._k15_tp_slot_shared(self):
-            return False
-        if self._s104_byteless_anchor_rank():
-            return False
-        mp = self._pdflip_mamba_pool()
-        probe = getattr(mp, "claim_needs_room", None)
-        if mp is None or not callable(probe) or not node.hash_value:
-            return False
         try:
+            if not _park_rearm.armed() or UnifiedRadixCache._k15_tp_slot_shared(self):
+                return False
+            if self._s104_byteless_anchor_rank():
+                return False
+            mp = self._pdflip_mamba_pool()
+            probe = getattr(mp, "claim_needs_room", None)
+            if mp is None or not callable(probe) or not node.hash_value:
+                return False
             if probe([node.hash_value[-1]]):
                 return False
-        except Exception:  # noqa: BLE001 - unreadable room = not re-armed (the old answer)
+        except Exception:  # noqa: BLE001 - unreadable room / a bare tree = not re-armed (the old answer)
             return False
         node.pdflip_park_anchor_dropped = False
         n = getattr(UnifiedRadixCache, "_park_rearm_local_n", 0) + 1
