@@ -1733,16 +1733,24 @@ def _req_kv_tokens(r) -> int:
     return _n(getattr(r, "origin_input_ids", None)) + _n(getattr(r, "output_ids", None))
 
 
-def _leaving_rows(sched, reqs) -> list:
+def _leaving_rows(sched, reqs, head_credited=None) -> list:
     """KVD-1024 (front KV class D, SOLL R7): what each of ``reqs`` (youngest first, the displacement order) adds to the
     rows the k youngest are GUARANTEED to give back when they leave together (``d_leaving_rows.joint_leaving_rows``,
     as increments: their prefix sums are the joint release) -- not the seat length. 27B ``_1024_003732`` 01:02:45:
     18-189 was sized 54190, its displacement freed 36043 (the 18137-token shared system prompt stayed locked by three
     other decodes) and the older 18-188 was refused 181 times behind it. Joint (review MUSS 2): rows only the k
     youngest hold between them come free with the k-th -- the sum of single bounds would never count them."""
-    from flliper.srt.pdflip.d_leaving_rows import joint_leaving_rows, marginals
+    from flliper.srt.pdflip.d_leaving_rows import aux_blocked_ids, joint_leaving_rows, marginals
 
-    return marginals(joint_leaving_rows(getattr(sched, "tree_cache", None), reqs))
+    tree = getattr(sched, "tree_cache", None)
+    blocked = None
+    if head_credited:
+        # review MUSS 1 (#215 x KVD): the nodes the older one's price already credits (it maps them, #215
+        # ``locked_device_gap``) never count as freed for it -- with the aux-blocked ones the release would skip anyway
+        reqs = list(reqs or ())
+        own = {id(getattr(r, "last_node", None)) for r in reqs if getattr(r, "last_node", None) is not None}
+        blocked = (aux_blocked_ids(tree, own) if tree is not None and reqs else set()) | set(head_credited)
+    return marginals(joint_leaving_rows(tree, reqs, blocked))
 
 
 def youngest_first(reqs) -> list:
@@ -1753,6 +1761,19 @@ def youngest_first(reqs) -> list:
     _on = _pa.enabled()
     return sorted(list(reqs or ()), key=lambda r: _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on),
                   reverse=True)
+
+
+def _head_credited(sched, older) -> set:
+    """Review MUSS 1: the node ids #215 credits ``older``'s lifetime price (``d_prefix_price.credited_node_ids`` with
+    the adder's own extent, ``schedule_policy._pp_load_back_extent``). Empty on any failure (nothing excluded: the
+    verdict as before -- the instrument of the walk counts its own fallbacks)."""
+    try:
+        from flliper.srt.managers.schedule_policy import _pp_load_back_extent
+        from flliper.srt.pdflip.d_prefix_price import credited_node_ids
+
+        return credited_node_ids(getattr(sched, "tree_cache", None), older, _pp_load_back_extent(older))
+    except Exception:  # noqa: BLE001
+        return set()
 
 
 #: KVD review SOLL 2: KV-trigger verdicts with younger running seats that said "nobody leaves" (per rank, cumulative;
@@ -1937,7 +1958,9 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
         if now is not None and then is not None:
             avail += now - int(then)
         reserve = view.get("reserve") or {}
-        rows = _leaving_rows(sched, young)
+        # review MUSS 1: the view's price is the adder's CREDITED price (#215 dev_gap) -- the credited gap nodes are
+        # excluded from the victims' release (else they count twice: credit now, gone once the victims alone held them)
+        rows = _leaving_rows(sched, young, _head_credited(sched, older))
         sizes = [(0 if wall else rows[i]) + int(reserve.get(str(r.rid), 0)) for i, r in enumerate(young)]
         basis = "adder"
     else:

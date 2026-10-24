@@ -254,6 +254,123 @@ def peek_admission_match(tree_cache: Any, ids: Any, extra_key: Optional[str], li
     return dev, host, key_depth
 
 
+def peek_locked_device_spans(tree_cache: Any, ids: Any, extra_key: Optional[str], limit: int
+                             ) -> List[Tuple[int, int]]:
+    """#215b FRONT-DEVICE-LOCKED: the ``[start, end)`` depth spans of ``ids``' key path whose rows are on D's device and
+    FULL-locked by another holder (``d_prefix_price.credits_row`` -- the one rule of D's lifetime-price credit
+    ``locked_device_gap``). Such rows cost the admission no allocation: below a Mamba cut the load-back MAPS them
+    (``init_load_back._collect_new_prefix_indices``), above it they are the prefix; and they are not in D's free reading
+    (a locked node is not evictable). 27B ``_1024_003732`` pdflip-18-188: the probe answered ``device=0 host=0`` (the
+    Mamba cut, ``anchor_unusable``) while the 18137-row shared system prompt stood locked on the device by three running
+    decodes -- the front priced 104476 instead of D's (#215) 86340.
+
+    READ-ONLY like :func:`peek_admission_match` (same key: bigram view, page aligned, ``limit``; same walk: a dead node
+    stops it, a partial child is not split -- its upper half ``[cum, cum + prefix_len)`` carries the child's slice and
+    lock, as ``_split_node`` would). Spans merged where adjacent. Raises like the peek (``PeekUnsupported`` on an
+    unknown component); an unreadable lock stops the walk there (``_Unreadable`` -> the spans so far)."""
+    from flliper.srt.environ import envs
+    from flliper.srt.mem_cache.radix_cache import RadixKey
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+    from flliper.srt.pdflip.d_leaving_rows import _full_cell, _Unreadable
+    from flliper.srt.pdflip.d_prefix_price import credits_row
+
+    tc = tree_cache
+    comps = tuple(getattr(tc, "_components_tuple", ()) or ())
+    unknown = {c.component_type for c in comps} - {ComponentType.FULL, ComponentType.MAMBA}
+    if unknown:
+        raise PeekUnsupported("locked spans: no read-only rule for component(s) %s" % sorted(str(k) for k in unknown))
+    if getattr(tc, "disable", False) or envs.FLLIPER_RADIX_FORCE_MISS.get():
+        return []
+    key = RadixKey(token_ids=ids, extra_key=extra_key, limit=int(limit))
+    key, _ = key.maybe_to_bigram_view(getattr(tc, "is_eagle", False))
+    page = int(getattr(tc, "page_size", 1) or 1)
+    if len(key) == 0:
+        return []
+    key = key.page_aligned(page)
+    if len(key) == 0:
+        return []
+    F = ComponentType.FULL
+    spans: List[Tuple[int, int]] = []
+
+    def _add(a: int, b: int) -> None:
+        if b <= a:
+            return
+        if spans and spans[-1][1] == a:
+            spans[-1] = (spans[-1][0], b)
+        else:
+            spans.append((a, b))
+
+    node = tc.root_node
+    child_key = key.child_key(page)
+    cum = 0
+    try:
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            ccd = child.component_data[F]
+            if ccd.value is None and ccd.host_value is None:   # dead node: the walk stops (as the peek)
+                break
+            prefix_len = child.key.match(key, page_size=page)
+            rows, lock = _full_cell(child)
+            if prefix_len < len(child.key):
+                if credits_row(rows, lock):
+                    _add(cum, cum + int(prefix_len))           # the would-be split parent: the child's slice + lock
+                break
+            if credits_row(rows, lock):
+                _add(cum, cum + int(prefix_len))
+            node = child
+            cum += prefix_len
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(page)
+    except _Unreadable:
+        pass
+    return spans
+
+
+#: #215b: the locked-span read's fallbacks by kind (``error`` / ``disagree``), cumulative per process; one line per
+#: kind at most every 10 s (KVD review MUSS 3 pattern)
+LOCKED_FALLBACKS: Dict[str, int] = {"error": 0, "disagree": 0}
+_locked_last_log: Dict[str, float] = {}
+
+
+def note_locked_fallback(kind: str, detail: str = "") -> None:
+    import logging
+    import time
+
+    LOCKED_FALLBACKS[kind] = LOCKED_FALLBACKS.get(kind, 0) + 1
+    now = time.monotonic()
+    if now - _locked_last_log.get(kind, -1e9) >= 10.0:
+        _locked_last_log[kind] = now
+        logging.getLogger(__name__).warning(
+            "D-PROBE-LOCKED-FALLBACK kind=%s n=%d %s (no locked device rows in the answer: the front prices as before)",
+            kind, LOCKED_FALLBACKS[kind], detail[:160])
+
+
+def locked_rows_within(spans: Sequence[Sequence[int]], end: int) -> int:
+    """#215b: rows of ``spans`` inside ``[0, end)``."""
+    return sum(max(0, min(int(b), int(end)) - int(a)) for a, b in spans if int(a) < int(end))
+
+
+def locked_rows_continued(spans: Sequence[Sequence[int]], covered: int) -> int:
+    """#215b review SOLL 2: the rows of the locked spans that END BEFORE ``covered`` -- only there does the priced cover
+    continue past them (a host/store tail D loads back, so its load-back MAPS the gap, #215 ``locked_device_gap``
+    counts only inside that extent). A span reaching ``covered`` has no continuation: D recomputes it (the first turn of
+    a new session whose cached part is just the shared prompt) -- it is not credited."""
+    return sum(int(b) - int(a) for a, b in spans if int(b) < int(covered))
+
+
+def locked_agreed(locked, g_ok, g_min, g_max, rid, fp_min=None, fp_max=None):
+    """#215b (D-PROBE GROUP-MIN, SOLL R11): the group's locked device spans -- this rank's, when every rank read them
+    (``g_ok``), the group's MIN of the locked rows equals its MAX, and (review SOLL 3) the fingerprint (the sum of the
+    span ends) agrees too; else None (not read: the front prices as before), the disagreement named rate-limited."""
+    if not int(g_ok):
+        return None
+    if int(g_min) != int(g_max) or (fp_min is not None and int(fp_min) != int(fp_max)):
+        note_locked_fallback("disagree", "rid=%s rows %d..%d fp %s..%s" % (rid, int(g_min), int(g_max), fp_min, fp_max))
+        return None
+    return [list(x) for x in locked]
+
+
 def match_numbers(match_result: Any) -> Tuple[int, int, int]:
     """(device tokens, host-tier tokens, key depth) of a ``MatchResult`` -- the admission's usable prefix is
     ``device + host`` (``Req.init_next_round_input``: prefix_indices + host_hit_length)."""
@@ -282,6 +399,11 @@ class ProbeAnswer:
     #: VISION-ROWS (rc30 visiontail): the image spans ([start, end), as ``mm_spans``) whose tower rows P published
     #: to the shared store (``vision_row_store``) -- D computes those positions itself, so they are no P-only tail
     mm_rows: Tuple[Tuple[int, int], ...] = ()
+    #: #215b: the depth spans whose rows are on D's device and FULL-locked by another holder (group-agreed,
+    #: ``peek_locked_device_spans``); ``device_locked_known`` False: a D build without the field (the front then prices
+    #: as before)
+    device_locked_spans: Tuple[Tuple[int, int], ...] = ()
+    device_locked_known: bool = False
 
     @property
     def n(self) -> int:
@@ -307,7 +429,10 @@ def parse_answer(body: Any) -> Optional[ProbeAnswer]:
                            handle_ms=float(body.get("handle_ms", 0.0) or 0.0),
                            total_ms=float(body.get("total_ms", 0.0) or 0.0),
                            extra_key=(None if body.get("extra_key") is None else str(body.get("extra_key"))),
-                           extra_key_known="extra_key" in body, mm_rows=rows)
+                           extra_key_known="extra_key" in body, mm_rows=rows,
+                           device_locked_spans=tuple((int(a), int(b))
+                                                     for a, b in (body.get("device_locked_spans") or ())),
+                           device_locked_known="device_locked_spans" in body)
     except (TypeError, ValueError, KeyError):
         return None
 
@@ -389,6 +514,10 @@ class ExactPrice:
     src: str
     #: VISION-ROWS: images ending past ``covered`` whose rows P published -- D computes them, no P-only
     tail_rows: int = 0
+    #: #215b: D's device-resident rows another holder keeps FULL-locked, inside ``covered`` (the load-back maps them,
+    #: or they are the prefix) -- they cost D's admission no allocation and are not in D's free reading. None: a D
+    #: build without the field (the front prices as before)
+    device_locked: Optional[int] = None
 
 
 def exact_price(ans: ProbeAnswer, store_tokens: int) -> ExactPrice:
@@ -405,9 +534,11 @@ def exact_price(ans: ProbeAnswer, store_tokens: int) -> ExactPrice:
     past = [(int(a), int(b)) for a, b in ans.mm_spans if int(b) > covered]
     tail = any(s not in rows for s in past)
     src = "d_tree" if tree >= store and tree > 0 else ("store" if store > 0 else "none")
+    locked = (locked_rows_continued(getattr(ans, "device_locked_spans", ()) or (), covered)
+              if getattr(ans, "device_locked_known", False) else None)
     return ExactPrice(uncached=max(0, n - covered), uncached_p=max(0, n - store), covered=covered,
                       tree_tokens=tree, store_tokens=store, image_in_tail=bool(tail), src=src,
-                      tail_rows=sum(1 for s in past if s in rows))
+                      tail_rows=sum(1 for s in past if s in rows), device_locked=locked)
 
 
 def class_uncached(price: ExactPrice) -> int:

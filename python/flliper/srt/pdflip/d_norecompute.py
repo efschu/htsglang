@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,57 @@ def enabled(env=None) -> bool:
     e = os.environ if env is None else env
     raw = (e.get(ENV, "") or "").strip().lower()
     return raw not in ("0", "false", "no", "off")
+
+
+def span_base(req: Any, record: Any) -> int:
+    """SHORT-FLIP-REPRICE-1024 (SOLL R2/R7/R11; 27B rc41 boot ..._1024_110644, D 11:40:21-22, pdflip-21-215): the
+    absolute prompt depth at which ``record``'s store read STARTED. A ``PrefetchOutcome`` counts span-relative --
+    ``deliverable`` is ``len(prefetch_key)`` and ``materialized = matched + loaded`` is measured from the span start
+    (``unified_radix_cache``: ``loaded = min_completed - insert_result.prefix_len``, the insert rooted at the span's
+    host node). Every reader of the store-short witness (``_pdflip_store_delivered``: ``d_would_compute``, the settle
+    remainder, the tail-adopt window, the capacity park, the P-span label) reads an ABSOLUTE depth. 215 kept 53750
+    tokens on D's device across the flip, read [53750, 70994), got 17091 of 17244, and the witness 17091 was taken as
+    the depth -- ``would_compute=53908`` instead of 158, over the front X: D-NORECOMPUTE wrote a needs-p, the front
+    classed a kurz request gross and P prefilled 158 tokens.
+
+    Review MUSS-1: the start is the RECORD's own (``record.span_start``, copied from the read's operation, stamped once
+    at registration), never the request's ``_prefetch_registered_prefix_len`` -- every later ``_prefetch_kvcache`` call
+    (deferral retry, #1456 HOLD-REFETCH, a declined re-issue, regroup) rewrites that stamp while the old record stands
+    (215 itself: D 11:41:02 ``#1456 HOLD-REFETCH ... declined:vote_negative``), and a rank-local re-match makes it
+    differ per rank (R11). ``req`` is kept for the defensive bound only.
+
+    0 for a Form A END-vote read (``synced_end`` is absolute already), a bare ``int`` record, a record without a start,
+    or a start that cannot be this read's (start + deliverable beyond the request's ids): the old reading."""
+    if record is None or getattr(record, "synced_end", None) is not None or not hasattr(record, "materialized"):
+        return 0
+    try:
+        base = int(getattr(record, "span_start", None) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if base <= 0:
+        return 0
+    ids = getattr(req, "full_untruncated_fill_ids", None)
+    try:
+        total = len(ids) if ids is not None else None
+        deliverable = int(getattr(record, "deliverable", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if total is not None and base + deliverable > total:
+        return 0   # not this read's start: never invent a depth the request does not have
+    return base
+
+
+def store_read_depth(req: Any, record: Any) -> Optional[int]:
+    """SHORT-FLIP-REPRICE-1024: the ABSOLUTE prompt depth ``record``'s store read left resident -- the END-vote's
+    reduced ``synced_end`` when present, else :func:`span_base` + ``materialized``. None = no annotated record."""
+    if record is None:
+        return None
+    se = getattr(record, "synced_end", None)
+    if se is not None:
+        return int(se)
+    if not hasattr(record, "materialized"):
+        return None
+    return span_base(req, record) + int(getattr(record, "materialized", 0) or 0)
 
 
 def refresh_delivered(req: Any, record: Any) -> bool:
@@ -70,8 +121,8 @@ def refresh_delivered(req: Any, record: Any) -> bool:
         return False
     if int(getattr(record, "deliverable", 0) or 0) <= 0 or getattr(record, "is_incomplete", True):
         return False
-    se = getattr(record, "synced_end", None)
-    now = int(se) if se is not None else int(getattr(record, "materialized", 0) or 0)
+    # SHORT-FLIP-REPRICE-1024: the record's ABSOLUTE depth (END vote, else span start + materialized)
+    now = int(store_read_depth(req, record) or 0)
     if now <= int(old):
         return False
     req._pdflip_store_delivered = now

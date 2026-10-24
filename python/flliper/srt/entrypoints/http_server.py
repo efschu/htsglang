@@ -1620,6 +1620,9 @@ async def pdflip_match_probe(raw_request: Request):
             "key_match_depth": int(out.key_match_depth),
             "mm_spans": [list(x) for x in (out.mm_spans or ())],
             "mm_rows": _mm_rows,
+            # #215b: locked device rows (spans) -- only when the scheduler read them (an old answer has no key)
+            **({"device_locked_spans": [list(x) for x in out.device_locked_spans]}
+               if getattr(out, "device_locked_spans", None) is not None else {}),
             # S63 F1: D's namespace of this prompt -- with D's ids the admission key, so the front's re-probe at the
             # set verdict asks the tree again without a second tokenization here
             "extra_key": getattr(tokenized, "extra_key", None),

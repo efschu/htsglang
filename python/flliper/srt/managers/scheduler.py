@@ -2154,6 +2154,19 @@ def _s88_deferred_reachability(scheduler, scanned_ids) -> None:
         said.clear()
 
 
+
+def _dmp_probe_locked_spans(tc, ids, extra_key, limit):
+    """#215b: ``(spans, ok)`` -- ``d_match_probe.peek_locked_device_spans``; a failure is ``([], 0)``, named
+    (rate-limited) and never the probe's failure (the front then prices as before)."""
+    from flliper.srt.pdflip import d_match_probe as _dmp
+
+    try:
+        return [tuple(x) for x in _dmp.peek_locked_device_spans(tc, ids, extra_key, limit)], 1
+    except Exception as e:  # noqa: BLE001
+        _dmp.note_locked_fallback("error", f"{type(e).__name__}: {str(e)[:120]}")
+        return [], 0
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -9337,7 +9350,7 @@ class Scheduler(
                                                  it.get("extra_key"), it.get("tokenize_ms"))
                 answers.append({f: getattr(o, f) for f in (
                     "rid", "success", "message", "input_ids", "device_tokens", "host_tokens", "key_match_depth",
-                    "mm_spans", "handle_ms", "tokenize_ms")})
+                    "mm_spans", "device_locked_spans", "handle_ms", "tokenize_ms")})
             out.batch = wrap_as_pickle(answers)
         return out
 
@@ -9411,21 +9424,29 @@ class Scheduler(
         ok, total, dev_l, key_l, err = 1, 0, 0, 0, ""
         ids: Any = array("q")
         spans: List[List[int]] = []
+        locked, lk_ok, lk_tot, lk_fp = [], 0, 0, 0
         try:
             ids, spans = self._pdflip_match_probe_pad(rid, input_ids, mm_inputs, extra_key)
             n = len(ids)
             if n > 1:
                 dev, host, key_l = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
                 dev_l, total = int(dev), int(dev) + int(host)
+                locked, lk_ok = _dmp_probe_locked_spans(tc, ids, extra_key, n - 1)
+                lk_tot = sum(int(b) - int(a) for a, b in locked)
+                lk_fp = sum(int(b) for _a, b in locked)   # review SOLL 3: the span ends, a fingerprint of WHERE
         except Exception as e:  # noqa: BLE001 -- named below; the reduce is still entered
             ok, err = 0, f"{type(e).__name__}: {str(e)[:160]}"
-        vals = [int(ok), int(total), int(dev_l), int(key_l)]
+        # #215b (SOLL R11): the locked device rows ride the SAME MIN reduce -- read ok on every rank, and the group's
+        # MIN equal to its MAX (one negated slot): the ranks agree, TP0's spans are the group's; else no number
+        vals = [int(ok), int(total), int(dev_l), int(key_l), int(lk_ok), int(lk_tot), -int(lk_tot), int(lk_fp),
+                -int(lk_fp)]
         grp = getattr(self, "tp_cpu_group", None)
         if grp is not None and torch.distributed.get_world_size(grp) > 1:
             t = torch.tensor(vals, dtype=torch.int64)
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
             vals = [int(v) for v in t.tolist()]
-        g_ok, g_total, g_dev, g_key = vals
+        g_ok, g_total, g_dev, g_key, g_lk_ok, g_lk_min, g_lk_negmax, g_fp_min, g_fp_negmax = vals
+        g_locked = _dmp.locked_agreed(locked, g_lk_ok, g_lk_min, -g_lk_negmax, rid, g_fp_min, -g_fp_negmax)
         if not g_ok:
             if err:
                 logger.warning("PDFLIP D-MATCH-PROBE FAILED rid=%s %s", rid, err)
@@ -9444,6 +9465,7 @@ class Scheduler(
             host_tokens=int(g_total - g_dev),
             key_match_depth=int(g_key),
             mm_spans=spans,
+            device_locked_spans=g_locked,
             handle_ms=(time.perf_counter() - t0) * 1000.0,
             tokenize_ms=float(tokenize_ms or 0.0),
         )
@@ -9458,11 +9480,16 @@ class Scheduler(
             ids, spans = self._pdflip_match_probe_pad(rid, input_ids, mm_inputs, extra_key)
             n = len(ids)
             dev = host = key_depth = 0
+            locked = None
             tc = getattr(self, "tree_cache", None)
             if n > 1 and tc is not None:
                 if not this_rank_follows():  # a Form A worker's anchors are bookkeeping: it adopts the host's depth
                     # the admission's key: the whole ids, limit = _compute_max_prefix_len (n - 1)
                     dev, host, key_depth = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
+                    # #215b: TP0's locked spans ARE the group's here, by the rule that makes its dev/host the group's
+                    # (Form A: the host's tree decides; symmetric tier: replicated trees and lock walks)
+                    _lk, _lk_ok = _dmp_probe_locked_spans(tc, ids, extra_key, n - 1)
+                    locked = [list(x) for x in _lk] if _lk_ok else None
             return PdFlipMatchProbeReqOutput(
                 rid=rid,
                 success=True,
@@ -9471,6 +9498,7 @@ class Scheduler(
                 host_tokens=int(host),
                 key_match_depth=int(key_depth),
                 mm_spans=spans,
+                device_locked_spans=locked,
                 handle_ms=(time.perf_counter() - t0) * 1000.0,
                 tokenize_ms=float(tokenize_ms or 0.0),
             )
@@ -17197,6 +17225,18 @@ class Scheduler(
             deliverable = (int(_dend) if _dend is not None
                            else deliverable + int(_synced_end) - int(outcome.synced))
             delivered = int(_synced_end)
+        # SHORT-FLIP-REPRICE-1024 (SOLL R2/R7/R11; 27B rc41 D 11:40:21-22, pdflip-21-215): off the END vote the
+        # record is SPAN-RELATIVE (deliverable = len(span), materialized from the span start), while every reader
+        # of the witness takes it as the ABSOLUTE depth. 215 read [53750, 70994) behind its L1.5-retained device
+        # prefix and got 17091: the witness said 17091, D-NORECOMPUTE priced 70999 - 17091 = 53908 > front X and
+        # sent a kurz request (real remainder 158) through P. The span start is added here (0 = the old reading:
+        # END vote, no stamp, a span from 0, or a stamp that cannot be this read's start).
+        from flliper.srt.pdflip import d_norecompute as _dnr_w
+
+        _base = _dnr_w.span_base(req, outcome)
+        if _base:
+            delivered += _base
+            deliverable += _base
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
@@ -17209,8 +17249,9 @@ class Scheduler(
         self._pdflip_store_short_seen = getattr(self, "_pdflip_store_short_seen", 0) + 1
         # DASHBOARD-AUS-IPC (30.09., FEHLT 5): the tokens these incomplete reads
         # delivered and could have delivered, summed (rankstats cache block)
-        self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered
-        self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable
+        # (store tokens: the span start a SHORT-FLIP-REPRICE base added is device-resident, not read)
+        self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered - _base
+        self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable - _base
         n = self._pdflip_store_short_seen
         # S18 (h16v3 1017_224250, pdflip-1-14/-15/-16): the store HELD the whole span (the probe's hit covers the
         # deliverable prefix; TAIL-CONSUME hit=118400) and D's read was cut by its own full arena (PDFLIP-READ-DEPTH

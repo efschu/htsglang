@@ -63,6 +63,9 @@ def three_ranks(monkeypatch):
         assert op == torch.distributed.ReduceOp.MIN
         mine = [int(v) for v in t.tolist()]
         peer = others.pop(0) if others else [mine, mine]
+        # #215b: the probe's vector carries three more slots (locked rows read ok, MIN, negated MAX); a peer given
+        # with the four of 1021 agrees with this rank on them
+        peer = [list(p) + mine[len(p):] for p in peer]
         calls.append((mine, peer))
         red = [min(a, *(p[i] for p in peer)) for i, a in enumerate(mine)]
         t.copy_(torch.tensor(red, dtype=torch.int64))

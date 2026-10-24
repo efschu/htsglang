@@ -4957,6 +4957,10 @@ def _decode_collect_window_s() -> float:
     except (TypeError, ValueError):
         return 0.0
 
+#: SHORT-FLIP-REPRICE-1024: the ``u_src`` of a RESUME-VIA-P leg classed on its ARRIVAL u (``Front._rvp_unrun_kurz_u``)
+RVP_U_SRC_ARRIVAL = "d_probe_arrival"
+
+
 def _dual_decode_collect_window_s() -> float:
     """27B DUAL (port 20.10.): the dual layout keeps the 27B DECODE-COLLECT window -- 15 s, the 27B
     default before the port -- unless FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S names one. The flip form
@@ -5972,7 +5976,11 @@ class Front:
                 if _usrc == "unpriced":
                     self.counters["rvp_text_unpriced"] = self.counters.get("rvp_text_unpriced", 0) + 1
                     _cls = "unpriced"  # B5: the line never says kurz for an entry that has no number
-                if str(r.get("reason", "")) == _rvp.REASON_WALL:
+                if _usrc == RVP_U_SRC_ARRIVAL:
+                    # SHORT-FLIP-REPRICE-1024: the leg's ids are the probed prompt (it never ran) -- D's number NOW on them
+                    Front._rvp_reprice_start(self, rid, p, ids=ids, extra_key=payload.get("extra_key"),
+                                             site="rvp_store_short")
+                elif str(r.get("reason", "")) == _rvp.REASON_WALL:
                     # NF-VISION-CACHED A2: the arrival's S63 key asks on the PROMPT ids -- applied to this leg it would drop
                     # the streamed output. The leg's own key (its context ids) replaces it when its exact number lands.
                     _rb = self.__dict__.get("_reprobe_book")
@@ -6052,9 +6060,95 @@ class Front:
         WENN DAS BILD UND DER GANZE KONTEXT GECACHT IST"): the rows are NEVER a class -- the interim class of
         ``_wall_interim`` (kurz or unpriced), and D's exact number on the leg's context ids NOW (``_rvp_reprice``)."""
         d_ext = int(rec.get("d_extent") or len(rec.get("input_ids") or ()))
-        if str(rec.get("reason", "")) != _rvp.REASON_WALL:
-            return d_ext, "d_extent"
-        return Front._wall_interim(self, rid, len(rec.get("input_ids") or ()), d_ext)
+        if str(rec.get("reason", "")) == _rvp.REASON_WALL:
+            return Front._wall_interim(self, rid, len(rec.get("input_ids") or ()), d_ext)
+        u_arr = Front._rvp_unrun_kurz_u(self, rid, rec, d_ext)
+        if u_arr is not None:
+            return u_arr, RVP_U_SRC_ARRIVAL
+        return d_ext, "d_extent"
+
+    #: SHORT-FLIP-REPRICE-1024 review SOLL-3: arrival prices kept (bounded, oldest out)
+    ARRIVAL_PRICES_KEPT = 4096
+
+    def _note_arrival_price(self, rid: str, xp: Any) -> None:
+        """SHORT-FLIP-REPRICE-1024 review SOLL-3: D's exact price of ``rid`` AT ITS ARRIVAL, written once (the arrival
+        D-PROBE, or the NF-1b late answer of that same probe). ``_probe_price`` is the LATEST price (SET-REPROBE and
+        ``_rvp_reprice`` overwrite it); the arrival class (SOLL R1, the one single-request decision) needs this one.
+        Never raises."""
+        try:
+            book = self.__dict__.setdefault("_arrival_price", collections.OrderedDict())
+            if str(rid) in book:
+                return
+            book[str(rid)] = xp
+            while len(book) > Front.ARRIVAL_PRICES_KEPT:
+                book.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- an instrument book
+            pass
+
+    def _arrival_placed(self, p: "Pending") -> str:
+        """SHORT-FLIP-REPRICE-1024 question (1): where an arrival that fell through the seat path STANDS, for the
+        ``PDFLIP-ROUTE ... BATCH queued`` line, which is written after every placement branch -- also after SHORT-IN-FLIP
+        put the entry into D's admission line (215: ``ARRIVAL-SEAT ... SHORT-IN-FLIP`` and ``BATCH queued (awake=P ...
+        queue=0)`` read as a double enqueue; it was one entry, in ``_ready_for_d``). ``d_line`` / ``queue`` /
+        ``none`` (by identity: ``Pending.__eq__`` compares fields). Instrument only."""
+        try:
+            if any(x is p for x in (getattr(self, "_ready_for_d", None) or ())):
+                return "d_line"
+            if any(x is p for x in (getattr(self, "queue", None) or ())):
+                return "queue"
+        except Exception:  # noqa: BLE001 -- an instrument
+            return "?"
+        return "none"
+
+    def _rvp_unrun_kurz_u(self, rid: str, rec: dict, d_ext: int) -> Optional[int]:
+        """SHORT-FLIP-REPRICE-1024 (SOLL R1 "ausser der Einstufung bei Ankunft", R2, R7, R11; 27B rc41 boot
+        ..._1024_110644, pdflip-21-215): the arrival u of a request D sent back with ``store_short_after_flip`` BEFORE it
+        ran -- or None (the leg keeps D's extent as before).
+
+        215 arrived kurz on D's exact number (D-PROBE u=865: device 53750 + store 70134, tier l2_arena; CLASSIFY R2), was
+        admitted on D, and D's settle answered ``d_extent=53908`` -- a store-read count taken as a prompt depth (the D
+        half of this fix, ``d_norecompute.span_base``). The front classed the leg on that number: ``RESUME-VIA-P CLASS
+        u=53908 class=gross`` -> ``SET-VERDICT ... COLLECT R4`` for a request whose remainder was 158 (SET-REPROBE 865 ->
+        158 five seconds later; P computed 158). A d_extent that contradicts the arrival class of a request that never
+        produced a token is no class number: the arrival u stands (kurz: no set member, no flip reason) and D's exact
+        number NOW follows (``_rvp_reprice``, started by the caller) -- the S63 rule, the verdict on D's number now.
+
+        Only for: reason ``store_short_after_flip``; the FIRST P leg (``attempt == 1``); the rid's ARRIVAL D price
+        (``_arrival_price``, write-once -- not ``_probe_price``) known, kurz at its X, no image in the
+        uncached tail; the leg's context ids exactly the probed prompt (nothing decoded: a PARKED decode resumed after a
+        flip is the other family -- its device copy is gone with the sleep and its extent is real, measured: P computed
+        the d_extent in 18 of 18 such legs on 24.10.); and d_extent at or above that request's halbX (a d_extent that
+        is itself kurz needs no override)."""
+        try:
+            from flliper.srt.pdflip import d_norecompute as _dnr
+
+            if str(rec.get("reason", "")) != _dnr.REASON:
+                return None
+            if int(rec.get("attempt") or 1) != 1:
+                return None   # review SOLL-3: a second P leg follows a P leg that ran -- D's extent stands
+            # review SOLL-3: the ARRIVAL price (write-once), never ``_probe_price`` -- SET-REPROBE and ``_rvp_reprice``
+            # overwrite that one with the latest price on the latest ids (a decoded request's leg ids would then match)
+            xp = (self.__dict__.get("_arrival_price") or {}).get(str(rid))
+            if xp is None or bool(getattr(xp, "image_in_tail", False)):
+                return None
+            n_ctx = len(rec.get("input_ids") or ())
+            if not n_ctx or int(xp.covered) + int(xp.uncached) != n_ctx:
+                return None   # streamed output past the probed prompt (a resumed decode) or other ids
+            u = int(_dmp.class_uncached(xp))
+            x = int(Front._x_at_depth(self, max(0, n_ctx - u)))
+            frac = Front._set_cfg()[0]
+            if phase_policy.classify_arrival(u, x, frac, False) != phase_policy.CLASS_KURZ:
+                return None
+            if int(d_ext) < phase_policy.half_x_of(x, frac):
+                return None   # D's extent is kurz itself: nothing to override
+        except Exception:  # noqa: BLE001 -- no number: D's extent as before
+            return None
+        self.counters["rvp_unrun_kurz_kept"] = self.counters.get("rvp_unrun_kurz_kept", 0) + 1
+        logger.warning("RESUME-VIA-P KURZ-KEPT rid=%s u=%d d_extent=%d reason=%s -- D sent back a request that never ran "
+                       "with an extent its arrival class (kurz, D's exact number at the arrival) contradicts: the arrival "
+                       "u stands, no set member, no flip reason (SOLL R1 R2 R7); D's exact number NOW follows",
+                       rid, u, int(d_ext), rec.get("reason", "?"))
+        return u
 
     #: NF-VISION-CACHED A3: pause between two rounds of an unpriced wall request's exact number (each round itself is
     #: bounded by the probe deadline and two store reads)
@@ -8003,6 +8097,7 @@ class Front:
                 _pbook[str(rid)] = _xp
                 while len(_pbook) > 4096:
                     _pbook.popitem(last=False)
+                Front._note_arrival_price(self, rid, _xp)  # SHORT-FLIP-REPRICE-1024 review SOLL-3 (NF-1b late arrival)
                 Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
                     ids=ans.ids, spans=tuple(ans.mm_spans), rows=tuple(ans.mm_rows), extra_key=ans.extra_key,
                     extra_key_known=bool(ans.extra_key_known), path=str(path),
@@ -8272,6 +8367,7 @@ class Front:
             _pbook[str(rid)] = _xp  # a later D refusal of this rid knows P's exact number (W123 requeue)
             while len(_pbook) > 4096:
                 _pbook.popitem(last=False)
+            Front._note_arrival_price(self, rid, _xp)  # SHORT-FLIP-REPRICE-1024 review SOLL-3: write-once
             # S63 F1: the key of this price, for the re-probe right before a set verdict that flips or assigns P
             Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
                 ids=_probe.ids, spans=tuple(_probe.mm_spans), rows=tuple(_probe.mm_rows), extra_key=_probe.extra_key,
@@ -8284,12 +8380,13 @@ class Front:
                 self.counters["d_probe_image_in_tail"] += 1
             logger.info("PDFLIP D-PROBE rid=%s n=%d device=%d host=%d store=%d tier=%s covered=%d uncached_d=%d "
                         "uncached_p=%d image_in_tail=%d tail_rows=%d images=%d class_u=%d ledger_pending=%d ledger_src=%s "
-                        "front_n=%s tokenize_ms=%.1f handle_ms=%.1f probe_ms=%.1f (S56: the class from D's exact "
-                        "numbers, R11 -- the front decides)",
+                        "front_n=%s device_locked=%s tokenize_ms=%.1f handle_ms=%.1f probe_ms=%.1f (S56: the class "
+                        "from D's exact numbers, R11 -- the front decides)",
                         rid, int(c.n), int(_probe.device_tokens), int(_probe.host_tokens), int(_xp.store_tokens),
                         tier, int(_xp.covered), int(_xp.uncached), int(_xp.uncached_p), int(_xp.image_in_tail),
                         int(_xp.tail_rows), len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
-                        (int(_c_front.n) if _c_front is not None else "-"), _probe.tokenize_ms,
+                        (int(_c_front.n) if _c_front is not None else "-"),
+                        ("-" if _xp.device_locked is None else int(_xp.device_locked)), _probe.tokenize_ms,
                         _probe.handle_ms, _probe.total_ms)
         # STOREREAD-1023: a request that asks input logprobs from position s is computed on D from s on, whatever
         # the store holds (Req._compute_max_prefix_len) -- the exact uncached count (order 19.10. "nichts schaetzen")
@@ -12992,11 +13089,12 @@ class Front:
         self._arm_client_watch(request, rid, p)  # H102
         _bq_src, _bq_class = Front._batch_queued_basis(self, _xx, remainder, _x_set, bool(p.p_only))
         logger.info("PDFLIP-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d "
-                    "u_src=%s class=%s p_phase_rider=%d) -- remainder is u, the number the class stands on (S105: "
+                    "u_src=%s class=%s p_phase_rider=%d) placed=%s -- remainder is u, the number the class stands on (S105: "
                     "est_prompt is the whole prompt, never the class basis; p_phase_rider=1 = a kurz request in P's "
-                    "phase joins P's batch, P-BATCH-ALL user 02.10. / SOLL R1a, not a flip under X)",
+                    "phase joins P's batch, P-BATCH-ALL user 02.10. / SOLL R1a, not a flip under X; placed= where the "
+                    "entry stands, d_line = D's admission line, never P's queue)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue),
-                    _bq_src, _bq_class, int(bool(_p_phase and short_ok)))
+                    _bq_src, _bq_class, int(bool(_p_phase and short_ok)), Front._arrival_placed(self, p))
         self._maybe_ple_admit_hint(p)  # fnFL2 H43
         try:
             await fut  # leg 1 done and D awake
@@ -17116,6 +17214,18 @@ class Front:
             running = False
         return _asr.shared_prefix_credit(est_prompt, uncached, common, running)
 
+    def _asr_device_locked(self, rid: Optional[str]) -> Optional[int]:
+        """#215b: D's locked device rows of ``rid``'s prompt inside its priced covered depth, from the D-PROBE answer the
+        price was taken on (``_probe_price``, ``d_match_probe.ExactPrice.device_locked``: group-agreed on D, R11).
+        None: no probe price, or a D build without the field -- the front prices as before."""
+        if rid is None:
+            return None
+        xp = (self.__dict__.get("_probe_price") or {}).get(str(rid))
+        v = getattr(xp, "device_locked", None) if xp is not None else None
+        if v is None or isinstance(v, bool) or not isinstance(v, int):
+            return None
+        return max(0, int(v))
+
     async def _arrival_seat_kv(self, est_prompt: int, max_tokens: Optional[int],
                                rid: Optional[str] = None,
                                uncached: Optional[int] = None) -> Tuple[bool, str, int]:
@@ -17165,6 +17275,17 @@ class Front:
         }
         _d_has = (None if basis["running"] is None else basis["running"] | basis["admitted"])
         shared = self._asr_shared_credit(rid, est_prompt, uncached, _d_has)
+        # #215b FRONT-DEVICE-LOCKED (SOLL R7, R11): D's device rows another holder keeps FULL-locked inside the price's
+        # covered depth cost D's admission no allocation (#215 ``locked_device_gap``: the load-back maps them below the
+        # Mamba cut) and are not in D's free reading -- the larger of the two credits. 27B ``_1024_003732`` 18-188:
+        # need 104476 (shared 0, D-PROBE device=0 from the Mamba cut) instead of 86340 (18137 locked prompt rows).
+        _locked = Front._asr_device_locked(self, rid)
+        _locked_credit = 0
+        if _locked is not None and int(_locked) > shared:
+            shared = min(max(0, int(est_prompt or 0)), int(_locked))
+            _locked_credit = shared
+            self.counters["arrival_seat_kv_device_locked_credit"] += 1
+        basis["locked_credit"] = int(_locked_credit)   # review SOLL 1 (a): an AGE PLAN grant on it is counted
         # KVOFFSET-1024: + what D's gate adds to extend + clip (one page, the Mamba gap; ``pdflip_kv.price_extra``)
         need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode) + _asr.price_extra(reading)
         # KVOFFSET-1024 (class B, SOLL R5/R11): the burst debit for EVERY KV test, not only the D line's -- rows the
@@ -17408,6 +17529,11 @@ class Front:
                                   head_lane=Front._prio_lane(self, head_rid), **_kw_set(freed_of=freed_of))
         Front._asr_note_kvd_none(self, st, head_rid, plan, head_arrival, seat_is_free, deficit, running, arrivals,
                                  seat_tokens, basis)
+        if plan and int(basis.get("locked_credit", 0) or 0) > 0:
+            # review SOLL 1 (a) (#215b x KVD): a displacement planned on a need that credits D's locked device rows --
+            # if the victims alone hold those rows, the release counts them a second time; D's verdict excludes them
+            # (review MUSS 1) and answers "nobody leaves" (``pdflip_kv.displace_nobody_leaves``): set the two side by side
+            self.counters["arrival_seat_age_plan_locked_credit"] += 1
         plans = st.setdefault("age_plan", {})
         key = "none" if plan is None else ("fits" if not plan else "displace")
         if plans.get(head_rid) != key:

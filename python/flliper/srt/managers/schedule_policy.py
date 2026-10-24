@@ -244,6 +244,7 @@ from flliper.srt.runtime_context import get_server_args
 from flliper.srt.server_args import ServerArgs
 from flliper.srt.pdflip import tail_adopt
 from flliper.srt.pdflip import d_admit_refusal as _d_admit_refusal
+from flliper.srt.pdflip import d_prefix_price as _d_prefix_price  # D-PREFIX-PRICE 1024 (#215)
 from flliper.srt.pdflip import tail_handoff
 from flliper.srt.managers import anchor_tails as _anchor_tails
 
@@ -3286,11 +3287,18 @@ class PrefillAdder:
         # the load-back writes those rows into the device pool at admission. Crediting it would admit
         # rows the pool does not have (pdflip-30-274: 58910 load-back rows vs available=42809) -- the
         # KV-OOM direction. The refusal stamp names host_hit/load_back (`_lifetime_load_back_terms`).
+        # #215 (review SOLL 5) is no contradiction: only the LOCKED DEVICE rows of the gap below a mamba-cut
+        # ``last_node`` leave the price (``dev_gap`` below, named in the same stamp) -- they are on the device
+        # already and the load-back maps them; host rows never leave it.
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        # D-PREFIX-PRICE 1024 (#215, SOLL R7/R11; 27B _1024_003732 pdflip-18-188 price 104477 = 18137 too high):
+        # the device rows the load-back MAPS without allocating -- below a mamba-cut ``last_node``, locked by another
+        # holder (not in the budget, secured until this admission's own lock). 0 without a load-back / unreadable.
+        dev_gap = _d_prefix_price.locked_device_gap(self.tree_cache, req, _pp_load_back_extent(req))
         # KVOFFSET-1024: the one price formula (D's pressure-park resume test reads the same, d_seats.admission_gate)
-        total_tokens = lifetime_price(cand_extend_input_len, req, self.page_size)
+        total_tokens = lifetime_price(cand_extend_input_len - dev_gap, req, self.page_size)
         # Upstream #36415: read the request's mamba debits BEFORE
         # `init_load_back` below -- a host load-back binds `req.mamba_pool_idx`
         # (MambaComponent.build_hicache_transfers), after which both helpers
@@ -3314,9 +3322,10 @@ class PrefillAdder:
         if _pdflip_chunk_admit() and not getattr(req, "pdflip_parked_span", 0):
             from flliper.srt.pdflip.park import chunk_admit_tokens as _cat
             # Q-700: the host load-back is not chunked -- charged whole
+            # D-PREFIX-PRICE: the mapped device gap leaves the extend and the whole-charged load-back alike
             total_tokens = (
-                _cat(cand_extend_input_len, self.rem_chunk_tokens,
-                     load_back=int(_pp_load_back_extent(req) or 0))
+                _cat(cand_extend_input_len - dev_gap, self.rem_chunk_tokens,
+                     load_back=max(0, int(_pp_load_back_extent(req) or 0) - dev_gap))
                 + max_new + self.page_size + mamba_gap_reserve
             )
         # Prefill-Spill (PS1-V1a): the born-spilled current-step demand is the
@@ -3372,6 +3381,8 @@ class PrefillAdder:
                     max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
                     prefix=prefix_len, host_hit=_lb_host_hit, load_back=_lb_load_back,
                 )
+                if dev_gap:  # D-PREFIX-PRICE: named only when credited (the line stays byte-identical otherwise)
+                    _gate_nums["dev_gap"] = int(dev_gap)
 
         if _gate is None and self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
@@ -3429,6 +3440,8 @@ class PrefillAdder:
                         max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
                         prefix=prefix_len, host_hit=_lb_host_hit, load_back=_lb_load_back,
                     )
+                    if dev_gap:  # D-PREFIX-PRICE: named only when credited (the line stays byte-identical otherwise)
+                        _gate_nums["dev_gap"] = int(dev_gap)
 
             if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(

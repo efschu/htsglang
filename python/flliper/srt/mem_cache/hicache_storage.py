@@ -1252,6 +1252,11 @@ class PrefetchOutcome(int):
         self.matched = int(matched if matched is not None else 0)
         self.deliverable = int(deliverable if deliverable is not None else 0)
         self.synced = int(synced if synced is not None else 0)
+        # SHORT-FLIP-REPRICE-1024 review MUSS-1: the ABSOLUTE prompt depth this read's span STARTED at, copied from
+        # its own operation at the record write (``_pdflip_span_start``, stamped once at registration) -- never from the
+        # request, whose stamp every later ``_prefetch_kvcache`` call rewrites while this record still stands. None =
+        # unknown (the readers then keep the span-relative reading). Not pickled (like ``synced_end``).
+        self.span_start = None
         return self
 
     @property
