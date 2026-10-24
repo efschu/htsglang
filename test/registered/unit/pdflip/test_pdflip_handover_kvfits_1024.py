@@ -387,3 +387,100 @@ def test_m_two_hand_offs_are_not_priced_against_the_same_free_rows(caplog):
             await _drop(adm)
 
     asyncio.run(body())
+
+
+# ------------------------------------------------------------------------- review A1-A3, S1, S3 (R2/R7, R5)
+def test_n_the_d_line_behind_a_kv_held_head_does_not_hold_a_kurz_arrival():
+    """Review A1 (R2/R7): [held head, an older-than-the-arrival hand-off that does not fit either] -- the kurz
+    arrival is held by neither at the short gate (before: it waited for the second entry, then P after the deadline)."""
+    async def body():
+        f = _front({"kv": FULL})
+        f.drain_deadline_s = 0.3
+        now = time.time()
+        _stamp(f, OLD, now - 200.0)
+        _stamp(f, HEAD, now - 30.0)
+        _stamp(f, YOUNG, now - 20.0)
+        await _running(f, OLD)
+        head = _pending(HEAD)
+        behind = _pending(YOUNG, prompt=60000, uncached=60000)    # need 64096 > 42809: no backfill either
+        f._ready_for_d.extend([head, behind])
+        adm = asyncio.ensure_future(f.d_admitter())
+        try:
+            await asyncio.sleep(0.3)
+            assert not head.fut.done() and not behind.fut.done()
+            await asyncio.wait_for(Front._short_gate_wait_by_age(f, "pdflip-30-290"), 0.2)
+            assert Front._older_waiter_than(f, "pdflip-30-290") is False
+        finally:
+            await _drop(adm)
+
+    asyncio.run(body())
+
+
+def test_o_a_kurz_d_direct_entry_passes_a_kv_held_head_past_the_bound():
+    """Review A2 (R2): a QUEUED-SHORT (d_direct, u=300 < halbX) behind a kv-held head is seated once it fits, the
+    #246 bound expired or not (before: it waited until the big head had room)."""
+    async def body():
+        f = _front({"kv": FULL})
+        f.d_wait_bound_s = 1.0
+        now = time.time()
+        f.t_awake = now - 100.0
+        _stamp(f, OLD, now - 200.0)
+        _stamp(f, HEAD, now - 30.0)
+        await _running(f, OLD)
+        head = _pending(HEAD)
+        short = _pending("pdflip-30-281", prompt=3000, uncached=300)   # need 7096 <= 42809
+        short.d_direct = True
+        f._ready_for_d.extend([head, short])
+        Front._d_kv_hold_st(f)[HEAD] = now - 50.0                 # the head waits 50 s: the bound (1 s) is over
+        f.__dict__["_d_kv_hold_first"] = {HEAD: now - 50.0}
+        adm = asyncio.ensure_future(f.d_admitter())
+        try:
+            await asyncio.wait_for(asyncio.shield(short.fut), 2.0)
+            assert not head.fut.done()
+        finally:
+            await _drop(adm)
+
+    asyncio.run(body())
+
+
+def test_p_the_backfill_clock_is_the_first_hold_not_the_last():
+    """Review S1: a head that fit once and was held again keeps the clock of its FIRST hold -- a halb/gross
+    younger entry does not backfill past the bound on a fresh t0."""
+    async def body():
+        f = _front({"kv": FULL})
+        f.d_wait_bound_s = 1.0
+        now = time.time()
+        f.t_awake = now - 100.0
+        _stamp(f, OLD, now - 200.0)
+        _stamp(f, HEAD, now - 30.0)
+        _stamp(f, YOUNG, now - 20.0)
+        await _running(f, OLD)
+        head = _pending(HEAD)
+        young = _pending(YOUNG, prompt=20000, uncached=20000)     # fits, not kurz
+        f._ready_for_d.extend([head, young])
+        Front._d_kv_hold_st(f)[HEAD] = now                        # re-held just now ...
+        f.__dict__["_d_kv_hold_first"] = {HEAD: now - 50.0}       # ... first held 50 s ago
+        adm = asyncio.ensure_future(f.d_admitter())
+        try:
+            await asyncio.sleep(0.5)
+            assert not young.fut.done(), "the bound restarted with the last hold"
+            assert f.counters["d_line_kv_backfill"] == 0
+        finally:
+            await _drop(adm)
+
+    asyncio.run(body())
+
+
+def test_q_d_runs_no_decode_the_head_is_never_held():
+    """Review S3: every live seat is a hand-off D does not run (refused/parked) -- no finish can free a row: not held."""
+    async def body():
+        f = _front({"kv": dict(FULL, running_rids=[], displaceable_rids=[])})
+        now = time.time()
+        _stamp(f, OLD, now - 200.0)
+        _stamp(f, HEAD, now - 30.0)
+        await _running(f, OLD)                                    # its seat lives, D runs nothing
+        head = _pending(HEAD)
+        f._ready_for_d.append(head)
+        assert await Front._d_line_kv_holds(f, head) is False
+
+    asyncio.run(body())
