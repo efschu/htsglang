@@ -27,6 +27,10 @@ STAGE 2 (``restart_driver``): the launcher writes P's exec record (argv, env, cw
      own crash-diagnose window ends in ``kill_process_tree`` on the specimens); past the grace it ends the session
      itself: MPS ``terminate_client`` for every old P pid first (#210: a SIGKILL on a computing MPS client is the
      undefined case), then ``kill_process_tree``;
+  1b. CARD ROOM: every P card must have P's planned budget free again (the LAST --rank-gpu-memory-mib of P's own
+     argv, summed per --rank-gpu-id card; NVML allocatable free) before the spawn -- a P that slept had lent its
+     weights' bytes to the card pool (#1956 WAKE-SEES-LOAN), D may still hold them; P comes back only once the card
+     has them free (bound ``FLLIPER_PDFLIP_DUAL_P_RESTART_CARD_WAIT_S``, default 600 s; no reserve on top);
   2. spawns P again with the SAME argv/env (same cards, same planner cut -- the record is the launcher's exec'd
      argv, nothing re-planned), new session, log appended, ``groups["P"].sid`` = the new pid;
   3. BARRIER (R11, the front decides alone): P counts as back only when its /health answers 200 AND every P rank
@@ -71,6 +75,8 @@ WAIT_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_WAIT_S"
 GRACE_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_GRACE_S"
 READY_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_READY_S"
 MAX_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_MAX"
+CARD_WAIT_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_CARD_WAIT_S"
+DEFAULT_CARD_WAIT_S = 600.0
 DEFAULT_WAIT_S = 900.0
 DEFAULT_GRACE_S = 90.0
 DEFAULT_READY_S = 900.0
@@ -434,6 +440,50 @@ def write_spec(path: str, *, argv: List[str], env: Dict[str, str], cwd: str, log
     return path
 
 
+def _flag_last(argv: List[str], flag: str) -> Optional[str]:
+    val = None
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif a.startswith(flag + "="):
+            val = a[len(flag) + 1:]
+    return val
+
+
+def card_need_from_argv(argv: List[str]) -> Dict[int, int]:
+    """P's planned budget per physical card from its OWN argv: the last ``--rank-gpu-memory-mib`` (argparse: the last
+    occurrence wins) summed per ``--rank-gpu-id`` card. {} = not derivable (the gate then leaves it to P's boot)."""
+    ids, mib = _flag_last(list(argv), "--rank-gpu-id"), _flag_last(list(argv), "--rank-gpu-memory-mib")
+    if not ids or not mib:
+        return {}
+    try:
+        cards = [int(x) for x in ids.split(",") if x.strip() != ""]
+        need = [int(x) for x in mib.split(",") if x.strip() != ""]
+    except ValueError:
+        return {}
+    if len(need) == 1 and len(cards) > 1:
+        need = need * len(cards)
+    if len(cards) != len(need):
+        return {}
+    out: Dict[int, int] = {}
+    for c, m in zip(cards, need):
+        out[c] = out.get(c, 0) + m
+    return out
+
+
+def card_room_verdict(need: Dict[int, int], free: Dict[int, int]) -> "tuple[bool, str]":
+    """Pure: every card's allocatable free >= P's planned budget there (no reserve on top)."""
+    if not need:
+        return True, "need not derivable from P's argv -- P's own boot checks"
+    if not free:
+        return False, "NVML unreadable"
+    short = ["nvml%d free=%s<need=%d" % (c, free.get(c, "?"), m) for c, m in sorted(need.items())
+             if int(free.get(c, -1)) < int(m)]
+    if short:
+        return False, " ".join(short)
+    return True, " ".join("nvml%d free=%d>=need=%d" % (c, free[c], m) for c, m in sorted(need.items()))
+
+
 def read_spec(path: str) -> Optional[dict]:
     if not path:
         return None
@@ -494,6 +544,13 @@ class RealIO:
             return "pids=%s mps_terminated=%s kill_process_tree=%s" % (pids, done, killed)
 
         return await asyncio.to_thread(_run)
+
+    def card_room(self) -> "tuple[bool, str]":
+        from flliper.srt.pdflip import front as _front_mod
+
+        need = card_need_from_argv(list(self.spec.get("argv") or []))
+        free = {int(c.nvml_index): int(c.free_mib) for c in _front_mod._nvml_free()} if need else {}
+        return card_room_verdict(need, free)
 
     def spawn(self) -> int:
         spec = self.spec
@@ -572,6 +629,18 @@ async def restart_driver(front, io, env=None) -> str:
                 await io.sleep(1.0)
             if io.session_alive(st.old_sid):
                 return _fail(front, "old P session %s still alive after kill_process_tree" % st.old_sid)
+        cwait = _num(env, CARD_WAIT_ENV, DEFAULT_CARD_WAIT_S)
+        t2 = io.now()
+        while True:
+            room, detail = io.card_room()
+            if room:
+                break
+            if io.now() - t2 >= cwait:
+                return _fail(front, "card room for P's boot not free within %s=%.0f s: %s" % (CARD_WAIT_ENV, cwait, detail))
+            if getattr(front, "state", None) == "STOP":
+                return _fail(front, "front stopped while P waited for card room")
+            await io.sleep(5.0)
+        st.note = "card room: %s" % detail
         if getattr(front, "state", None) == "STOP":
             return _fail(front, "front stopped while P was away")
         st.t_spawn = io.now()
@@ -579,8 +648,8 @@ async def restart_driver(front, io, env=None) -> str:
         front.groups["P"].sid = st.new_pid
         st.state = JOINING
         logger.warning("%s P-RESTART spawned pid=%d (session = pid) from the launcher's record (same argv/env: same "
-                       "cards, same planner cut) after old session %s ended; waiting for health 200 + every rank's "
-                       "stage file (R11 barrier)", MARK, st.new_pid, st.old_sid)
+                       "cards, same planner cut) after old session %s ended; %s; waiting for health 200 + every "
+                       "rank's stage file (R11 barrier)", MARK, st.new_pid, st.old_sid, st.note)
         ready = _num(env, READY_ENV, DEFAULT_READY_S)
         while io.now() - st.t_spawn < ready:
             rc = io.spawned_exited()

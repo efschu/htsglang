@@ -284,12 +284,13 @@ class FakeIO:
     """The Fake-Launcher: the driver's effects as a script."""
 
     def __init__(self, *, alive_for=0, survives_kill=False, health_after=0, signed_after=0, exits_rc=None,
-                 spec=True, stage_files=True):
+                 spec=True, stage_files=True, room_at=0):
         self.t = 0.0
         self.spec = {"argv": ["python3", "-m", "x"], "env": {}} if spec else {}
         self.alive_for, self.survives_kill = alive_for, survives_kill
         self.health_after, self.signed_after, self.exits_rc = health_after, signed_after, exits_rc
         self.stage_files = stage_files
+        self.room_at = room_at
         self.calls = []
         self.killed = False
 
@@ -308,6 +309,10 @@ class FakeIO:
         self.calls.append(("end_session", sid, self.t))
         self.killed = True
         return "pids=[1,2] mps_terminated=[1,2] kill_process_tree=ok"
+
+    def card_room(self):
+        ok = self.t >= self.room_at
+        return ok, ("nvml0 free=7000>=need=6610" if ok else "nvml0 free=2100<need=6610")
 
     def spawn(self):
         self.calls.append(("spawn", self.t, self.session_alive(P_SID)))
@@ -398,11 +403,44 @@ class RestartDriver(unittest.TestCase):
         self.assertEqual(_drive(f, io), S.FAILED)
         self.assertEqual(io.calls, [])
 
+    def test_the_card_room_gate_holds_the_spawn(self):
+        f = _dead_front()
+        io = FakeIO(room_at=200)
+        self.assertEqual(_drive(f, io), S.SERVING)
+        self.assertGreaterEqual(io.calls[0][1], 200)                          # spawned only once the card had room
+        f = _dead_front()
+        io = FakeIO(room_at=10 ** 6)
+        self.assertEqual(_drive(f, io, **{S.CARD_WAIT_ENV: "60"}), S.FAILED)
+        self.assertEqual(io.calls, [])
+        self.assertIn("nvml0 free=2100<need=6610", S.state_of(f).note)
+
     def test_no_record_no_spawn(self):
         f = _dead_front()
         io = FakeIO(spec=False)
         self.assertEqual(_drive(f, io), S.FAILED)
         self.assertEqual(io.calls, [])
+
+
+class CardNeed(unittest.TestCase):
+    # specimen 10240650, P's argv: two --rank-gpu-memory-mib, argparse keeps the last
+    ARGV = ["python", "-m", "flliper.launch_server", "--rank-gpu-id", "0,1,2", "--rank-gpu-memory-mib",
+            "26256,16128,15384", "--port", "30031", "--rank-gpu-memory-mib", "6610,5050,5200"]
+
+    def test_the_last_budget_per_card(self):
+        self.assertEqual(S.card_need_from_argv(self.ARGV), {0: 6610, 1: 5050, 2: 5200})
+        self.assertEqual(S.card_need_from_argv(["--rank-gpu-id=0,0,1", "--rank-gpu-memory-mib=100,200,300"]),
+                         {0: 300, 1: 300})                                    # co-located ranks add up
+        self.assertEqual(S.card_need_from_argv(["--rank-gpu-id", "0,1"]), {})
+        self.assertEqual(S.card_need_from_argv(["--rank-gpu-id", "0,1", "--rank-gpu-memory-mib", "1,2,3"]), {})
+
+    def test_verdict_no_reserve_on_top(self):
+        need = {0: 6610, 1: 5050}
+        self.assertTrue(S.card_room_verdict(need, {0: 6610, 1: 5050})[0])     # exactly the budget is enough
+        ok, why = S.card_room_verdict(need, {0: 6609, 1: 9000})
+        self.assertFalse(ok)
+        self.assertIn("nvml0 free=6609<need=6610", why)
+        self.assertFalse(S.card_room_verdict(need, {})[0])                   # NVML blind: no spawn on a guess
+        self.assertTrue(S.card_room_verdict({}, {})[0])
 
 
 class RespawnRecord(unittest.TestCase):
