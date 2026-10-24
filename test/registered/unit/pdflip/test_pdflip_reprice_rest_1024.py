@@ -239,3 +239,15 @@ def test_a_held_read_that_lands_inside_the_bound_is_untouched(caplog):
         assert _tick(s, r) == 1
     assert not any("SETTLE-HELD-READ" in m for m in caplog.messages)
     assert dn.d_would_compute(r) == 220 and not rvp.take_requests(rvp.needs_p_dir())
+
+
+def test_the_fix_needs_220s_span_start_on_the_landed_record(monkeypatch):
+    """Dependency on #220 (MUSS-1, record.span_start): the landed re-read [119552, 146176) is span-relative (26624).
+    Read without its start it cannot raise the witness above 119552, and the waited-for release still prices 26844."""
+    monkeypatch.setattr(dn, "span_base", lambda req, record: 0)
+    s, r, _calls = _settle_sched()
+    _to_the_lapse(s, r)
+    _land(s, r)
+    _tick(s, r)
+    recs = rvp.take_requests(rvp.needs_p_dir())
+    assert r._pdflip_store_delivered == FIRST and len(recs) == 1 and recs[0]["d_extent"] == 26844
