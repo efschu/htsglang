@@ -62,6 +62,9 @@ from typing import Any, Iterable, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 MARK = "R2-KURZ-CHUNK"
+#: R2-KURZ-CHUNK 1024 (SCHEDULER-SOLL R2/R7, 27B D): default ON; the waiting kurz requests that fit whole next to
+#: the carried continuation get their share of the pass chunk before it (no wait behind a longer D prefill);
+#: ``0``/false/off/no restores the old continuation-first budget (kurz refused ``trunc_len_zero`` until it ends).
 ENV = "FLLIPER_PDFLIP_R2_KURZ_CHUNK_RESERVE"
 #: Req attribute: how many passes this request was reserved for (group-agreed: admission outcomes are)
 ATTR_TRIES = "_pdflip_r2kurz_reserve_n"
