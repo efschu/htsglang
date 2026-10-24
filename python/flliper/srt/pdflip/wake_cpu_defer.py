@@ -57,7 +57,8 @@ LAUNCH_MAX_MS_DEFAULT = 8000.0
 _clock = time.monotonic
 _ev = threading.Event()
 _ev.set()  # not armed = released
-_st = {"armed_at": None, "extends": 0, "deadline": 0.0, "why": "init", "wake": 0, "in_launch": False}
+_st = {"armed_at": None, "extends": 0, "deadline": 0.0, "why": "init", "wake": 0, "in_launch": False,
+       "launch_gen": 0, "launch_done_gen": 0}
 _lock = threading.Lock()
 _launch_idle = threading.Event()
 _launch_idle.set()  # no launch in flight
@@ -101,10 +102,17 @@ def armed() -> bool:
     return not _ev.is_set()
 
 
+def hold_bound_s(env=None) -> float:
+    """The longest a released-by-bound deferral can hold: the bound plus the launch cap (s)."""
+    return _max_s(env) + _launch_max_s(env)
+
+
 def launch_begin() -> None:
     """Top of ``run_batch``: a launch is in flight (one attribute read while not armed)."""
     if _ev.is_set():
         return
+    # review 1024 SOLL 2: a GENERATION, so a waiter that saw launch g wait for g's end, not for the next launch's
+    _st["launch_gen"] += 1
     _st["in_launch"] = True
     _launch_idle.clear()
 
@@ -113,6 +121,7 @@ def launch_end() -> None:
     """``run_batch``'s ``finally``: the launch returned (also when it raised)."""
     if not _st["in_launch"]:
         return
+    _st["launch_done_gen"] = _st["launch_gen"]
     _st["in_launch"] = False
     _launch_idle.set()
 
@@ -167,10 +176,15 @@ def wait(who: str = "") -> float:
         if _st["in_launch"]:
             # WAKE-OUTLIERS-1024: the bound ran out inside a launch -- the deferred work starts when it returns
             # (or at a release meanwhile, e.g. the release leg's join), capped: never a gate
+            gen = _st["launch_gen"]
             cap = _clock() + _launch_max_s()
-            while _st["in_launch"] and not _ev.is_set() and _clock() < cap:
-                _launch_idle.wait(min(0.05, max(0.0, cap - _clock())))
-            release("bound+launch_cap" if _st["in_launch"] else "bound+launch_end")
+
+            def _running() -> bool:
+                return _st["launch_done_gen"] < gen
+
+            while _running() and not _ev.is_set() and _clock() < cap:
+                _launch_idle.wait(min(0.01, max(0.0, cap - _clock())))
+            release("bound+launch_cap" if _running() else "bound+launch_end")
         else:
             release("bound")
     held = _clock() - t0
@@ -190,6 +204,7 @@ def state() -> dict:
 
 def _reset_for_tests() -> None:
     with _lock:
-        _st.update(armed_at=None, extends=0, deadline=0.0, why="init", wake=0, in_launch=False)
+        _st.update(armed_at=None, extends=0, deadline=0.0, why="init", wake=0, in_launch=False, launch_gen=0,
+                   launch_done_gen=0)
         _ev.set()
         _launch_idle.set()

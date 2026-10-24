@@ -18,23 +18,42 @@ Boot ``boot_weg2_dkr27bbar1drei10240803_b9cddabda1_1024_080355`` (int8, P = PP3,
 
 import inspect
 import os
+import signal
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
 import pytest
 
 from flliper.srt.mem_cache.storage.file import store_journal as SJ
-from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor, _is_component_stem
+from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
 SHARED = "_K"
 PAGE = 4096
 ENV_PEERS = "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS"
+HARD_LIMIT_S = 20
 
 
-def _ev(d, tp=0, pp=0, cp=0, group="D", shared=True):
+@pytest.fixture(autouse=True)
+def _hard_limit():
+    """Review 1024 MUSS 3: every test of this file is hard-bounded (no pytest-timeout in the desk image) -- a hung
+    case (a mutant's never-ending launch) fails here instead of keeping a remote desk container alive."""
+    def _boom(signum, frame):
+        raise TimeoutError(f"hard test limit {HARD_LIMIT_S} s")
+
+    old = signal.signal(signal.SIGALRM, _boom)
+    signal.alarm(HARD_LIMIT_S)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _ev(d, tp=0, pp=0, cp=0, group="D", shared=True, **kw):
     def _iter_existing():
         for name in sorted(os.listdir(d)):
             if name.endswith(".bin"):
@@ -44,7 +63,7 @@ def _ev(d, tp=0, pp=0, cp=0, group="D", shared=True):
         return LRUFileEvictor(d, SHARED, tp_rank=tp, pp_rank=pp, attn_cp_rank=cp,
                               writes_shared_keys=shared, scan_suffixes=(SHARED,),
                               extra_config={"max_size": str(10 ** 9), "max_size_scope": "shared"},
-                              writer_count=1, iter_existing=_iter_existing)
+                              writer_count=1, iter_existing=_iter_existing, **kw)
 
 
 def _t_lines(ev):
@@ -81,9 +100,32 @@ COMP = ["m000.mamba" + SHARED, "q000.qsa_indexer" + SHARED, "d000.draft" + SHARE
 
 
 class TestTouchLinesOfTpPeers(_Env):
-    def test_component_tags_are_the_eviction_instruments_tags(self):
-        assert all(_is_component_stem(s) for s in COMP)
-        assert not any(_is_component_stem(s) for s in KV)
+    def test_only_the_group_wide_kv_page_qualifies(self):
+        peer = _ev(self.d, tp=1)
+        assert all(peer._is_group_wide_kv_key(s) for s in KV)
+        assert not any(peer._is_group_wide_kv_key(s) for s in COMP)
+        assert not peer._is_group_wide_kv_key("k000" + SHARED + "_1_3"), "a per-rank suffix is never group-wide"
+        assert not peer._is_group_wide_kv_key("a000.swa" + SHARED + "_1_3")
+
+    def test_review_muss2_structural_gates_keep_every_line(self):
+        """dcp owner form (#239: the host may abstain from a read its peers do), DP attention (disjoint requests) and
+        a phase-changing rank identity (Weg 1) -- the peer keeps its KV line."""
+        for kw in ({"dcp_owner_mode": True}, {"dp_attention": True}, {"rank_identity_stable": False}):
+            peer = _ev(self.d, tp=1, **kw)
+            self._touch(peer, KV)
+            assert _t_lines(peer) == KV, kw
+
+    def test_live_suffix_from_the_backend_decides(self):
+        """The backend re-derives its KV suffix when the canonical page is installed after construction: the evictor
+        asks it at every touch. None = no key is group-wide (rank term in the suffix / dcp owner form)."""
+        cur = {"s": None}
+        peer = _ev(self.d, tp=1, touch_dedupe_suffix=lambda: cur["s"])
+        self._touch(peer, KV[:2])
+        cur["s"] = SHARED
+        self._touch(peer, KV[2:4])
+        cur["s"] = "_model_1_3"
+        self._touch(peer, KV[4:])
+        assert _t_lines(peer) == KV[:2] + KV[4:]
 
     def test_tp_peer_leaves_the_kv_page_line_to_the_owner(self):
         owner, peer1, peer2 = _ev(self.d, tp=0), _ev(self.d, tp=1), _ev(self.d, tp=2)
@@ -142,7 +184,7 @@ def wcd(monkeypatch):
 
 
 def _waiter(W, out):
-    th = threading.Thread(target=lambda: out.setdefault("h", W.wait("store_rescan")))
+    th = threading.Thread(target=lambda: out.setdefault("h", W.wait("store_rescan")), daemon=True)
     th.start()
     return th
 
@@ -264,3 +306,26 @@ def test_park_demote_runs_when_no_wake_is_deferred(wcd, monkeypatch):
     finally:
         d.stop.set()
         d.thread.join(2.0)
+
+
+def test_hicache_file_hands_the_evictor_the_structural_facts_and_the_live_suffix():
+    from flliper.srt.mem_cache import hicache_storage as H
+
+    src = inspect.getsource(H.HiCacheFile.__init__)
+    for frag in ("dcp_owner_mode=self.dcp_owner_mode", "dp_attention=_dp_attention_on()",
+                 'rank_identity_stable=self._l3p_group() in ("P", "D")', "touch_dedupe_suffix=self._touch_dedupe_suffix"):
+        assert frag in src, frag
+    fake = types.SimpleNamespace(dcp_owner_mode=False, _kv_config_suffix_is_group_wide=True, kv_config_suffix="_m_h")
+    assert H.HiCacheFile._touch_dedupe_suffix(fake) == "_m_h"
+    fake.dcp_owner_mode = True
+    assert H.HiCacheFile._touch_dedupe_suffix(fake) is None
+    fake.dcp_owner_mode, fake._kv_config_suffix_is_group_wide = False, False
+    assert H.HiCacheFile._touch_dedupe_suffix(fake) is None
+
+
+def test_park_demote_own_bound_is_the_deferral_bound_in_ticks(wcd, monkeypatch):
+    from flliper.srt.pdflip import park_demote as PD
+
+    monkeypatch.setenv(wcd.ENV_MAX_MS, "4000")
+    monkeypatch.setenv(wcd.ENV_LAUNCH_MAX_MS, "8000")
+    assert PD._max_skipped_ticks(1.0) == 13, "ceil((4000 + 8000) ms / 1 s) + 1"

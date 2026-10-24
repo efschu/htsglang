@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -138,14 +139,6 @@ def _kv_sidecar_twins(stem: str) -> Tuple[str, ...]:
     return tuple(stem[:u] + tag + stem[u:] for tag in _PAIR_SIDECAR_TAGS)
 
 
-
-#: WAKE-OUTLIERS-1024: the component tags of a store page (the same tags ``_note_evicted_file`` names); a stem without
-#: one is a canonical KV page, shared by every TP rank of a group.
-_COMPONENT_STEM_TAGS = (".qsa_indexer", ".mamba", ".draft")
-
-
-def _is_component_stem(stem: str) -> bool:
-    return any(tag in stem for tag in _COMPONENT_STEM_TAGS)
 
 
 class PdFlipL3EvictorPauseRefused(RuntimeError):
@@ -281,6 +274,10 @@ class LRUFileEvictor:
         iter_staging: Optional[Callable[[], Iterable[os.stat_result]]] = None,
         pins: Optional[Any] = None,
         require_watermark: bool = False,
+        dcp_owner_mode: bool = False,
+        dp_attention: bool = False,
+        rank_identity_stable: bool = True,
+        touch_dedupe_suffix: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         # #410: the pin ledger, or None. None is the default and every code
         # path guards on it, so a store without checkpoints behaves exactly as
@@ -390,12 +387,20 @@ class LRUFileEvictor:
             tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
         )
         # WAKE-OUTLIERS-1024: a pure TP peer of the owner (same pp stage and cp position, tp_rank > 0) reads the
-        # SAME canonical KV pages as the owner (identical PDFLIP-READ-STAGES page counts on every D TP rank), so its
-        # T lines duplicate the owner's -- see _journal_touch. PP stages read different page sets and keep theirs.
+        # SAME group-wide KV page files as the owner (identical PDFLIP-READ-STAGES page counts on every D TP rank), so
+        # its T lines for them duplicate the owner's -- see _journal_touch. PP stages read different page sets and keep
+        # theirs. Review 1024 MUSS 2: never where that premise is not shown -- dcp_owner_mode (the #239 owner-row form
+        # lets the host rank ABSTAIN from a read its peers do), DP attention (disjoint requests per attention rank) and
+        # a rank identity that changes with the phase (Weg 1 cutover: this flag is computed once, here).
         self._journal_touch_tp_peer = bool(
             self._writes_shared_keys and not self._is_storage_owner
             and tp_rank > 0 and pp_rank == 0 and attn_cp_rank == 0
+            and not dcp_owner_mode and not dp_attention and rank_identity_stable
         )
+        self._touch_tp_rank = int(tp_rank)
+        # the backend's CURRENT group-wide KV suffix (it is re-derived when the canonical page is installed after
+        # construction); None = no key qualifies. Without it: the static suffix pair of this constructor.
+        self._touch_dedupe_suffix_fn = touch_dedupe_suffix
         # 28.09. THE INDEX IS PERSISTED IN THE STORE (store_journal.py): every
         # writing rank of a shared-key store appends write-ahead lines to its own
         # journal; an attach loads snapshot + journals instead of walking, the
@@ -1294,7 +1299,7 @@ class LRUFileEvictor:
         try:
             if not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH.get():
                 return
-            if (getattr(self, "_journal_touch_tp_peer", False) and not _is_component_stem(suffixed_key)
+            if (getattr(self, "_journal_touch_tp_peer", False) and self._is_group_wide_kv_key(suffixed_key)
                     and not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS.get()):
                 # WAKE-OUTLIERS-1024: the owner journals this canonical KV page's read hit itself (TP peers read the
                 # identical page set); a peer's line is a duplicate the other group's owner parses at its wake
@@ -1314,6 +1319,30 @@ class LRUFileEvictor:
             jn.write("T", now, 0, suffixed_key)
         except Exception:  # noqa: BLE001 -- a recency line is never a reason to fail a read
             return
+
+    def _touch_dedupe_suffix(self) -> Optional[str]:
+        """WAKE-OUTLIERS-1024: the KV suffix every rank of the group names, or None."""
+        fn = getattr(self, "_touch_dedupe_suffix_fn", None)
+        if fn is not None:
+            try:
+                return fn() or None
+            except Exception:  # noqa: BLE001 -- no answer = no dedupe, the line is written
+                return None
+        suf = self.kv_config_suffix or self.config_suffix
+        # a suffix with this rank's tp term names a per-rank file (config_suffix ``..._{tp_rank}_{tp_size}``)
+        if not suf or re.search(r"_%d_\d+(?:_|$)" % int(getattr(self, "_touch_tp_rank", 0)), suf):
+            return None
+        return suf
+
+    def _is_group_wide_kv_key(self, suffixed_key: str) -> bool:
+        """Review 1024 MUSS 1 (whitelist): a plain KV page under the group-wide KV suffix -- the stem carries no
+        component tag (no '.'), and the suffix no rank term. Every other key (.swa/.indexer/.deepseek_v4_*/.mamba/
+        .draft/... and every per-rank suffix) is this rank's own file and keeps its T line."""
+        suf = self._touch_dedupe_suffix()
+        if not suf or not suffixed_key.endswith(suf):
+            return False
+        stem = suffixed_key[: -len(suf)]
+        return bool(stem) and "." not in stem
 
     def _touch_mtime(self, tensor_path: str) -> None:
         """Record the recency where the SIBLING owner can read it (N2).

@@ -3996,8 +3996,9 @@ class Envs:
     # and those ranks read the identical page set (D TP0/TP1/TP2 PDFLIP-READ-STAGES: 8776008 pages each) -- three
     # identical lines per page. P PP0 parsed and applied 0.1-3.4 M journal lines per wake (95 % T), 0.4-6.8 s of
     # GIL-bound Python beside PP0's first P forwards. On (default False = deduplicated): a non-owner rank at the
-    # owner's pp/cp position (a pure TP peer) leaves the T line of a canonical KV page to the owner; component pages
-    # (.mamba/.draft/.qsa_indexer) and every PP stage keep theirs. True = every rank journals its read hits again.
+    # owner's pp/cp position (a pure TP peer) leaves the T line of a plain KV page under the GROUP-WIDE KV suffix to
+    # the owner; every other key (components, per-rank suffixes), every PP stage, the dcp owner form, DP attention and
+    # ranks outside a Weg-2 group keep theirs. True = every rank journals its read hits again.
     FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS = EnvBool(False)
     FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
