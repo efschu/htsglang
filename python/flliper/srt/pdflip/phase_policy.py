@@ -653,21 +653,50 @@ def _anchored(m: SetMember, present: "Iterable[str]") -> bool:
     return bool(a) and a != m.rid and a in present and int(m.own_uncached or 0) > 0
 
 
-def member_class(m: SetMember, x_class: int, half_frac: float, present: "Iterable[str]" = ()) -> str:
+def _kurz_anchored(m: SetMember, present: "Iterable[str]", kurz_anchors: "Iterable[str]") -> bool:
+    """SIBLING-U-1024 section 10 (planner decision 24.10., SOLL R1/R2/R1u): ``m`` was discounted against an anchor that is NO
+    set member -- a KURZ request (R2: own u < halbX, D at once; :func:`set_keep` leaves it out) that is still in the evaluated
+    list (``kurz_anchors``), i.e. not computed yet. Before that anchor is computed, ``m``'s D figure is its own one."""
+    a = str(getattr(m, "anchor", "") or "")
+    return (bool(a) and a != m.rid and a not in present and a in kurz_anchors
+            and int(m.own_uncached or 0) > 0)
+
+
+def s_share(m: SetMember, riders: "Iterable[str]", present: "Iterable[str]", kurz_anchors: "Iterable[str]" = ()) -> int:
+    """The tokens ``m`` adds to S (SOLL R1, R1u, R2; ONE truth for :func:`set_verdict` and the front's line): a RIDER adds
+    nothing (R2/R3, planner 24.10.); a member discounted against a KURZ non-member anchor that is no rider adds its OWN figure
+    (R1u "zaehlt dieses Stueck EINMAL": the kurz anchor is never in S (R2/R6k), so the shared piece is in no one's share
+    unless this member carries it -- section 10); every other member its ``uncached`` (the R1u union figure)."""
+    if m.rid in riders:
+        return 0
+    if _kurz_anchored(m, present, kurz_anchors):
+        return max(0, int(m.own_uncached))
+    return max(0, int(m.uncached))
+
+
+def member_class(m: SetMember, x_class: int, half_frac: float, present: "Iterable[str]" = (),
+                 kurz_anchors: "Iterable[str]" = ()) -> str:
     """The class of a set member (R2/R3/R4/R9, R2a its own X). SOLL section 2: u = what really must be prefilled. A member
     whose shared prefix an earlier member IN THE SET (``present``, its ``anchor``) brings is classed on its REST
     (``uncached``, the R1u union figure: SIBLING-U-1024, duo rc42 14:00:15 pdflip-16-112 own 4677 / rest 163 at X 4096 was
     classed gross on 4677 and flipped its anchor's R4 wait after 1.5 s); every other member on its own arrival figure as
-    before (``own_uncached or uncached``)."""
+    before (``own_uncached or uncached``). Section 10 (planner 24.10.): behind a KURZ non-member anchor (``kurz_anchors``,
+    R2) a member whose rest is kurz is a rider (kurz); one whose rest is not kurz keeps its own figure (it is no rider and
+    the discount is no S share for it either, :func:`s_share`)."""
     xm = int(m.x_own) or int(x_class)
     if m.p_only:
         return CLASS_P_ONLY
-    if _anchored(m, set(present)):
+    present = set(present)
+    if _anchored(m, present):
         return classify_arrival(int(m.uncached), xm, half_frac, False)
+    if (_kurz_anchored(m, present, set(kurz_anchors))
+            and classify_arrival(int(m.uncached), xm, half_frac, False) == CLASS_KURZ):
+        return CLASS_KURZ
     return classify_arrival(m.own_uncached or m.uncached, xm, half_frac, False)
 
 
-def sibling_riders(members: Sequence[SetMember], x_class: int, half_frac: float) -> frozenset:
+def sibling_riders(members: Sequence[SetMember], x_class: int, half_frac: float,
+                   kurz_anchors: "Iterable[str]" = ()) -> frozenset:
     """SIBLING-U-1024 (SOLL R2 "nie ein Flip fuer einen kurzen Request", R4 "Flip erst, wenn ein weiterer Halb-/Gross-
     Request dazukommt", R1a, R1u): the rids of the members that are KURZ on their rest behind an anchor in the set while
     their own figure is not kurz. Such a member is no trigger (no R4 company, not big) and its rest is NOT in S (R2 "nie
@@ -676,11 +705,15 @@ def sibling_riders(members: Sequence[SetMember], x_class: int, half_frac: float)
     It cannot go to D with its anchor (R2) because on D, before its anchor is computed, its u is the own figure (4677 > X in
     the metal case) -- its rest exists only behind the anchor: on a D verdict it waits behind the D anchor
     (:func:`rider_hold_step`, review MUSS-1 / planner variant (a)). Anchors must be members of
-    ``members`` (a running D prefill is no anchor here: its overlap stays in the rest as before)."""
+    ``members`` (a running D prefill is no anchor here: its overlap stays in the rest as before) -- or, section 10 (planner
+    decision 24.10.: "gleich ob Set-Mitglied oder sofortiger R2-D-Prefill"), a KURZ request in ``kurz_anchors`` (evaluated,
+    no member by R2, not computed yet): the rider waits behind that D anchor by the same mechanism; the kurz anchor itself
+    stays R2 (D at once)."""
     present = {m.rid for m in members}
+    ka = set(kurz_anchors)
     out = set()
     for m in members:
-        if m.p_only or not _anchored(m, present):
+        if m.p_only or not (_anchored(m, present) or _kurz_anchored(m, present, ka)):
             continue
         xm = int(m.x_own) or int(x_class)
         if (classify_arrival(int(m.uncached), xm, half_frac, False) == CLASS_KURZ
@@ -692,7 +725,8 @@ def sibling_riders(members: Sequence[SetMember], x_class: int, half_frac: float)
 def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float, t_half_s: float,
                 now: float, t_open: Optional[float], d_decoding: bool, seats_free: int,
                 d_prefill_running_uncached: int = 0, new_since_last: int = 0,
-                class_x_tokens: Optional[int] = None, d_granted_unstarted: int = 0) -> SetVerdict:
+                class_x_tokens: Optional[int] = None, d_granted_unstarted: int = 0,
+                kurz_anchors: "Iterable[str]" = ()) -> SetVerdict:
     """The set's verdict (SOLL R1, R3-R6, R8, R9). ``members`` are the collected halb/big requests (a kurz one never
     belongs to a set, R2). ``t_open`` is the stamp of the FIRST member (None: the oldest member's arrival) -- the
     timer starts there ONCE per set (R3), later members never restart it. ``S`` = sum of the members' uncached
@@ -715,7 +749,14 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     verdict is held, every flip verdict stands. R8 (nothing decodes on D) is NEVER held: "ohne Decode auf D wird sofort
     entschieden: D bei S < X, P bei S >= X" -- a COLLECT at d_decoding=0 is the rc30 06:36:19Z violation (pdflip-0-4,
     S=3821 + 2226 kurz grants). 0 (default) = nothing held: the verdicts are byte-identical to before S2a (the section-4
-    compatibility test pins it)."""
+    compatibility test pins it).
+
+    SIBLING-U-1024 section 10 (planner decision 24.10.; R1, R2, R1u, R7, R11): ``kurz_anchors`` = the rids of KURZ requests
+    the caller evaluated but left out (:func:`decide`'s R2 own-figure filter) -- anchors that are no members. A member kurz
+    on its rest behind one is a rider (no trigger, not in S, waits behind that D anchor on a D verdict); a non-rider behind
+    one adds its own figure (:func:`s_share`). A set of riders only has nothing to collect: D at once (R2), the riders wait
+    behind their anchors (the front). () (default) = byte-identical (with no kurz anchor a rider's anchor is a member, so
+    a riders-only set cannot occur)."""
     x = int(x_tokens)
     xc = int(class_x_tokens) if class_x_tokens else x
     hx = half_x_of(xc, half_frac)
@@ -728,10 +769,13 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     # SIBLING-U-1024 (SOLL section 2, R2, R4, R1a): a member classed kurz on its rest behind an anchor in the set is a
     # RIDER -- no R4 company, never big, its rest NOT in S (R1/R2/R3: the same class decision that makes it kurz keeps it
     # out of the sum; planner decision 24.10.); it rides whatever the set decides (R1a)
-    riders = sibling_riders(members, xc, half_frac)
+    ka = frozenset(kurz_anchors or ())
+    # section 10: the kurz anchors are passed only when there are any -- without them the calls are the section-4 ones
+    riders = sibling_riders(members, xc, half_frac, ka) if ka else sibling_riders(members, xc, half_frac)
     present = {m.rid for m in members}
-    s = sum(max(0, int(m.uncached)) for m in members if m.rid not in riders) + running
-    classes = [member_class(m, xc, half_frac, present) for m in members]
+    s = sum(s_share(m, riders, present, ka) for m in members) + running
+    classes = [(member_class(m, xc, half_frac, present, ka) if ka else member_class(m, xc, half_frac, present))
+               for m in members]
     big = any(c in (CLASS_GROSS, CLASS_P_ONLY) for c in classes)
     n_trig = len(members) - len(riders)
     t0 = float(t_open) if t_open is not None else min(float(m.t_arrive) for m in members)
@@ -748,6 +792,11 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     if running > 0 and s > x:
         return SetVerdict(V_REROUTE_P, "R6 S=%d > X=%d with a D prefill of %d running (new=%d)" % (s, x, running, new),
                           left, s, hx)
+    if n_trig <= 0:
+        # SIBLING-U-1024 section 10 (R2, planner 24.10.): only riders behind KURZ non-member anchors -- nothing to collect, no
+        # trigger: D at once (the kurz anchors go by R2 without a wait); the front holds each rider behind its D anchor
+        return SetVerdict(V_D_AFTER_TIMER, "R2 riders only (n=%d): no trigger member, D now (S=%d); each rider waits behind its "
+                          "kurz D anchor" % (len(members), s), 0.0, s, hx)
     def _d_verdict(why: str, left_s: float) -> SetVerdict:
         gu = max(0, int(d_granted_unstarted))
         if gu > 0 and s + gu > x:          # S49: a grant D has not begun is no flip reason, but D is not handed more on top
@@ -798,6 +847,14 @@ def set_keep(members: Sequence[SetMember], x_class: int, half_frac: float) -> Tu
             continue
         keep.append(m)
     return keep, out
+
+
+def set_riders(members: Sequence[SetMember], x_class: int, half_frac: float) -> Tuple[List[SetMember], List[str], frozenset]:
+    """``(keep, kurz_left_out, riders)`` -- the ONE rider set of a verdict (SIBLING-U-1024 section 10): :func:`set_keep`'s members,
+    and the riders among them behind a member anchor OR a kurz left-out anchor (R2, not computed yet). The front's line and its
+    rider hold use exactly this, as :func:`decide` does."""
+    keep, out = set_keep(members, x_class, half_frac)
+    return keep, out, sibling_riders(keep, x_class, half_frac, out)
 
 
 #: SIBLING-U-1024 review MUSS-1 (planner decision 24.10., variant (a)): the outcomes of one look at a rider held behind its
@@ -851,8 +908,8 @@ def decide(kind: str, **kw) -> "SetDecision":
     xc = int(kw.get("class_x_tokens") or kw["x_tokens"])
     keep, out = set_keep(members, xc, half_frac)
     present = {m.rid for m in keep}
-    classes = [member_class(m, xc, half_frac, present) for m in keep]
-    sv = set_verdict(keep, **kw)
+    classes = [member_class(m, xc, half_frac, present, out) for m in keep]
+    sv = set_verdict(keep, kurz_anchors=out, **kw)   # section 10: a kurz left-out request can be a rider's anchor
     return SetDecision(sv, _rule_tag(sv.why, sv.verdict), tuple(classes), tuple(m.rid for m in keep), tuple(out))
 
 

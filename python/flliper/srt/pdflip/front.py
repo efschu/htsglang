@@ -16111,11 +16111,14 @@ class Front:
         # SIBLING-U-1024 review SOLL-2: classes and riders against the SAME presence set ``decide`` uses (the members left
         # after the R2 own-figure filter, ``phase_policy.set_keep``) -- never against all members (the line could name a rider
         # the verdict did not have)
-        _keep, _kurz_out = phase_policy.set_keep(members, x_cls or x_tok, frac)
+        # section 10 (planner 24.10.): a kurz left-out request can be a rider's anchor (``phase_policy.set_riders``)
+        _keep, _kurz_out, _riders = phase_policy.set_riders(members, x_cls or x_tok, frac)
         _present = {m.rid for m in _keep}
-        classes = [phase_policy.member_class(m, x_cls or x_tok, frac, _present) for m in members]
-        _riders = phase_policy.sibling_riders(_keep, x_cls or x_tok, frac)
-        _shared = sum(m.own_uncached - m.uncached for m in members if m.own_uncached)
+        classes = [phase_policy.member_class(m, x_cls or x_tok, frac, _present, _kurz_out) for m in members]
+        # the shared piece S does NOT carry: a member behind a kurz non-member anchor that is no rider adds its own figure
+        # (phase_policy.s_share) -- its shared piece is in S already
+        _shared = sum(m.own_uncached - m.uncached for m in members if m.own_uncached
+                      and phase_policy.s_share(m, _riders, _present, _kurz_out) != int(m.own_uncached))
         _rider_rest = sum(max(0, int(m.uncached)) for m in members if m.rid in _riders)
         if _shared > 0:
             # R1u (20.10.): S is already the union figure (a shared piece once); SIBLING-U-1024: a member behind an anchor
@@ -16124,10 +16127,12 @@ class Front:
                                                                             int(sv.s_tokens) + _rider_rest + _shared)
         if _riders:
             self.counters["set_sibling_rider"] += 1
+            _ka = sorted({m.anchor for m in members if m.rid in _riders and m.anchor in _kurz_out})
             why = "%s [sibling-rider=%s kurz on its rest behind %s: no trigger, no R4 company, not in S, rides a flip " \
-                  "(R1a); on a D verdict it waits behind its anchor (SOLL u = the rest)]" % (why, ",".join("%s:%d" % (m.rid, int(m.uncached)) for m in members
-                                                      if m.rid in _riders),
-                                         ",".join(sorted({m.anchor for m in members if m.rid in _riders})))
+                  "(R1a); on a D verdict it waits behind its anchor (SOLL u = the rest)%s]" % (
+                      why, ",".join("%s:%d" % (m.rid, int(m.uncached)) for m in members if m.rid in _riders),
+                      ",".join(sorted({m.anchor for m in members if m.rid in _riders})),
+                      (" kurz-anchor=%s (R2: D at once, no member)" % ",".join(_ka)) if _ka else "")
         if xk > 0:
             why = "%s xk=%d" % (why, xk)   # H16V review A2: X(k) is information only
         # EZ-S1: ONE record, SET-VERDICT (SOLL section 4, byte-identical to the H91 line) derived from the same data as the
@@ -16206,6 +16211,10 @@ class Front:
                 _r2only = True
                 sv = phase_policy.SetVerdict(phase_policy.V_D_AFTER_TIMER, "R2 kurz only: no set member, D now (S=0)", 0.0, 0,
                                              sv.half_x)
+            elif _dec.in_set and all(c == phase_policy.CLASS_KURZ for c in _dec.classes):
+                # SIBLING-U-1024 section 10 (R2): riders only, behind kurz non-member anchors -- the policy said D now; like
+                # "R2 kurz only" no R6 piece can turn it (the riders are no S share, they wait behind their D anchors)
+                _r2only = True
             if unstarted > 0 and sv.verdict == phase_policy.V_COLLECT and sv.why.startswith("NS:S49"):
                 self.counters["set_xsum_hold_unstarted"] += 1
         else:
@@ -16632,8 +16641,8 @@ class Front:
             # AFTER its anchor is computed -- the D verdict does NOT release it with the anchor in this tick; it waits behind its
             # D anchor (``_rider_hold_tick``). The riders are the verdict's own (same presence set as ``decide``)
             _xc = int(kw.get("x_cls") or kw.get("x_tok") or 0)
-            _keep, _out = phase_policy.set_keep(members, _xc, kw["frac"])
-            _rs = phase_policy.sibling_riders(_keep, _xc, kw["frac"])
+            # section 10: riders behind a member anchor OR a kurz non-member anchor (R2, planner 24.10.) -- the same set as decide
+            _keep, _out, _rs = phase_policy.set_riders(members, _xc, kw["frac"])
             _held_now = Front._rider_hold_begin(self, st, [m for m in _keep if m.rid in _rs], live_q, now)
             for _q in live_q:
                 if _q.rid in _held_now:
