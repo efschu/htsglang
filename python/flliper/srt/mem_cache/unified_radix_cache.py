@@ -1188,6 +1188,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: `check_hicache_events` round (a dict while the instrument is on and the
     #: round's drain runs, else None -- the drain records nothing then).
     _hc_parts = None
+    #: QUIESCE-LOADBACK-1023: `loading_check` is RANK-LOCAL here (#737,
+    #: `_count_ready_acks` -- no collective), so a flush's idle vote may drain
+    #: this rank's finished load-back acks in any pass
+    #: (managers/pdflip_quiesce_loadback.py). A tree whose loading_check
+    #: reduces over the group must not set it.
+    LOADING_CHECK_RANK_LOCAL = True
 
     @property
     def req_to_token_pool(self):

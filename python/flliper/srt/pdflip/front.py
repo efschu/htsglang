@@ -3014,6 +3014,42 @@ def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     return "rank idle, front still holds requests"
 
 
+#: QUIESCE-BUSY-1023 env gate (27B port 1024, closes the SCHNITT5 review RISK
+#: "abort only by code change"): default ON; ``0``/false/no/off restores the old
+#: both-busy reading (``witness_verdict`` agreement -> the sleep legs run).
+QUIESCE_BUSY_ABORT_ENV = "FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT"
+
+
+def quiesce_busy_abort_enabled(env=None) -> bool:
+    e = os.environ if env is None else env
+    return (str(e.get(QUIESCE_BUSY_ABORT_ENV, "1") or "1").strip().lower()
+            not in ("0", "false", "no", "off"))
+
+
+def quiesce_busy_both(front_outstanding: int, rank_idle: bool) -> bool:
+    """Both witnesses busy at the quiesce deadline (the W120 form), gate-free."""
+    return int(front_outstanding) > 0 and not bool(rank_idle)
+
+
+def quiesce_busy_abort(front_outstanding: int, rank_idle: bool, env=None) -> bool:
+    """QUIESCE-BUSY-1023: the quiesce deadline ended with BOTH witnesses busy.
+
+    ``witness_verdict`` reads (front holds requests, group not idle) as
+    agreement -- true, but it is agreement that the group is BUSY, and the
+    flip went on into the sleep legs: NF rc36p ``..._1023_215911`` D epoch 4,
+    22:30:55Z, the 90 s quiesce ended not idle (D's awake re-queue had put the
+    park back and D decoded pdflip-4-207), the front's ledger held that rid,
+    ``/release_memory_occupation`` went out, every D rank raised W120
+    (running_batch, last_batch, overlap_result_queue), W29, RANK-DEATH.
+    Nothing has slept at this point, so the flip is aborted instead (the
+    EARLY-FLIP abort: D stays awake and serves, the front re-decides on the
+    next tick, SOLL R11). True = abort.
+
+    Gated by ``FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT`` (default on; 27B port 1024):
+    off returns False and the flip proceeds as before the fix."""
+    return quiesce_busy_both(front_outstanding, rank_idle) and quiesce_busy_abort_enabled(env)
+
+
 def park_lapse_race(group_name: str, ledger: List[str], parked, rank_idle: bool) -> List[str]:
     """Q-699b: the rids of a W3 'rank idle, front still holds requests' that
     are only a PARK-LAPSE clock race -- empty when it is a real disagreement.
@@ -21058,6 +21094,30 @@ class Front:
                          f"{wv}: front ledger {sorted(_wl)} (outstanding "
                          f"{sorted(S.outstanding)}) vs group({src}) "
                          f"flush_cache (reduced over every rank, #1268) -> {msg[:400]!r}")
+            return
+        if not quiesce_busy_abort_enabled() and quiesce_busy_both(len(_wl), idle):
+            # gate off (FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT=0): the pre-1023 path
+            # runs on -- name it, so a W120 that follows is attributable.
+            self.counters["quiesce_busy_abort_gated_off"] += 1
+            logger.warning(
+                "PDFLIP-FLIP QUIESCE-BUSY gated off (%s=0) epoch=%d sleep=%s ledger=%s -- both witnesses "
+                "busy, the sleep legs run as before QUIESCE-BUSY-1023", QUIESCE_BUSY_ABORT_ENV,
+                self.epoch, src, sorted(_wl)[:8])
+        if quiesce_busy_abort(len(_wl), idle):
+            # QUIESCE-BUSY-1023: both witnesses say BUSY at the deadline -- no
+            # sleep RPC may go out to a group that is serving (it can only end
+            # in W120/W29 on every rank). Nothing slept yet: abort the flip, D
+            # stays awake with admission open, the controller re-decides.
+            self.counters["quiesce_busy_abort"] += 1
+            logger.warning(
+                "PDFLIP-FLIP QUIESCE-BUSY-ABORT epoch=%d sleep=%s wake=%s ledger=%s after_ms=%.0f -- the "
+                "quiesce deadline ended with the group NOT idle and the front still holding work; no "
+                "sleep RPC goes out (QUIESCE-BUSY-1023). Last refusal: %r", self.epoch, src, dst,
+                sorted(_wl)[:8], (time.time() - t_flip0) * 1000.0, str(msg)[:400])
+            self.admit_d = True
+            Front._early_flip_abort(
+                self, types.SimpleNamespace(rid=",".join(sorted(_wl)[:4]) or "-", why="quiesce-busy",
+                                            t_begin=t_flip0), src, dst)
             return
         if _early is not None:
             # EARLY-FLIP: drain + quiesce ran beside the trigger's pricing; nothing

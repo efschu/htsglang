@@ -1319,6 +1319,40 @@ def _h110_promised_rows(adder) -> int:
     return rows
 
 
+#: R2/R7 PAGE FLOOR (switch ``FLLIPER_PDFLIP_MIXED_CHUNK_PAGE_FLOOR``, default ON; ``0`` = the old subtraction).
+_MIXED_CHUNK_PAGE_FLOOR_ENV = "FLLIPER_PDFLIP_MIXED_CHUNK_PAGE_FLOOR"
+
+
+def _chunk_after_mixed_decode(rem_chunk: int, mixed_decode_tokens: int, page_size: int) -> int:
+    """The pass's chunk budget after the mixed decode rows took their tokens -- never below ONE PAGE.
+
+    SCHEDULER-SOLL v2 R2 ("kurz sofort auf D") and R7 ("kann D einen Request unter X nicht nehmen, ist das ein
+    Defekt"). Specimen: NF boot weg2..._1023_234711 (rc36p), D, 00:12:48-00:13:54Z. The corridor width actuator
+    (``corridor_width.MIN_CHUNK_TOKENS`` = 64, ``extend_trim.rows_cap`` "never below one page -- a chunk must make
+    progress") had cut the pass chunk to its liveness floor of 64 tokens (TP0 post=810 MiB against the 767 MiB law).
+    MIXED-D (``is_mixed_chunk``, S32) then took ``running_bs`` (2..5) of those 64 for the decode rows:
+    ``rem_chunk=62``. ``add_one_req`` aligns the chunk DOWN to the page (``62 // 64 * 64 = 0``) and refused every
+    pass with ``gate=trunc_len_zero`` (``D-ADMIT-REFUSED rem_chunk=59..63``, 64 refusals, ``waited_s=66.2``) --
+    the three kurz requests pdflip-6-179/-180/-182 (u=927/250/200) never started; each reverted admission also
+    issued a host load-back whose undrained ack held the next flip's quiesce (``hicache_load_back(1)``, 58.8 s).
+    The floor was a LIVENESS property that this subtraction defeated one line later.
+
+    The floor only ever LIFTS a budget that the subtraction pushed below one page while the pre-subtraction
+    budget held one: a chunk that is configured below a page stays as it is, and any budget >= one page after
+    the subtraction is untouched (byte-identical off the specimen). The forward then carries one page of
+    prefill plus ``mixed_decode_tokens`` decode rows (<= the running batch), a few rows more than the
+    narrowed chunk -- the corridor's floor is priced per page, not per row."""
+    after = int(rem_chunk) - int(mixed_decode_tokens)
+    page = max(1, int(page_size or 1))
+    if (
+        mixed_decode_tokens > 0
+        and after < page <= int(rem_chunk)
+        and (os.environ.get(_MIXED_CHUNK_PAGE_FLOOR_ENV, "1") or "1").strip().lower() not in ("0", "false", "off", "no")
+    ):
+        return page
+    return after
+
+
 class PrefillAdder:
     # PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): written by `lanes_p.configure_adder` only when the rank holds lane state
     # (an RPC or a stamp arrived with FLLIPER_PDFLIP_LANES=1); these class defaults ARE the switch-off behaviour.
@@ -1457,7 +1491,9 @@ class PrefillAdder:
             self._init_dllm_meta(dllm_config)
 
         if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= num_mixed_decode_tokens
+            self.rem_chunk_tokens = _chunk_after_mixed_decode(
+                self.rem_chunk_tokens, num_mixed_decode_tokens, self.page_size
+            )
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
 
