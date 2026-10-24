@@ -1370,6 +1370,116 @@ def _chunk_after_mixed_decode(rem_chunk: int, mixed_decode_tokens: int, page_siz
     return after
 
 
+# ---------------------------------------------------------------------------
+# KVOFFSET-1024 (SOLL v2 R5/R7/R11): ONE formula for D's lifetime gate, read by every party that prices against it.
+#
+# 27B int4ar _1023_223241 / _1024_003732: the front's ARRIVAL-SEAT / D-line KV test (``arrival_seat_rule.kv_fits``)
+# read D's ``available + evictable`` and passed four after_p hand-offs that only D's DECODE RESERVE refused
+# (``rem_total_token_offset``: pdflip-25-238 87 refusals in 23.4 s); D's own pressure-park resume
+# (``d_seats.admission_gate``) tested ``avail >= context`` while the gate charged ``extend + clip + page`` against
+# ``available + deliverable - offset`` (pdflip-34-283: ``PRESSURE-RESUME avail=108507 need=104951``, then
+# ``price=109048 budget=107704.184`` -- 568 refusals in 174.1 s). The terms below are the ones ``add_one_req`` /
+# ``rem_total_tokens`` use, factored out so the publisher (``Scheduler.get_internal_state`` -> ``pdflip_kv``), the
+# resume test and the adder itself compute the same number. No new term, no reserve: each function is the adder's
+# own arithmetic, moved here verbatim.
+# ---------------------------------------------------------------------------
+
+
+#: ``max_new_tokens=None`` means "the rest of the context" -- the scheduler's own normalisation reads it as this
+#: before clamping to the context (``Scheduler``: ``max_new_tokens if not None else 1 << 30``); every term below is
+#: clipped at ``CLIP_MAX_NEW_TOKENS`` anyway, so a None prices the full clip.
+_MAX_NEW_UNSET = 1 << 30
+
+
+def _max_new_minus_out(req) -> int:
+    """``max_new_tokens - len(output_ids)``, armed against an unnormalised request (KVOFFSET-1024 Qwen-RISK: the
+    pressure-park resume test prices parked requests BEFORE the group MIN collective; ``max_new_tokens`` is
+    ``Optional[int]``): None max_new = the context rest (``_MAX_NEW_UNSET``), None output_ids = 0. Byte-identical
+    for every normalised request."""
+    mx = req.sampling_params.max_new_tokens
+    out = req.output_ids
+    return (_MAX_NEW_UNSET if mx is None else mx) - (0 if out is None else len(out))
+
+
+def decode_clip_of(req) -> int:
+    """The decode term a NEW request is charged at admission: ``min(max(max_new - out, 0), CLIP)``
+    (``add_one_req``'s ``max_new``)."""
+    return min(
+        max(_max_new_minus_out(req), 0),
+        CLIP_MAX_NEW_TOKENS,
+    )
+
+
+def running_request_reserve(req, new_token_ratio: float) -> float:
+    """The decode reserve a RUNNING request holds in the lifetime budget (``rem_total_token_offset``):
+    ``min(max_new - out, CLIP) * new_token_ratio`` -- the adder's
+    ``_get_running_request_total_token_offset``, byte for byte (no clamp at 0, as upstream)."""
+    return (
+        min(
+            _max_new_minus_out(req),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        * new_token_ratio
+    )
+
+
+def running_decode_reserve(reqs, new_token_ratio: float, num_mixed_decode_tokens: int = 0) -> float:
+    """``rem_total_token_offset`` at the start of a pass: the mixed decode rows plus every running request's
+    reserve (``PrefillAdder.__init__``)."""
+    return num_mixed_decode_tokens + sum(
+        running_request_reserve(r, new_token_ratio) for r in (reqs or ())
+    )
+
+
+def lifetime_price(extend_tokens: int, req, page_size: int, mamba_gap: int = 0) -> int:
+    """What the lifetime gate charges a new request: ``extend + decode clip + one page + mamba gap``
+    (``add_one_req``'s ``total_tokens`` before the chunk-admit rewrite, which a parked request never takes)."""
+    return int(extend_tokens) + decode_clip_of(req) + int(page_size) + int(mamba_gap)
+
+
+def mamba_slot_full_token_cost(allocator) -> int:
+    """The shared-gap cost a new Mamba state adds to the price (``PrefillAdder._mamba_slot_cost``): non-zero only on
+    the unified Mamba pool."""
+    if isinstance(allocator, UnifiedMambaTokenToKVPoolAllocator):
+        return int(allocator.mamba_slot_full_token_cost())
+    return 0
+
+
+def lifetime_available_and_evictable(allocator, tree_cache, is_all_swa: Optional[bool] = None,
+                                     is_hybrid_swa: Optional[bool] = None,
+                                     is_hybrid_ssm: Optional[bool] = None):
+    """``(available, evictable)`` as the lifetime gate reads them, per pool kind (all-SWA, hybrid SWA, hybrid SSM with
+    the peel's DELIVERABLE evictable -- not the reported count --, plain). ``PrefillAdder.rem_total_tokens`` /
+    ``cur_rem_tokens`` call this with their own flags (review S4: one formula, not a copy); None derives each flag as
+    ``PrefillAdder.__init__`` does (the publisher, ``pdflip/d_lifetime_reading.py``)."""
+    if is_all_swa is None:
+        is_all_swa = isinstance(allocator, PureSWATokenToKVPoolAllocator)
+    if is_hybrid_swa is None:
+        is_hybrid_swa = isinstance(allocator, (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator))
+    if is_hybrid_ssm is None:
+        _sm = getattr(tree_cache, "supports_mamba", None)
+        is_hybrid_ssm = bool(callable(_sm) and _sm())
+    if is_all_swa:
+        return allocator.swa_available_size(), tree_cache.swa_evictable_size()
+    if is_hybrid_swa:
+        return allocator.full_available_size(), tree_cache.full_evictable_size()
+    if is_hybrid_ssm:
+        # ED (rc12o b1): the peel's deliverable count, not the reported one
+        # (mamba-locked nodes and their ancestors are counted but unpeelable).
+        return allocator.available_size(), deliverable_evictable_cap_aware_or(
+            tree_cache, tree_cache.full_evictable_size)
+    return allocator.available_size(), tree_cache.evictable_size()
+
+
+def lifetime_budget(available: int, evictable: int, offset: float, dcp_deficit: int = 0,
+                    fundable_floor: Optional[int] = None, ledger_outstanding: int = 0) -> float:
+    """``rem_total_tokens`` from its terms: ``min(A + E - offset - dcp, floor - offset) - ledger`` (the adder applies
+    the ledger itself through ``effective_rem_total_tokens``; it passes 0 here)."""
+    local = available + evictable - offset - dcp_deficit
+    budget = local if fundable_floor is None else min(local, fundable_floor - offset)
+    return budget - ledger_outstanding if ledger_outstanding else budget
+
+
 class PrefillAdder:
     # PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): written by `lanes_p.configure_adder` only when the rank holds lane state
     # (an RPC or a stamp arrived with FLLIPER_PDFLIP_LANES=1); these class defaults ARE the switch-off behaviour.
@@ -1778,57 +1888,28 @@ class PrefillAdder:
         return int(self._get_running_request_total_token_offset(req))
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * self.new_token_ratio
-        )
+        # KVOFFSET-1024: the one formula D also publishes (``pdflip_kv.decode_reserve``) and its resume test reads
+        return running_request_reserve(req, self.new_token_ratio)
 
     @property
     def rem_total_tokens(self):
-        if self.is_all_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
-            )
-        elif self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        elif self.is_hybrid_ssm_cache:
-            # ED (rc12o b1): the peel's deliverable count, not the reported one
-            # (mamba-locked nodes and their ancestors are counted but unpeelable).
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
+        # KVOFFSET-1024 review S4: the pool terms and the budget are the shared functions D publishes from
+        # (``lifetime_available_and_evictable`` / ``lifetime_budget``) -- one formula, called here, not a copy.
+        _avail, _evict = lifetime_available_and_evictable(
+            self.token_to_kv_pool_allocator, self.tree_cache,
+            self.is_all_swa, self.is_hybrid_swa, self.is_hybrid_ssm_cache)
         # dcp_avail_deficit (0 off the uneven-DCP kv-session-offload path) pins
         # the budget to the binding rank's available_size -> rank-uniform.
-        local_budget = (
-            available_and_evictable
-            - self.rem_total_token_offset
-            - self.dcp_avail_deficit
-        )
         # #681: cap by what the GROUP can fund. The floor is already the
         # group MIN (`uniform_avail_for_evict`), so `dcp_avail_deficit` -- the
         # other mechanism for pinning a local number to the binding rank -- is
-        # deliberately NOT subtracted a second time here. `rem_total_token_offset`
+        # deliberately NOT subtracted a second time there. `rem_total_token_offset`
         # IS, so the floor is spent down by this round's admissions exactly as
         # the local term is. None -> no reduce published -> untouched.
-        if self.fundable_extend_floor is None:
-            budget = local_budget
-        else:
-            budget = min(
-                local_budget, self.fundable_extend_floor - self.rem_total_token_offset
-            )
+        budget = lifetime_budget(
+            _avail, _evict, self.rem_total_token_offset, self.dcp_avail_deficit,
+            self.fundable_extend_floor, 0,
+        )
         # #701 defect (b): CROSS-PASS RESERVATION. PrefillAdder is rebuilt every
         # pass and reserves only remaining DECODE, so a resident chunked
         # request's remaining PREFILL is invisible here and later admissions
@@ -1879,28 +1960,11 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_all_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
-            )
-        elif self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        elif self.is_hybrid_ssm_cache:
-            # ED (rc12o b1): the peel's deliverable count, not the reported one
-            # (mamba-locked nodes and their ancestors are counted but unpeelable).
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
+        # KVOFFSET-1024 review S4: the same pool terms as rem_total_tokens (one formula)
+        _avail, _evict = lifetime_available_and_evictable(
+            self.token_to_kv_pool_allocator, self.tree_cache,
+            self.is_all_swa, self.is_hybrid_swa, self.is_hybrid_ssm_cache)
+        available_and_evictable = _avail + _evict
 
         # dcp_avail_deficit (0 off the uneven-DCP kv-session-offload path) pins
         # the budget to the binding rank's available_size -> rank-uniform.
@@ -3216,10 +3280,7 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
+        max_new = decode_clip_of(req)
         # 27B 24.10. (SOLL R5/R7): `prefix_indices` is the DEVICE prefix. A host-tier hit (handback
         # store / L2 / L3, `host_hit_length`, the load-back extent) stays IN this extend on purpose:
         # the load-back writes those rows into the device pool at admission. Crediting it would admit
@@ -3228,7 +3289,8 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        # KVOFFSET-1024: the one price formula (D's pressure-park resume test reads the same, d_seats.admission_gate)
+        total_tokens = lifetime_price(cand_extend_input_len, req, self.page_size)
         # Upstream #36415: read the request's mamba debits BEFORE
         # `init_load_back` below -- a host load-back binds `req.mamba_pool_idx`
         # (MambaComponent.build_hicache_transfers), after which both helpers

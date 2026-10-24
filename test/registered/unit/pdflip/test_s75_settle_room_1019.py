@@ -289,7 +289,9 @@ def test_the_reading_is_the_group_min_of_free_plus_evictable(monkeypatch):
                                   uniform_min_avail=lambda: FREE)
     sched._pdflip_group_min_ints = lambda vals: (seen.append(list(vals)), [vals[0] - 1000, vals[1]])[1]
     read = dpr._resume_fit_reading(sched)
-    assert read() == FREE + EVICT - 1000 and seen == [[FREE + EVICT, 1]]
+    # KVOFFSET-1024 (class E): the reading is this rank's LIFETIME budget as the largest price the gate admits
+    # (``ceil(rem_total_tokens) - 1``: the gate refuses at price >= budget); nothing runs here, so no reserve
+    assert read() == FREE + EVICT - 1 - 1000 and seen == [[FREE + EVICT - 1, 1]]
     monkeypatch.setenv(dpr.RESUME_FIT_EVICTABLE_ENV, "0")
     assert dpr._resume_fit_reading(sched)() == FREE, "switch off: the free ids, as before"
 
@@ -319,7 +321,7 @@ def test_2_1_a_rank_without_a_reading_still_enters_the_min_exactly_once(monkeypa
     """3 ranks, rank 1's allocator raises. Each rank must enter the group MIN once (its peers do);
     the fake collective answers every rank with the element-wise MIN of all three payloads."""
     monkeypatch.delenv(dpr.RESUME_FIT_EVICTABLE_ENV, raising=False)
-    payloads = {0: [FREE + EVICT, 1], 1: [0, 0], 2: [FREE + EVICT, 1]}
+    payloads = {0: [FREE + EVICT - 1, 1], 1: [0, 0], 2: [FREE + EVICT - 1, 1]}   # KVOFFSET-1024: largest price
     group_min = [min(col) for col in zip(*payloads.values())]
     entered, sent = {0: 0, 1: 0, 2: 0}, {}
 
@@ -339,6 +341,46 @@ def test_2_1_a_rank_without_a_reading_still_enters_the_min_exactly_once(monkeypa
     assert sent == payloads, "the rank without a reading sends the sentinel (ok=0)"
     assert results == [None, None, None], "the group refuses the early resume alike, by name"
     assert any("UNREAD" in m for m in _lines(caplog, dpr.RESUME_HELD_MARK))
+
+
+class _RaisingLedger:
+    def outstanding_tokens(self):
+        raise RuntimeError("ledger gone")
+
+
+def test_2_1b_a_rank_whose_budget_terms_raise_still_enters_the_min_exactly_once(monkeypatch):
+    """KVOFFSET-1024 review A2 (S75 2.1 for the lifetime reading): the resume reading now reads more terms than the pool
+    (dcp deficit, ledger, decode reserve). A rank that raises on ANY of them sends the sentinel into the one MIN --
+    never leaves before the collective (a peer alone in the gloo MIN hangs: W17)."""
+    monkeypatch.delenv(dpr.RESUME_FIT_EVICTABLE_ENV, raising=False)
+
+    def _boom():
+        raise RuntimeError("deficit gone")
+
+    bad_req = types.SimpleNamespace(rid="bad", output_ids=[], finished=lambda: False,       # a corrupt reserve term
+                                    sampling_params=types.SimpleNamespace(max_new_tokens="corrupt"))
+    entered, sent = {}, {}
+
+    def make(i):
+        def gm(vals):
+            entered[i] = entered.get(i, 0) + 1
+            sent[i] = list(vals)
+            return [0, 0]
+        return gm
+
+    kinds = {
+        0: dict(uniform_budget_deficit=_boom),
+        1: dict(chunked_commitment_ledger=_RaisingLedger()),
+        2: dict(running_batch=types.SimpleNamespace(reqs=[bad_req])),
+    }
+    results = []
+    for i, extra in kinds.items():
+        s = types.SimpleNamespace(token_to_kv_pool_allocator=_Alloc(FREE), tree_cache=_Tree(EVICT),
+                                  uniform_min_avail=lambda: FREE, _pdflip_group_min_ints=make(i), **extra)
+        results.append(dpr._resume_fit_reading(s, getattr(s, "running_batch", None))())
+    assert entered == {0: 1, 1: 1, 2: 1}, "every rank enters the group MIN exactly once"
+    assert all(v[1] == 0 for v in sent.values()), "a rank whose terms raise sends the sentinel (ok=0)"
+    assert results == [None, None, None]
 
 
 def _p_then_d(rid, delivered):

@@ -206,6 +206,11 @@ class ChunkedCommitmentLedger:
     def outstanding_tokens(self) -> int:
         return int(sum(self._outstanding.values()))
 
+    def request_ids(self) -> list:
+        """KVOFFSET-1024: the request ids holding a commitment (read-only copy) -- the front must not charge
+        their rows a second time (the published lifetime budget already subtracts the ledger)."""
+        return list(self._outstanding.keys())
+
     def note_deferred(self, request_id: str, pass_index: int) -> None:
         """Telemetry for the defer band, so a wedge is observable rather than
         silent -- the failure mode defect 3 names."""

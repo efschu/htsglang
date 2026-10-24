@@ -11699,6 +11699,9 @@ class Scheduler(
             # `update_dcp_admission_state`'s packed reduce, where it already
             # lives.
             self._uniform_corridor_width = None
+            # KVOFFSET-1024: NAMED GAP, same shape -- no reduce of its own here, so no group ratio; the publisher then
+            # prices with TP0's own ratio and says so (``decode_reserve_scope=tp0``)
+            self._kvoffset_group_ratio = None
             # #1203: NAMED GAP, same shape as the #639 host floor above. This
             # branch takes no reduce of its own, so the seam-transport premise
             # stays unreduced and its read site decides on this rank's own
@@ -11740,6 +11743,10 @@ class Scheduler(
             )
             self._uniform_min_avail = local_avail
             self._uniform_budget_deficit = 0
+            # KVOFFSET-1024: one rank -- its own ratio IS the group's
+            from flliper.srt.pdflip import d_lifetime_reading as _dlr1
+
+            self._kvoffset_group_ratio = _dlr1.local_ratio(self)
             # One rank: nothing to diverge from, so the floor stays OFF and
             # every cache-mutation trigger keeps reading its live local value
             # -- byte-identical to the pre-#616g path.
@@ -12148,6 +12155,17 @@ class Scheduler(
         # own head index captured before the append. No new collective.
         _s42_hold_at = len(vals)
         vals = vals + _pdflip_head_vote_hold.build_hold_payload(_s42_held)
+        # KVOFFSET-1024 (SOLL R11, Rang-Einigkeit): THE DECODE-RESERVE RATIO rides this reduce as ONE negated slot, so
+        # the MIN yields the group MAX of ``new_token_ratio``. The ratio is RANK-LOCAL (NF y6h 10011531: TP0 priced a
+        # reservation at 4964, TP1/TP2 at 6592 -- idle resets and decay steps differ per rank), and each rank's
+        # lifetime gate subtracts ITS OWN reserve; the group admits only when every rank admits (tp_admission_agree),
+        # so the binding reserve is the largest one. ``pdflip_kv.decode_reserve`` (get_internal_state, TP0) prices the
+        # running decodes with this agreed ratio, never TP0's own. Its head index is captured before the append, it is
+        # read back by that index, and it sits before the tail-indexed ballot. No new collective.
+        _ratio_at = len(vals)
+        from flliper.srt.pdflip import d_lifetime_reading as _dlr
+
+        vals = vals + [-_dlr.ratio_ppm(_dlr.local_ratio(self))]
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -12166,6 +12184,8 @@ class Scheduler(
         _pdflip_head_vote_hold.resolve_group(
             self, t[_s42_hold_at : _s42_hold_at + 2].tolist()
         )
+        # KVOFFSET-1024: the group MAX of the decode-reserve ratio, read back by its captured index
+        self._kvoffset_group_ratio = _dlr.ratio_from_ppm(-int(t[_ratio_at]))
         # #794: the group's tightest corridor width, read back before the
         # ballot so a later change to the ballot layout cannot silently move it.
         self._uniform_corridor_width = int(t[_corridor_at])
@@ -24304,6 +24324,17 @@ class Scheduler(
             from flliper.srt.pdflip.d_park_runtime import displaceable_rids as _disp_rids
 
             ret["pdflip_kv"]["displaceable_rids"] = _disp_rids(getattr(self, "running_batch", None))[:64]
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
+            pass
+        # KVOFFSET-1024 (SOLL R11/R5/R7, pdflip/d_lifetime_reading.py): the terms of D's lifetime gate -- decode
+        # reserve (group-agreed ratio), deliverable evictable, floor, dcp deficit, ledger -- as ``lifetime_budget``,
+        # in the SAME reading; the front takes it by min() in ``arrival_seat_rule.kv_free``. Numbers only; its own
+        # try so a failure here leaves the reading above exactly as it was (the front then decides as before).
+        try:
+            if isinstance(ret.get("pdflip_kv"), dict):
+                from flliper.srt.pdflip.d_lifetime_reading import lifetime_reading
+
+                ret["pdflip_kv"].update(lifetime_reading(self))
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
             pass
         # PDFLIP MODE-PARITY (h16m 1014, N4): this group's priority mode for the

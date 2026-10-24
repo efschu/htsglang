@@ -14061,21 +14061,12 @@ class Front:
         est = d_seat_need(int(getattr(p, "est_prompt", 0) or 0), int(getattr(p, "leg1_prompt_tokens", 0) or 0))[0]
         fits, why, deficit = await self._arrival_seat_kv(
             est, _asr.max_tokens_of(getattr(p, "payload", None)), p.rid, int(getattr(p, "est_uncached", 0) or 0))
-        # no await from here on: the basis, the terms and the free room are THIS test's (S94 review A2)
+        # no await from here on: the basis and the terms are THIS test's (S94 review A2)
         st = self._asr_st()
         basis = Front._asr_kv_basis(self)
-        terms = st.pop("need_terms", None)         # an ARRIVAL-SEAT grant's counter input, never the D line's
-        free = st.get("last_kv_free")
-        debit, n_debit = Front._d_line_kv_debit(self, basis, p.rid)
-        if debit > 0 and not basis.get("unread") and free is not None and terms:
-            # THE BURST (27B 23:10:49-52: 30-273, 30-274, 30-275 handed to D within 3 s, 59k each): seats the front gave
-            # to requests D does not run yet are rows D's reading does not contain -- charged like _d_charged_since
-            # charges the host pool, so two hand-offs are never priced against the same free rows
-            need = max(0, est - int(terms[0])) + int(terms[1])
-            room = int(free) - int(debit)
-            fits = need <= room
-            deficit = 0 if fits else need - max(0, room)
-            why = "%s [D-line debit %d of %d seat(s) D does not run yet: room %d]" % (why, debit, n_debit, room)
+        st.pop("need_terms", None)         # an ARRIVAL-SEAT grant's counter input, never the D line's
+        # KVOFFSET-1024: the burst debit (THE BURST, 27B 23:10:49-52: 30-273/274/275 within 3 s, 59k each) is applied
+        # inside the KV test itself now (:meth:`_arrival_seat_kv`), for the D line and ARRIVAL-SEAT alike
         return bool(fits), str(why), int(deficit or 0), basis
 
     def _d_line_kv_debit(self, basis: Dict[str, Any], exclude_rid: str) -> Tuple[int, int]:
@@ -14084,10 +14075,26 @@ class Front:
         admitted on D, so D's available/evictable cannot contain them. Each is charged its Seat tokens (the realised
         prompt) plus D's decode clip, as D will price it. Rids the front knows parked keep their span in D's tree and
         resume by D's own SEAT-AGE -- not charged. An old D without ``running_rids``: the seats taken after the
-        reading's time (``_asr_state["kv"]``), else nothing (named by the 0)."""
+        reading's time (``_asr_state["kv"]``), else nothing (named by the 0).
+
+        KVOFFSET-1024 (class B, SOLL R5/R11): charged for EVERY KV test (ARRIVAL-SEAT and the D line), and
+        * a rid D has admitted but not merged into its running batch (``admitted_rids``: its rows are in the reading
+          already) or whose chunked commitment D's lifetime budget subtracts (``ledger_rids``) is not charged again;
+        * a seat whose need a KV verdict priced (``kv_priced``: prompt - shared credit + clip + price extra) is charged
+          THAT, not the bare seat tokens -- a kurz request priced 4641 against a running predecessor holds 4641, not
+          its 64193-token prompt;
+        * an ARRIVAL-SEAT grant not yet seated (``granted``, the window between verdict and Seat) is charged its priced
+          need too;
+        * the clip is D's (``pdflip_kv.decode_clip``, review S5), not the front's default.
+        A seat D retracted itself (decode pressure: span RETAINED in the tree, evictable, re-admitted ahead of new
+        work) is charged as well: its span is in D's free count as evictable, and its re-admission maps exactly those
+        rows -- the debit removes them from the room a newcomer sees (27B _1024_003732 01:18:25: 30-294 and 26-255
+        retracted for one pass, the front read free=278852 = the whole pool and granted pdflip-30-296; D re-admitted
+        both and refused 30-296 by gate=lifetime)."""
         running = basis.get("running")
         st = self._asr_st()
         parked = set((st.get("parked") or {}).keys()) | set((getattr(self, "_d_parked", None) or {}).keys())
+        skip = set(basis.get("admitted") or ()) | set(basis.get("ledger") or ())
         t_read = None
         if running is None:
             cached = st.get("kv")
@@ -14098,19 +14105,45 @@ class Front:
             clip = int(basis.get("decode_clip") or 0) or _asr.default_decode_clip()
         except (TypeError, ValueError):
             clip = _asr.default_decode_clip()
+        priced = st.setdefault("kv_priced", {})
         tokens, n = 0, 0
+        seat_rids = set()
         for s in list(getattr(self, "_d_seats_live", ()) or ()):
             r = getattr(s, "rid", None)
-            if r == exclude_rid or r in parked:
+            seat_rids.add(r)
+            if r == exclude_rid or r in parked or r in skip:
                 continue
             if running is not None:
                 if r in running:
                     continue
             elif float(getattr(s, "t_taken", 0.0) or 0.0) <= t_read:
                 continue
-            tokens += max(0, int(getattr(s, "tokens", 0) or 0)) + clip
+            got = priced.get(r)
+            tokens += int(got[0]) if got is not None else max(0, int(getattr(s, "tokens", 0) or 0)) + clip
             n += 1
+        if running is not None:
+            for r, _t in list((st.get("granted") or {}).items()):
+                if r == exclude_rid or r in seat_rids or r in running or r in parked or r in skip:
+                    continue
+                got = priced.get(r)
+                if got is None:
+                    continue
+                tokens += int(got[0])
+                n += 1
+        live = seat_rids | set((st.get("granted") or {}).keys())
+        now = time.time()
+        for r in [r for r, v in priced.items() if r not in live and now - float(v[1]) > 60.0]:
+            priced.pop(r, None)   # a verdict that never became a seat (a D-line head between its KV verdict and its
+            #                       seat is kept: it is seated after the semaphor)
         return tokens, n
+
+    def _asr_note_kv_priced(self, rid: str, need: Optional[int]) -> None:
+        """KVOFFSET-1024: a KV verdict let ``rid`` go -- ``need`` (the need ITS OWN KV test priced, taken from that
+        test's basis right after it returned: review A1, a shared slot is overwritten by every other waiter's and the
+        older P candidates' KV tests during the caller's awaits) is what the burst debit charges for it until D runs
+        it (:meth:`_d_line_kv_debit`). None (no number): nothing is noted, the seat is charged its tokens + clip."""
+        if need is not None:
+            self._asr_st().setdefault("kv_priced", {})[rid] = (int(need), time.time())
 
     async def _d_line_kv_holds(self, p: "Pending") -> bool:
         """HANDOVER-KVFITS 1024 (SOLL R5, R11): True = the D line's head ``p`` takes no D seat now -- D's DEVICE KV
@@ -14158,6 +14191,7 @@ class Front:
             return False
         if fits:
             Front._d_line_kv_hold_end(self, p.rid, why)
+            Front._asr_note_kv_priced(self, p.rid, basis.get("need"))   # KVOFFSET-1024: charged until D runs it
             return False
         if basis.get("running") is not None and not basis.get("running"):
             # review S3: D runs no decode at all in this reading -- no finish can free a row for it (all seats are
@@ -14172,6 +14206,7 @@ class Front:
                 st.setdefault("age_victims", {})[p.rid] = list(plan)
                 st.setdefault("dline_claims", {})[p.rid] = now
                 holds.pop(p.rid, None)
+                Front._asr_note_kv_priced(self, p.rid, basis.get("need"))   # KVOFFSET-1024
                 self.counters["d_admit_kv_age_to_d"] += 1
                 logger.info("PDFLIP D-ADMIT-KV-AGE rid=%s victims=%s %s (HANDOVER-KVFITS + AGE PLAN, PRIO=ALTER: the "
                             "older hand-off goes to D, D's SEAT-AGE displaces the younger decodes for it on its real "
@@ -16964,10 +16999,16 @@ class Front:
         return fits, why
 
     def _asr_shared_credit(self, rid: Optional[str], est_prompt: int,
-                           uncached: Optional[int]) -> int:
+                           uncached: Optional[int], d_has: Optional[set] = None) -> int:
         """NF-STAU-KV: the prefix ``rid`` shares with its session's previous
         turn while that turn RUNS on D (not parked: a parked turn's pages are
-        evictable and already in D's free reading)."""
+        evictable and already in D's free reading).
+
+        KVOFFSET-1024 (class B, 27B _1023_223241 23:15:59,478-,562): ``d_has`` = the rids whose rows are in D's reading
+        (``running_rids`` + ``admitted_rids``). A predecessor the front has GRANTED but D does not run yet has no page on
+        D to share: pdflip-34-282 was priced ``shared 63648`` (need 4641) against pdflip-34-281 granted 48 ms earlier
+        and still unprefilled; 34-283 ``shared 18104`` the same way -- three grants 50248 + 4641 + 90936 = 145825
+        against one reading free=114674. An old D without the fields (``d_has`` None): unchanged."""
         if rid is None:
             return 0
         got = (self.__dict__.get("_sess_prev") or {}).get(str(rid))
@@ -16976,6 +17017,8 @@ class Front:
         prev_rid, common = got
         running = (prev_rid in self._flip_ledger(self.groups["D"])
                    and prev_rid not in self._asr_st()["parked"])
+        if running and d_has is not None and prev_rid not in d_has:
+            running = False
         return _asr.shared_prefix_credit(est_prompt, uncached, common, running)
 
     async def _arrival_seat_kv(self, est_prompt: int, max_tokens: Optional[int],
@@ -16995,25 +17038,73 @@ class Front:
             clip = _asr.default_decode_clip()
         reserve = _asr.decode_reserve(max_tokens, _asr.default_reserve())
         decode = _asr.decode_part(max_tokens, _asr.default_reserve(), clip)
-        shared = self._asr_shared_credit(rid, est_prompt, uncached)
-        need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode)
-        fits, why = _asr.kv_fits(need, reading)
-        free = _asr.kv_free(reading)
-        self._asr_st()["last_kv_free"] = free   # S60 F2: the room this tick's verdicts were formed on
         # S94: the AGE PLAN reads whether D had a number at all, whether its backup wall stands and which decodes D
         # runs. S94 review A2: ONE basis object of THIS reading; a caller takes it with :meth:`_asr_kv_basis` right
         # after its own await (no await in between) and hands it on -- the shared slot is overwritten by every other
         # waiter's KV test during the caller's later awaits (``_asr_older_blocked``, the other waiters of the tick).
         _rr = reading.get("running_rids") if reading else None
         _dr = reading.get("displaceable_rids") if reading else None
-        self._asr_st()["last_kv_basis"] = {
+        _ad = reading.get("admitted_rids") if reading else None
+        _lr = reading.get("ledger_rids") if reading else None
+        _rb = reading.get("decode_reserve_by_rid") if reading else None
+        basis = {
             "unread": not reading,
             "wall": _asr.backup_wall(reading),
             "running": set(str(r) for r in _rr) if isinstance(_rr, (list, tuple)) else None,
             # NF-C-SITZ 1021: the decodes D can park NOW (spec decode: the batch's back) -- None = an old D
             "displaceable": set(str(r) for r in _dr) if isinstance(_dr, (list, tuple)) else None,
             "decode_clip": clip,   # HANDOVER-KVFITS review S5: the D-line debit charges D's own clip of this reading
+            # KVOFFSET-1024: rows D holds for requests not in ``running`` yet (unmerged extend, chunked) and the
+            # chunked commitments its lifetime budget already subtracts -- never charged a second time
+            "admitted": set(str(r) for r in _ad) if isinstance(_ad, (list, tuple)) else set(),
+            "ledger": set(str(r) for r in _lr) if isinstance(_lr, (list, tuple)) else set(),
+            # KVOFFSET-1024: each running decode's share of D's reserve (given back when it is displaced)
+            "reserve_by_rid": ({str(k): int(v) for k, v in _rb.items()} if isinstance(_rb, dict) else {}),
         }
+        _d_has = (None if basis["running"] is None else basis["running"] | basis["admitted"])
+        shared = self._asr_shared_credit(rid, est_prompt, uncached, _d_has)
+        # KVOFFSET-1024: + what D's gate adds to extend + clip (one page, the Mamba gap; ``pdflip_kv.price_extra``)
+        need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode) + _asr.price_extra(reading)
+        # KVOFFSET-1024 (class B, SOLL R5/R11): the burst debit for EVERY KV test, not only the D line's -- rows the
+        # front promised to requests D does not run in THIS reading (27B 23:15:59 three grants against one reading;
+        # _1024_003732 01:18:25,947 pdflip-30-296 granted against free=278852 = the whole pool while D had retracted
+        # BOTH running decodes 30-294 / 26-255 for one pass, their spans evictable, re-admitted the next pass)
+        debit, n_debit = (Front._d_line_kv_debit(self, basis, rid) if reading else (0, 0))
+        fits, why = _asr.kv_fits(need, reading, debit, decode)
+        free = _asr.kv_free(reading)
+        if free is not None and debit > 0:
+            free = int(free) - int(debit)
+        if debit > 0:
+            why = "%s [D-line debit %d of %d seat(s) D does not run yet: room %s]" % (
+                why, debit, n_debit, "-" if free is None else int(free))
+        self._asr_st()["last_kv_free"] = free   # S60 F2: the room this tick's verdicts were formed on
+        self._asr_st()["last_kv_basis"] = basis
+        basis["need"] = int(need)   # KVOFFSET-1024 review A1: what a grant on THIS test is charged (per test, no slot)
+        st0 = self._asr_st()
+        _uh = st0.setdefault("unread_held", {})
+        if reading:
+            _uh.pop(rid, None)
+        if not reading and rid is not None and rid in (st0.get("waiters") or {}) and \
+                (st0.get("wait_named") or {}).get(rid) == "kv" and \
+                (getattr(self, "_d_seats_live", None) or ()):
+            # KVOFFSET-1024 (class C, SOLL R5; 27B _1023_223241 pdflip-32-276: ``wait_seat why=kv need=63165 >
+            # free=40361`` at 23:11:31, then ``d_prefill ... kv=unread kv=absent age_ms=1034`` at 23:14:10 after 158 s
+            # -- D refused it 34 times in 7.1 s): a waiter that is waiting FOR KV keeps waiting when D gives no number
+            # this tick -- an absent reading neither admits nor refuses (the D line's rule, HANDOVER-KVFITS). A first
+            # tick without a number still goes (EZ-S1 A10, R2: the seat plan decides, D's admission is the guard).
+            self.counters["arrival_seat_kv_unread_held"] += 1
+            fits, why = False, "kv=unread held (it waited for KV; no number this tick -- it keeps waiting)"
+            # review S3: named -- at the first held tick and then every 10 s of the same unread series (the WAIT_SEAT
+            # line is printed only on a change of why_wait, and a KV waiter's is "kv" already). The hold needs a live
+            # D seat (the D line's rule): with none, no finish can free a row and it goes (D's admission guards).
+            _now = time.time()
+            _t0, _last = _uh.get(rid, (_now, 0.0))
+            if _now - _last >= 10.0:
+                logger.info("%s ARRIVAL-SEAT-KV-UNREAD-HELD rid=%s held_s=%.1f seats_live=%d (KVOFFSET-1024 class C, "
+                            "SOLL R5: it waits FOR KV and D gave no number -- an absent reading neither admits nor "
+                            "refuses)", _asr.MARKER, rid, _now - _t0, len(getattr(self, "_d_seats_live", ()) or ()))
+                _last = _now
+            _uh[rid] = (_t0, _last)
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
             why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
@@ -17166,12 +17257,19 @@ class Front:
             if t is not None:
                 arrivals[r] = t
         tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        _rb = basis.get("reserve_by_rid") or {}
+        if _rb:
+            # KVOFFSET-1024: the deficit is formed against D's lifetime room (decode reserve subtracted); a displaced
+            # decode gives its reserve share back besides its rows (``PrefillAdder.released_by_leaving``, the size D's
+            # own ``kv_displace_would_fit`` gives a victim) -- the front's victim price carries the same share
+            tokens = {r: v + int(_rb.get(r, 0) or 0) for r, v in tokens.items()}
         if basis.get("wall"):
             # S94 (R5): under D's backup wall a displaced decode frees no KV row -- D sizes every victim 0
             # (``d_park_runtime.kv_displace_would_fit``: "a victim's retained KV goes back to the tree and is as
             # unpayable as the rest"). The front plans with D's numbers: a KV deficit is not coverable by victims, only
             # a missing SEAT is (the head then still has to fit D's payable room).
-            tokens = {r: 0 for r in tokens}
+            tokens = {r: int(_rb.get(r, 0) or 0) for r in tokens}   # KVOFFSET review NIT: D still gives the reserve
+            #                                                                 share back under the wall (0 + reserve)
         plan = _asr.displace_plan(head_arrival, seat_is_free, deficit, running, arrivals, tokens,
                                   lane_of={r: Front._prio_lane(self, r) for r in running},  # PRIO-AS-AGE 1014
                                   head_lane=Front._prio_lane(self, head_rid))
@@ -17432,6 +17530,8 @@ class Front:
                     continue
                 fits, why, deficit = (await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
                                       if free else (True, "no seat", 0))
+                # KVOFFSET-1024 review A1: THIS test's need, taken before any further await
+                my_need = Front._asr_kv_basis(self).get("need") if free else None
                 if free:
                     # H16V F4: the seat count again after the KV await (see the AGE PLAN path)
                     taken, n = self._arrival_seat_taken(for_rid=rid)
@@ -17458,6 +17558,7 @@ class Front:
                     st["granted"][rid] = time.time()
                     self.counters["arrival_seat_d_prefill"] += 1
                     self._asr_note_need_terms()
+                    Front._asr_note_kv_priced(self, rid, my_need)   # KVOFFSET-1024: the burst debit charges it
                     if backfill:
                         self.counters["arrival_seat_backfill"] += 1
                     ms = self._asr_verdict_ms(rid, None)
@@ -17571,6 +17672,7 @@ class Front:
                 st.setdefault("age_victims", {})[rid] = list(plan)   # H16V A4: these victims are spoken for
             self.counters["arrival_seat_d_prefill"] += 1
             self._asr_note_need_terms()
+            Front._asr_note_kv_priced(self, rid, kv_basis.get("need"))   # KVOFFSET-1024 review A1: its OWN need
             if not first and fits:
                 self.counters["arrival_seat_backfill"] += 1
             if to_d:
