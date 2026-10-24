@@ -309,7 +309,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
         logger.warning(
-            "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+            "The explicit --enable-mixed-chunk is turned off under dflash speculative decoding; group D still "
+            "arms MIXED-D for short prefills (scheduler _mixed_d_short, FLLIPER_PDFLIP_MIXED_D_SHORT, "
+            "27B-MIXEDD-DFLASH-1024)."
         )
 
 
