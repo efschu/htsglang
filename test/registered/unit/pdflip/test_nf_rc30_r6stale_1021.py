@@ -180,11 +180,14 @@ def test_r1u_uses_the_counted_free_piece(monkeypatch, tmp_path):
 
 
 # ------------------------------------------------------------------------------------------------ review Auflage A1 (D commit)
-def test_a1_live_48_687_at_14_395_commit_marker_holds_the_d_verdict_until_chunk2_starts(monkeypatch, caplog, tmp_path):
+def test_a1_live_48_687_at_14_395_commit_marker_rest_784_cannot_lift_s_to_x_the_d_verdict_is_final_now(monkeypatch, caplog,
+                                                                                                    tmp_path):
     """Review A1, live 48-687: the SET-REPROBE answer left D's recv step at 14.395 -- chunk 1 had ended (polled: free 784), chunk
     2 (784) not yet launched (device start 14.403). D's recv step marked the chunked_req COMMITTED: the front counts nothing of
-    it and HOLDS the final verdict (here D_AFTER_TIMER, T_halb over) one tick instead of deciding on a free that D is about to
-    launch; chunk 2's start record (free 0) then lets the set go to D (R3) -- no flip under X (R7), no redirect."""
+    it. #200 (SOLL R3/R8 against R6): the most the marker can add is D's rest 784 -- S = 4584 + 784 = 5368 < X = 6114, so no
+    start record can make it R6 and the D verdict (T_halb over) is final at once; before #200 it was held one tick for a number
+    that could not change it. No flip under X (R7), no redirect. The hold for a rest that CAN lift S to X stays:
+    test_nf_r6halt_dtimer_1024.py::test_r6_commit_pending_rest_that_can_lift_s_to_x_holds."""
     _on(monkeypatch)
     now = time.time()
     f = _front_48(now, tmp_path, chunk2_launched=False, waited=6.8)
@@ -195,19 +198,13 @@ def test_a1_live_48_687_at_14_395_commit_marker_holds_the_d_verdict_until_chunk2
         w.commit_next(rids=[RID_RUN])                   # end of D's recv step: chunk 2 is fixed
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
         assert f._dc_carried_running() == 0
-        assert f._decode_collect(now) == "hold"
-    sv = _verdicts(caplog)
-    assert sv and all("verdict=COLLECT" in m and "R6 commit pending" in m for m in sv), sv
-    assert f.counters["set_r6_commit_hold"] >= 1 and f.counters["r6_commit_pending"] == 1
-    assert any("R6-COMMIT-PENDING rid=%s" % RID_RUN in m for m in caplog.messages)
-    for w in ws:                                        # D launches chunk 2 = the whole remainder
-        w.note_extend(rids=[RID_RUN], rests=[CHUNK2], extend_lens=[CHUNK2])
-    caplog.clear()
-    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._dc_carried_running() == 0
-        f._decode_collect(now)
+        assert f._decode_collect(now) == "D"
     sv = _verdicts(caplog)
     assert any("verdict=D_AFTER_TIMER" in m and "S=%d" % U_SET in m for m in sv), sv
+    assert not any("R6 commit pending" in m for m in sv), sv
+    assert f.counters["r6_commit_pending"] == 1 and f.counters["set_r6_commit_hold"] == 0
+    assert f.counters["set_r6_hold_d_free"] == 1
+    assert any("R6-COMMIT-PENDING rid=%s" % RID_RUN in m for m in caplog.messages)
     assert f.counters["r6_redirected"] == 0
 
 
