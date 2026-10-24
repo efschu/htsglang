@@ -47,6 +47,7 @@ from flliper.srt.managers.io_struct import (
 )
 from flliper.srt.managers.pdflip_memory_saver import (
     pdflip_tms_resume,
+    resume_then_land as _pdflip_resume_then_land,
     PDFLIP_SLEEP_MIN_RELEASED_FRACTION,
     PDFLIP_SLEEP_TAGS,
     PdFlipRankDisagree,
@@ -2318,7 +2319,8 @@ class SchedulerWeightUpdaterManager:
                                      epoch, submitted=list(submitted))
         resume_ms = park.unpark_start(
             tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
-            resume=lambda t: pdflip_tms_resume(self.memory_saver_adapter, t))
+            resume=lambda t: _pdflip_resume_then_land(  # WAKE-FLOOR-1024: map, then land
+                lambda: pdflip_tms_resume(self.memory_saver_adapter, t), credit, t, epoch))
         self._pdflip_draft_unpark_ph0 = (phases, len(phases))
         logger.info("PDFLIP-DRAFT-UNPARK start tag=%s resume_ms=%.0f issue_ms=%.0f bytes=%d",
                     GPU_MEMORY_TYPE_WEIGHTS_DRAFT, resume_ms, park.unpark_issue_ms,
@@ -5414,9 +5416,13 @@ class SchedulerWeightUpdaterManager:
             try:  # Task #20: free, unpromised VRAM may be staged (overdraw)
                 _free = self._pdflip_free_bytes()
                 _floor = self._pdflip_corridor_floor_bytes()
+                # WAKE-FLOOR-1024: the reader too, so the debit grades the card
+                # under the counter lock (a waker claim that landed meanwhile is in it)
+                _reader = self._pdflip_free_bytes
             except Exception:  # noqa: BLE001 -- no probe, no overdraw
-                _free, _floor = None, None
-            if not credit.debit("ipc-stage", n, free_bytes=_free, floor_bytes=_floor):
+                _free, _floor, _reader = None, None, None
+            if not credit.debit("ipc-stage", n, free_bytes=_free, floor_bytes=_floor,
+                                free_reader=_reader):
                 logger.info(
                     "PDFLIP-SEQ stage-charge REFUSED %d MiB: the card's credit balance "
                     "is what the waking rank is promised; host path for this tag",
@@ -9924,6 +9930,55 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001 -- no plan is "not measurable", never a refusal
             return None
 
+    def _pdflip_kv_wait_peer_staging(self, epoch, free, need, floor):
+        """WAKE-FLOOR-1024: bounded wait, before the late kv_cache resume, for
+        the co-located sleeper's on-card staging (booked on THIS flip's credit
+        counter) to be freed, while the pool would otherwise land below the
+        corridor floor. Order, not a reserve: returns the (re-read) free
+        figure and never refuses; with no counter, no staging owed, or an
+        unreadable figure it returns ``free`` unchanged at once."""
+        if free is None or need is None or int(need) <= 0:
+            return free
+        if int(free) - int(floor or 0) >= int(need):
+            return free
+        credit, credit_epoch = self._pdflip_credit_reader(epoch)
+        if credit is None:
+            logger.info(
+                "PDFLIP-WAKE-KV-STAGE-WAIT epoch=%s free=%d MiB need=%d MiB floor=%d MiB "
+                "no-counter (no co-located sleeper credit on this flip): nothing owed, "
+                "no wait -- the pool lands below the floor by %d MiB (WAKE-FLOOR-1024)",
+                epoch, int(free) >> 20, int(need) >> 20, int(floor or 0) >> 20,
+                (int(floor or 0) - (int(free) - int(need))) >> 20)
+            return free
+
+        def _owed() -> int:
+            st = credit.read() or {}
+            if str(st.get("epoch")) != str(credit_epoch):
+                return 0
+            return int(st.get("staged_bytes", 0) or 0)
+
+        try:
+            from flliper.srt.pdflip.wake_kv import (
+                KV_STAGE_WAIT_MAX_S,
+                kv_fit_wait_s,
+                wait_for_peer_staging,
+            )
+
+            free2, waited, owed = wait_for_peer_staging(
+                self._pdflip_free_bytes, need, floor, _owed,
+                wait_s=min(kv_fit_wait_s(), KV_STAGE_WAIT_MAX_S))
+        except Exception as exc:  # noqa: BLE001 -- the wait is an order, never a gate
+            logger.info("PDFLIP-WAKE-KV-STAGE-WAIT skipped (%s: %s)", type(exc).__name__, exc)
+            return free
+        if True:  # review SOLL-4: every floor breach is named, waited or not
+            logger.info(
+                "PDFLIP-WAKE-KV-STAGE-WAIT epoch=%s free=%d -> %s MiB need=%d MiB floor=%d MiB "
+                "waited_ms=%.0f peer_staged_left=%d MiB (the sleeper's on-card staging freed "
+                "before the pool maps -- order, not a reserve; WAKE-FLOOR-1024)",
+                epoch, int(free) >> 20, "n/a" if free2 is None else int(free2) >> 20,
+                int(need) >> 20, int(floor or 0) >> 20, waited * 1000, int(owed) >> 20)
+        return free if free2 is None else free2
+
     def _pdflip_await_vram_credit(self, credit, tag: str, need_bytes: int,
                                 epoch=None, submitted=None) -> None:
         if credit is None or need_bytes <= 0:
@@ -11146,6 +11201,11 @@ class SchedulerWeightUpdaterManager:
                 logger.info(
                     "L15-WAKE-NEED tag=kv_cache plan=%d mapped=%d need=%d",
                     _kv_plan, _kv_mapped, int(_kv_need or 0))
+            # WAKE-FLOOR-1024: the co-located sleeper's on-card staging is
+            # freed at ITS leg end, concurrent with this call -- map the pool
+            # after that release, not on top of it (duo _1024_100906 PP0:
+            # 10432 free - 10326 kv -> 106 MiB, the staging went 10 ms later).
+            _kv_free = self._pdflip_kv_wait_peer_staging(_kv_epoch, _kv_free, _kv_need, _kv_floor)
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
             if _unfit is not None and _kv_free is not None:
                 # z30y7: the sleeper's leg runs concurrently and may still be
@@ -11620,7 +11680,9 @@ class SchedulerWeightUpdaterManager:
                         "memory_saver_adapter.resume(tag)",
                         tag, int(tag_bytes.get(tag, 0)) // MIB_,
                         "armed" if credit is not None else "none", credit_epoch,
-                        (self._pdflip_free_bytes() or 0) // MIB_,
+                        # review SOLL-3: an unreadable NVML is "n/a", never a false 0
+                        ("n/a" if (_fb_begin := self._pdflip_free_bytes()) is None
+                         else _fb_begin // MIB_),
                         PDFLIP_GROUP_FENCE_BUDGET_S,
                     )
                     self._pdflip_await_vram_credit(
@@ -11631,7 +11693,11 @@ class SchedulerWeightUpdaterManager:
                     logger.info("PDFLIP-RESUME credit-ok tag=%s -- entering resume(tag)", tag)
                     # weg2xsn269: a refused remap raises here (rc from the
                     # hook's tms_resume_rc) instead of exit(1) inside cuMemCreate.
-                    pdflip_tms_resume(self.memory_saver_adapter, tag)
+                    # WAKE-FLOOR-1024: map, THEN leave the pending book the
+                    # sleeper's staging debit subtracts (resume_then_land owns the order)
+                    _pdflip_resume_then_land(
+                        lambda: pdflip_tms_resume(self.memory_saver_adapter, tag),
+                        credit, tag, credit_epoch)
                     # H31: this tag's buffers exist now -- their pad+extra rows
                     # go on the side stream while the legs run on.
                     _rearm_pf = self._pdflip_rearm_prefetch_issue(_rearm_pf, tag)
