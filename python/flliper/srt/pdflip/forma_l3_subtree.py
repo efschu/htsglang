@@ -68,7 +68,7 @@ class _State:
         # worker: (hash, depth) -> passes pending
         self.wpend: Dict[Tuple[str, int], int] = {}
         self.n = {"queued": 0, "dropped": 0, "kept": 0, "anchor_save": 0, "worker_dropped": 0,
-                  "worker_pending": 0, "diverged": 0}
+                  "worker_pending": 0, "diverged": 0, "anchor_skipped": 0, "worker_veto": 0}
 
 
 _ST = _State()
@@ -351,6 +351,11 @@ def note_refused(tree: Any, node: Any, why: str) -> bool:
     its next broadcast, at most the tokens the peel still asked for (``tree._s39_peel`` = [need, queued])."""
     if not on() or _r12().role() != "host":
         return False
+    if _prefetch_anchor(tree, node):
+        # HLEAF-STALE-1024 S1 (review): the anchor of TP0's in-flight read cannot leave at the next broadcast -- not
+        # queued, so room_pending() promises no room S39 will not deliver and the peel pays with the next leaf
+        _ST.n["anchor_skipped"] += 1
+        return False
     key = id(node)
     if key in _ST.queue:
         return True
@@ -378,6 +383,9 @@ def queue_for_room(tree: Any, nodes: List[Any], why: str = "kv_compact") -> int:
     n = 0
     for node in nodes:
         if node is None:
+            continue
+        if _prefetch_anchor(tree, node):
+            _ST.n["anchor_skipped"] += 1     # HLEAF-STALE-1024 S1: see note_refused
             continue
         key = id(node)
         if key not in _ST.queue:
@@ -439,6 +447,20 @@ def flush_at_broadcast(tree: Any = None) -> int:
                 if stuck is not None:
                     r12.kept_note("s39_l3drop")
                     _kept(t, node, ent, "worker_cannot_delete", " holder=%s" % (getattr(stuck, "id", "?"),))
+                    continue
+            # HLEAF-STALE-1024 A1 (review): a worker that could not follow this drop -- its own in-flight read
+            # anchors the leaf or a node below it, or its subtree holds a node on its device / un-backed / with a
+            # live aux state (what its apply_drop answers with DIVERGED) -- publishes the key (``s39``). TP0 leaves
+            # the drop alone, one decision for the group; dequeued (no room promised), the peel asks again.
+            veto = r12.worker_s39_veto_keys(t)
+            if veto:
+                held = next((d for d in [node] + list(order) if r12.node_key(d) in veto), None)
+                if held is not None:
+                    _ST.queue.pop(key, None)
+                    _ST.n["worker_veto"] += 1
+                    _ST.n["dequeued"] = _ST.n.get("dequeued", 0) + 1   # 27B: no KVLEITER census here
+                    _ST.last_dequeue = "worker_veto"
+                    r12.kept_note("s39_worker_veto")
                     continue
             ok, awhy = _anchor_ready(t, node)
             if not ok:

@@ -186,6 +186,11 @@ class _State:
         #: S41 (review S39): keys this worker holds ON ITS DEVICE (``dv``) -- TP0's S39 subtree drop must not include
         #: an interior node a worker has device-resident (``nd`` cannot tell: every interior node has children)
         self.dev_device: set = set()
+        #: HLEAF-STALE-1024 A1 (review): keys of nodes this worker cannot let an S39 drop take (``s39``) -- the anchor
+        #: of one of ITS in-flight reads, or a node whose subtree here holds what its ``apply_drop`` answers with
+        #: DIVERGED (a node on the device, an un-backed node, a live aux device state) or such an anchor. TP0 leaves
+        #: a leaf whose drop would touch one of them alone (one decision for the group, SOLL R11).
+        self.dev_s39_veto: set = set()
         # named stop found outside a consume (own-ack time); raised at the end of the next consume
         self.k21_stop_msg: Optional[str] = None
         # number of broadcasts consumed on this rank
@@ -1055,7 +1060,8 @@ def _dev_publish(tree: Any) -> bool:
         with open(tmp, "w") as f:
             json.dump({"ev": sorted([k[0], k[1]] for k in _S.dev_evicted),
                        "nd": sorted([k[0], k[1]] for k in _S.dev_nodelete),
-                       "dv": sorted([k[0], k[1]] for k in _S.dev_device)}, f)
+                       "dv": sorted([k[0], k[1]] for k in _S.dev_device),
+                       "s39": sorted([k[0], k[1]] for k in _S.dev_s39_veto)}, f)
         os.replace(tmp, path)
     except OSError as exc:
         if _note("dev_publish_error", 16):
@@ -1088,10 +1094,12 @@ def _dev_refresh(tree: Any) -> None:
     cur: set = set()
     nd: set = set()
     dv: set = set()
+    walk: List[Any] = []
     stack = list(tree.root_node.children.values())
     while stack:
         n = stack.pop()
         stack.extend(n.children.values())
+        walk.append(n)
         k = node_key(n)
         if k is None:
             continue
@@ -1101,18 +1109,85 @@ def _dev_refresh(tree: Any) -> None:
             dv.add(k)
         if n.children or n.component_data[base].value is not None:
             nd.add(k)
-    if cur != _S.dev_evicted or nd != _S.dev_nodelete or dv != _S.dev_device:
+    veto = _s39_veto_keys(tree, walk, base)
+    if (cur != _S.dev_evicted or nd != _S.dev_nodelete or dv != _S.dev_device
+            or veto != _S.dev_s39_veto):
         _S.dev_evicted, _S.dev_nodelete, _S.dev_device = cur, nd, dv
+        _S.dev_s39_veto = veto
         _dev_publish(tree)
 
 
-def _read_worker_sets(tree: Any) -> Tuple[set, set, set]:
+def _s39_veto_keys(tree: Any, walk: List[Any], base: int) -> set:
+    """HLEAF-STALE-1024 A1: the ``s39`` key set of this worker (see ``_State.dev_s39_veto``). ``walk`` = every node of
+    the tree in pre-order (parents before children). A node is a veto when it anchors an in-flight read of this rank, is
+    device-locked, or when a node below it (a) is what this worker's ``forma_l3_subtree.subtree(tp0=False)`` refuses
+    (on the device, un-backed, locked, a write in flight, a live aux device state -- answered with DIVERGED or a
+    pending that ends DIVERGED once the pinned span is loaded back) or (b) anchors such a read. TP0 applies the same
+    rules to its own subtree; this set lets it apply them to every worker's. NF rc39 boot 1024_074822
+    showed the read half (node 310 dropped under pdflip-4-108's in-flight read); the review of the fix the subtree
+    half: a worker's read that completes below the leaf hangs a child TP0 does not have, the load-back puts it on the
+    device and the drop TP0 decided ends DIVERGED."""
+    anchors = set()
+    for rec in (getattr(tree, "ongoing_prefetch", None) or {}).values():
+        a = getattr(rec, "anchor_node", None)
+        if a is None and isinstance(rec, tuple) and rec:
+            a = rec[0]
+        if a is not None and a is not getattr(tree, "root_node", None):
+            anchors.add(id(a))
+    owt = getattr(tree, "ongoing_write_through", None) or {}
+    dmr = getattr(tree, "_pdflip_direct_mamba_rows", None) or {}
+
+    def _locked(n: Any) -> bool:
+        return any(int(getattr(cd, "lock_ref", 0) or 0) > 0 or int(getattr(cd, "host_lock_ref", 0) or 0) > 0
+                   for cd in n.component_data)
+
+    def _child_blocks(c: Any) -> bool:
+        # the worker's own ``subtree(tp0=False)`` refusals, every one of them: on the device, un-backed, a lock (a
+        # pinned read span is loaded back next -- a pending drop would end DIVERGED), a write in flight, a live aux
+        # device state
+        cds = c.component_data
+        return (cds[base].value is not None or cds[base].host_value is None or _locked(c)
+                or getattr(c, "id", None) in owt or getattr(c, "write_through_pending_id", None) is not None
+                or getattr(c, "id", None) in dmr
+                or any(i != base and getattr(cd, "value", None) is not None for i, cd in enumerate(cds)))
+
+    veto: set = set()
+    held_below: Dict[int, bool] = {}
+    for n in reversed(walk):          # children before their parents
+        below = any(held_below.get(id(c), False) or id(c) in anchors or _child_blocks(c)
+                    for c in n.children.values())
+        held_below[id(n)] = below
+        # the node itself: an anchor of this rank's read, or device-locked (a running request may extend below it)
+        own = id(n) in anchors or any(int(getattr(cd, "lock_ref", 0) or 0) > 0 for cd in n.component_data)
+        if below or own:
+            k = node_key(n)
+            if k is not None:
+                veto.add(k)
+    return veto
+
+
+def worker_read_registered(tree: Any) -> None:
+    """HLEAF-STALE-1024 A1: a worker registered a storage read -- its anchor is published NOW, not at the next
+    consume: TP0's next broadcast may otherwise decide the drop before this worker's refresh (the read was registered
+    after this pass's consume). The pass's own HiCache control collective orders the write before TP0's attach."""
+    if role() != "worker":
+        return
+    try:
+        register_tree(tree)
+        _dev_refresh(tree)
+    except Exception as exc:  # noqa: BLE001 - the applicability publish never breaks the read's registration
+        if _note("dev_refresh_error", 16):
+            logger.warning("R12 SPILL-APPLICABILITY refresh at read registration failed: %r", exc)
+
+
+def _read_worker_sets(tree: Any) -> Tuple[set, set, set, set]:
     prefix = _dev_dir_prefix(_tree_arena(tree))
     ev: set = set()
     nd: set = set()
     dv: set = set()
+    s39: set = set()
     if prefix is None:
-        return ev, nd, dv
+        return ev, nd, dv, s39
     import glob
     import json
 
@@ -1135,11 +1210,13 @@ def _read_worker_sets(tree: Any) -> Tuple[set, set, set]:
                 nd.add((str(h), int(d)))
             for h, d in doc.get("dv", ()):
                 dv.add((str(h), int(d)))
+            for h, d in doc.get("s39", ()):
+                s39.add((str(h), int(d)))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             if _note("dev_read_error", 16):
                 logger.warning("R12 SPILL-APPLICABILITY read of %s failed: %r (TP0 decides without that "
                                "worker's state; a node it cannot follow on is named SPILL-DIVERGED)", path, exc)
-    return ev, nd, dv
+    return ev, nd, dv, s39
 
 
 def kept_note(path: str, n: int = 1) -> None:
@@ -1169,6 +1246,12 @@ def worker_device_keys(tree: Any) -> set:
     is one that worker cannot delete -- TP0 leaves such a drop alone instead of sending a verdict the worker answers
     with DIVERGED. ``nd`` cannot say it for an interior node (every interior node has children)."""
     return _read_worker_sets(tree)[2]
+
+
+def worker_s39_veto_keys(tree: Any) -> set:
+    """TP0: the union of every live worker's ``s39`` keys (HLEAF-STALE-1024 A1) -- an S39 drop touching one of them
+    (the leaf or a node of its subtree) is one that worker could not follow: TP0 leaves it alone."""
+    return _read_worker_sets(tree)[3]
 
 
 def await_complete(tree: Any, node: Any, fallback_transit: bool, l3_ok: bool = False) -> bool:
@@ -1358,8 +1441,9 @@ def on_tree_reset(tree: Any) -> None:
     _S.k21_confirmed = {}
     _S.k21_expect = set()
     _S.rr_open = {}
-    if _S.dev_evicted or _S.dev_nodelete or _S.dev_device:
+    if _S.dev_evicted or _S.dev_nodelete or _S.dev_device or _S.dev_s39_veto:
         _S.dev_evicted, _S.dev_nodelete, _S.dev_device = set(), set(), set()
+        _S.dev_s39_veto = set()
         _dev_publish(tree)   # the nodes are gone: no key may block a re-inserted prefix
     _S.k21_stop_msg = None
     _S.rebind_wait = {}

@@ -12171,6 +12171,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        # HLEAF-STALE-1024 A1: a Form A worker publishes its read's anchor at once (TP0's S39 veto set)
+        _r12.worker_read_registered(self)
 
     def _prefetch_line_terms(self, need: int) -> dict:
         """The named terms of the #915 L1/L2 lines (#1068 slice 4), read in
@@ -13093,7 +13095,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # references since they resolved, and this termination is the group's
         # vote that all of them have; the order protection ends here. A SHORT
         # read keeps it: the refetch (#1471) still needs the rest.
-        if int(min_completed_tokens) >= len(prefetch_key):
+        # HLEAF-STALE-1024 S3 (review): a read the group refused for its detached anchor took NOTHING over -- the
+        # hand-off keeps its protection for the re-read that follows (the group's MIN, every rank alike).
+        if int(min_completed_tokens) >= len(prefetch_key) and _anchor_in_tree:
             _pdflip_handoff_consumed(req_id, "fetch", loaded=int(min_completed_tokens))
 
         # #841: a declined insert loaded NOTHING into the tree. Reporting the
