@@ -4404,6 +4404,21 @@ ARMING_FLOOR_MIB = 1229.0
 #: binding stage), which is the residual this constant carries.
 P_PP_STAGE_FIXED_MIB = _PROFILE_27B.constant("P_PP_STAGE_FIXED_MIB")
 
+#: PPCUT-INT4AR 24.10.: WHICH CHECKPOINT'S non-layer weights the profile's
+#: P_PP_STAGE_FIXED_MIB record carries, per profile -- (label, embedding MiB,
+#: lm_head MiB), read from that checkpoint's safetensors headers.  The 27B
+#: record (PP-POSTEN 29.09.) was fitted on boots 09291750/09291831/09291331,
+#: whose P argv names --model-path .../Qwen3.8-27B-INT8-gdncov-vocabembed:
+#: embed_tokens I8 [248320, 5120] 1212.5 + weight_scale 0.47 MiB, lm_head BF16
+#: [248320, 5120] 2425.0 MiB.  ``solve_p_cut`` moves the record onto the
+#: booted checkpoint's own header bytes (pp_cut_launch.stage_fixed_checkpoint_
+#: delta, one-sided); a profile without an entry keeps its record unchanged
+#: and says so.  Measured reason: boot dkr27bint4arrc4bar1int4ar10241254 (BF16
+#: embedding) realised PP0 226647 tokens where the record priced 301650.
+P_PP_STAGE_FIXED_REF_NONLAYER_MIB: Dict[str, Tuple[str, float, float]] = {
+    "qwen27b": ("Qwen3.8-27B-INT8-gdncov-vocabembed", 1212.97, 2425.0),
+}
+
 #: The `prefill activation reserve` post, MiB per rank. 1.000 GiB on every
 #: rank of both boots. It had NO FIELD in the pool model before #1286.
 P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
@@ -19113,6 +19128,10 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
     }
     profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
     changed: List[str] = []
+    # PPCUT-INT4AR 24.10.: an operator-stated stage-fixed vector is THEIR
+    # measurement of THIS checkpoint; solve_p_cut moves only the record default.
+    ns.pp_cut_stage_fixed_given = bool(
+        pdflip_form.flag_given(argv_words, "--pp-cut-stage-fixed-mib"))
     for flag, dest, of in PROFILE_ARG_DEFAULTS:
         # A store_true flag's "--no-" twin (LS6) counts as given, too.
         if (pdflip_form.flag_given(argv_words, flag)
@@ -22742,6 +22761,29 @@ def solve_p_cut(
             log(_ctx_line)
             _rope_delta = _ctx_delta
         _stage_fixed = tuple(float(v) + float(d) for v, d in zip(_stage_fixed, _rope_delta))
+    # PPCUT-INT4AR 24.10.: the record's non-layer half is its reference
+    # checkpoint's embedding/lm_head; move it onto THIS checkpoint's header
+    # bytes (one-sided: only a larger payload is added).  An operator-given
+    # vector is left alone; a profile without a registered reference too.
+    _sf_ref = P_PP_STAGE_FIXED_REF_NONLAYER_MIB.get(
+        str(getattr(ns, "profile", None) or PROFILE_QWEN27B))
+    if getattr(ns, "pp_cut_stage_fixed_given", False):
+        log("PP-CUT STAGE-FIXED CHECKPOINT: --pp-cut-stage-fixed-mib given on the command line "
+            "-> taken as this checkpoint's measurement, not moved")
+    elif _sf_ref is None:
+        log("PP-CUT STAGE-FIXED CHECKPOINT: profile %r registers no reference checkpoint for its "
+            "P_PP_STAGE_FIXED_MIB record (P_PP_STAGE_FIXED_REF_NONLAYER_MIB) -> record unchanged"
+            % (getattr(ns, "profile", None),))
+    else:
+        _stage_fixed, _sf_line = _cut.stage_fixed_checkpoint_delta(
+            _stage_fixed,
+            ref_label=_sf_ref[0],
+            ref_embedding_mib=float(_sf_ref[1]),
+            ref_lm_head_mib=float(_sf_ref[2]),
+            embedding_mib=float(terms.embedding_weight_bytes) / _pp_cut.MIB,
+            lm_head_mib=float(terms.lm_head_weight_bytes) / _pp_cut.MIB,
+        )
+        log(_sf_line)
     _booked = p_pool_posts_as_booked(ns)
     # the draft cell rides the same per-model gate: a model whose row keeps the old posts keeps the old cell
     _p_draft_cell, _p_draft_cell_line = (p_draft_kv_cell_bytes_by_stage(ns, len(budgets_p), text_cfg)
