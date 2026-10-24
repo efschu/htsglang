@@ -35,6 +35,11 @@ CAUSES (the dominant one is ``cause=``, every one present is listed in ``notes=`
                          Boot 1023_144422 14:49:12-36Z: 34 gaps of 450-580 ms ``cause=other`` with ``rest`` 400-500 ms
                          -- D re-probed two refused hand-backs (keys=118709 / 107619, readable=0) every round
                          (``D-ADMIT-AFTER-REFUSALS refusals=37 waited_s=20.1 gates={lifetime:37}``); no span named it.
+* ``result_host``     -- SWEEPCENSUS-1023: the ``result`` span (host time of process_batch_result: a finished
+                         request's release, the S108 turn end's L2 publish sweep) is at least half of the rest.
+                         Boot 1023_223241 D TP0 23:26:52-23:35:26Z: 20 gaps ``cause=other`` and 15 ``cause=d_prefill``
+                         (d_prefill_ms 347-9153 of gaps up to 52 s) whose ``result`` span held 5-44 s -- the full-arena
+                         room census per chain node; the extends' fallback named them d_prefill, the rest other.
 * ``other``           -- none of these: the rest of the gap (``other_ms`` = gap minus the extends' wall).
 * ``idle``            -- S106: no request of the round that opened the gap is in the round that closed it (the
                          earlier decodes finished, a new request opened the next stream): nothing was paused --
@@ -85,7 +90,7 @@ _ATTR = "_pdflip_d_decode_gap"
 NOTE_CAUSES = ("skipfirst_hold", "f3_decode_first", "seat", "wake_read", "lend_return", "lend")
 #: S106: the notes whose own wall is measured (``note_ms``); they name the gap only when that wall dominates it
 TIMED_CAUSES = ("lend_return", "lend")
-CAUSES = ("flip", "idle", "mixed_prefill", "d_prefill") + NOTE_CAUSES + ("store_probe", "other",)
+CAUSES = ("flip", "idle", "mixed_prefill", "d_prefill") + NOTE_CAUSES + ("result_host", "store_probe", "other",)
 
 #: FLIPTIME-1023: store presence probes since the last decode round, from ANY thread of this process
 #: (``n``, ``keys``, wall ms, thread-CPU ms) -- filled by :func:`note_probe`, taken by the tracker per round
@@ -224,7 +229,11 @@ class Tracker:
         elif self.ext_n > 0 and self.ext_ms >= 0.5 * gap_ms:
             cause = "d_prefill"
         else:
-            cause = next((c for c in NOTE_CAUSES if _names(c)), "d_prefill" if self.ext_n else "other")
+            cause = next((c for c in NOTE_CAUSES if _names(c)), None)
+            if cause is None:
+                # SWEEPCENSUS-1023: the result span (process_batch_result host time) holds at least half of the rest
+                cause = ("result_host" if float(self.spans.get("result", 0.0)) >= 0.5 * other_ms > 0.0
+                         else ("d_prefill" if self.ext_n else "other"))
         probe = _take_probe()
         if cause == "other" and probe[0] and probe[3] >= 0.5 * other_ms:
             cause = "store_probe"   # FLIPTIME-1023: the probes' thread CPU is at least half of the unnamed rest
