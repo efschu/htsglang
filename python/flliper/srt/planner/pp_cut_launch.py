@@ -788,6 +788,80 @@ def ms_per_layer_from_card_library(
     )
 
 
+def stage_fixed_checkpoint_delta(
+    stage_fixed_mib: Sequence[float],
+    *,
+    ref_label: str,
+    ref_embedding_mib: float,
+    ref_lm_head_mib: float,
+    embedding_mib: float,
+    lm_head_mib: float,
+) -> Tuple[Tuple[float, ...], str]:
+    """The per-stage fixed posts, moved onto THIS checkpoint's non-layer weights.
+
+    ``P_PP_STAGE_FIXED_MIB`` is a MEASURED role vector -- "weights + runtime
+    state" minus the per-layer half -- and the non-layer weights inside it are
+    the REFERENCE checkpoint's: the input embedding on the first stage,
+    ``lm_head`` on the last.  The per-layer half is re-priced from every boot's
+    own headers; this half was not, so a checkpoint whose embedding or head has
+    another dtype than the reference's was priced with the reference's bytes.
+
+    MEASURED (boot dkr27bint4arrc4bar1int4ar10241254, 24.10., cut 36,28): the
+    record's reference ran Qwen3.8-27B-INT8-gdncov-vocabembed (I8 embedding,
+    1213.0 MiB); the int4ar checkpoint carries a BF16 embedding (2425.0 MiB).
+    PP0's 'weights + runtime state' 9.271 GiB minus 36 x 187.7 MiB gives a real
+    stage-0 fixed post of 2736 MiB against the record's 1418.4, and group P's
+    own sizing realised 226647 tokens on PP0 where this model priced 301650
+    (-1318 MiB, the OOM direction).  The embedding delta is 1212 of those 1318.
+
+    ONE-SIDED ON PURPOSE.  A larger non-layer payload than the reference's is
+    ADDED (it is resident, header bytes are exact).  A SMALLER one (e.g. an
+    NVFP4 ``lm_head`` -- 606.2 MiB of ``lm_head.weight`` in the headers,
+    its scale tensors are not counted by ``checkpoint_weight_terms`` -- against
+    the reference's BF16 2425) is NOT
+    credited: crediting it raises the priced pool, which is the direction a
+    wrong post OOMs in, and no boot of such a form has yet measured the
+    stage-fixed post the credit would rest on.  The uncredited MiB are named on
+    the line so the operator sees what is left on the table.
+
+    A single-stage vector carries both payloads on stage 0.  Returns the
+    adjusted vector and one provenance line; an empty input is returned as is
+    (``refuse_unfunded_posts`` names it).
+    """
+    fixed = tuple(float(v) for v in stage_fixed_mib)
+    if not fixed:
+        return fixed, "PP-CUT STAGE-FIXED CHECKPOINT: no stage-fixed vector -- nothing to move"
+    d_emb = float(embedding_mib) - float(ref_embedding_mib)
+    d_head = float(lm_head_mib) - float(ref_lm_head_mib)
+    add = [0.0] * len(fixed)
+    add[0] += max(0.0, d_emb)
+    add[-1] += max(0.0, d_head)
+    out = tuple(v + a for v, a in zip(fixed, add))
+    not_credited = [
+        ("%s absent from the headers (tied to the embedding?) %+.1f MiB" % (name, d))
+        if float(got) <= 0.0 else ("%s %+.1f MiB" % (name, d))
+        for name, d, got in (("embedding", d_emb, embedding_mib), ("lm_head", d_head, lm_head_mib))
+        if d < 0.0
+    ]
+    line = (
+        "PP-CUT STAGE-FIXED CHECKPOINT: record reference %s (embedding %.1f, lm_head %.1f MiB) "
+        "-> this checkpoint (embedding %.1f, lm_head %.1f MiB): stage-fixed %s -> %s MiB "
+        "(first stage += embedding delta, last stage += lm_head delta, one-sided)%s"
+        % (
+            ref_label,
+            float(ref_embedding_mib),
+            float(ref_lm_head_mib),
+            float(embedding_mib),
+            float(lm_head_mib),
+            ",".join("%.1f" % v for v in fixed),
+            ",".join("%.1f" % v for v in out),
+            ("; NOT credited (smaller than the reference, unmeasured as a post): "
+             + ", ".join(not_credited)) if not_credited else "",
+        )
+    )
+    return out, line
+
+
 def derive_pool_floor_from_cut(
     frontier: Sequence[CutCandidate],
     servable: Sequence[CutCandidate],

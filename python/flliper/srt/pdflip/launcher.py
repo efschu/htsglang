@@ -4405,6 +4405,21 @@ ARMING_FLOOR_MIB = 1229.0
 #: binding stage), which is the residual this constant carries.
 P_PP_STAGE_FIXED_MIB = _PROFILE_27B.constant("P_PP_STAGE_FIXED_MIB")
 
+#: PPCUT-INT4AR 24.10.: WHICH CHECKPOINT'S non-layer weights the profile's
+#: P_PP_STAGE_FIXED_MIB record carries, per profile -- (label, embedding MiB,
+#: lm_head MiB), read from that checkpoint's safetensors headers.  The 27B
+#: record (PP-POSTEN 29.09.) was fitted on boots 09291750/09291831/09291331,
+#: whose P argv names --model-path .../Qwen3.8-27B-INT8-gdncov-vocabembed:
+#: embed_tokens I8 [248320, 5120] 1212.5 + weight_scale 0.47 MiB, lm_head BF16
+#: [248320, 5120] 2425.0 MiB.  ``solve_p_cut`` moves the record onto the
+#: booted checkpoint's own header bytes (pp_cut_launch.stage_fixed_checkpoint_
+#: delta, one-sided); a profile without an entry keeps its record unchanged
+#: and says so.  Measured reason: boot dkr27bint4arrc4bar1int4ar10241254 (BF16
+#: embedding) realised PP0 226647 tokens where the record priced 301650.
+P_PP_STAGE_FIXED_REF_NONLAYER_MIB: Dict[str, Tuple[str, float, float]] = {
+    "qwen27b": ("Qwen3.8-27B-INT8-gdncov-vocabembed", 1212.97, 2425.0),
+}
+
 #: The `prefill activation reserve` post, MiB per rank. 1.000 GiB on every
 #: rank of both boots. It had NO FIELD in the pool model before #1286.
 P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
@@ -10348,6 +10363,91 @@ def _rope_cache_cols(cfg: dict) -> int:
         return int(int(head_dim) * float(factor if factor is not None else 1.0))
     except (TypeError, ValueError):
         return 0
+
+
+GGUF_DENSE_VOCAB_ENV = "FLLIPER_GGUF_DENSE_VOCAB"
+
+
+def _p_gguf_dense_vocab(ns, model: Optional[str]) -> bool:
+    """True when group P loads a GGUF checkpoint with the legacy dense vocab
+    (``model_loader.gguf_qwen35.gguf_dense_vocab``: token_embd/output are
+    dequantized to BF16 at load) -- read where P reads it: the exported env,
+    overridden by an ``--env-p`` entry.  The name is restated here only so this
+    module does not import torch; the reader's spelling is pinned by a test."""
+    if not model or not os.path.isfile(str(model)):
+        return False
+    from flliper.srt.pdflip import gguf_census as _gguf_census
+
+    if not _gguf_census.is_gguf_checkpoint(str(model)):
+        return False
+    val = os.environ.get(GGUF_DENSE_VOCAB_ENV, "0")
+    try:
+        val = parse_group_env(str(getattr(ns, "env_p", "") or "")).get(GGUF_DENSE_VOCAB_ENV, val)
+    except ValueError:
+        pass
+    return str(val).strip() == "1"
+
+
+def p_stage_fixed_for_checkpoint(
+    ns, stage_fixed: Sequence[float], terms, *, text_cfg: Optional[Dict] = None,
+    model: Optional[str] = None,
+) -> Tuple[Tuple[float, ...], str]:
+    """PPCUT-INT4AR 24.10.: group P's per-stage fixed posts for THIS checkpoint.
+
+    Three branches, each with its own line:
+
+    * ``--pp-cut-stage-fixed-mib`` given on the command line
+      (``ns.pp_cut_stage_fixed_given``, set by :func:`apply_profile_arg_defaults`)
+      -> the operator's measurement of this checkpoint, unchanged;
+    * the profile registers no reference checkpoint in
+      :data:`P_PP_STAGE_FIXED_REF_NONLAYER_MIB` -> the record, unchanged;
+    * otherwise the record is moved onto this checkpoint's RESIDENT non-layer
+      bytes by ``pp_cut_launch.stage_fixed_checkpoint_delta`` (first stage +=
+      embedding delta, last stage += lm_head delta, one-sided).
+
+    RESIDENT, not header bytes, where the two differ: a GGUF checkpoint loaded
+    with ``FLLIPER_GGUF_DENSE_VOCAB=1`` dequantizes token_embd/output to BF16,
+    so the header's quant size would under-book the first stage by the
+    dequantization growth (review #222 SOLL-2).  There the dense BF16 size
+    ``vocab_size x hidden_size x 2`` from the config is used for both.
+    """
+    fixed = tuple(float(v) for v in stage_fixed)
+    if getattr(ns, "pp_cut_stage_fixed_given", False):
+        return fixed, ("PP-CUT STAGE-FIXED CHECKPOINT: --pp-cut-stage-fixed-mib given on the command "
+                       "line -> taken as this checkpoint's measurement, not moved")
+    profile = str(getattr(ns, "profile", None) or PROFILE_QWEN27B)
+    ref = P_PP_STAGE_FIXED_REF_NONLAYER_MIB.get(profile)
+    if ref is None:
+        return fixed, ("PP-CUT STAGE-FIXED CHECKPOINT: profile %r registers no reference checkpoint for "
+                       "its P_PP_STAGE_FIXED_MIB record (P_PP_STAGE_FIXED_REF_NONLAYER_MIB) -> record "
+                       "unchanged" % (profile,))
+    from flliper.srt.planner import pp_cut as _pp_cut
+    from flliper.srt.planner import pp_cut_launch as _cut
+
+    emb_mib = float(terms.embedding_weight_bytes) / _pp_cut.MIB
+    head_mib = float(terms.lm_head_weight_bytes) / _pp_cut.MIB
+    note = ""
+    if _p_gguf_dense_vocab(ns, model):
+        cfg = text_cfg or {}
+        vocab, hidden = int(cfg.get("vocab_size") or 0), int(cfg.get("hidden_size") or 0)
+        if vocab > 0 and hidden > 0:
+            dense = vocab * hidden * 2 / _pp_cut.MIB
+            note = ("; GGUF %s=1: token_embd/output dequantized to BF16 at load -> resident "
+                    "%.1f MiB each (header %.1f / %.1f)" % (GGUF_DENSE_VOCAB_ENV, dense, emb_mib, head_mib))
+            emb_mib, head_mib = max(emb_mib, dense), max(head_mib, dense)
+        else:
+            note = ("; GGUF %s=1 but the config states no vocab_size/hidden_size -- header bytes "
+                    "used, the first stage may be UNDER-booked by the dequantization growth"
+                    % (GGUF_DENSE_VOCAB_ENV,))
+    out, line = _cut.stage_fixed_checkpoint_delta(
+        fixed,
+        ref_label=ref[0],
+        ref_embedding_mib=float(ref[1]),
+        ref_lm_head_mib=float(ref[2]),
+        embedding_mib=emb_mib,
+        lm_head_mib=head_mib,
+    )
+    return out, line + note
 
 
 def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Optional[str]]:
@@ -19401,6 +19501,10 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
     }
     profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
     changed: List[str] = []
+    # PPCUT-INT4AR 24.10.: an operator-stated stage-fixed vector is THEIR
+    # measurement of THIS checkpoint; solve_p_cut moves only the record default.
+    ns.pp_cut_stage_fixed_given = bool(
+        pdflip_form.flag_given(argv_words, "--pp-cut-stage-fixed-mib"))
     for flag, dest, of in PROFILE_ARG_DEFAULTS:
         # A store_true flag's "--no-" twin (LS6) counts as given, too.
         if (pdflip_form.flag_given(argv_words, flag)
@@ -23030,6 +23134,11 @@ def solve_p_cut(
             log(_ctx_line)
             _rope_delta = _ctx_delta
         _stage_fixed = tuple(float(v) + float(d) for v, d in zip(_stage_fixed, _rope_delta))
+    # PPCUT-INT4AR 24.10.: the record's non-layer half is its reference
+    # checkpoint's embedding/lm_head; move it onto THIS checkpoint's bytes.
+    _stage_fixed, _sf_line = p_stage_fixed_for_checkpoint(
+        ns, _stage_fixed, terms, text_cfg=text_cfg, model=model)
+    log(_sf_line)
     _booked = p_pool_posts_as_booked(ns)
     # the draft cell rides the same per-model gate: a model whose row keeps the old posts keeps the old cell
     _p_draft_cell, _p_draft_cell_line = (p_draft_kv_cell_bytes_by_stage(ns, len(budgets_p), text_cfg)
