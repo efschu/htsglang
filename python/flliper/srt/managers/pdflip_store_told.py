@@ -683,6 +683,14 @@ def forget_left_queue(scheduler, req, why: str) -> List[str]:
         _return_untold_dual_grant(scheduler, req, why)
     if _forget_intake_t(scheduler, rid, held):
         dropped.append("intake_t")
+    # TWIN-REREAD review MUSS 1: a request that leaves the queue unadmitted takes its S90b state pin with it
+    _unpin_s90b = getattr(getattr(scheduler, "tree_cache", None), "_pdflip_s90b_unpin", None)
+    if callable(_unpin_s90b):
+        try:
+            if _unpin_s90b(rid):
+                dropped.append("s90b_pin")
+        except Exception:  # noqa: BLE001 - bookkeeping
+            pass
     if dropped:
         n = getattr(scheduler, "_q580_forget_n", 0) + 1
         scheduler._q580_forget_n = n
@@ -3002,7 +3010,9 @@ def _pop_credit_keep_pin(tree, rid: str) -> int:
     pin stays until the request leaves the queue (``p_intake.settle_told``
     releases it with the kept verdict) or the read is aborted."""
     pins = getattr(tree, "_prefetch_span_pins", None)
-    if not pins or str(rid) not in pins:
+    # TWIN-REREAD review MUSS 1: an S90b state pin is kept the same way (live: loaded=0, no span pin at all)
+    s90b = (getattr(tree, "__dict__", None) or {}).get("_pdflip_s90b_pins")
+    if (not pins or str(rid) not in pins) and not (s90b and str(rid) in s90b):
         return int(tree.pop_prefetch_loaded_tokens(rid) or 0)
     (getattr(tree, "_pdflip_dormant_done", None) or {}).pop(str(rid), None)
     return int(tree.prefetch_loaded_tokens_by_reqid.pop(rid, 0) or 0)

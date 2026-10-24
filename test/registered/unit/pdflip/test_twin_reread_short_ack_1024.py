@@ -265,3 +265,45 @@ def test_review_pf_ring_asymmetric_attach_keeps_one_plan_on_every_rank(monkeypat
     assert getattr(ring.stages[0], "_pf_fallback_n", 0) == 1
     assert getattr(ring.stages[1], "_pf_ack_state_at_own_n", 0) == 1
     assert getattr(ring.stages[2], "_pf_ack_state_at_own_n", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Review MUSS 1 (review-twin-reread-1024.md): the S90b state pin's exits on the scheduler side
+
+class _PinTree:
+    def __init__(self):
+        self.__dict__["_pdflip_s90b_pins"] = {"pdflip-0-2": [("node", None, False, TOLD)]}
+        self.unpinned, self.popped = [], []
+        self.prefetch_loaded_tokens_by_reqid = {"pdflip-0-2": 0}
+
+    def _pdflip_s90b_unpin(self, rid, above=None):
+        self.unpinned.append((rid, above))
+        return 1
+
+    def pop_prefetch_loaded_tokens(self, rid):
+        self.popped.append(rid)
+        return 0
+
+
+def test_the_credit_pop_keeps_the_state_pin_without_a_span_pin():
+    """Live loaded=0: no #1417 span pin exists -- the plain pop would have released the state pin at the told
+    admission's first visit (H91 KEPT: seated a pass later)."""
+    t = _PinTree()
+    st._pop_credit_keep_pin(t, "pdflip-0-2")
+    assert t.popped == []
+
+
+def test_a_floor_releases_the_state_pins_deeper_than_the_floor(monkeypatch):
+    t = _PinTree()
+    s = types.SimpleNamespace(tree_cache=t, ps=types.SimpleNamespace(pp_rank=1))
+    monkeypatch.setattr(fb, "follower_forget", lambda scheduler, rid: None)
+    monkeypatch.setattr(fb, "note_floor_applied", lambda *a, **k: None)
+    fb.apply_floor(s, "pdflip-0-3", 8192)
+    assert t.unpinned == [("pdflip-0-3", 8192)]
+
+
+def test_a_request_leaving_the_queue_unadmitted_takes_its_state_pin():
+    t = _PinTree()
+    s = types.SimpleNamespace(tree_cache=t, ps=types.SimpleNamespace(pp_rank=2), _pdflip_store_told_armed=True)
+    dropped = st.forget_left_queue(s, types.SimpleNamespace(rid="pdflip-0-2"), "abort")
+    assert t.unpinned == [("pdflip-0-2", None)] and "s90b_pin" in dropped

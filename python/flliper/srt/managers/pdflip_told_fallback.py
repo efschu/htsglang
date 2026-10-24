@@ -1281,6 +1281,13 @@ def apply_floor(scheduler, rid: str, floor: int) -> None:
         _st._pop_credit_keep_pin(scheduler.tree_cache, rid)
     except Exception:  # noqa: BLE001 - bookkeeping; the satisfied mark decides
         pass
+    # TWIN-REREAD review MUSS 1: an S90b state pinned deeper than the floor is not what this rank admits -- released
+    _unpin_s90b = getattr(getattr(scheduler, "tree_cache", None), "_pdflip_s90b_unpin", None)
+    if callable(_unpin_s90b):
+        try:
+            _unpin_s90b(rid, above=int(floor))
+        except Exception:  # noqa: BLE001 - bookkeeping
+            pass
     sat = getattr(scheduler, "_pdflip_store_told_satisfied", None)
     if sat is None:
         sat = scheduler._pdflip_store_told_satisfied = {}
@@ -1548,12 +1555,14 @@ def _state_at_own(scheduler, req, rid: str, own: int, res: int) -> int:
     if got >= own:
         n = _bump(scheduler, "_pf_ack_state_at_own_n")
         if n <= 32 or n % _LOG_EVERY == 0:
+            _ms = getattr(req, "_pdflip_s90b_attach_ms", None)
             logger.warning(
-                "PF TOLD-ACK STATE-AT-OWN rank pp=%s rid=%s kv=%d resumable_before=%d (n=%d): this rank's read "
-                "completed the KV span without its recurrent state; the anchor of that depth was read from the "
-                "store and attached (S90b) -- the ack names the full depth instead of PP0 answering told=0 for "
-                "every rank",
-                getattr(scheduler.ps, "pp_rank", "?"), str(rid), int(own), int(res), n,
+                "PF TOLD-ACK STATE-AT-OWN rank pp=%s rid=%s kv=%d resumable_before=%d attach_ms=%s (n=%d): this "
+                "rank's read completed the KV span without its recurrent state; the anchor of that depth was read "
+                "from the store, attached (S90b) and pinned under the rid until the seat -- the ack names the full "
+                "depth instead of PP0 answering told=0 for every rank",
+                getattr(scheduler.ps, "pp_rank", "?"), str(rid), int(own), int(res),
+                "-" if _ms is None else "%.1f" % float(_ms), n,
             )
     return got
 
