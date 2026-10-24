@@ -44,6 +44,7 @@ V1 simplifications, each declared (also in the launcher's deviation list):
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import argparse
 import asyncio
 import collections
@@ -6812,7 +6813,7 @@ class Front:
             # ``pdflip-2-6`` would drop the live ``pdflip-2-60`` with it -- a user's request lost. An orphan whose rid
             # prefixes any other rid the front or this park knows is not aborted (named; the next park asks again).
             names = held | {str(r) for r in rids}
-            shadowed = [o for o in orphans if any(n != o and n.startswith(o) for n in names)]
+            shadowed = [o for o in orphans if any(n != o and _abort_rid_hit(n, o) for n in names)]  # D's abort rule (#1580)
             if shadowed:
                 self.counters["d_orphan_abort_prefix_skip"] += len(shadowed)
                 logger.warning("PDFLIP D-ORPHAN-ABORT-SKIP rids=%s epoch=%d -- D aborts by rid PREFIX and another "

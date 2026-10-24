@@ -55,6 +55,7 @@ Host RAM: one more memfd slot of one chunk's rows (16384 x 16 x 320 B =
 
 from __future__ import annotations
 
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit
 import collections
 import logging
 import threading
@@ -348,7 +349,7 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
     def drop(self, rid: Optional[str], *, abort_all: bool, reason: str) -> int:
         with self._lock:
             def hit(r: str) -> bool:
-                return abort_all or (bool(rid) and r.startswith(str(rid)))
+                return abort_all or (bool(rid) and _abort_rid_hit(r, rid))
 
             n = 0
             for r in [r for r in self._adm_queue if hit(r)]:
