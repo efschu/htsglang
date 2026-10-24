@@ -51,6 +51,7 @@ from flliper.srt.mem_cache import probe_hold as _probe_hold
 from flliper.srt.pdflip import read_depth as _rd  # READ-DEPTH 1014 (C5)
 from flliper.srt.pdflip import kv_durchlauf as _kv_dl  # S36 KV-DURCHLAUF
 from flliper.srt.managers import pdflip_told_ack_early as _told_ack_early  # S50 TOLD-ACK-EARLY
+from flliper.srt.managers import discard_named as _discard_named  # #221 Fix A: discarded reads are named
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -2874,6 +2875,12 @@ class HiCacheController:
         prints the ONE line that names the bound, the joined thread roles,
         the terminated and drained operation counts and the seconds spent.
         """
+        # #221 Fix A (site reset_join): the join counts what the stop OBSERVED; the read units
+        # it discards -- the operations it terminates (read here, BEFORE the stop: afterwards
+        # the loops have consumed them) and the tree's ongoing_prefetch records `_reset_full`
+        # dropped without a trace -- are named below, one line per rid, one census unit each.
+        _dn_ops = _discard_named.snapshot_ops(self)
+        _dn_records = self.__dict__.pop("_discard_named_records", None)
         if self.pdflip_reset_reaper_alive():
             # PARK-READ-DETACH: a detached reset of this sleep is still joining;
             # its reaper restarts the pipeline. Only the scheduler-side queues here.
@@ -2882,6 +2889,7 @@ class HiCacheController:
             self.ack_write_queue.clear()
             self.ack_load_queue.clear()
             logger.info("#1068 RESET MERGED into the pending PARK-READ-DETACH reaper (no second join)")
+            _discard_named.name_reset_join(logger, _dn_ops, _dn_records)
             return
         _rids = self._pdflip_park_read_detach_rids()
         stop = self._pdflip_stop_storage_threads_detached(_rids) if _rids else None
@@ -2896,6 +2904,7 @@ class HiCacheController:
             self.load_queue.clear()
             self.ack_write_queue.clear()
             self.ack_load_queue.clear()
+            _discard_named.name_reset_join(logger, _dn_ops, _dn_records)
             return
         if stop is None:
             stop = self._stop_storage_threads()
@@ -2908,6 +2917,7 @@ class HiCacheController:
             stop.drained_ops,
             stop.joined_s,
         )
+        _discard_named.name_reset_join(logger, _dn_ops, _dn_records)
 
         self.write_queue.clear()
         self.load_queue.clear()

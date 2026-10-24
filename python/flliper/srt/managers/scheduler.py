@@ -244,6 +244,7 @@ from flliper.srt.pdflip import wake_preload as _pdflip_wake_preload  # DP-NACHLA
 from flliper.srt.pdflip import flush_verdict as _pdflip_flush_verdict  # z30j PP0 flush verdict
 from flliper.srt.managers import pdflip_flush_nonblock as _pdflip_flush_nonblock  # B1 (30.09.)
 from flliper.srt.managers import pdflip_quiesce_loadback as _pdflip_quiesce_loadback  # QUIESCE-LOADBACK-1023
+from flliper.srt.managers import discard_named as _discard_named  # #221 Fix A: discarded marks are named
 from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
@@ -2037,6 +2038,30 @@ def _pdflip_parked_owned_prefetch_of(sched) -> frozenset:
             ongoing_prefetch=getattr(tc, "ongoing_prefetch", None) or ())
     except Exception:  # noqa: BLE001
         return frozenset()
+
+
+def _discard_named_sleep_reset(sched) -> tuple:
+    """#221 Fix A (site sleep_reset): the D sleep flush's ``tree_cache.reset()`` killed the
+    operation that guarded the #1068 marks of the HELD population -- the requests the sleep holds
+    on purpose (flip / lane / RESUME-VIA-P parks, the #1443 dormant hold, the #1471 post-wake
+    settle: the same three lists ``_pdflip_liveness_hold_publish`` publishes). Their marks are
+    cleared BY NAME with a census exit (``defer_lost_at_reset``), the counterpart of the cutover's
+    ``_clear_prefetch_deferral_for_reissue``; the wake's own read decides anew. NO re-issue here.
+
+    The queue is NOT in the population: a request waiting in ``waiting_queue`` keeps its mark, the
+    next pass's ``_retry_deferred_prefetches`` re-issues it (a live mark is never closed). The
+    lists are replicated on every rank (``park_running`` is a broadcast), so the cleared set is
+    rank-identical and nothing here is a collective. Never raises into the flush."""
+    try:
+        held = []
+        for attr in ("pdflip_d_parked", "pdflip_dormant_hold", "pdflip_post_wake_settle"):
+            held.extend(getattr(sched, attr, None) or ())
+        return _discard_named.discard_marks(
+            held, _discard_named.SITE_SLEEP_RESET, logger,
+            getattr(sched, "_clear_prefetch_deferral_fields", None))
+    except Exception as exc:  # noqa: BLE001 -- the flush never breaks on its own bookkeeping
+        logger.warning("#221 DISCARD-NAMED site=sleep_reset failed (%s: %s)", type(exc).__name__, exc)
+        return [], 0, 0
 
 
 #: DP-NACHLAUF 02.10. (N5u fcf0366fdb, every P>D): the sleep path reset P's
@@ -7392,9 +7417,11 @@ class Scheduler(
         req._1456_last = now
         req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
         _pdflip_short_read.note_reissue(req, _have2)
-        clear = getattr(self, "_clear_prefetch_deferral_fields", None)
-        if clear is not None:
-            clear(req)  # the shortfall mark is ours to re-issue, not the drain's
+        # #221 Fix A (site hold_refetch_clear): the shortfall mark is ours to re-issue, not the
+        # drain's -- cleared BY NAME with its census exit (defer_cleared_refetch), not silently
+        _discard_named.discard_mark(
+            req, _discard_named.SITE_HOLD_REFETCH_CLEAR, logger,
+            getattr(self, "_clear_prefetch_deferral_fields", None), via="refetch")
         if _told_plan is None:
             verdict = self._prefetch_kvcache(req)
         else:
@@ -7426,9 +7453,9 @@ class Scheduler(
             return "due"
         req._1456_last = now
         req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
-        clear = getattr(self, "_clear_prefetch_deferral_fields", None)
-        if clear is not None:
-            clear(req)
+        _discard_named.discard_mark(  # #221 Fix A (site hold_refetch_clear), the budget re-read
+            req, _discard_named.SITE_HOLD_REFETCH_CLEAR, logger,
+            getattr(self, "_clear_prefetch_deferral_fields", None), via="budget")
         plan = pdflip_store_told.refetch_plan(self, req)
         if plan is None or plan == pdflip_store_told.REFETCH_SKIP:
             verdict = self._prefetch_kvcache(req)
@@ -9798,6 +9825,16 @@ class Scheduler(
     # exactly one exit, so the identity the acceptance reads, per rank, is
     #   deferred == landed + defer_expired + defer_released + defer_dropped
     #               + defer_cleared_cutover
+    # #221 Fix A adds two exits (managers/discard_named.py, each with a
+    # '#221 DISCARD-NAMED site=... rid=... marks=... tokens=...' line):
+    # defer_cleared_refetch (clearer (d): the HOLD-REFETCH of
+    # `_pdflip_refetch_one` / `_pdflip_refetch_budget`) and defer_lost_at_reset
+    # (clearer (e): the D sleep flush's tree reset, over the HELD population
+    # only; `_discard_named_sleep_reset`), so on a build with the switch on
+    #   deferred == landed + defer_expired + defer_released + defer_dropped
+    #               + defer_cleared_reissue + defer_cleared_refetch
+    #               + defer_lost_at_reset
+    # (the key the cutover clearer counts is `defer_cleared_reissue`.)
     # UNDEFERRABLE and DEFER REFUSED are taken BEFORE a mark exists (the
     # request's own span exceeds the limit / the deferral is refused on this
     # rank-phase) and sit OUTSIDE the partition: counted, never members.
@@ -23612,6 +23649,7 @@ class Scheduler(
                         _prd_cc._pdflip_reset_detach_rids = _pdflip_parked_owned_prefetch_of(self)
                     try:
                         self.tree_cache.reset()
+                        _discard_named_sleep_reset(self)  # #221 Fix A: the held marks the reset orphaned, named
                         _pdflip_flush_nonblock.sweep_memo_clear(self)  # h16v S12 V2: new tree, old stamp void
                         _fsub.mark("tree_reset")
                         self.req_to_token_pool.clear()
