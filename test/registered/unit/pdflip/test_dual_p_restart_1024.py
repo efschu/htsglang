@@ -841,6 +841,32 @@ class ArenaCensus(unittest.TestCase):
         line = [m for m in cm.output if "S7B P-BACK" in m][0]
         self.assertIn("arena-32768.bin:pinned 50->48 refs 179->120 claimed 3->1", line)
 
+    def test_a_real_arena_reads_as_a_census(self):
+        # Qwen check (24.10.): the reader called ArenaView.close(), which does not exist -> every live arena 'unreadable'
+        import ctypes
+
+        from flliper.srt.mem_cache.storage.file import hicache_arena as HA
+
+        if HA._load_lib() is None:
+            self.fail("arena helper (arena.c) not loadable in this image -- the census cannot be checked")
+        page = 4096
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "arena-%d.bin" % page)
+            arena = HA.ShmArena(path, page, 8)
+            buf = (ctypes.c_uint8 * page)()
+            for stem in ("pg0", "pg1"):
+                self.assertEqual(arena.write([stem], [page], [((0, page),)], [ctypes.addressof(buf)]), [1])
+            got = S.arena_census_of(path)
+            self.assertIsNotNone(got)
+            self.assertEqual((got["slots"], got["complete"], got["claimed"]), (8, 2, 0))
+            pinned, refs, complete = arena.ref_census()                         # the same header read as the writer's
+            self.assertEqual((got["pinned"], got["refs"], got["complete"]), (pinned, refs, complete))
+            self.assertIsNotNone(S.arena_census_of(path))                       # twice: the view was really let go
+            fake_front = types.SimpleNamespace(tag="s7bt")
+            with mock.patch.object(S, "arena_paths", lambda fr, tags=None: [path]):
+                self.assertEqual(S.arena_census(fake_front), {os.path.basename(path): got})
+            arena.close()
+
     def test_delta_text(self):
         self.assertEqual(S.arena_delta_text({}, {}), "none")
         self.assertIn("unreadable", S.arena_delta_text({"a": None}, {"a": None}))

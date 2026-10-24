@@ -531,9 +531,20 @@ def arena_census_of(path: str) -> Optional[Dict[str, int]]:
             del u32, hdr, state, ref
             return res
         finally:
-            v.close()
+            _close_view(v)
     except Exception:  # noqa: BLE001 -- an instrument never stops the front
         return None
+
+
+def _close_view(v) -> None:
+    """ArenaView has no close() (ShmArena's close is another class): drop the base pointer and unmap here. A close
+    that fails (a view still exported) must never discard a census already read -- Qwen check of #214, 24.10.:
+    ``v.close()`` raised AttributeError and every live arena read 'unreadable'."""
+    try:
+        v._base = None
+        v._mm.close()
+    except Exception:  # noqa: BLE001 -- the mapping goes with the object at GC
+        pass
 
 
 def arena_census(front) -> Dict[str, Any]:
