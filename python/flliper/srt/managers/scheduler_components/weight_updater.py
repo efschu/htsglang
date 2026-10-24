@@ -5415,12 +5415,13 @@ class SchedulerWeightUpdaterManager:
             try:  # Task #20: free, unpromised VRAM may be staged (overdraw)
                 _free = self._pdflip_free_bytes()
                 _floor = self._pdflip_corridor_floor_bytes()
+                # WAKE-FLOOR-1024: the reader too, so the debit grades the card
+                # under the counter lock (a waker claim that landed meanwhile is in it)
+                _reader = self._pdflip_free_bytes
             except Exception:  # noqa: BLE001 -- no probe, no overdraw
-                _free, _floor = None, None
-            # WAKE-FLOOR-1024: the reader too, so the debit grades the card
-            # under the counter lock (a waker claim that landed meanwhile is in it)
+                _free, _floor, _reader = None, None, None
             if not credit.debit("ipc-stage", n, free_bytes=_free, floor_bytes=_floor,
-                                free_reader=self._pdflip_free_bytes):
+                                free_reader=_reader):
                 logger.info(
                     "PDFLIP-SEQ stage-charge REFUSED %d MiB: the card's credit balance "
                     "is what the waking rank is promised; host path for this tag",

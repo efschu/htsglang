@@ -290,7 +290,8 @@ def test_wiring_resume_lands_charge_reads_kv_waits():
     assert "_pdflip_credit_landed(credit, GPU_MEMORY_TYPE_WEIGHTS_DRAFT, epoch)" in src[j:j + 300]
     # the staging debit gets the reader (graded under the lock)
     k = src.index("def _charge(nbytes: int):")
-    assert "free_reader=self._pdflip_free_bytes" in src[k:k + 1200]
+    assert "_reader = self._pdflip_free_bytes" in src[k:k + 1200]
+    assert "free_reader=_reader" in src[k:k + 1200]
     # the late kv resume waits for the peer staging BEFORE its fit check
     a = src.index("self._pdflip_kv_wait_peer_staging(_kv_epoch, _kv_free, _kv_need, _kv_floor)")
     b = src.index("_unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)")
