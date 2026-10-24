@@ -14642,7 +14642,7 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
     vote_deltas = list(deltas)
     # PDFLIP-ADMIT-BOOK (desk/27b-admit-trim-1024): the admission peak priced beside the vote line -- per card the
     # larger of the two posts (they never coexist), only where the record's form runs
-    deltas = booked_rest_admit_deltas(cards, rests, vote_deltas, profile, group, log)
+    deltas = booked_rest_admit_deltas(cards, rests, vote_deltas, profile, group, log, rest_name=name)
     if any(deltas):
         rests = [None if v is None else int(v) + int(d) for v, d in zip(rests, deltas)]
         if deltas == vote_deltas:
@@ -14699,7 +14699,7 @@ def d_admit_need_record(profile: Optional[str] = None, n: Optional[int] = None,
 
 def booked_rest_admit_deltas(cards: List[Card], rests: Sequence[Optional[int]], vote_deltas: Sequence[int],
                              profile: Optional[str] = None, group: str = "D",
-                             log: Optional[Log] = None) -> List[int]:
+                             log: Optional[Log] = None, rest_name: Optional[str] = None) -> List[int]:
     """PDFLIP-ADMIT-BOOK (desk/27b-admit-trim-1024, budget_rest): per card ``max(vote-line delta,
     ceil8(D_ADMIT_NEED_MIB))`` where the card has a booked rest and the record's form runs; the vote-line deltas
     unchanged everywhere else (no record, foreign form, switch off, group P). The admission peak (post-wake handbacks,
@@ -14716,6 +14716,16 @@ def booked_rest_admit_deltas(cards: List[Card], rests: Sequence[Optional[int]], 
             log(f"{_budget_rest.ADMIT_MARKER} group={group}: off -- {src}; the vote-line delta alone")
         return list(vote_deltas)
     out = _budget_rest.admit_deltas(rests, vote_deltas, needs)
+    # review S1: the need is relative to the rest it was derived beside -- another rest is named loudly (and still
+    # booked: dropping the post would be the OOM direction), never carried on silently
+    basis_name, basis_mib = _budget_rest.ADMIT_REST_BASIS
+    off = [(i, r) for i, r in enumerate(rests) if r is not None and int(r) != int(basis_mib)]
+    if log is not None and (off or (rest_name is not None and str(rest_name) != basis_name)):
+        log(f"{_budget_rest.ADMIT_MARKER} REST-MISMATCH group={group}: {_budget_rest.ADMIT_RECORD} was derived beside "
+            f"{basis_name} {basis_mib} MiB per card; this pass books {rest_name or '?'} "
+            f"{','.join('-' if r is None else str(r) for r in rests)} -- the need still books (dropping it is the OOM "
+            f"direction) but is NOT re-derived for this rest: re-measure with python -m flliper.srt.pdflip.budget_rest "
+            f"--admit-need")
     if log is not None:
         for i, c in enumerate(cards):
             if rests[i] is None:

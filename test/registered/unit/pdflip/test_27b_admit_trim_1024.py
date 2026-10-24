@@ -1,27 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PDFLIP-ADMIT-BOOK 24.10. (Auftrag #212; review-vote-line-single M2 / SOLL S1): the D extend's admission peak.
+"""PDFLIP-ADMIT-BOOK 24.10. (Auftrag #212; review-vote-line-single M2 / SOLL S1; review admit-trim M1-M4): the D
+extend's admission peak.
 
 Every D extend pass runs ``width vote (trim, read post) -> admission (post-wake handbacks: Mamba restore + KV
 load-back) -> forward trim (card_free_before = driver free after the admission) -> forward``; the near-OOM law asks
 ``post - A >= 400`` at the admission instant.
 
-Measured on the six int4ar serving boots (2x 3080, D TP2), chunk-window census (budget_rest.admission_passes; the
-vote line is logged only when the cap CHANGES, so the vote-log pairing of extend_passes sees a fraction of the passes
-and reported 376 / 390): 33 admission instants under 400, down to 216 MiB (TP1). The admission peak A grows with the
-handback count and saturates at the capture set (bs <= 6): max 512 int4ar / 516 INT8 drei / 522 NVFP4 duo.
+Census (budget_rest.admission_passes): every chunk window, vote-log independent; a round window closed by the extend
+itself at its forward's end (round t_unix_ms == chunk t0_unix_ms) is NOT a pass boundary (review M1 -- reading it as
+one dropped 1980 of the 7604 int4ar windows, the serving case). Six int4ar serving boots (2x 3080, D TP2): 995
+admission passes, 57 admission instants under 400 (TP1 45), minimum 32 MiB (_1023_223241 23:19:34 TP1). The peak A
+saturates at 504..522 MiB from 3-4 handbacks on all three forms.
 
-No trim fixes it (S1 measured a no-op): the int4ar vote trim (static 1104 > 400 + 522) ran before 32 of the 33 low
-instants and returned <= 64 MiB (the remaining cache sits in segments with live blocks); over every pass of all three
-forms there is no admission pass where the vote did not trim and post < 400 + A. The budget priced no admission term.
+Two classes: 47 instants after a vote trim (it returned <= 204 MiB; the rest of the cache is not returnable) -- only
+the budget helps; 10 without one (``armed`` left over from refused admissions, 568 in 174 s before the 32) --
+``extend_trim.before_admission`` trims there now (review M3).
 
-The fix prices it: ``D_ADMIT_NEED_MIB = near-OOM 400 + A_peak 522 - post_floor 608 = 314`` (derived from two
-measured maxima), booked per card as ``max(vote-line delta, ceil8(need))`` -- the admission and the forward never
-coexist, so the larger post, never the sum. Form gate: int4ar only. INT8 drei derives 118 (carried by its vote-line
-delta 344 / 400..472), NVFP4 duo 0, NVFP4 dual has no width vote.
+The price: ``D_ADMIT_NEED_MIB = near-OOM 400 + A_peak 522 - post_floor 508 = 414`` (post_floor = lowest post of ANY
+pass, review M2), booked per card as ``max(vote-line delta, ceil8(need)) = 416``. Form gate: int4ar only; INT8 drei
+derives 300 on its current trim regime (carried by its vote-line delta 344 / 400..472), NVFP4 duo 52 (not booked,
+measured minimum 690), NVFP4 dual has no width vote.
 
 Danger directions pinned here:
-- OOM: the admission post forgotten, the peak of one form only, the floor from the vote-logged passes only, the
-  in-sample shortfall instead of the bound, rounded down, the form gate letting nothing through.
+- OOM: the admission post forgotten, the peak of one form only, the floor from admission passes or vote-logged passes
+  only, the in-sample shortfall instead of the bound, rounded down, the form gate shut, the pass boundary at the
+  extend-closed round, the admission trim gone or never trimming.
 - KV / narrow: the posts summed instead of the larger one, the post booked on a form that does not need it.
 """
 
@@ -40,6 +43,7 @@ from flliper.srt.managers import corridor_guard as CG  # noqa: E402
 from flliper.srt.pdflip import budget_rest as BR  # noqa: E402
 from flliper.srt.pdflip import card_identity as CI  # noqa: E402
 from flliper.srt.pdflip import corridor_budget as CB  # noqa: E402
+from flliper.srt.pdflip import extend_trim as ET  # noqa: E402
 from flliper.srt.pdflip import form as F  # noqa: E402
 from flliper.srt.pdflip import inventory_view as IV  # noqa: E402
 from flliper.srt.pdflip import launcher as L  # noqa: E402
@@ -48,10 +52,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_27b_int8_tp1corridor_1024 as PRE  # noqa: E402  (same directory: the predecessor's live-boot rig)
 
 FIX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "admit_trim_1024")
-NEED = 314             # D_ADMIT_NEED_MIB (this file recomputes it from the boots)
-BOOKED = 320           # ceil8(314)
+NEED = 414             # D_ADMIT_NEED_MIB (this file recomputes it from the boots)
+BOOKED = 416           # ceil8(414)
 A_PEAK = 522           # NVFP4 duo, 5 handbacks
-POST_FLOOR = 608       # int4ar TP0, lowest vote post of an admission pass
+POST_FLOOR = 508       # int4ar TP1, lowest post of any pass
+ADM_FLOOR = 540        # int4ar TP1, lowest post of an admission pass (not the floor: review M2)
+#: the INT8 drei boots of 21.10. ran TP1/TP2 without a static trim (retired regime, named, not this record's form)
+DREI_RETIRED = ("dkr27bbar1drei10210018", "dkr27bbar1drei10210043")
 SINGLE_DELTA = 344     # INT8 drei vote-line delta (VOTE-LINE-SINGLE)
 FLOOR_DELTAS = [472, 408, 400]
 INT4AR_MODEL = "Huihui-Qwen3.8-27B-Abliterated-INT4-W4A16-AutoRound-ct"
@@ -125,15 +132,24 @@ def _int4ar_pass(lines, model=INT4AR_MODEL, admit="1", single="1"):
     return budgets, kw
 
 
+
+
+def _ceil8(x):
+    return -(-int(x) // 8) * 8
+
+
 class TheBootsViolateTheEdge(CustomTestCase):
-    def test_the_chunk_window_census_sees_every_pass(self):
+    def test_the_census_carries_the_trims_of_every_extend(self):
         ps = _passes("int4ar")
         self.assertEqual(len(ps), 7604)
+        # review M1: 1980 windows came out empty when the extend-closed round line ended the pass; 13 are left
+        # (passes whose trims were not logged at all)
+        self.assertEqual(sum(1 for p in ps if p.post is None and p.fwd_before is None), 13)
+        self.assertEqual(sum(1 for p in ps if p.admission is not None and p.admission >= BR.ADMIT_MIN_MIB), 995)
         low = [p for p in ps if p.fwd_before is not None and p.fwd_before < CG.NEAR_OOM_MIB]
-        self.assertEqual(len(low), 33)
-        self.assertEqual(sum(1 for p in low if p.rank == 1), 26)
-        self.assertEqual(min(p.fwd_before for p in low), 216)
-        # INT8 drei and NVFP4 duo hold the edge at their boots' budgets
+        self.assertEqual(len(low), 57)
+        self.assertEqual(sum(1 for p in low if p.rank == 1), 45)
+        self.assertEqual(min(p.fwd_before for p in low), 32)
         for form in ("drei", "duo"):
             self.assertFalse([p for p in _passes(form) if p.fwd_before is not None and p.fwd_before < 400], form)
 
@@ -148,10 +164,50 @@ class TheBootsViolateTheEdge(CustomTestCase):
         self.assertEqual(tp0, [(1058.0, "vote", 630.0), (888.0, "vote", 402.0), (1032.0, "vote", 600.0),
                                (860.0, "vote", 376.0)])
 
+    def test_only_the_round_closed_by_the_extend_is_no_boundary(self):
+        """Review M1, the boundary itself: a round whose t_unix_ms is the next chunk's t0_unix_ms (closed at the
+        extend's forward end) keeps the pass; a self-closed round (other t), a trim after the round, a flip or an
+        idle window end it."""
+        def lines(*rows):
+            return "\n".join(f"[2026-10-23 23:19:3{i} TP1] {r}" for i, r in enumerate(rows))
+        trim_v = "PDFLIP-EXTEND-CACHE-TRIM rank=1 ms=1 released=60 card_free_before=620 card_free_after=680 threshold=1104"
+        trim_f = "PDFLIP-EXTEND-CACHE-TRIM rank=1 ms=9 released=630 card_free_before=32 card_free_after=662 threshold=1104"
+        chunk = "PDFLIP-VRAM-PEAK rank=1 phase=chunk rows=247 n=1 t0_unix_ms=200 t_unix_ms=201 card_free_mib=600"
+
+        def rnd(t):
+            return f"PDFLIP-VRAM-PEAK rank=1 phase=round n=26 t0_unix_ms=100 t_unix_ms={t} card_free_mib=430"
+        kept = BR.admission_passes(lines(trim_v, trim_f, rnd(200), chunk))[1][0]
+        self.assertEqual((kept.post, kept.fwd_before, kept.admission), (680.0, 32.0, 648.0))
+        for text in (lines(trim_v, trim_f, rnd(199), chunk),
+                     lines(trim_v, trim_f, "PDFLIP-VRAM-PEAK rank=1 phase=idle n=0 t0_unix_ms=1 t_unix_ms=200 "
+                                           "card_free_mib=430", chunk),
+                     lines(trim_v, trim_f, "PDFLIP-VRAM-PEAK rank=1 phase=flip leg=resume t0_unix_ms=1 "
+                                           "t_unix_ms=200 card_free_mib=430", chunk)):
+            p = BR.admission_passes(text)[1][0]
+            self.assertEqual((p.post, p.fwd_before), (None, None), text)
+        p = BR.admission_passes(lines(trim_v, rnd(200), trim_f, chunk))[1][0]   # a trim after the round: boundary
+        self.assertEqual((p.post, p.fwd_before), (None, 32.0))
+        # the vote-log pairing obeys the same boundary
+        vote = ("PDFLIP-EXTEND-STUECKELUNG rank=1 geplant=4096 cap=1 post=680 cache_free=600 funds=driver "
+                "rate=0.3091 floor=1024")
+        ext = BR.extend_passes(lines(trim_v, vote, trim_f, rnd(200), chunk))
+        self.assertEqual([(q.post, q.fwd_before) for q in ext[1]], [(680.0, 32.0)])
+        self.assertEqual(BR.extend_passes(lines(trim_v, vote, trim_f, rnd(199), chunk)), {})
+
+    def test_an_admission_trim_marks_the_post_before_the_admission(self):
+        text = "\n".join([
+            "[2026-10-23 23:19:30 TP1] PDFLIP-EXTEND-CACHE-TRIM rank=1 ms=50 released=600 card_free_before=60 "
+            "card_free_after=660 threshold=1104 site=admit",
+            "[2026-10-23 23:19:31 TP1] PDFLIP-EXTEND-CACHE-TRIM rank=1 ms=9 released=300 card_free_before=170 "
+            "card_free_after=470 threshold=1104",
+            "[2026-10-23 23:19:31 TP1] PDFLIP-VRAM-PEAK rank=1 phase=chunk rows=247 n=1 t0_unix_ms=1 t_unix_ms=2 "
+            "card_free_mib=600"])
+        p = BR.admission_passes(text)[1][0]
+        self.assertEqual((p.post, p.post_src, p.fwd_before, p.admission, p.vote_released),
+                         (660.0, "admit", 170.0, 490.0, 600.0))
+
     def test_the_vote_log_pairing_misses_the_low_rank(self):
-        """The instrument trap of the predecessor's figure: the vote line is logged only when the cap changes -- TP1
-        logged none in these two post-wake windows, extend_passes pairs nothing there and its minimum is TP0 376,
-        while TP1 went to 218 / 224."""
+        """The instrument trap of the predecessor's figure: the vote line is logged only when the cap changes."""
         with open(os.path.join(FIX_DIR, "excerpt_223241_D.txt")) as fh:
             text = fh.read()
         ext = BR.extend_passes(text)
@@ -160,21 +216,106 @@ class TheBootsViolateTheEdge(CustomTestCase):
         self.assertEqual(min(p.fwd_before for p in BR.admission_passes(text)[1]), 218.0)
 
 
-class NoTrimFixesIt(CustomTestCase):
-    def test_no_admission_pass_where_the_vote_did_not_trim_below_its_need(self):
-        """S1 (trim before the admission under 400 + A) would act only on such a pass: there is none on any form."""
-        for form in ("int4ar", "drei", "duo"):
-            s1 = [p for p in _passes(form) if p.admission is not None and p.admission >= BR.ADMIT_MIN_MIB
-                  and p.vote_released is None and p.post < CG.NEAR_OOM_MIB + p.admission]
-            self.assertEqual(s1, [], form)
+class _Cuda:
+    """torch.cuda in MiB: ``free`` card bytes, ``cache`` returnable by empty_cache."""
 
-    def test_the_vote_trim_ran_before_the_low_instants_and_returned_little(self):
-        low = [p for p in _passes("int4ar") if p.fwd_before is not None and p.fwd_before < 400]
+    def __init__(self, free, cache):
+        self.free, self.cache, self.syncs, self.empties = float(free), float(cache), 0, 0
+
+    def is_current_stream_capturing(self):
+        return False
+
+    def mem_get_info(self):
+        return int(self.free * ET.MIB), int(20055 * ET.MIB)
+
+    def memory_reserved(self):
+        return int((10000 + self.cache) * ET.MIB)
+
+    def synchronize(self):
+        self.syncs += 1
+
+    def empty_cache(self):
+        self.empties += 1
+        self.free += self.cache
+        self.cache = 0.0
+
+
+class TheTwoClasses(CustomTestCase):
+    def test_the_vote_trimmed_class_and_the_armed_class(self):
+        ps = _passes("int4ar")
+        low = [p for p in ps if p.fwd_before is not None and p.fwd_before < 400]
         trimmed = [p for p in low if p.vote_released is not None]
-        self.assertEqual(len(trimmed), 32)
-        self.assertLessEqual(max(p.vote_released for p in trimmed), 64)
-        # the one without: first pass after a resume, the vote's trim still armed from before the flip (post unknown)
-        self.assertEqual([(p.rank, p.post) for p in low if p.vote_released is None], [(1, None)])
+        self.assertEqual(len(trimmed), 47)
+        self.assertEqual(max(p.vote_released for p in trimmed), 204)
+        armed = [p for p in ps if p.fwd_before is not None and p.vote_released is None]
+        self.assertEqual(len(armed), 148)
+        self.assertEqual(sorted(p.fwd_before for p in armed if p.fwd_before < 400)[:2], [32.0, 222.0])
+        self.assertEqual(sum(1 for p in armed if p.fwd_before < 400), 10)
+
+    def _rig(self, thresholds="1104,1104"):
+        ET.reset_for_tests()
+        ET._CACHE["thresholds"] = ET.parse_thresholds(thresholds)
+        ET._CACHE["rates"] = ET.parse_thresholds("0.3091,0.3091")
+        ET._CACHE["measure"] = False
+        ET._CACHE["measure_ranks"] = None
+        ET._CACHE["cap_floor"] = False
+        ET._CACHE["vote_fixed"] = None
+        ET._CACHE["line"] = 1024.0
+
+    def tearDown(self):
+        ET.reset_for_tests()
+
+    def test_the_admission_trims_when_the_armed_vote_did_not(self):
+        """The 32 MiB pass: the vote of an earlier pass trimmed and stayed armed (its admission was refused, no
+        extend ran), decode refilled the cache; this pass's vote does not trim -- the admission does."""
+        self._rig()
+        cuda = _Cuda(free=700, cache=50)
+        with mock.patch.object(ET, "_torch_cap_mib", return_value=None):
+            ET.width_vote(cuda, 1, 4096, 1, True)           # pass 1: vote trims, armed
+            self.assertEqual(cuda.empties, 1)
+            cuda.cache, cuda.free = 630.0, 60.0                # refused admission, decode rounds refill the cache
+            ET.width_vote(cuda, 1, 4096, 1, True)           # pass 2: armed -> the vote does not trim
+            self.assertEqual(cuda.empties, 1)
+            line = ET.before_admission(cuda, 1)
+        self.assertIsNotNone(line)
+        self.assertIn("site=admit", line)
+        self.assertIn("card_free_before=60", line)
+        self.assertEqual((cuda.empties, cuda.free), (2, 690.0))
+        self.assertIsNone(ET.before_admission(cuda, 1))     # once per pass
+        self.assertEqual(cuda.empties, 2)
+
+    def test_no_second_trim_when_the_vote_trimmed_this_pass(self):
+        self._rig()
+        cuda = _Cuda(free=700, cache=50)
+        with mock.patch.object(ET, "_torch_cap_mib", return_value=None):
+            ET.width_vote(cuda, 1, 4096, 1, True)
+        cuda.cache, cuda.free = 300.0, 400.0
+        self.assertIsNone(ET.before_admission(cuda, 1))
+        self.assertEqual(cuda.empties, 1)
+
+    def test_no_threshold_no_rank_no_trim(self):
+        self._rig(thresholds="")
+        cuda = _Cuda(free=60, cache=600)
+        with mock.patch.object(ET, "_torch_cap_mib", return_value=None):
+            ET.width_vote(cuda, 1, 4096, 1, True)
+        self.assertIsNone(ET.before_admission(cuda, 1))
+        self._rig()
+        self.assertIsNone(ET.before_admission(cuda, None))
+        self.assertEqual(cuda.empties, 0)
+
+    def test_the_scheduler_trims_before_the_admission_allocates(self):
+        """The hook sits where a request has passed the X gate (note_admit) and before add_one_req (Mamba restore and
+        KV load-back allocate there): rank-local memory care, no verdict moves (SOLL R11)."""
+        import inspect
+
+        from flliper.srt.managers import scheduler as S
+
+        src = inspect.getsource(S)
+        i = src.index("_pdflip_hbd.note_admit(req)")
+        j = src.index("_pdflip_extend_trim.before_admission(torch.cuda", i)
+        k = src.index("adder.add_one_req(", i)
+        self.assertLess(j, k)
+        self.assertLess(j - i, 600)
 
 
 class TheRecordIsTheDerivation(CustomTestCase):
@@ -186,25 +327,26 @@ class TheRecordIsTheDerivation(CustomTestCase):
         need, lines = BR.admit_need_from_passes(FORM["int4ar"], float(CG.NEAR_OOM_MIB), A_PEAK)
         self.assertEqual(need, NEED)
         self.assertEqual(NEED, CG.NEAR_OOM_MIB + A_PEAK - POST_FLOOR)
-        self.assertTrue(any("rank=0 post_floor 608" in ln for ln in lines), lines)
-        self.assertTrue(any("rank=1 post_floor 658" in ln and "26 admission instant(s) under 400" in ln
-                            for ln in lines), lines)
+        self.assertTrue(any("rank=1 post_floor 508" in ln and "lowest admission-pass post 540" in ln
+                            and "45 admission instant(s) under 400" in ln for ln in lines), lines)
         rec = F.PROFILES[F.PROFILE_QWEN27B].constants[BR.ADMIT_RECORD]
         self.assertEqual(list(rec.value), [NEED] * 3)
         self.assertEqual(tuple(rec.boots), BR.BOOTS_ADMIT_NEED)
         self.assertEqual(tuple(rec.boots), INT4AR_TAGS)
 
-    def test_one_forms_peak_the_vote_logged_floor_or_the_in_sample_short_book_less(self):
-        """Every shortcut lands under the bound -- the OOM direction."""
+    def test_every_shortcut_books_less(self):
+        """One form's peak, the admission-pass floor, the vote-logged floor, the in-sample shortfall: all under the
+        bound -- the OOM direction."""
         own, _ = BR.admit_need_from_passes(FORM["int4ar"], 400.0)            # A_peak 512 (int4ar only)
-        self.assertEqual(own, 304)
-        voted = [{r: [p for p in v if p.post_src == "vote"] for r, v in b.items()} for b in FORM["int4ar"]]
-        vote_only, _ = BR.admit_need_from_passes(voted, 400.0, A_PEAK)
-        self.assertLess(vote_only, NEED)
-        in_sample = 400 - min(p.fwd_before for p in _passes("int4ar") if p.fwd_before is not None)
-        self.assertEqual(in_sample, 184)
-        for short in (own, vote_only, in_sample):
-            self.assertLess(-(-short // 8) * 8, BOOKED)
+        self.assertEqual(own, 404)
+        ps = _passes("int4ar")
+        adm_floor = min(p.post for p in ps if p.admission is not None and p.admission >= BR.ADMIT_MIN_MIB)
+        self.assertEqual(adm_floor, ADM_FLOOR)
+        vote_floor = min(p.post for p in ps if p.post_src == "vote")
+        in_sample = 400 - min(p.fwd_before for p in ps if p.fwd_before is not None)
+        self.assertEqual(in_sample, 368)
+        for short in (own, 400 + A_PEAK - adm_floor, 400 + A_PEAK - vote_floor, in_sample):
+            self.assertLess(_ceil8(short), BOOKED, short)
 
     def test_the_booked_post_holds_every_measured_instant_and_the_bound(self):
         for p in _passes("int4ar"):
@@ -212,12 +354,17 @@ class TheRecordIsTheDerivation(CustomTestCase):
                 self.assertGreaterEqual(p.fwd_before + BOOKED, CG.NEAR_OOM_MIB, p)
         self.assertGreaterEqual(POST_FLOOR + BOOKED - A_PEAK, CG.NEAR_OOM_MIB)
 
-    def test_int8_drei_and_duo_are_carried(self):
-        drei, _ = BR.admit_need_from_passes(FORM["drei"], 400.0, A_PEAK)
+    def test_int8_drei_and_duo(self):
+        cur = [per for t, (f, per) in ALL.items() if f == "drei" and t not in DREI_RETIRED]
+        retired = [per for t, (f, per) in ALL.items() if t in DREI_RETIRED]
+        drei, _ = BR.admit_need_from_passes(cur, 400.0, A_PEAK)
+        self.assertEqual(drei, 300)
+        self.assertLessEqual(_ceil8(drei), SINGLE_DELTA)
+        self.assertLessEqual(_ceil8(drei), min(FLOOR_DELTAS))
+        self.assertEqual(BR.admit_need_from_passes(retired, 400.0, A_PEAK)[0], 872)   # named, not this form
         duo, _ = BR.admit_need_from_passes(FORM["duo"], 400.0, A_PEAK)
-        self.assertEqual((drei, duo), (118, 0))
-        self.assertLessEqual(-(-drei // 8) * 8, SINGLE_DELTA)
-        self.assertLessEqual(-(-drei // 8) * 8, min(FLOOR_DELTAS))
+        self.assertEqual(duo, 52)
+        self.assertGreaterEqual(min(p.fwd_before for p in _passes("duo") if p.fwd_before is not None), 690)
 
 
 class TheBudgetBooksTheAdmission(CustomTestCase):
@@ -229,12 +376,22 @@ class TheBudgetBooksTheAdmission(CustomTestCase):
         lines = []
         budgets, kw = _int4ar_pass(lines)
         self.assertEqual([h - b for h, b in zip(INT4AR_HEAD, budgets)], [BOOKED, BOOKED])
-        self.assertEqual(budgets, [17160, 16944])
+        self.assertEqual(budgets, [17064, 16848])
         self.assertEqual(kw["booked_rest_mib"], [2079 + BOOKED, 2079 + BOOKED])
         self.assertIn(BR.ADMIT_MARKER, kw["booked_rest_provenance"])
         self.assertIn("not a reserve", kw["booked_rest_provenance"])
         named = [ln for ln in lines if BR.ADMIT_MARKER in ln and f"= {BOOKED} MiB: books {BOOKED}" in ln]
         self.assertEqual(len(named), 2, lines)
+        self.assertFalse([ln for ln in lines if "REST-MISMATCH" in ln], lines)
+
+    def test_another_rest_is_named_and_still_booked(self):
+        lines = []
+        with _published(INT4AR_MODEL), mock.patch.dict(os.environ, {BR.ADMIT_ENV: "1"}):
+            got = L.booked_rest_admit_deltas(_int4ar_cards(), [2300, 2300], [0, 0], F.PROFILE_QWEN27B, "D",
+                                             lines.append, rest_name="D_AWAKE_REST_BOOKED_MIB")
+        self.assertEqual(got, [BOOKED, BOOKED])
+        self.assertTrue(any("REST-MISMATCH" in ln and "re-measure" in ln for ln in lines), lines)
+        self.assertEqual(BR.ADMIT_REST_BASIS, ("D_AWAKE_REST_BOOKED_MIB", 2079))
 
     def test_the_torch_cap_is_byte_identical(self):
         b, kw = _int4ar_pass([])
@@ -262,7 +419,7 @@ class TheBudgetBooksTheAdmission(CustomTestCase):
         self.assertFalse(BR.admit_book_on({BR.ADMIT_ENV: "0"}))
 
     def test_int8_drei_budgets_are_unchanged(self):
-        """The INT8 drei rig (5090 + 2x 3080): not the record's form; its vote-line delta 344 carries its 118."""
+        """The INT8 drei rig (5090 + 2x 3080): not the record's form; its vote-line delta 344 carries its 300."""
         lines = []
         with _published(DREI_MODEL), mock.patch.dict(os.environ, {BR.ADMIT_ENV: "1"}):
             _, budgets, _ = PRE._d_pass(lines, PRE._floors(), single="1")
@@ -291,10 +448,10 @@ class TheBudgetBooksTheAdmission(CustomTestCase):
 
 class TheLargerPostNeverTheSum(CustomTestCase):
     def test_pure_deltas(self):
-        self.assertEqual(BR.admit_deltas([2079, 2079], [0, 0], [314.0, 314.0]), [320, 320])
-        self.assertEqual(BR.admit_deltas([2079, 2079], [344, 344], [314.0, 314.0]), [344, 344])
-        self.assertEqual(BR.admit_deltas([2079, 2079], [0, 400], [314.0, 314.0]), [320, 400])
-        self.assertEqual(BR.admit_deltas([None, 2079], [0, 0], [314.0, 314.0]), [0, 320])
+        self.assertEqual(BR.admit_deltas([2079, 2079], [0, 0], [414.0, 414.0]), [416, 416])
+        self.assertEqual(BR.admit_deltas([2079, 2079], [472, 472], [414.0, 414.0]), [472, 472])
+        self.assertEqual(BR.admit_deltas([2079, 2079], [0, 400], [414.0, 414.0]), [416, 416])
+        self.assertEqual(BR.admit_deltas([None, 2079], [0, 0], [414.0, 414.0]), [0, 416])
         self.assertEqual(BR.admit_deltas([2079], [8], None), [8])
         self.assertEqual(BR.admit_deltas([1, 1, 1], [0, 0, 0], [320.0, 321.0, -5.0]), [320, 328, 0])
         with self.assertRaises(ValueError):

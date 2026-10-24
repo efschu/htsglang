@@ -26,9 +26,12 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from flliper.srt.managers import corridor_guard as CG  # noqa: E402
 from flliper.srt.pdflip import budget_rest as BR  # noqa: E402
+from flliper.srt.pdflip import form as F  # noqa: E402
 
 FIX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "admit_trim_1024")
-BOOKED = 320  # ceil8(D_ADMIT_NEED_MIB 314) as booked by 17edfeebc7
+# the SHIPPED record, booked up to the 8-MiB grain (17edfeebc7 booked 320 and went red here; the author's rework reads
+# the record so the test follows it -- it must stay >= 368 for the 32 MiB instant)
+BOOKED = -(-int(F.PROFILES[F.PROFILE_QWEN27B].constants[BR.ADMIT_RECORD].value[0]) // 8) * 8
 
 
 def _read(name):

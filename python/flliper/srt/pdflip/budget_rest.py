@@ -487,14 +487,17 @@ def extend_passes(group_text: str) -> Dict[int, List[ExtendPass]]:
     out: Dict[int, List[ExtendPass]] = {}
     pend: Dict[int, Tuple[str, Dict[str, str]]] = {}
     trims: Dict[int, List[Dict[str, str]]] = {}
+    # review admit-trim M1 (24.10.): a round window closed by the extend itself at its forward's end (round
+    # t_unix_ms == the next chunk's t0_unix_ms, nothing in between) does not unpair -- held here until it is known
+    rounds: Dict[int, Optional[int]] = {}
     for ln in group_text.splitlines():
         if "PDFLIP-EXTEND-STUECKELUNG" in ln:
             kind = "vote"
         elif "PDFLIP-EXTEND-CACHE-TRIM" in ln:
             kind = "trim"
         elif "PDFLIP-VRAM-PEAK" in ln:
-            kind = "chunk" if "phase=chunk" in ln else ("other" if ("phase=round" in ln or "phase=flip" in ln)
-                                                       else "")
+            kind = "chunk" if "phase=chunk" in ln else ("round" if "phase=round" in ln else
+                                                       ("other" if "phase=flip" in ln else ""))
             if not kind:
                 continue
         else:
@@ -504,6 +507,17 @@ def extend_passes(group_text: str) -> Dict[int, List[ExtendPass]]:
             continue
         ts, r = m.group(1), int(m.group(2))
         d = dict(_RX_KV.findall(ln))
+        if kind == "round":
+            if r in rounds:          # two rounds in a row: the first was self-closed
+                pend.pop(r, None)
+                trims.pop(r, None)
+            rounds[r] = _window_t(d, "t_unix_ms")
+            continue
+        if r in rounds:
+            rt = rounds.pop(r)
+            if not (kind == "chunk" and rt is not None and _window_t(d, "t0_unix_ms") == rt):
+                pend.pop(r, None)    # a self-closed round between the vote and this event: unpaired
+                trims.pop(r, None)
         if kind == "vote":
             pend[r] = (ts, d)
             trims[r] = []
@@ -571,8 +585,8 @@ def vote_fixed_from_passes(passes: Mapping[int, Sequence[ExtendPass]]) -> Tuple[
 
 
 # --------------------------------------------------------------------------
-# PDFLIP-ADMIT-BOOK (desk/27b-admit-trim-1024, Auftrag #212, review-vote-line-single M2 / SOLL S1): the D extend's
-# ADMISSION PEAK, priced as a budget post.
+# PDFLIP-ADMIT-BOOK (desk/27b-admit-trim-1024, Auftrag #212, review-vote-line-single M2 / SOLL S1; review admit-trim
+# M1-M4 24.10.): the D extend's ADMISSION PEAK, priced as a budget post.
 #
 # Every D extend pass runs, on each rank,
 #
@@ -581,19 +595,20 @@ def vote_fixed_from_passes(passes: Mapping[int, Sequence[ExtendPass]]) -> Tuple[
 #     admission, released = the admission's fresh segments) -> forward
 #
 # so the card's driver free at the admission instant is ``post - A`` and the near-OOM law asks ``post - A >= 400``.
-# The admission peak A grows with the number of handback requests and saturates at the capture set (bs <= 6):
-# measured 1 -> <= 334, 2 -> <= 484, 3 -> <= 510, 4..6 -> 504..522 MiB over int4ar, INT8 drei and NVFP4 duo.
+# The admission peak A grows with the number of handback requests (capture set bs <= 6, DEFAULT_D_BS = max_running = 6)
+# and with the summed load-back depth (correlation 0.74 on int4ar), and saturates at 504..522 MiB from 3-4 handbacks
+# on int4ar, INT8 drei and NVFP4 duo alike (load-backs measured up to 136k tokens deep; deeper ones are unmeasured).
 #
-# WHY NO TRIM FIXES IT (the reviewer's S1, "trim before the admission under 400 + A", measured a no-op): on int4ar the
-# vote's static threshold is 1104 > 400 + 522, so a vote trim RAN before every admission pass with post < 1104 and
-# returned <= 62 MiB -- the 650-730 MiB the allocator still caches are free blocks inside segments that hold live
-# blocks, which empty_cache cannot return and the admission's allocations do not fit (they take fresh segments, the
-# forward trim then returns 278-410 MiB). Over every pass of int4ar / INT8 drei / NVFP4 duo there is NO admission
-# pass where the vote did not trim and post < 400 + A. What is left after the trim is set by the budget, and no
-# budget term priced A: the int4ar D cards (rest 2079 UNIFORM from the INT8 3080 twin, vote-line delta 0 because the
-# int4ar floor is UNMEASURED) went down to 216 MiB driver free at the admission (TP1, 22:59:34 / 00:57:30), 33
-# admission instants under 400 over five serving boots. (The vote-log pairing of extend_passes sees only votes whose
-# cap CHANGED; it saw 376 / 390 -- the chunk-window census below is vote-log independent.)
+# MEASURED on six int4ar serving boots (chunk-window census :func:`admission_passes`, vote-log independent, with the
+# pass boundary of review M1): 995 admission passes, 57 admission instants under 400 (TP1 45, TP0 12), minimum
+# 32 MiB (``_1023_223241`` 23:19:34 TP1, TP0 222). Two classes:
+#   - the vote trim RAN before the admission (47 of the 57, it returned <= 204 MiB): the remaining 650-730 MiB of
+#     allocator cache sit in segments with live blocks, the admission takes fresh segments -- only the budget helps;
+#   - the vote did NOT trim (148 passes, 10 of the 57, among them 32 and 222): ``armed`` was left over from passes
+#     whose admission was refused (568 refusals in 174 s before the 32 MiB instant), decode rounds refilled the cache
+#     and the forward trim then returned up to 630 MiB. ``extend_trim.before_admission`` trims there now.
+# (The vote-log pairing of extend_passes saw 376 / 390, the first census of this branch 216: the vote line is logged
+# only when the cap changes, and a round window closed by the extend itself was read as a pass boundary.)
 #
 # THE PRICE (no reserve -- a derived bound from two measured maxima):
 #
@@ -601,14 +616,17 @@ def vote_fixed_from_passes(passes: Mapping[int, Sequence[ExtendPass]]) -> Tuple[
 #
 #     A_peak      max admission peak over the 27B handback path (all forms: same model geometry, D TP2/TP3 mamba +
 #                 KV load-back), 522 MiB (NVFP4 duo, 5 handbacks)
-#     post_floor  the lowest vote post (driver free after the vote trim) of a pass that carried an admission, on
-#                 the record's form, under the budget its boots ran (rest record + vote-line delta 0)
+#     post_floor  the lowest post (driver free after the vote trim) of ANY pass on the record's form -- an admission is
+#                 not structurally tied to passes with a high post (review M2) -- under the budget its boots ran (rest
+#                 record D_AWAKE_REST_BOOKED_MIB 2079 borrowed from the INT8 3080 twin, vote-line delta 0)
 #
 # booked beside the rest as ``max(vote-line delta, ceil8(need))`` -- the admission and the forward never coexist
 # (the forward trim releases the admission's segments before the forward; an untrimmed forward runs at post - A
 # >= threshold >= the vote line), so the larger of the two posts is the card's need, never their sum. One value for
 # every rank (TP-symmetric shards, the max). FORM GATE as VOTE-LINE-SINGLE: the record holds only for its boots'
-# form (:data:`ADMIT_NEED_FORMS`). ``FLLIPER_PDFLIP_ADMIT_BOOK=0`` = the budgets of 9a25171a59 (default ON).
+# form (:data:`ADMIT_NEED_FORMS`), and only beside the rest it was derived under (:data:`ADMIT_REST_BASIS`; another
+# rest is named loudly and asks for a re-measurement). ``FLLIPER_PDFLIP_ADMIT_BOOK=0`` = the budgets of 9a25171a59
+# (default ON).
 # --------------------------------------------------------------------------
 
 ADMIT_MARKER = "PDFLIP-ADMIT-BOOK"
@@ -616,10 +634,12 @@ ADMIT_RECORD = "D_ADMIT_NEED_MIB"
 #: launcher switch: =0 books no admission post (the budgets of 9a25171a59); default on (user order 14.10.)
 ADMIT_ENV = "FLLIPER_PDFLIP_ADMIT_BOOK"
 ADMIT_BASIS = ("DERIVED from two measured maxima (near-OOM 400 + admission peak over the 27B handback path - lowest "
-               "vote post of an admission pass on the record's form); not a reserve")
+               "post of any pass on the record's form); not a reserve")
 #: a pass "carried an admission" when the forward trim found the card this much below the vote's post (MiB): the
 #: smallest post-wake handback measured 58 MiB; below it the difference is decode/round noise of the allocator
 ADMIT_MIN_MIB = 50.0
+#: the rest the record was derived beside (record name, value on every int4ar card): another rest = re-measure
+ADMIT_REST_BASIS: Tuple[str, int] = ("D_AWAKE_REST_BOOKED_MIB", 2079)
 #: the record's boots (int4ar serving boots, 23./24.10.) and their form
 BOOTS_ADMIT_NEED: Tuple[str, ...] = (
     "dkr27bint4arbar1int4ar10231552",
@@ -660,9 +680,10 @@ class AdmitPass:
 
     ``post`` the driver free the admission started from: the vote line's ``post=`` when one was logged in the pass
     (``post_src`` "vote"), else the vote trim's ``card_free_after`` when the pass trimmed twice ("trim"), else
-    ``None``. ``fwd_before`` / ``released`` the pass's LAST trim (the forward trim: driver free after the admission,
-    the segments it returned), ``None`` / 0 without one. ``rows`` / ``end`` the chunk's rows and end free.
-    ``vote_released`` what the vote's own trim returned before the admission (``None`` = the vote did not trim)."""
+    ``None``. ``fwd_before`` / ``released`` the pass's forward trim (driver free after the admission, the segments it
+    returned), ``None`` / 0 without one. ``rows`` / ``end`` the chunk's rows and end free. ``vote_released`` what the
+    trim right before the admission returned -- the admission trim (``site=admit``) or the vote's own trim; ``None`` =
+    nothing trimmed before the admission (the armed class, review M3)."""
 
     rank: int
     ts: str
@@ -682,12 +703,30 @@ class AdmitPass:
         return float(self.post) - float(self.fwd_before)
 
 
+def _window_t(d: Mapping[str, str], key: str) -> Optional[int]:
+    try:
+        return int(d[key])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 def admission_passes(group_text: str) -> Dict[int, List[AdmitPass]]:
-    """Every chunk window of a D log with the pass that led to it, per rank in log order. A ``phase=round`` /
-    ``phase=flip`` window ends a pass without a chunk. Inside a pass the trims BEFORE a logged vote are vote trims,
-    the last trim after it is the forward trim; without a logged vote and two or more trims the first is the vote
-    trim and the last the forward trim (the vote trims once per extend, ``extend_trim.width_vote`` / armed); a single
-    trim without a vote is read as the forward trim (``post`` unknown). Pure (text in, passes out)."""
+    """Every chunk window of a D log with the pass that led to it, per rank in log order -- independent of the
+    width-vote line, which is logged only when the cap CHANGES.
+
+    PASS BOUNDARIES (review 24.10. M1): a ``phase=flip`` / ``phase=idle`` window and a SELF-closed ``phase=round``
+    window (N rounds or 5 s) end a pass. A ``phase=round`` window closed by the extend itself does NOT:
+    ``vram_peak_window.on_forward_end`` closes a pending round window at the END of the extend forward, right before the
+    extend's own ``phase=chunk`` line (round ``t_unix_ms`` == chunk ``t0_unix_ms``), while that extend's vote trim and
+    forward trim were logged at the forward's START, before it. Treating that round line as a boundary dropped the
+    trims of every extend that followed decode rounds -- 1980 of 7604 int4ar chunk windows, the serving case, among
+    them the 32 MiB admission instant (``_1023_223241`` 23:19:34 TP1).
+
+    INSIDE A PASS: a trim logged with ``site=admit`` (``extend_trim.before_admission``) is the trim right before the
+    admission; the last other trim after the last vote / admission trim is the forward trim. ``post`` is, in this
+    order of preference, the admission trim's ``card_free_after`` ("admit"), the logged vote's ``post=`` ("vote"), the
+    first of two or more trims' ``card_free_after`` ("trim", the vote trim -- the vote trims once per extend), else
+    ``None`` (a single trim without a vote is read as the forward trim). Pure (text in, passes out)."""
     out: Dict[int, List[AdmitPass]] = {}
     ev: Dict[int, List[Tuple[str, Dict[str, str]]]] = {}
     for ln in group_text.splitlines():
@@ -696,9 +735,13 @@ def admission_passes(group_text: str) -> Dict[int, List[AdmitPass]]:
         elif "PDFLIP-EXTEND-CACHE-TRIM" in ln:
             kind = "trim"
         elif "PDFLIP-VRAM-PEAK" in ln:
-            kind = "chunk" if "phase=chunk" in ln else ("other" if ("phase=round" in ln or "phase=flip" in ln)
-                                                       else "")
-            if not kind:
+            if "phase=chunk" in ln:
+                kind = "chunk"
+            elif "phase=round" in ln:
+                kind = "round"
+            elif "phase=flip" in ln or "phase=idle" in ln:
+                kind = "other"
+            else:
                 continue
         else:
             continue
@@ -707,36 +750,49 @@ def admission_passes(group_text: str) -> Dict[int, List[AdmitPass]]:
             continue
         ts, r = m.group(1), int(m.group(2))
         d = dict(_RX_KV.findall(ln))
-        if kind in ("vote", "trim"):
+        if kind == "trim" and d.get("site") == "admit":
+            kind = "atrim"
+        if kind in ("vote", "trim", "atrim", "round"):
             ev.setdefault(r, []).append((kind, d))
             continue
         evs = ev.pop(r, [])
         if kind == "other":
             continue
+        t0 = _window_t(d, "t0_unix_ms")
+        cut = -1
+        for i, (k, x) in enumerate(evs):
+            if k != "round":
+                continue
+            if i == len(evs) - 1 and t0 is not None and _window_t(x, "t_unix_ms") == t0:
+                continue  # closed by this extend at its forward's end: not a boundary
+            cut = i
+        evs = [e for e in evs[cut + 1:] if e[0] != "round"]
         try:
+            ai = max((i for i, (k, _) in enumerate(evs) if k == "atrim"), default=None)
             vi = max((i for i, (k, _) in enumerate(evs) if k == "vote"), default=None)
             trims = [x for k, x in evs if k == "trim"]
             post: Optional[float] = None
             src = ""
-            fwd: Optional[Dict[str, str]] = None
-            vtr: Optional[Dict[str, str]] = None
-            if vi is not None:
+            pre: Optional[Dict[str, str]] = None
+            start = max(-1 if ai is None else ai, -1 if vi is None else vi)
+            after = [x for k, x in evs[start + 1:] if k == "trim"]
+            fwd: Optional[Dict[str, str]] = after[-1] if after else None
+            if ai is not None:
+                pre = evs[ai][1]
+                post, src = float(pre["card_free_after"]), "admit"
+            elif vi is not None:
                 post, src = float(evs[vi][1]["post"]), "vote"
                 before = [x for k, x in evs[:vi] if k == "trim"]
-                vtr = before[-1] if before else None
-                after = [x for k, x in evs[vi + 1:] if k == "trim"]
-                fwd = after[-1] if after else None
+                pre = before[-1] if before else None
             elif len(trims) >= 2:
                 post, src = float(trims[0]["card_free_after"]), "trim"
-                vtr, fwd = trims[0], trims[-1]
-            elif trims:
-                fwd = trims[-1]
+                pre = trims[0]
             out.setdefault(r, []).append(AdmitPass(
                 rank=r, ts=ts, post=post, post_src=src,
                 fwd_before=None if fwd is None else float(fwd["card_free_before"]),
                 released=0.0 if fwd is None else float(fwd["released"]),
                 rows=int(d.get("rows", 0) or 0), end=float(d["card_free_mib"]),
-                vote_released=None if vtr is None else float(vtr["released"])))
+                vote_released=None if pre is None else float(pre["released"])))
         except (KeyError, ValueError):
             continue
     return out
@@ -750,27 +806,34 @@ def admission_peak(boots: Sequence[Mapping[int, Sequence[AdmitPass]]]) -> Option
 
 def admit_need_from_passes(boots: Sequence[Mapping[int, Sequence[AdmitPass]]], near_oom_mib: float,
                            peak_mib: Optional[float] = None) -> Tuple[Optional[int], List[str]]:
-    """``D_ADMIT_NEED_MIB`` of the record's form: ``ceil(max over ranks (near_oom + A_peak - post_floor[rank]))``,
-    ``post_floor`` the lowest ``post`` of a pass whose admission is >= :data:`ADMIT_MIN_MIB` over all ``boots`` (the
-    record's form), ``A_peak`` = ``peak_mib`` (the 27B handback path over all forms) or, without it, the largest
-    admission of these boots. 0 when the floor already carries it; ``None`` without an admission pass. One value for
-    every rank (TP-symmetric shards, the max). Lines name per rank the instants under ``near_oom`` at the boots'
-    budget, the floor, the peak and the need. Pure; ``near_oom_mib`` is ``corridor_guard.NEAR_OOM_MIB`` (the caller
-    passes it: one source)."""
+    """``D_ADMIT_NEED_MIB`` of the record's form: ``ceil(max over ranks (near_oom + A_peak - post_floor[rank]))``.
+
+    ``post_floor`` is the lowest ``post`` over EVERY pass of ``boots`` whose post is known (review M2 24.10.): an
+    admission (handback, #988 load-back) is not structurally tied to passes with a high post -- the lowest posts lie in
+    the same minutes as admissions -- so no pass is excluded without a structural reason. ``A_peak`` = ``peak_mib``
+    (the 27B handback path over all forms) or, without it, the largest admission of these boots. 0 when the floor
+    already carries it; ``None`` without a pass with a known post or without an admission. One value for every rank
+    (TP-symmetric shards, the max). Lines name per rank the floor, the lowest admission-pass post (>= ADMIT_MIN_MIB),
+    the instants under ``near_oom`` at the boots' budget and the need. Pure; ``near_oom_mib`` is
+    ``corridor_guard.NEAR_OOM_MIB`` (the caller passes it: one source)."""
     lines: List[str] = []
     a_peak = admission_peak(boots) if peak_mib is None else float(peak_mib)
     floors: Dict[int, AdmitPass] = {}
+    adm_floors: Dict[int, AdmitPass] = {}
     low: Dict[int, List[AdmitPass]] = {}
     for b in boots:
         for r, v in b.items():
             for p in v:
                 if p.fwd_before is not None and p.fwd_before < near_oom_mib:
                     low.setdefault(r, []).append(p)
-                a = p.admission
-                if a is None or a < ADMIT_MIN_MIB:
+                if p.post is None:
                     continue
                 if r not in floors or float(p.post) < float(floors[r].post):  # type: ignore[arg-type]
                     floors[r] = p
+                a = p.admission
+                if a is not None and a >= ADMIT_MIN_MIB and (
+                        r not in adm_floors or float(p.post) < float(adm_floors[r].post)):  # type: ignore[arg-type]
+                    adm_floors[r] = p
     if a_peak is None or not floors:
         lines.append(f"{ADMIT_MARKER} no admission pass -- {ADMIT_RECORD} not measured")
         return None, lines
@@ -778,16 +841,18 @@ def admit_need_from_passes(boots: Sequence[Mapping[int, Sequence[AdmitPass]]], n
     for r in sorted(floors):
         f = floors[r]
         nr = float(near_oom_mib) + a_peak - float(f.post)  # type: ignore[arg-type]
+        af = adm_floors.get(r)
         lo = low.get(r, [])
         w = min(lo, key=lambda p: float(p.fwd_before)) if lo else None  # type: ignore[arg-type]
-        lines.append(f"{ADMIT_MARKER} rank={r} post_floor {f.post:.0f} MiB ({f.ts}, admission {f.admission:.0f}) "
-                     f"+ peak {a_peak:.0f} -> need {nr:.0f} MiB; {len(lo)} admission instant(s) under "
+        lines.append(f"{ADMIT_MARKER} rank={r} post_floor {f.post:.0f} MiB ({f.ts}, any pass)"
+                     + ("" if af is None else f", lowest admission-pass post {af.post:.0f} ({af.ts})")
+                     + f" + peak {a_peak:.0f} -> need {nr:.0f} MiB; {len(lo)} admission instant(s) under "
                      f"{near_oom_mib:.0f} at the boots' budget"
                      + ("" if w is None else f", min {w.fwd_before:.0f} at {w.ts}"))
         need = max(need, nr)
     val = int(math.ceil(max(0.0, need) - 1e-9))
     lines.append(f"{ADMIT_MARKER} {ADMIT_RECORD} = {val} MiB (near-OOM {near_oom_mib:.0f} + peak {a_peak:.0f} - "
-                 f"lowest admission post; {ADMIT_BASIS})")
+                 f"lowest post of any pass; {ADMIT_BASIS})")
     return val, lines
 
 
