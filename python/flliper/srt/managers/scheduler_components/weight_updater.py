@@ -9951,10 +9951,15 @@ class SchedulerWeightUpdaterManager:
             return int(st.get("staged_bytes", 0) or 0)
 
         try:
-            from flliper.srt.pdflip.wake_kv import kv_fit_wait_s, wait_for_peer_staging
+            from flliper.srt.pdflip.wake_kv import (
+                KV_STAGE_WAIT_MAX_S,
+                kv_fit_wait_s,
+                wait_for_peer_staging,
+            )
 
             free2, waited, owed = wait_for_peer_staging(
-                self._pdflip_free_bytes, need, floor, _owed, wait_s=kv_fit_wait_s())
+                self._pdflip_free_bytes, need, floor, _owed,
+                wait_s=min(kv_fit_wait_s(), KV_STAGE_WAIT_MAX_S))
         except Exception as exc:  # noqa: BLE001 -- the wait is an order, never a gate
             logger.info("PDFLIP-WAKE-KV-STAGE-WAIT skipped (%s: %s)", type(exc).__name__, exc)
             return free

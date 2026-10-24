@@ -320,6 +320,9 @@ def test_kv_wait_method_reads_this_flips_counter(tmp_path):
     stub = SimpleNamespace(_pdflip_credit_reader=lambda e: (c, str(e)), _pdflip_free_bytes=_free)
     got = WU._pdflip_kv_wait_peer_staging(stub, "ep9", 10432 * MIB, 10326 * MIB, 1024 * MIB)
     assert got == 11644 * MIB
+    # the wake is never held long for a booking that does not come back
+    assert WKV.KV_STAGE_WAIT_MAX_S <= 2.0
+    assert "wait_s=min(kv_fit_wait_s(), KV_STAGE_WAIT_MAX_S)" in _wu_src()
     # another flip's counter owes nothing: no wait, the reading comes back as given
     c2 = PMS.VramCredit("GPU-wf-f", credit_dir=str(tmp_path))
     c2.begin_leg("ep9")

@@ -234,6 +234,10 @@ def wait_for_kv_fit(read_free, need_bytes, floor_bytes: int = 0, wait_s: float =
 #: WAKE-FLOOR-1024: poll cadence of the peer-staging wait below -- the
 #: sleeper's leg-end drain frees its staging within tens of ms.
 KV_STAGE_POLL_S = 0.01
+#: ... and its bound: the release lands at the sleeper's leg end, tens of ms
+#: after its last deposit; a booking that never comes back must not hold a
+#: wake for the fit wait's 20 s.
+KV_STAGE_WAIT_MAX_S = 2.0
 
 
 def wait_for_peer_staging(read_free, need_bytes, floor_bytes, owed_reader,
