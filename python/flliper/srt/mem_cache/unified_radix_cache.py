@@ -66,6 +66,7 @@ from flliper.srt.mem_cache.common import (
 )
 from flliper.srt.mem_cache import hicache_write_path
 from flliper.srt.mem_cache import form_a_host_shadow as _r12
+from flliper.srt.mem_cache import mamba_evict_probe as _mamba_evict_probe
 from flliper.srt.managers.scheduler_components.host_round_cost import (
     COUNTERS as _HOST_COST,
 )
@@ -1762,6 +1763,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Everything _reset_full does for the tree: prefetch pins, host
         # arena values, deferred publish/cap state, counters, fresh root
         # (lock_ref 1), empty LRU lists and leaf sets, zeroed sizes.
+        self._mamba_evict_keep_ids = {id(n) for n in keep_set}   # MAMBA-EVICT-PROBE-1024: kept, not dropped
         _t1 = time.perf_counter()
         self._reset_full()
         _t2 = time.perf_counter()
@@ -2531,6 +2533,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         def _mk(name: str) -> None:
             _ts.append((name, time.perf_counter()))
+
+        # MAMBA-EVICT-PROBE-1024 (#228b): one line for the device mamba states this reset drops (secured/unsecured
+        # read BEFORE the host release below); reset_keep names its kept nodes
+        _keep_ids = self.__dict__.pop("_mamba_evict_keep_ids", None)
+        _mamba_evict_probe.note_reset(self, site="reset_keep" if _keep_ids else "reset", keep_ids=_keep_ids)
 
         # S20 (h16v3 22:48:14-22:49:08, the D arena held full by the workers' stale host rows): a Form A WORKER
         # learned its tree only from worker_keeps / worker_short -- the first of them at 22:49:08. Until then every
@@ -4743,6 +4750,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "pin covers a load-back or a running request; the caller "
                     "must select an unlocked node, never free under the pin."
                 )
+            if comp.component_type == ComponentType.MAMBA and cd.value is not None:
+                # MAMBA-EVICT-PROBE-1024 (#228b): every device mamba state that leaves the tree, with its
+                # site (caller chain) and whether a copy survives -- before evict_component frees it
+                _mamba_evict_probe.note_device_evict(self, node, cd, host_too=EvictLayer.HOST in target)
         _fcd = (node.component_data[BASE_COMPONENT_TYPE]
                 if comp.component_type == BASE_COMPONENT_TYPE else None)
         if (
@@ -16667,6 +16678,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             return
         n = len(value)
+        if ct == ComponentType.MAMBA:   # MAMBA-EVICT-PROBE-1024: the #1055 reclaim side door
+            _mamba_evict_probe.note(self, node, cd, site="reclaim", frame=sys._getframe(1))
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] -= n
         else:
