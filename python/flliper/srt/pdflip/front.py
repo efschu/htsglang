@@ -4321,6 +4321,10 @@ class Pending:
     measure_reoffer: bool = False
     #: EZ-S2b: the arrival decision was ``RIDE_P`` (R1a): a decided flip carries this kurz request; it is no trigger (R2)
     ride_p: bool = False
+    #: SIBLING-U-1024 review MUSS-1 / SOLL-1 (planner 24.10., variant (a)): the anchor rid this sibling RIDER waits behind on D
+    #: ("" = none). While set it is no set member and no P trigger (``phase_policy.immediate_park_trigger``): it is kurz only
+    #: after its anchor is computed (``Front._rider_hold_tick``). Cleared at the end of the wait and at every flip.
+    sibling_hold: str = ""
 
 
 #: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
@@ -15391,6 +15395,8 @@ class Front:
         if st is None:
             st = self.__dict__["_set_state"] = _fd.DeciderState(epoch=None)
         if st.get("epoch") != self.epoch:
+            if st.get("rider_hold"):
+                Front._rider_flags_clear(self, "epoch")   # SIBLING-U-1024 MUSS-1: no hold outlives its D epoch
             st.reset(self.epoch)
         return st
 
@@ -15538,6 +15544,14 @@ class Front:
                    for r, u, t, q in items]
         return phase_policy.shared_prefix_discount(entries, lambda a, b: Front._set_common(self, a, b))
 
+    def _set_discount_anchored(self, items: Sequence[Tuple[str, int, float, Any]]) -> Dict[str, Tuple[int, str]]:
+        """:meth:`_set_discount` plus the earlier member each discount is taken from (SIBLING-U-1024, ``SetMember.anchor``:
+        a member is classed on its rest while that anchor is in the set, SOLL section 2 / R2 / R4)."""
+        sess_of = self.__dict__.get("_sess_by_rid") or {}
+        entries = [(r, int(u), Front._set_depth_of(self, r, q), float(t), str(sess_of.get(str(r)) or ""))
+                   for r, u, t, q in items]
+        return phase_policy.shared_prefix_discount_anchored(entries, lambda a, b: Front._set_common(self, a, b))
+
     def _set_x_for(self, rids_depths: Sequence[Tuple[str, int, int]]) -> int:
         """The X the set's S is decided against: SOLL R2a, the smallest own X of the members (each at its own depth),
         nothing else. ``(rid, depth, X at k=1)`` per member. H16V review A2: X(k) = X + (k-1) x P fixed cost is NOT a
@@ -15623,9 +15637,12 @@ class Front:
             # state-chosen entry (D refused it ...) UNDER halbX is a defect report (R7), never a member and no flip reason
             frac = Front._set_cfg()[0]
             out = []
+            _held = st.get("rider_hold") or {}
             for q in live_q:
                 if q.rid in st["go_p"]:
                     continue
+                if q.rid in _held:
+                    continue                       # SIBLING-U-1024 MUSS-1: waits behind its D anchor -- no member (R2/R7)
                 if q.rid in st.get("d_after", ()):
                     continue                       # A1: the timer ended with D's verdict -- D's now, no second verdict per tick
                 if getattr(q, "measure_reoffer", False):
@@ -15641,7 +15658,7 @@ class Front:
                     else:
                         _fd.rider_under_x(self, q.rid, u, xq, "state=requeue/carrier/deferred under halbX: no flip (R7)")
             return out
-        return [q for q in live_q if q.rid not in st["go_p"]
+        return [q for q in live_q if q.rid not in st["go_p"] and q.rid not in (st.get("rider_hold") or {})
                 and (phase_policy.immediate_park_trigger([q], x_tok) is not None or Front._measured_halb_member(q))]
 
     @staticmethod
@@ -15676,15 +15693,22 @@ class Front:
             else:
                 _p_only = bool(getattr(q, "p_only", False)) or (u < xq and not _meas)
             raw.append((q.rid, u, float(_lctl.clock_t(q, now)), _p_only, q))
+        _held = st.get("rider_hold") or {}
         for rid, tup in st["shorts"].items():
+            if rid in _held:
+                continue   # SIBLING-U-1024 MUSS-1: a SHORT rider waits behind its D anchor -- no member, no S share (R2/R7)
             t, u = tup[0], tup[1]
             xs[rid] = int(tup[2]) if len(tup) > 2 and tup[2] else int(self.tp_prefill_max_tokens)
             depth[rid] = Front._set_depth_of(self, rid)
             raw.append((rid, int(u), float(t), False, None))
-        eff = Front._set_discount(self, [(r, u, t, q) for r, u, t, _p, q in raw])
+        _effa = Front._set_discount_anchored(self, [(r, u, t, q) for r, u, t, _p, q in raw])
+        eff = {r: v[0] for r, v in _effa.items()}
         _xo = _fd.enabled()
+        # SIBLING-U-1024 (SOLL section 2, R2/R4): the member the discount came from rides along as ``anchor`` -- while it is
+        # in the set, the discounted member is classed on its rest (phase_policy.member_class / sibling_riders)
         out = [phase_policy.SetMember(r, eff.get(r, u), t, p, own_uncached=(u if eff.get(r, u) != u else 0),
-                                      x_own=(int(xs.get(r, 0)) if _xo else 0))
+                                      x_own=(int(xs.get(r, 0)) if _xo else 0),
+                                      anchor=(_effa[r][1] if r in _effa and eff.get(r, u) != u else ""))
                for r, u, t, p, _q in raw]
         st["xs"] = xs
         st["depths"] = depth
@@ -16224,12 +16248,31 @@ class Front:
                  verdict: str, why: str, x_tok: int, frac: float, t_half: float, decoding: bool, seats: int,
                  waited: float, x_cls: int = 0, xk: int = 0, unstarted: int = 0) -> None:
         """``PDFLIP SET-VERDICT`` (SOLL section 4), the exact format, once per decision."""
-        classes = [phase_policy.classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or x_cls or x_tok, frac, m.p_only)
-                   for m in members]
-        _shared = sum(m.own_uncached - m.uncached for m in members if m.own_uncached)
+        # SIBLING-U-1024 review SOLL-2: classes and riders against the SAME presence set ``decide`` uses (the members left
+        # after the R2 own-figure filter, ``phase_policy.set_keep``) -- never against all members (the line could name a rider
+        # the verdict did not have)
+        # section 10 (planner 24.10.): a kurz left-out request can be a rider's anchor (``phase_policy.set_riders``)
+        _keep, _kurz_out, _riders = phase_policy.set_riders(members, x_cls or x_tok, frac)
+        _present = {m.rid for m in _keep}
+        classes = [phase_policy.member_class(m, x_cls or x_tok, frac, _present, _kurz_out) for m in members]
+        # the shared piece S does NOT carry: a member behind a kurz non-member anchor that is no rider adds its own figure
+        # (phase_policy.s_share) -- its shared piece is in S already
+        _shared = sum(m.own_uncached - m.uncached for m in members if m.own_uncached
+                      and phase_policy.s_share(m, _riders, _present, _kurz_out) != int(m.own_uncached))
+        _rider_rest = sum(max(0, int(m.uncached)) for m in members if m.rid in _riders)
         if _shared > 0:
-            # R1u (20.10.): S is already the union figure (a shared piece once); the own figures only class the members
-            why = "%s [prefix-shared=%d counted once in S (R1u), S_own=%d]" % (why, _shared, int(sv.s_tokens) + _shared)
+            # R1u (20.10.): S is already the union figure (a shared piece once); SIBLING-U-1024: a member behind an anchor
+            # in the set is classed on that same rest, a rider's (kurz) rest is not in S (R2/R3, planner 24.10.)
+            why = "%s [prefix-shared=%d counted once in S (R1u), S_own=%d]" % (why, _shared,
+                                                                            int(sv.s_tokens) + _rider_rest + _shared)
+        if _riders:
+            self.counters["set_sibling_rider"] += 1
+            _ka = sorted({m.anchor for m in members if m.rid in _riders and m.anchor in _kurz_out})
+            why = "%s [sibling-rider=%s kurz on its rest behind %s: no trigger, no R4 company, not in S, rides a flip " \
+                  "(R1a); on a D verdict it waits behind its anchor (SOLL u = the rest)%s]" % (
+                      why, ",".join("%s:%d" % (m.rid, int(m.uncached)) for m in members if m.rid in _riders),
+                      ",".join(sorted({m.anchor for m in members if m.rid in _riders})),
+                      (" kurz-anchor=%s (R2: D at once, no member)" % ",".join(_ka)) if _ka else "")
         if xk > 0:
             why = "%s xk=%d" % (why, xk)   # H16V review A2: X(k) is information only
         # EZ-S1: ONE record, SET-VERDICT (SOLL section 4, byte-identical to the H91 line) derived from the same data as the
@@ -16308,6 +16351,10 @@ class Front:
                 _r2only = True
                 sv = phase_policy.SetVerdict(phase_policy.V_D_AFTER_TIMER, "R2 kurz only: no set member, D now (S=0)", 0.0, 0,
                                              sv.half_x)
+            elif _dec.in_set and all(c == phase_policy.CLASS_KURZ for c in _dec.classes):
+                # SIBLING-U-1024 section 10 (R2): riders only, behind kurz non-member anchors -- the policy said D now; like
+                # "R2 kurz only" no R6 piece can turn it (the riders are no S share, they wait behind their D anchors)
+                _r2only = True
             if unstarted > 0 and sv.verdict == phase_policy.V_COLLECT and sv.why.startswith("NS:S49"):
                 self.counters["set_xsum_hold_unstarted"] += 1
         else:
@@ -16680,8 +16727,10 @@ class Front:
             for rid in list(st["shorts"]):  # a SHORT that joined while the flip is committed rides it
                 st["released"][rid] = "P"
                 st["go_p"].add(rid)
+            Front._rider_hold_rides_flip(self, st, live_q, "committed")   # SIBLING-U-1024 MUSS-1: R1a
             st["shorts"] = {}
             return "P"
+        Front._rider_hold_tick(self, now, live_q, st)   # SIBLING-U-1024 MUSS-1 / SOLL-1: riders behind their D anchors
         ev = self._set_eval(now, live_q, st)
         if ev is None:
             st["t_open"] = None
@@ -16726,8 +16775,18 @@ class Front:
         route = "D" if sv.verdict == phase_policy.V_D_AFTER_TIMER else "P"
         self._set_log(st, members, sv, verdict=sv.verdict, why=sv.why, **kw)
         self.counters["set_" + sv.verdict.lower()] += 1
+        _held_now: frozenset = frozenset()
         if route == "D":
+            # SIBLING-U-1024 review MUSS-1 / SOLL-1 (planner 24.10., variant (a); SOLL R1/R2/R7, R11): a rider is kurz only
+            # AFTER its anchor is computed -- the D verdict does NOT release it with the anchor in this tick; it waits behind its
+            # D anchor (``_rider_hold_tick``). The riders are the verdict's own (same presence set as ``decide``)
+            _xc = int(kw.get("x_cls") or kw.get("x_tok") or 0)
+            # section 10: riders behind a member anchor OR a kurz non-member anchor (R2, planner 24.10.) -- the same set as decide
+            _keep, _out, _rs = phase_policy.set_riders(members, _xc, kw["frac"])
+            _held_now = Front._rider_hold_begin(self, st, [m for m in _keep if m.rid in _rs], live_q, now)
             for _q in live_q:
+                if _q.rid in _held_now:
+                    continue   # MUSS-1: no d_eligible for a rider in the anchor's tick
                 if Front._measured_halb_member(_q) and _q.rid in st["xs"]:
                     # EZ-S1 review B1 (R3): the timer ended without S >= X -- the measured halb member goes to D, which
                     # takes it under the decision X (``_asr_queued_short_to_d``), not the barrier
@@ -16741,10 +16800,13 @@ class Front:
                     st.setdefault("d_after", set()).add(_q.rid)
                     self.counters["wait_seat_halb_to_d"] += 1
         for rid in list(st["shorts"]):
+            if route == "D" and rid in (st.get("rider_hold") or {}):
+                continue   # MUSS-1: a SHORT rider stays on its seat path behind its D anchor (no release, no grant)
             st["released"][rid] = route
             if route == "D" and envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
                 self._d_pf_book().grant(rid=rid, tokens=int(st["shorts"][rid][1]), now=now)  # X-SUM-PRICE
         if route == "P":
+            Front._rider_hold_rides_flip(self, st, live_q, sv.verdict)   # SIBLING-U-1024 MUSS-1: a decided flip takes it (R1a)
             st["go_p"].update(m.rid for m in members)
             if sv.verdict == phase_policy.V_PARK_NO_SEAT:
                 # R5: no seat for the set on D = prefill and park, NO flip begins -- committed, but not a DECIDED flip
@@ -16771,8 +16833,148 @@ class Front:
                 logger.info("PDFLIP SET-REROUTE epoch=%d n=%d rids=%s running_uncached=%d -- R6: the waiting D-line "
                             "entries ride the flip to P with the set", self.epoch, _n, _wait[:8],
                             self._dc_carried_running())
-        st.update(shorts={}, t_open=None, set_id=st["set_id"] + 1, seen=0, logged=None)
+        # MUSS-1: a SHORT rider still waiting behind its D anchor keeps its place on the seat path (no member until released)
+        _keep_shorts = {r: t for r, t in st["shorts"].items() if r in (st.get("rider_hold") or {})}
+        st.update(shorts=_keep_shorts, t_open=None, set_id=st["set_id"] + 1, seen=0, logged=None)
         return route
+
+    # -- SIBLING-U-1024 review MUSS-1 / SOLL-1: a RIDER waits behind its D anchor (planner decision 24.10., variant (a)) ------
+    @staticmethod
+    def _rider_wait_on() -> bool:
+        """``FLLIPER_PDFLIP_SIBLING_RIDER_WAIT`` (default ON)."""
+        try:
+            return bool(envs.FLLIPER_PDFLIP_SIBLING_RIDER_WAIT.get())
+        except Exception:  # noqa: BLE001 -- a partial env: the switch reads ON (new features on)
+            return True
+
+    def _rider_flags_clear(self, why: str) -> int:
+        """Clear every queue entry's ``sibling_hold`` (a flip / a new D epoch ends every wait: the holds were this epoch's)."""
+        n = 0
+        for p in list(getattr(self, "queue", ()) or ()):
+            if getattr(p, "sibling_hold", ""):
+                try:
+                    p.sibling_hold = ""
+                except Exception:  # noqa: BLE001 -- a frozen test double
+                    continue
+                n += 1
+        if n:
+            self.counters["sibling_rider_wait_cleared"] += n
+            logger.info("PDFLIP SIBLING-RIDER-WAIT cleared n=%d why=%s epoch=%d -- the D epoch ends every rider wait (R1a: a flip "
+                        "takes it)", n, why, int(getattr(self, "epoch", 0)))
+        return n
+
+    def _rider_anchor_state(self, anchor: str, live_q: List["Pending"], st: dict) -> str:
+        """Where the rider's anchor is (``phase_policy.ANCHOR_*``), front-side only (R11): ``pending`` while it is handed to D
+        and its D prefill is not over -- still queued for D, in D's admission line, released on the seat path, or an open
+        ``d_pf_book`` row (granted, no first content yet); ``done`` once D holds it with its row closed (the shared prefix is
+        computed on D); ``gone`` otherwise (aborted, client gone, parked, rerouted, dead)."""
+        a = str(anchor or "")
+        if not a:
+            return phase_policy.ANCHOR_GONE
+        if any(getattr(p, "rid", None) == a for p in live_q):
+            return phase_policy.ANCHOR_PENDING
+        if any(getattr(p, "rid", None) == a for p in list(getattr(self, "_ready_for_d", ()) or ())):
+            return phase_policy.ANCHOR_PENDING
+        if st["released"].get(a) == "D" or a in st["shorts"]:
+            return phase_policy.ANCHOR_PENDING
+        book = self.__dict__.get("_d_pf")
+        if book is not None and book.is_open(rid=a):
+            return phase_policy.ANCHOR_PENDING
+        groups = getattr(self, "groups", None)
+        D = groups.get("D") if isinstance(groups, dict) else None
+        if D is not None and a in (getattr(D, "outstanding", None) or ()):
+            return phase_policy.ANCHOR_DONE
+        return phase_policy.ANCHOR_GONE
+
+    def _rider_hold_begin(self, st: dict, riders: Sequence["phase_policy.SetMember"], live_q: List["Pending"],
+                          now: float) -> frozenset:
+        """The D verdict of a set with riders: each rider waits behind its anchor instead of being released with it (MUSS-1,
+        SOLL R1/R2/R7). Returns the rids held. Switch off: nothing held, named once per set (the pre-review release)."""
+        if not riders:
+            return frozenset()
+        if not Front._rider_wait_on():
+            self.counters["sibling_rider_wait_off"] += len(riders)
+            logger.info("PDFLIP SIBLING-RIDER-WAIT off rids=%s set=%d epoch=%d -- FLLIPER_PDFLIP_SIBLING_RIDER_WAIT=0: the riders go "
+                        "to D with their anchors in one tick (their own figure is on D uncounted)",
+                        ",".join(m.rid for m in riders), int(st.get("set_id", 0)), int(getattr(self, "epoch", 0)))
+            return frozenset()
+        hold = st.setdefault("rider_hold", {})
+        _frac, t_half = Front._set_cfg()
+        out = set()
+        for m in riders:
+            q = next((p for p in live_q if p.rid == m.rid), None)
+            if q is not None:
+                try:
+                    q.sibling_hold = str(m.anchor)
+                except Exception:  # noqa: BLE001 -- a frozen test double: the hold book still excludes it
+                    pass
+            elif m.rid not in st["shorts"]:
+                continue
+            hold[m.rid] = {"anchor": str(m.anchor), "t0": float(now), "own": int(m.own_uncached or m.uncached),
+                           "rest": int(m.uncached), "short": q is None, "phase": "anchor", "t_done": None}
+            out.add(m.rid)
+            self.counters["sibling_rider_wait"] += 1
+            logger.info("PDFLIP SIBLING-RIDER-WAIT begin rid=%s anchor=%s own=%d rest=%d where=%s bound_s=%.1f set=%d epoch=%d -- "
+                        "the set went to D: the rider is kurz only after its anchor is computed, it is NOT released with it "
+                        "(SOLL R1/R2/R7; it waits for the anchor's D prefill, then the re-probe reads its rest; anchor gone or "
+                        "bound over: its own figure classes it; FLLIPER_PDFLIP_SIBLING_RIDER_WAIT, bound = T_halb)",
+                        m.rid, m.anchor, int(m.own_uncached or m.uncached), int(m.uncached),
+                        "short" if q is None else "queue", t_half, int(st.get("set_id", 0)), int(getattr(self, "epoch", 0)))
+        return frozenset(out)
+
+    def _rider_hold_end(self, st: dict, rid: str, outcome: str, why: str, now: float, live_q: List["Pending"]) -> None:
+        h = (st.get("rider_hold") or {}).pop(rid, None)
+        if h is None:
+            return
+        for p in live_q:
+            if p.rid == rid and getattr(p, "sibling_hold", ""):
+                try:
+                    p.sibling_hold = ""
+                except Exception:  # noqa: BLE001
+                    pass
+        self.counters["sibling_rider_wait_" + outcome] += 1
+        logger.info("PDFLIP SIBLING-RIDER-WAIT end rid=%s anchor=%s outcome=%s waited_s=%.2f own=%d rest=%d epoch=%d -- %s",
+                    rid, h.get("anchor"), outcome, max(0.0, float(now) - float(h.get("t0", now))), int(h.get("own", 0)),
+                    int(h.get("rest", 0)), int(getattr(self, "epoch", 0)), why)
+
+    def _rider_hold_rides_flip(self, st: dict, live_q: List["Pending"], verdict: str) -> None:
+        """R1a: a decided flip takes every pending prefill -- a rider waiting behind its D anchor too (a SHORT rider is released
+        with the other SHORTs by the caller; a queue rider is committed here)."""
+        hold = st.get("rider_hold") or {}
+        for rid in list(hold):
+            if any(p.rid == rid for p in live_q):
+                st["go_p"].add(rid)
+            Front._rider_hold_end(self, st, rid, "rides_flip", "a flip is decided (%s): it rides it (R1a)" % verdict,
+                                  time.time(), live_q)
+
+    def _rider_hold_tick(self, now: float, live_q: List["Pending"], st: dict) -> None:
+        """One look at every rider waiting behind its D anchor (``phase_policy.rider_hold_step``): anchor done -> the S63
+        re-probe reads its rest, then it is a member again (kurz -> R2 D at once, else R3/R4); anchor gone or bound
+        (T_halb) over -> a member again on its own figure. The front decides (R11)."""
+        hold = st.get("rider_hold")
+        if not hold:
+            return
+        _frac, t_half = Front._set_cfg()
+        for rid, h in list(hold.items()):
+            if rid not in st["shorts"] and not any(p.rid == rid for p in live_q):
+                Front._rider_hold_end(self, st, rid, "left", "the rider left (served, cancelled, client gone)", now, live_q)
+                continue
+            if h.get("phase") == "reprobe":
+                # the anchor is done; the re-probe of the rider's number runs -- bounded by the S63 bound
+                if (Front._set_reprobe_gate(self, [rid], "sibling-rider", "RIDER_RELEASE")
+                        or now - float(h.get("t_done") or now) >= Front._reprobe_bound_s()):
+                    Front._rider_hold_end(self, st, rid, phase_policy.RIDER_RELEASE_REST,
+                                          "re-probed after the anchor's D prefill: classed on D's number now", now, live_q)
+                continue
+            state = Front._rider_anchor_state(self, h.get("anchor", ""), live_q, st)
+            act, why = phase_policy.rider_hold_step(state, now - float(h.get("t0", now)), t_half)
+            if act == phase_policy.RIDER_HOLD:
+                continue
+            if act == phase_policy.RIDER_RELEASE_REST:
+                h["phase"], h["t_done"] = "reprobe", float(now)
+                if not Front._set_reprobe_gate(self, [rid], "sibling-rider", "RIDER_RELEASE"):
+                    continue   # S63: its number is asked again; it is a member once D's number has landed
+            Front._rider_hold_end(self, st, rid, act, why, now, live_q)
 
     def _set_flip_justified(self, now: float) -> bool:
         """SOLL R7/A8: the ONLY ways the controller's work-exhausted / economics path may flip D->P: a set verdict
@@ -16785,6 +16987,9 @@ class Front:
             return False
         if self._decode_collect(now, live_q) == "P":
             return True
+        live_q = [p for p in live_q if not getattr(p, "sibling_hold", "")]   # SIBLING-U-1024 MUSS-1: no flip work (R2/R7)
+        if not live_q:
+            return False
         if _fd.enabled():
             # EZ-S2a (R1, plan A8 contradiction 3, #41): there is ONE set. The queue-sum second set is gone: queued work
             # that is no member (kurz, or a set under X) is no flip reason. FLIP-HELD stays as a line (alias) and becomes
@@ -16898,8 +17103,8 @@ class Front:
                 own = self._set_st()["released"].pop(rid, None)
                 if own is not None:
                     return own
-                if route is None:
-                    return None
+                if route is None and rid not in (self._set_st().get("rider_hold") or {}):
+                    return None   # SIBLING-U-1024 MUSS-1: a rider behind its D anchor keeps waiting (bounded by the hold)
                 await asyncio.sleep(0.05)
             return "D"
         finally:
@@ -22533,6 +22738,7 @@ class Front:
                     return
         self._flip_marks["dc"] = time.time()
         self.awake = dst
+        Front._rider_flags_clear(self, "flip")   # SIBLING-U-1024 MUSS-1: every rider wait ends with its D epoch
         self.epoch += 1
         self.admit_d = True
         if not self._enter_state("serving"):
