@@ -272,7 +272,8 @@ def test_both_intake_calls_stamp_the_span_start_on_the_record():
     calls = re.findall(r"self\.tree_cache\.prefetch_from_storage\((.*?)\n\s*\)\n", src, flags=re.S)
     assert len(calls) == 2, len(calls)
     for c in calls:
-        assert ("key_base=int(_matched_len)" in c) or ("span_start=int(_matched_len)" in c), c
+        # the stamp reads span_base first (the collective call), then key_base (27B) / span_start (NF)
+        assert any(k + "=int(_matched_len)" in c for k in ("span_base", "key_base", "span_start")), c
     tree = inspect.getsource(urc.UnifiedRadixCache.prefetch_from_storage)
     assert ("_ss = span_base if span_base is not None else key_base" in tree
             or "_ss = span_base if span_base is not None else span_start" in tree)
