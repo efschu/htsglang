@@ -244,6 +244,34 @@ if TYPE_CHECKING:
     from flliper.srt.model_executor.model_runner import ModelRunner
 
 
+
+def join_pending_hicache_load(model_runner) -> bool:
+    """GRAPH-H2D-WAIT-1024 (#237 Teil A, review done/review-pwake-237-1024.md): the ONLY join between a HiCache
+    load-back and the forward that reads it is ``LayerDoneCounter.wait_until``, called from the pools'
+    ``get_key_buffer`` / ``get_value_buffer`` / mamba accessors -- Python hooks that a CUDA-graph replay never runs
+    (the graph was captured with ``consumer_index`` -1, so it holds no wait node). The load rides its own
+    non-blocking ``load_stream`` (arena page load = a gather kernel); without this join the first chunk after a
+    load-back (27B int8/duo/dual P, full prefill graph n=512) read device rows whose H2D was still in flight.
+
+    When the batch consumes a producer (``consumer_index >= 0``, set by ``tp_worker.set_hicache_consumer``) the
+    current stream waits for the producer's LAST layer event (``finish_event``: one load stream, so it covers every
+    layer + the mamba pool transfers + draft rows) -- a device-side ``wait_event``, no host block, the graph/eager
+    choice unchanged, rank-uniform (the consumer index comes from the batch every rank builds alike). Same pattern as
+    ``pdflip/tail_adopt.run_skip``. Returns True when it joined. No switch: a correctness join.
+    """
+    ltc = None
+    for pool in (getattr(model_runner, "token_to_kv_pool", None), getattr(model_runner, "req_to_token_pool", None)):
+        ltc = getattr(pool, "layer_transfer_counter", None)
+        if ltc is not None:
+            break
+    if ltc is None or int(getattr(ltc, "consumer_index", -1)) < 0:
+        return False
+    n = int(getattr(ltc, "num_layers", 0) or 0)
+    if n <= 0:
+        return False
+    ltc.wait_until(n - 1)
+    return True
+
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
@@ -1435,6 +1463,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # GRAPH-H2D-WAIT-1024 (#237 Teil A): a replay runs no per-layer get_*_buffer hook -- join the batch's
+        # whole HiCache load-back on the device BEFORE the captured body reads the KV / recurrent rows
+        join_pending_hicache_load(self.model_runner)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
