@@ -802,6 +802,7 @@ class RealDualPass(unittest.TestCase):
     def _patches(self, leg1):
         F = front_mod.Front
         return [mock.patch.object(F, "leg1", leg1), mock.patch.object(F, "_log_p_prefix_reuse", lambda self, r: None),
+                mock.patch.object(F, "note_x_sample", lambda self, kind, value: None),
                 mock.patch.object(front_mod, "_dual_p_pressure", lambda paths: 0),
                 mock.patch.object(F, "_dual_p_held_by_stage", lambda self: False),
                 mock.patch.object(F, "_q696_stall_held", lambda self: False),
@@ -843,7 +844,8 @@ class RealDualPass(unittest.TestCase):
             self.assertEqual(f.counters["s7b_legs_aborted"], 1)
             self.assertEqual(S.state_of(f).state, S.FAILED)                    # no restart armed in this test
             S.tick(f)                                                          # the controller: gone for good -> named 503
-            self.assertIn("P-ABSENT-NO-RESTART", str(q[0].fut.exception(timeout=0)))
+            self.assertTrue(q[0].fut.done())                                   # an asyncio future: done, then read
+            self.assertIn("P-ABSENT-NO-RESTART", str(q[0].fut.exception()))
 
     def test_a_marked_leg_that_still_returns_200_goes_to_d(self):
         async def leg1(self, p):
