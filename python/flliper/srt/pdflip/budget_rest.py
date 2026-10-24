@@ -878,6 +878,190 @@ def admit_deltas(rests: Sequence[Optional[int]], vote_deltas: Sequence[int],
 
 
 # --------------------------------------------------------------------------
+# #217 ADMIT-PEAK (desk/27b-admit-peak-1024, 24.10.): WHAT THE ADMISSION PEAK A IS, and the stage geometry the record
+# D_ADMIT_NEED_MIB was measured under.
+#
+# A = post - fwd_before of an admission pass is two DEVICE STAGES of the post-wake load-back plus small blocks:
+#
+#   KV page stage  arena_pool._load_pages_all_layers: ``dev_stage = torch.empty((min(B, pages), page_bytes))`` per load,
+#                  B = 8192 x 32 KiB = 256 MiB from 8192 rank pages on. It is freed at the load's end and every vote /
+#                  forward trim (empty_cache) hands its segment back, so EVERY admission cudaMallocs it again: the
+#                  forward trim after a handback releases 278..282 MiB = this stage + 22..26 MiB (rc42 _1024_125438,
+#                  rc4 _1024_091424, every logged pass with >= 8192 rank pages, both ranks).
+#   mamba stage    arena_mamba_pool._load_states_all_layers: ``self._state_dev_stage``, min(256 MiB // row, slots) rows,
+#                  LIVE until the sleep (sleep_staging drops it) and re-created by the first load after every wake --
+#                  the handback admission. PDFLIP-SLEEP-STAGING (unsampled): 224.4 int4ar (6 x 37.4), 187.0 drei TP1/2
+#                  (10 x 18.7), 205.7 / 233.8 duo TP1 / TP0. ``A - released`` of a first pass after a wake = this stage
+#                  + 2..8 MiB (154 at 4 slots, 226..232 at >= 6): the part the forward trim cannot return.
+#
+#   A_peak 504..522 = 256 + 224..234 + 22..32 (duo 522 = 256 + 233.8 + 32.2).
+#
+# #217 shrinks both: the KV device stage to 64 MiB (arena_pool._PAGE_LOAD_DEVICE_STAGE_BYTES; "cpu" mode keeps 256) and
+# the mamba stage to ONE row per block in "dma" mode (split vectorised, arena_mamba_pool._state_load_block_rows).
+# PROJECTED (HOCHRECHNUNG -- NOT booked): A_peak = 64 + largest row 51.4 (duo TP1) + rest 32.2 = 147.6 -> need =
+# 400 + 147.6 - 508 = 40 (booked 40) instead of 414 (416): ~376 MiB per int4ar card. The record stays 414 until a
+# census MEASURES A under the #217 stages: :func:`admit_record_may_replace` is the gate the census prints, and only its
+# "yes" lets a census value replace the record (the review-test edge "every raw forward trim + booked >= 400" keeps
+# holding the old boots either way).
+# --------------------------------------------------------------------------
+
+#: the stage geometry D_ADMIT_NEED_MIB 414 was measured under (every record boot: PDFLIP-ARENA-PAGE-LOAD block=8192
+#: mode=kernel, PDFLIP-ARENA-STATE-LOAD block=6 mode=dma)
+ADMIT_STAGE_BASIS: Tuple[Tuple[str, int], ...] = (("kv_page_stage_mib", 256), ("mamba_state_block_rows", 6))
+#: the #217 geometry a census must show on EVERY boot before its need may replace the record
+ADMIT_STAGE_217_KV_MIB = 64
+ADMIT_STAGE_217_MAMBA_ROWS = 1
+#: the measured parts of A_peak (MiB) and the #217 projection (HOCHRECHNUNG: a sum of measured parts, never booked)
+ADMIT_PEAK_PARTS: Tuple[Tuple[str, float], ...] = (("kv_page_stage", 256.0), ("mamba_state_stage", 233.8),
+                                                   ("small_blocks", 32.2))
+ADMIT_PEAK_217_PROJECTION: Tuple[Tuple[str, float], ...] = (("kv_page_stage", 64.0), ("mamba_state_row", 51.4),
+                                                            ("small_blocks", 32.2))
+ADMIT_STAGE_MARKER = "PDFLIP-ADMIT-STAGE"
+
+
+def admit_peak_projection(post_floor_mib: float = 508.0, near_oom_mib: float = 400.0) -> Tuple[float, int, str]:
+    """``(A_peak, need, label)`` of the #217 stages -- a HOCHRECHNUNG from measured parts (KV stage 64 by construction,
+    the largest single mamba row 51.4 of the duo TP1 state load, the small blocks 32.2 left over beside the measured
+    stages). Never booked; :data:`ADMIT_RECORD` keeps its measured value until :func:`admit_record_may_replace`."""
+    a = sum(v for _, v in ADMIT_PEAK_217_PROJECTION)
+    need = int(math.ceil(max(0.0, float(near_oom_mib) + a - float(post_floor_mib)) - 1e-9))
+    return a, need, (f"HOCHRECHNUNG (not booked): #217 A_peak {a:.1f} = "
+                     + " + ".join(f"{k} {v:.1f}" for k, v in ADMIT_PEAK_217_PROJECTION)
+                     + f" -> need {need} MiB; measured basis A_peak {sum(v for _, v in ADMIT_PEAK_PARTS):.1f}")
+
+
+@dataclass(frozen=True)
+class AdmitStageBasis:
+    """The load-back stages one D log ran with: ``kv_stage_mib`` per PDFLIP-ARENA-PAGE-LOAD line of the whole-page
+    modes (block x page bytes; owner-lane lines are not this stage), ``state_blocks`` the ``block=`` of every
+    PDFLIP-ARENA-STATE-LOAD line in "dma" mode, ``mamba_stage_mib`` the PDFLIP-SLEEP-STAGING ``mamba_state_stage``
+    values (the live mamba stage at each sleep)."""
+
+    kv_stage_mib: Tuple[float, ...]
+    state_blocks: Tuple[int, ...]
+    mamba_stage_mib: Tuple[float, ...]
+
+
+_RX_PAGE_LOAD = re.compile(r"ARENA-PAGE-LOAD n=\d+ rows=\d+ pages=(\d+) block=(\d+) bytes=(\d+) mode=(\w+)")
+_RX_STATE_LOAD = re.compile(r"ARENA-STATE-LOAD n=\d+ slots=\d+ own_bytes=\d+ block=(\d+) mode=(\w+)")
+_RX_SLEEP_STAGE = re.compile(r"SLEEP-STAGING freed [\d.]+ MiB \(([^)]*)\)")
+
+
+def admit_stage_basis(d_text: str) -> AdmitStageBasis:
+    """The stage geometry of one D log (text in, :class:`AdmitStageBasis` out). Pure."""
+    kv: List[float] = []
+    st: List[int] = []
+    ms: List[float] = []
+    for ln in d_text.splitlines():
+        if "ARENA-PAGE-LOAD" in ln and "lane_dma=" not in ln:
+            m = _RX_PAGE_LOAD.search(ln)
+            if m and int(m.group(1)) > 0:
+                page = int(m.group(3)) / int(m.group(1))
+                kv.append(int(m.group(2)) * page / (1 << 20))
+        elif "ARENA-STATE-LOAD" in ln:
+            m = _RX_STATE_LOAD.search(ln)
+            if m and m.group(2) == "dma":
+                st.append(int(m.group(1)))
+        elif "SLEEP-STAGING freed" in ln:
+            m = _RX_SLEEP_STAGE.search(ln)
+            if m:
+                mm = re.search(r"mamba_state_stage ([\d.]+)", m.group(1))
+                ms.append(float(mm.group(1)) if mm else 0.0)
+    return AdmitStageBasis(tuple(kv), tuple(st), tuple(ms))
+
+
+@dataclass(frozen=True)
+class AdmitPeakPart:
+    """One admission that logged its loads (PDFLIP-ARENA-PAGE-LOAD / -STATE-LOAD are printed for the first 8 loads and
+    every 64th): the trim before it (``post``), the forward trim after it (``fwd_before``, ``released``), the KV page
+    stage it allocated (min(block, pages) x page bytes) and the mamba state stage (min(block, slots) x row). ``after_sleep``
+    = the first load after a PDFLIP-SLEEP-STAGING line of this rank (the mamba stage was allocated afresh)."""
+
+    rank: int
+    ts: str
+    post: float
+    fwd_before: float
+    released: float
+    kv_stage_mib: float
+    mamba_stage_mib: float
+    after_sleep: bool
+
+    @property
+    def admission(self) -> float:
+        return self.post - self.fwd_before
+
+
+def admit_peak_parts(d_text: str) -> List[AdmitPeakPart]:
+    """#217 instrument: every logged load paired with the trims around it, per rank in log order -- the decomposition
+    A = KV stage (released by the forward trim) + mamba stage (live, A - released after a sleep) + small blocks. Pure."""
+    out: List[AdmitPeakPart] = []
+    st: Dict[int, Dict[str, object]] = {}
+    for ln in d_text.splitlines():
+        m = _RX_RANK.match(ln)
+        if not m:
+            continue
+        ts, r = m.group(1), int(m.group(2))
+        s = st.setdefault(r, {"post": None, "kv": 0.0, "ms": 0.0, "pend": False, "sleep": True})
+        if "SLEEP-STAGING freed" in ln:
+            s["sleep"] = True
+        elif "ARENA-STATE-LOAD" in ln:
+            d = dict(_RX_KV.findall(ln))
+            try:
+                n, own, blk = int(d["slots"]), int(d["own_bytes"]), int(d["block"])
+                s["ms"] = max(float(s["ms"]), min(blk, n) * (own / max(1, n)) / (1 << 20))  # type: ignore[arg-type]
+                s["pend"] = True
+            except (KeyError, ValueError):
+                pass
+        elif "ARENA-PAGE-LOAD" in ln and "lane_dma=" not in ln:
+            d = dict(_RX_KV.findall(ln))
+            try:
+                pages, blk, nb = int(d["pages"]), int(d["block"]), int(d["bytes"])
+                s["kv"] = float(s["kv"]) + min(blk, pages) * (nb / max(1, pages)) / (1 << 20)  # type: ignore[arg-type]
+                s["pend"] = True
+            except (KeyError, ValueError):
+                pass
+        elif "PDFLIP-EXTEND-CACHE-TRIM" in ln:
+            d = dict(_RX_KV.findall(ln))
+            try:
+                before, rel, after = float(d["card_free_before"]), float(d["released"]), float(d["card_free_after"])
+            except (KeyError, ValueError):
+                continue
+            if s["pend"] and s["post"] is not None:
+                out.append(AdmitPeakPart(rank=r, ts=ts, post=float(s["post"]), fwd_before=before,  # type: ignore[arg-type]
+                                         released=rel, kv_stage_mib=float(s["kv"]),  # type: ignore[arg-type]
+                                         mamba_stage_mib=float(s["ms"]), after_sleep=bool(s["sleep"])))  # type: ignore[arg-type]
+                s["sleep"] = False
+            s.update(post=after, kv=0.0, ms=0.0, pend=False)
+    return out
+
+
+def admit_record_may_replace(bases: Sequence[Tuple[str, AdmitStageBasis]]) -> Tuple[bool, List[str]]:
+    """May a census over these boots replace D_ADMIT_NEED_MIB? Only when EVERY boot measured A under the #217 stages:
+    at least one whole-page load and one dma state load logged, every KV stage <= :data:`ADMIT_STAGE_217_KV_MIB` and
+    every state block == :data:`ADMIT_STAGE_217_MAMBA_ROWS`. Anything else -- an old-geometry boot, a boot that never
+    logged a load (no instrument is not a measurement) -- answers no: its A is the 256-MiB stages' (or unknown), and a
+    smaller need from it would be booked against a peak nobody measured (the OOM direction). Lines name per boot what
+    it ran. Pure."""
+    ok = bool(bases)
+    lines: List[str] = []
+    for tag, b in bases:
+        kv_max = max(b.kv_stage_mib) if b.kv_stage_mib else None
+        st_max = max(b.state_blocks) if b.state_blocks else None
+        ms_max = max(b.mamba_stage_mib) if b.mamba_stage_mib else None
+        good = (kv_max is not None and st_max is not None and kv_max <= ADMIT_STAGE_217_KV_MIB + 1e-6
+                and st_max == ADMIT_STAGE_217_MAMBA_ROWS)
+        ok = ok and good
+        lines.append(f"{ADMIT_STAGE_MARKER} boot={tag} kv_stage_max={'-' if kv_max is None else f'{kv_max:.0f}'} MiB "
+                     f"state_block_max={'-' if st_max is None else st_max} mamba_stage_at_sleep_max="
+                     f"{'-' if ms_max is None else f'{ms_max:.1f}'} MiB -> "
+                     + ("#217 stages" if good else "NOT the #217 stages (A of the 256-MiB stages, or no load logged)"))
+    lines.append(f"{ADMIT_STAGE_MARKER} {ADMIT_RECORD} may be replaced by this census: "
+                 + ("YES (every boot measured A under the #217 stages)" if ok else
+                    f"NO -- the record stays (measured basis {dict(ADMIT_STAGE_BASIS)})"))
+    return ok, lines
+
+
+# --------------------------------------------------------------------------
 # PDFLIP-ALLOC-OVERHANG (desk/27b-d-alloc-overhang-0929): the rest SPLIT into its
 # posts, and the part the torch cache cap (pdflip/torch_cache_cap.py, P0
 # 5f33ec18836a) takes away.
@@ -1239,6 +1423,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         need, alines = admit_need_from_passes(own, float(NEAR_OOM_MIB), admission_peak(own + other))
         for ln in alines:
             print(ln)
+
+        def _stage_text(path: str) -> str:
+            with open(path, errors="replace") as fh:
+                return "".join(ln for ln in fh if "ARENA-PAGE-LOAD" in ln or "ARENA-STATE-LOAD" in ln
+                               or "SLEEP-STAGING freed" in ln)
+
+        # #217: the stage geometry each census boot ran -- only an all-#217 census may replace the record
+        stage_paths = [re.sub(r"\.front\.log$", ".D.log", p) for p in a.front_logs] + list(a.admit_peak_d_log)
+        _may, slines = admit_record_may_replace([(os.path.basename(p), admit_stage_basis(_stage_text(p)))
+                                                 for p in stage_paths if os.path.exists(p)])
+        for ln in slines:
+            print(ln)
+        for p in stage_paths:
+            if not os.path.exists(p):
+                continue
+            with open(p, errors="replace") as fh:
+                parts = admit_peak_parts("".join(
+                    ln for ln in fh if "ARENA-PAGE-LOAD" in ln or "ARENA-STATE-LOAD" in ln
+                    or "SLEEP-STAGING freed" in ln or "PDFLIP-EXTEND-CACHE-TRIM" in ln))
+            for q in parts:
+                print(f"{ADMIT_STAGE_MARKER} part boot={os.path.basename(p)} rank={q.rank} {q.ts} A={q.admission:.0f} "
+                      f"released={q.released:.0f} kv_stage={q.kv_stage_mib:.1f} mamba_stage={q.mamba_stage_mib:.1f} "
+                      f"A-released={q.admission - q.released:.0f} after_sleep={int(q.after_sleep)}")
+        print(f"{ADMIT_STAGE_MARKER} {admit_peak_projection()[2]}")
         print(json.dumps({"name": ADMIT_RECORD, "value": None if need is None else [need] * int(a.cards),
                           "boots": [b[0] for b in boots], "kind": "memory"}))
     vals, lines = record_from_boots(boots, a.group, a.cards)

@@ -1161,27 +1161,71 @@ def _arena_page_load_timing() -> bool:
 
 #: The pinned stage the default block was tuned for: 8192 pages of the 27B's
 #: 32-KiB page (xsn325: 10.4-12.5 GB/s vs 5.9-11 at 2048) = 256 MiB per stage.
+#: Since #217 only the "cpu" mode (two alternating PINNED host stages, the CPU
+#: gather of block i+1 overlapping the DMA of block i) keeps it.
 _PAGE_LOAD_STAGE_BYTES = 8192 * 32768
 
+#: #217 ADMIT-PEAK (24.10.): the DEVICE stage of the "kernel" and "dma" modes.
+#:
+#: MEASURED (int4ar rc42 _1024_125438 / rc4 _1024_091424, every logged
+#: admission pass, both ranks): the forward trim right after a handback
+#: admission releases 278-282 MiB whenever the load-back has >= 8192 rank pages
+#: -- this stage (min(8192, pages) x 32 KiB = 256 MiB, a fresh ``torch.empty``
+#: per load) plus 22-26 MiB of small blocks. The vote trim and the forward trim
+#: (``empty_cache``) hand its segment back every pass, so EVERY admission
+#: cudaMallocs it again: it is the ~278-MiB base of the admission peak A that
+#: PDFLIP-ADMIT-BOOK prices (D_ADMIT_NEED_MIB, A_peak 504..522 = this stage +
+#: the mamba state stage + ~25).
+#:
+#: In "kernel" mode the GPU gathers a block in one launch and scatters it with
+#: 2 x L ``index_copy_``; no host sync between blocks (unlike "cpu"), so the
+#: block size only sets how many launches the scheduler thread issues. The
+#: issue cost is mostly PER PAGE, not per block (PDFLIP-START-LOADING ``kv``
+#: TP1/TP0: 3/4 ms for 2 blocks of 14.8k rank pages, 17/63 ms for 8 blocks of
+#: 61k): 30 instead of 8 blocks for a 61k-page load add ~11-44 ms of issue
+#: against ~200 ms of GPU copy (2 GB, LOAD-DEVICE 9.4 GB/s end to end) -- the
+#: copy still bounds the load. 64 MiB is also the S36 KV-DURCHLAUF stage of
+#: this file (``kv_durchlauf.block_pages``). The gain (192 MiB of A per card)
+#: is a HOCHRECHNUNG until a boot's census measures it.
+_PAGE_LOAD_DEVICE_STAGE_BYTES = 2048 * 32768
 
-def _arena_page_load_block(page_bytes: int = 0) -> int:
-    """Pages per pinned stage of the all-layer page load.
+#: #217 switch: unset = on (the 64-MiB KV device stage above and the one-row
+#: mamba state stage of arena_mamba_pool); 0/false/no/off = the 256-MiB stages
+#: of 69e2d95e68 (the geometry D_ADMIT_NEED_MIB 414 was measured under). An
+#: explicit FLLIPER_PDFLIP_ARENA_PAGE_LOAD_BLOCK / _STATE_LOAD_BLOCK_BYTES wins.
+ENV_ADMIT_PEAK_STAGES = "FLLIPER_PDFLIP_ADMIT_PEAK_STAGES"
+
+
+def admit_peak_stages_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_ADMIT_PEAK_STAGES, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _arena_page_load_block(page_bytes: int = 0, mode: Optional[str] = None) -> int:
+    """Pages per stage of the all-layer page load.
 
     fnFL2x65 (23.09.): the default was a PAGE COUNT tuned for the 27B's 32-KiB
     page. A Next Flash page is 786432 B (12 layers x 64 tokens x 1 KiB), so the
     same count pinned 2 x 6 GiB (+ the device stage) on D TP0 at the wake --
     shmem +15 GiB in 4 s, the kernel OOM-killed the rank (x63/x64/x65, py-spy in
-    ``_load_pages_all_layers``). Unset, the block is 256 MiB worth of pages of
-    THIS pool's page; an explicit env value stays a page count."""
+    ``_load_pages_all_layers``). Unset, the block is a fixed number of BYTES
+    worth of pages of THIS pool's page (a page <= 32 KiB counts as 32 KiB); an
+    explicit env value stays a page count.
+
+    #217: ``mode`` "cpu" keeps the 256-MiB pinned stage (xsn325); every other
+    mode (``None`` included: the device modes are the default) takes the
+    64-MiB device stage, :data:`_PAGE_LOAD_DEVICE_STAGE_BYTES`."""
     v = os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "").strip()
     if v:
         try:
             return max(64, int(v))
         except ValueError:
             pass
+    stage = (_PAGE_LOAD_STAGE_BYTES if (mode == "cpu" or not admit_peak_stages_on())
+             else _PAGE_LOAD_DEVICE_STAGE_BYTES)
     if int(page_bytes or 0) > 32768:
-        return max(64, _PAGE_LOAD_STAGE_BYTES // int(page_bytes))
-    return 8192
+        return max(64, stage // int(page_bytes))
+    return stage // 32768
 
 
 #: N4E rollback switch without a rebuild (27B d7f588e017): =0 restores the
@@ -2087,7 +2131,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return
         dev = device_pool.k_buffer[0].device
         pb = self._page_bytes
-        B = _arena_page_load_block(pb)  # x65: a 256-MiB stage, not 8192 pages of any size
+        # #217: the stage follows the mode this load will run -- "cpu" keeps the
+        # 256-MiB pinned stage (xsn325), the device modes take 64 MiB (the
+        # admission peak's base, see _PAGE_LOAD_DEVICE_STAGE_BYTES); the same
+        # expression as the mode resolution below, so both always agree
+        _stage_mode = mode or getattr(self, "_page_mode", None) or _arena_page_load_mode(pb)
+        if _stage_mode == "kernel" and dev.type != "cuda":
+            _stage_mode = "cpu"
+        B = _arena_page_load_block(pb, _stage_mode)  # x65: bytes per stage, not a page count of any size
         if lanes is not None and not os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "").strip():
             # F22: the worker's stage is a quarter of TP0's (64 MiB of NF
             # pages) -- below the 2 x rows x cell device temporaries per layer

@@ -149,14 +149,20 @@ def test_an_arena_pool_without_bytes_bids_the_sentinel():
 def test_the_page_load_block_keeps_the_27b_form_and_caps_the_paged_stage():
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop(ap.ARENA_PAGE_LOAD_BLOCK_ENV, None)
-        assert ap._arena_page_load_block(32768) == 8192   # 27B: 256 MiB per stage, unchanged
-        assert ap._arena_page_load_block(0) == 8192       # unbound / desk fixtures
+        os.environ.pop(ap.ENV_ADMIT_PEAK_STAGES, None)
+        # the PINNED stages of the "cpu" mode (x65's law): 256 MiB per stage
+        assert ap._arena_page_load_block(32768, "cpu") == 8192   # 27B: 256 MiB per stage, unchanged
+        assert ap._arena_page_load_block(0, "cpu") == 8192       # unbound / desk fixtures
         # Next Flash: 12 layers x 64 tokens x 1 KiB = 786432 B per page; 8192 of
         # them pinned 2 x 6 GiB on D TP0 at the wake (x63-x65, kernel OOM)
-        b = ap._arena_page_load_block(786432)
+        b = ap._arena_page_load_block(786432, "cpu")
         assert b == 8192 * 32768 // 786432 == 341
         assert 2 * b * 786432 <= 2 * (256 << 20)
-        assert ap._arena_page_load_block(64 << 20) == 64  # never below the floor
+        assert ap._arena_page_load_block(64 << 20, "cpu") == 64  # never below the floor
+        # #217 ADMIT-PEAK: the device modes ("kernel"/"dma", the default) stage 64 MiB
+        assert ap._arena_page_load_block(32768) == ap._arena_page_load_block(32768, "kernel") == 2048
+        assert ap._arena_page_load_block(786432, "dma") == (64 << 20) // 786432 == 85
+        assert ap._arena_page_load_block(64 << 20) == 64         # never below the floor
 
 
 def test_an_explicit_page_load_block_stays_a_page_count():
