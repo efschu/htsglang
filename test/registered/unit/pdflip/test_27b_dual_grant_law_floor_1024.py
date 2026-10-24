@@ -102,8 +102,8 @@ def _card(d_committed, p_committed=0):
     d = K.CardKvLedger(path, "D")
     p = K.CardKvLedger(path, "P")
     # D keeps its boot pool mapped until P has joined (12:00:52 JOIN "kept mapped", 12:01:44 SHRINK)
-    d.contribute(M.d_contrib, committed=M.d_contrib, pid=os.getpid())
-    p.contribute(M.p_contrib, committed=0, pid=os.getpid() + 100000)
+    d.contribute(M.d_contrib, committed=M.d_contrib)
+    p.contribute(M.p_contrib, committed=0)          # one live pid for both groups (a dead pid is reaped)
     assert p.book_unpriced(M.book) == M.book
     d.release(M.d_contrib - int(d_committed))
     if p_committed:
