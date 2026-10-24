@@ -333,3 +333,102 @@ def test_r6k_the_kurz_rest_ends_on_d_before_the_flip_not_parked_at_a_chunk_bound
     finally:
         loop.close()
     assert calls
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# R2 / R7: D must be able to TAKE a kurz request. NF boot weg2..._1023_234711 (rc36p), D, 00:12:48-00:13:54Z: the corridor
+# actuator cut the pass chunk to its 64-token liveness floor, MIXED-D took running_bs (2) of it for decode rows, and
+# ``add_one_req`` aligned 62 down to the page (0): 64 x ``gate=trunc_len_zero`` for pdflip-6-179 (u=927), 180 (u=250) and
+# 182 (u=200) never started (waited_s=66.2). The floor was a liveness property defeated one line later.
+# R1a stays as it is: a decided flip takes the still-waiting kurz along (PARK-HANDBACK, test_pdflip_park_handback_1002).
+# ---------------------------------------------------------------------------------------------------------------------
+_PAGE = 64
+_MAX_NEW = 4096
+
+
+def _mixed_adder(rem_chunk, mixed, n_running=2, avail=10**6):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from flliper.srt.managers.schedule_policy import PrefillAdder
+    from flliper.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+    from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    tc = MagicMock()
+    tc.supports_mamba.return_value = False
+    tc.evictable_size.return_value = 0
+    tc.full_evictable_size.return_value = 0
+    tc.swa_evictable_size.return_value = 0
+    tc.disable = False
+    tc.uniform_avail_floor = None
+    tc.inc_lock_ref.return_value = IncLockRefResult()
+    tc.dec_lock_ref.return_value = DecLockRefResult()
+    alloc = MagicMock()
+    alloc.available_size.return_value = avail
+    alloc.full_available_size.return_value = avail
+    alloc.swa_available_size.return_value = 0
+    running = MagicMock()
+    running.reqs = [SimpleNamespace(rid=f"run-{i}", output_ids=[],
+                                    sampling_params=SimpleNamespace(max_new_tokens=_MAX_NEW)) for i in range(n_running)]
+    return PrefillAdder(
+        page_size=_PAGE, tree_cache=tc, token_to_kv_pool_allocator=alloc, running_batch=running, new_token_ratio=1.0,
+        rem_input_tokens=10**9, rem_chunk_tokens=rem_chunk, num_mixed_decode_tokens=mixed,
+        priority_scheduling_preemption_threshold=0,
+    )
+
+
+def _kurz_req(fill, rid="pdflip-6-179"):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from flliper.srt.managers.schedule_batch import Req
+
+    req = MagicMock(spec=Req)
+    req.rid = rid
+    req.priority = 0
+    req.prefix_indices = []
+    req.full_untruncated_fill_ids = list(range(fill))
+    req.output_ids = []
+    req.sampling_params = SimpleNamespace(max_new_tokens=_MAX_NEW, ignore_eos=False)
+    req.time_stats = SimpleNamespace(wait_queue_entry_time=0)
+    req.retracted_stain = False
+    req.finished.return_value = False
+    req.needs_host_load_back.return_value = False
+    req.host_hit_length = 0
+    req.last_node = MagicMock()
+    req.born_spilled = False
+    req.born_spilled_deep = False
+    return req
+
+
+def test_r2_r7_the_corridor_floor_chunk_survives_the_mixed_decode_rows():
+    """The specimen: chunk 64 (corridor liveness floor), 2 decode rows mixed in -> the chunk stays ONE PAGE and the kurz
+    request (u=927) is admitted as a chunk instead of being refused ``trunc_len_zero`` pass after pass (R7)."""
+    for running in (1, 2, 3, 4, 5):  # rem_chunk=63..59 in the boot's refusals
+        adder = _mixed_adder(rem_chunk=64, mixed=running, n_running=running)
+        assert adder.rem_chunk_tokens == _PAGE, running
+        adder.add_one_req(_kurz_req(927), truncation_align_size=None)
+        assert len(adder.can_run_list) == 1, "R2/R7: D takes the kurz request (running=%d)" % running
+
+
+def test_r2_r7_the_old_subtraction_is_what_refused_it(monkeypatch):
+    """Pin of the cause: with the page floor switched off the very same pass reproduces the specimen (62, refused)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_MIXED_CHUNK_PAGE_FLOOR", "0")
+    adder = _mixed_adder(rem_chunk=64, mixed=2)
+    assert adder.rem_chunk_tokens == 62
+    adder.add_one_req(_kurz_req(927), truncation_align_size=None)
+    assert adder.can_run_list == []
+
+
+def test_r2_r7_the_page_floor_changes_nothing_off_the_specimen():
+    """Only a budget the subtraction pushes BELOW one page (from >= one page) is lifted; everything else is the old number."""
+    from flliper.srt.managers.schedule_policy import _chunk_after_mixed_decode as f
+
+    assert f(4096, 3, _PAGE) == 4093
+    assert f(320, 5, _PAGE) == 315
+    assert f(128, 64, _PAGE) == 64        # exactly one page left: untouched
+    assert f(128, 65, _PAGE) == 64        # pushed below a page, lifted to the floor
+    assert f(64, 0, _PAGE) == 64          # no mixed rows: nothing to defend
+    assert f(60, 2, _PAGE) == 58          # configured below a page: not ours to lift
+    assert f(64, 2, _PAGE) == 64
