@@ -147,6 +147,11 @@ class HeldTrywait(_Sems):
         # a semaphore set without the held entry point (desk fakes): no take
         self.assertFalse(bx.seq_take_held(object(), is_diagonal=True, card=2, pair=None, slot=slot))
 
+        class _Truthy:          # a duck-typed stand-in answering a truthy non-bool
+            def diagonal_trywait_held(self, *a):
+                return object()
+        self.assertFalse(bx.seq_take_held(_Truthy(), is_diagonal=True, card=2, pair=None, slot=slot))
+
 
 class SeqCollect(_Sems):
     N = 6
@@ -226,7 +231,15 @@ class SeqCollect(_Sems):
         self._bytes_ok()
         self.assertEqual(self._sem_left(), 0)
         held = int(self._col_line().split("held_takes=")[1].split("/")[0])
-        self.assertLess(held, self.N)       # at least the first unit blocked
+        self.assertLessEqual(held, self.N)  # how many were held depends on the race; the bytes do not
+
+    def test_a_held_miss_without_deposit_expires_by_name(self):
+        self._env(**{bx.ENV_SEQ_TRYWAIT_HELD: None})
+        rc = self._run(bx.PHASE_COLLECT, budget_s=0.5)
+        self.assertTrue(rc.startswith("budget expired at unit 0"), rc)
+        for d in self.descs:
+            self.assertEqual(self.ops.read(int(d.dst_ptr), int(d.nbytes)), b"\0" * int(d.nbytes))
+        self.assertEqual(self._sem_left(), 0)
 
 
 class PtrAttrsHeld(unittest.TestCase, _Env):

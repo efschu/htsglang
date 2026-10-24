@@ -3614,7 +3614,9 @@ def seq_take_held(sems, *, is_diagonal: bool, card, pair, slot: int) -> bool:
     fn = getattr(sems, "diagonal_trywait_held" if is_diagonal else "trywait_held", None)
     if not callable(fn):
         return False
-    return bool(fn(int(card) if is_diagonal else int(pair), int(slot), "full"))
+    # only a real True is a taken token: a duck-typed stand-in answering a
+    # truthy non-bool (a Mock) must not license a unit whose token nobody took
+    return fn(int(card) if is_diagonal else int(pair), int(slot), "full") is True
 
 
 #: FLIP-LEGS 02.10.: a SEQ deposit writes ONE record file per sync group
