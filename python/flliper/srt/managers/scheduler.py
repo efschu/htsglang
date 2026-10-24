@@ -11913,6 +11913,13 @@ class Scheduler(
         # TAIL, so inserting here leaves both readings intact.
         _corridor_at = len(vals)
         vals = vals + [self._local_corridor_width_ceiling()]
+        # VOTE-FIXED-LIVE (24.10., pdflip/vote_fixed_live.py rule 4, SOLL R11): the D ranks' measured fixed part
+        # of an extend rides this reduce as ONE MIN slot carrying -ceil(F) -- the group MAX, so every rank's
+        # width-vote line holds the worst rank's reading (TP-symmetric passes, but trimmed on different ranks).
+        # Contributed UNCONDITIONALLY (0 without a reading: neutral, F >= 0), its own head index captured
+        # before the append, read back before the tail-indexed ballot. No new collective.
+        _vfix_at = len(vals)
+        vals = vals + [_pdflip_extend_trim.live_fixed_payload()]
         # #791b: THE PREFETCH BALLOT rides the SAME reduce (instr22/instr23:
         # the admission loop's rank-local prefetch verdict split the TP
         # replicas -- one rank admitted a batch its peers declined, three
@@ -11937,7 +11944,7 @@ class Scheduler(
         #
         # Payload order, in full, after this block:
         #   [avail, (admission,) -avail, host, -host, mamba, -mamba,
-        #    corridor, admit_limit, seam_premise, phase_domain[..],
+        #    corridor, -vote_fixed, admit_limit, seam_premise, phase_domain[..],
         #    head_match[0..TP_HEAD_SLOTS-1],
         #    ballot_digest, -ballot_digest, ballot_v0..v{K-1}]
         #
@@ -12169,6 +12176,8 @@ class Scheduler(
         # #794: the group's tightest corridor width, read back before the
         # ballot so a later change to the ballot layout cannot silently move it.
         self._uniform_corridor_width = int(t[_corridor_at])
+        # VOTE-FIXED-LIVE: the group max of F (ratchet up) for the next vote's line
+        _pdflip_extend_trim.live_fixed_group(int(t[_vfix_at]))
         # #823 W9: read back by the indices captured above, before the ballot,
         # so a later change to the ballot layout cannot silently move them --
         # the same discipline the corridor width is read under.

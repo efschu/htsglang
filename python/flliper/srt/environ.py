@@ -1793,6 +1793,17 @@ class Envs:
     # MEASURED votes with the line near-OOM 400 + this value instead of the floor (the floor is the
     # 4096-row activation the rate already prices). Unset = the floor line, byte for byte.
     FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB = EnvStr(None)
+    # VOTE-FIXED-LIVE (24.10., desk/27b-vote-fixed-live-1024, pdflip/vote_fixed_live.py): the D rank measures
+    # the fixed part itself (vote post - extend end incl. draft - start rate x rows over trimmed, non-first
+    # passes), raises the single line with it (never lowers), shares the group max on the packed reduce and
+    # persists its readings per form; the launcher seeds the next boot from the form's store once MIN_BOOTS
+    # boots measured it. Default ON; 0 = the seed alone (VOTE-LINE-SINGLE), no store.
+    FLLIPER_PDFLIP_VOTE_FIXED_LIVE = EnvBool(True)
+    # launcher -> D ranks: the form digest, the D inventory (positional by rank), the boot tag, the store root
+    FLLIPER_PDFLIP_VOTE_FIXED_FORM = EnvStr(None)
+    FLLIPER_PDFLIP_VOTE_FIXED_CARDS = EnvStr(None)
+    FLLIPER_PDFLIP_VOTE_FIXED_BOOT = EnvStr(None)
+    FLLIPER_PDFLIP_VOTE_FIXED_DIR = EnvStr(None)
     # Q-694b EXTEND-RATE (NF port 1003): the rank MEASURES its own extend
     # transient per row (allocator peak / reserved growth of every target
     # extend of >= 2048 rows) and votes with max(start rate, measured x 1.15),

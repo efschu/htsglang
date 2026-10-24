@@ -233,6 +233,15 @@ def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time, *,
 
     vram_actual.on_window(phase, peak_alloc=pa, peak_reserved=pr, start_alloc=start_alloc,
                           rows=rows, leg=leg, seats=seats)
+    # VOTE-FIXED-LIVE (pdflip/vote_fixed_live.py): the chunk's end read pairs the width vote's pass; the other
+    # windows commit it (flip / idle also unpair a pending vote). Off / no vote on this rank: a no-op.
+    if free >= 0:
+        try:
+            from flliper.srt.pdflip import extend_trim as _et
+
+            _et.live_note_window(phase, rows, free / MIB)
+        except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+            logger.debug("%s live meter skipped: %s", MARKER, exc)
     return line
 
 
@@ -266,6 +275,13 @@ def on_forward_end(runner, forward_batch, cuda) -> Optional[str]:
         _STATE["seats"] = int(bs)
         return _close(cuda, rank, "chunk", f" rows={rows}", rows=max(0, rows))
     if mode.is_decode() or is_verify:
+        # VOTE-FIXED-LIVE: a target decode / verify ended -- the open extend reading commits, a pending vote unpairs
+        try:
+            from flliper.srt.pdflip import extend_trim as _et
+
+            _et.live_note_target_decode()
+        except Exception:  # noqa: BLE001
+            pass
         _STATE["rounds"] += 1
         if bs > _STATE["seats"]:
             _STATE["seats"] = int(bs)
