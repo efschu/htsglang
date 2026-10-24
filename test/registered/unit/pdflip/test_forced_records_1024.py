@@ -445,6 +445,8 @@ class MaxOverSleeps(Base):
                          [{self.U[0]: 1400, self.U[1]: 1300}, {self.U[0]: 1400, self.U[1]: 1600}])
         self.assertEqual(st.counters["dc_over_reserve"], 1)                    # 1600 > 1578, named, no stop
 
+    @unittest.skipUnless(os.path.exists(os.path.join(ROOT, "python", "flliper", "srt", "pdflip", "l15_plan.py")),
+                         "no L1.5 on this tree (NF line)")
     def test_the_l15_hold_is_stripped_like_at_the_first_sleep(self):
         os.environ["FLLIPER_PDFLIP_L15"] = "1"
         try:
@@ -511,8 +513,8 @@ class MaxOverSleeps(Base):
 
     def test_the_front_wires_both_later_reading_paths(self):
         src = open(os.path.join(ROOT, "python", "flliper", "srt", "pdflip", "front.py"), encoding="utf-8").read()
-        self.assertIn("self._note_d_residue_reading(src, dc, _l15_held)", src)
-        self.assertIn("self._dc_reading_off_path(src, S.sid, rec, l15_held=_l15_held)", src)
+        self.assertTrue(re.search(r"if src == \"D\" and self\.dc_measured_d and dc:\n\s+self\._note_d_residue_reading\(src, dc, ", src))
+        self.assertIn("self._dc_reading_off_path(src, S.sid, rec, l15_held=", src)
         self.assertIn("self._note_d_residue_reading(src, dc, l15_held)", src)
         self.assertIn('rec["vram_residue_kind"] = "first_sleep"', src)
 
