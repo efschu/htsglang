@@ -333,3 +333,216 @@ def test_r6k_the_kurz_rest_ends_on_d_before_the_flip_not_parked_at_a_chunk_bound
     finally:
         loop.close()
     assert calls
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# R2 / R7 (+ R5, R6k untouched): a kurz request is not starved behind a carried continuation. 27B int4ar boot
+# weg2..._1023_223241 (D, TP0, X=4096 / halbX=2048 from the front): the corridor narrowed the pass chunk to 256
+# (#794 GROUP-NARROWED 4096 -> 256); the continuation (pdflip-2-21, kurz u=1265; elsewhere halb D_AFTER_TIMER u=3805)
+# took all 256 through ``add_chunked_req`` before the waiting loop, and every kurz behind it read ``rem_chunk=0``:
+# ``D-ADMIT-REFUSED rid=pdflip-2-22 gate=trunc_len_zero rem_chunk=0 uncached=188`` (3 passes, 1.3 s), pdflip-20-190
+# u=26 (1.3 s), pdflip-2-25 u=221 (10 passes, 4.3 s) -- 48 TP0 refusals for 18 kurz rids. The seat was granted (R5).
+# The fix (pdflip/r2_kurz_chunk.py, wired at the ``lanes_p.chunk_scope`` seam): the kurz needs that fit WHOLE next to the
+# continuation's floor are reserved before it; it is charged only what it took.
+# ---------------------------------------------------------------------------------------------------------------------
+_K_CHUNK = 256
+_K_HALFX = 2048
+
+
+def _k_adder(rem_chunk=_K_CHUNK, page_size=1):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from flliper.srt.managers.schedule_policy import PrefillAdder
+    from flliper.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+    from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    tc = MagicMock()
+    tc.supports_mamba.return_value = False
+    tc.evictable_size.return_value = 0
+    tc.full_evictable_size.return_value = 0
+    tc.swa_evictable_size.return_value = 0
+    tc.disable = False
+    tc.uniform_avail_floor = None
+    tc.inc_lock_ref.return_value = IncLockRefResult()
+    tc.dec_lock_ref.return_value = DecLockRefResult()
+    alloc = MagicMock()
+    for name in ("available_size", "full_available_size", "swa_available_size"):
+        getattr(alloc, name).return_value = 10**6
+    running = MagicMock()
+    running.reqs = []
+    return PrefillAdder(
+        page_size=page_size, tree_cache=tc, token_to_kv_pool_allocator=alloc, running_batch=running,
+        new_token_ratio=1.0, rem_input_tokens=10**9, rem_chunk_tokens=rem_chunk, num_mixed_decode_tokens=0,
+        priority_scheduling_preemption_threshold=0,
+    )
+
+
+def _k_req(rid, fill, prefix=0, *, priced=None, halfx=_K_HALFX, xgate=None, front_x=4096):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from flliper.srt.managers.schedule_batch import Req
+    from flliper.srt.utils.common import Range
+
+    r = MagicMock(spec=Req)
+    r.rid = rid
+    r.priority = 0
+    r.prefix_indices = list(range(prefix))
+    r.full_untruncated_fill_ids = list(range(fill))
+    r.output_ids = []
+    r.host_hit_length = 0
+    r.swa_host_hit_length = 0
+    r.sampling_params = SimpleNamespace(max_new_tokens=512, ignore_eos=False)
+    r.time_stats = SimpleNamespace(wait_queue_entry_time=0)
+    r.retracted_stain = False
+    r.born_spilled = False
+    r.born_spilled_deep = False
+    r.last_node = MagicMock()
+    r.mamba_pool_idx = None
+    r.finished.return_value = False
+    r.needs_host_load_back.return_value = False
+    r.set_extend_range = MagicMock(side_effect=lambda a, b: setattr(r, "extend_range", Range(a, b)))
+    if priced is not None:  # the front's D leg headers (front_x.py) and D's own group-priced X-gate reading
+        r.weg2_front_x = front_x
+        r.weg2_front_priced = priced
+        r.weg2_front_halfx = halfx
+        r._pdflip_xgate_priced = xgate
+    return r
+
+
+def _k_sched(queue, x=12288):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(server_args=SimpleNamespace(tp_prefill_max_tokens=x), waiting_queue=list(queue))
+
+
+def _k_pass(adder, sched, cont):
+    """One D pass as ``Scheduler.get_new_batch_prefill`` runs it: the continuation inside the two scopes, then the
+    waiting loop (``add_one_req`` in queue order). Returns the continuation as the scheduler keeps it."""
+    from flliper.srt.pdflip import lanes_p
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    with lanes_p.chunk_scope(adder, cont), k.reserve_scope(adder, sched, cont):
+        kept = adder.add_chunked_req(cont)
+    adder.chunked_req_outstanding = kept is not None
+    for req in list(sched.waiting_queue):
+        adder.add_one_req(req, truncation_align_size=None)
+    return kept
+
+
+def _k_cont():
+    # pdflip-2-21 at 22:38:06: prefix 64993, 1265 uncached in all, one 256 chunk a pass
+    return _k_req("pdflip-2-21", 64993 + 1265, prefix=64993)
+
+
+def test_r2_kurz_rides_the_pass_of_a_continuation_that_held_the_whole_chunk():
+    """The specimen: chunk 256, continuation with 1265 left; pdflip-2-22 (front priced 700 from P's store, D's own
+    group-priced extent 188) and pdflip-20-190 (u=26) are admitted in THIS pass; the continuation keeps the rest."""
+    for rid, u, priced in (("pdflip-2-22", 188, 700), ("pdflip-20-190", 26, 26)):
+        adder = _k_adder()
+        cont = _k_cont()
+        kurz = _k_req(rid, u, priced=priced, xgate=(u, 4097))
+        kept = _k_pass(adder, _k_sched([kurz]), cont)
+        assert kurz in adder.can_run_list, "R2/R7: the kurz request rides this pass (%s)" % rid
+        assert kept is cont, "the continuation stays chunked"
+        need = u + 1  # D's extent + one page (page_size 1 on 27B)
+        assert cont.extend_range.end - cont.extend_range.start == _K_CHUNK - need
+        assert kurz.extend_range.end - kurz.extend_range.start == u
+
+
+def test_r2_kurz_switch_off_is_the_specimen(monkeypatch):
+    """Pin of the cause: with the switch off the continuation takes all 256 and the kurz request is refused
+    ``trunc_len_zero`` (the boot's 48 refusals)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_R2_KURZ_CHUNK_RESERVE", "0")
+    adder = _k_adder()
+    cont = _k_cont()
+    kurz = _k_req("pdflip-2-22", 188, priced=700, xgate=(188, 4097))
+    _k_pass(adder, _k_sched([kurz]), cont)
+    assert cont.extend_range.end - cont.extend_range.start == _K_CHUNK
+    assert adder.can_run_list == [cont]
+
+
+def test_r2_kurz_reserve_only_for_the_fronts_kurz_and_never_below_the_continuation_floor():
+    """Halb (front priced >= halbX) is never reserved for (R3 owns it); a kurz that does not fit next to the
+    continuation's floor (one page) waits as before; several kurz are taken greedily in queue order."""
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    halb = _k_req("pdflip-14-122", 2286, priced=2286, xgate=(2286, 4097))
+    big_kurz = _k_req("pdflip-4-62", 462, priced=462, xgate=(462, 4097))
+    a = _k_req("a", 100, priced=100, xgate=(100, 4097))
+    b = _k_req("b", 300, priced=300, xgate=(300, 4097))
+    c = _k_req("c", 50, priced=50, xgate=(50, 4097))
+    plan = k.plan_reserve([halb, big_kurz, a, b, c], _K_CHUNK, 1, 1)
+    assert plan.rids == [("a", 101), ("c", 51)]
+    assert [r for r, _ in plan.nofit] == ["pdflip-4-62", "b"]
+    assert plan.reserve == 152
+    # the continuation always keeps its floor: a kurz of exactly chunk-floor+1 needs does not fit
+    edge = _k_req("e", _K_CHUNK - 1, priced=_K_CHUNK - 1, xgate=(_K_CHUNK - 1, 4097))   # need 256 > room 255
+    assert k.plan_reserve([edge], _K_CHUNK, 1, 1).reserve == 0
+    # the halb continuation still progresses with the floor when the kurz take the rest
+    adder = _k_adder()
+    cont = _k_cont()
+    fill = _k_req("f", _K_CHUNK - 2, priced=_K_CHUNK - 2, xgate=(_K_CHUNK - 2, 4097))   # need 255 = room
+    _k_pass(adder, _k_sched([fill]), cont)
+    assert cont.extend_range.end - cont.extend_range.start == 1
+    assert fill in adder.can_run_list
+
+
+def test_r2_kurz_reserve_reads_ds_extent_the_measure_barrier_and_nothing_unpriced():
+    """Size = D's group-priced X-gate extent (never the front's price); a MEASURE barrier (price 0) is kurz by D's extent
+    under halbX; no X-gate reading yet / no carried halbX / an already decoding request = no reservation."""
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    assert k.kurz_need(_k_req("p", 188, priced=700, xgate=(188, 4097)), 1) == 189
+    assert k.kurz_need(_k_req("m", 908, priced=0, halfx=2047, xgate=(908, 2047)), 1) == 909   # pdflip-38-298 shape
+    assert k.kurz_need(_k_req("mh", 2100, priced=0, halfx=2047, xgate=(2100, 2047)), 1) is None
+    assert k.kurz_need(_k_req("nx", 188, priced=188, xgate=None), 1) is None
+    assert k.kurz_need(_k_req("nh", 188), 1) is None
+    dec = _k_req("dec", 188, priced=188, xgate=(188, 4097))
+    dec.output_ids = [7]
+    assert k.kurz_need(dec, 1) is None
+    assert k.kurz_need(_k_req("pg", 100, priced=100, xgate=(100, 4097)), 64) == 192   # ceil to the page + one page
+
+
+def test_r2_kurz_reserve_is_bounded_group_d_only_and_restores_the_groups_charge():
+    """MAX_TRIES caps a reservation another gate keeps refusing; group P (no riegel) and a forwarded schedule never
+    reserve; the charge restored is what the continuation REALLY took (CHUNKGEOM group MIN cut it further)."""
+    from types import SimpleNamespace
+
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    kurz = _k_req("pdflip-30-275", 188, priced=188, xgate=(188, 4097))
+    for _ in range(k.MAX_TRIES):
+        adder = _k_adder()
+        with k.reserve_scope(adder, _k_sched([kurz]), _k_cont()):
+            assert adder.rem_chunk_tokens == _K_CHUNK - 189
+    adder = _k_adder()
+    with k.reserve_scope(adder, _k_sched([kurz]), _k_cont()):
+        assert adder.rem_chunk_tokens == _K_CHUNK, "after MAX_TRIES the continuation is not cut any more"
+    fresh = _k_req("x", 188, priced=188, xgate=(188, 4097))
+    assert k.plan_for_pass(_k_adder(), _k_sched([fresh], x=0), _k_cont()) is None            # group P
+    told = _k_adder()
+    told.scheduled_extents = {"pdflip-2-21": 1}
+    assert k.plan_for_pass(told, _k_sched([fresh]), _k_cont()) is None                         # executes a schedule
+    adder = _k_adder()
+    adder.tp_admission_agree = SimpleNamespace(chunk_min=lambda rid, v: min(int(v), 40))
+    cont = _k_cont()
+    _k_pass(adder, _k_sched([fresh]), cont)
+    assert cont.extend_range.end - cont.extend_range.start == 40
+    assert fresh in adder.can_run_list
+    assert adder.rem_chunk_tokens == _K_CHUNK - 40 - 188
+
+
+def test_r2_kurz_reserve_is_wired_at_the_continuation_seam():
+    """The admission pass itself is too large to drive here: pinned by text -- the reservation wraps the continuation's
+    ``add_chunked_req`` (inside the lane scope) and therefore precedes the waiting-queue loop."""
+    import flliper.srt.managers.scheduler as sch
+
+    src = open(sch.__file__).read()
+    i = src.index("_pdflip_r2_kurz_chunk.reserve_scope(")
+    j = src.index("self.chunked_req = adder.add_chunked_req(self.chunked_req)", i)
+    assert j - i < 200
+    assert src.rfind("_lanes_p.chunk_scope(adder, self.chunked_req)", 0, i) > i - 200
+    assert src.index("adder.chunked_req_outstanding = self.chunked_req is not None", j) > j
