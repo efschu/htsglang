@@ -13834,6 +13834,13 @@ class Front:
                 or (not _asr.enabled() and self._d_phase_seats_full(rid, own_seat=True))):
             self._d_seat.release()
             return None
+        if self._d_direct_yields(rid, uncached=uncached):
+            # R4OVER-1024 review A2 (SOLL R1a/R2/R6k): a flip became DECIDED while this request waited at the seat
+            # semaphore -- it rides P's batch; a grant now would be an UNBEGUN late grant the R6k finish hold cannot see
+            # (the flip would park it: the FLIPTIME-1023 class)
+            self._d_seat.release()
+            self.counters["short_seat_yield_after_sem"] += 1
+            return None
         return Seat(self, rid, "short", tokens=est_tokens)
 
     def _short_gate_by_age_on(self) -> bool:
@@ -14459,7 +14466,104 @@ class Front:
             out.append(str(rid))
         return out
 
-    def _r2_kurz_grant_hold(self, sv: "phase_policy.SetVerdict", now: float) -> "phase_policy.SetVerdict":
+    #: R4OVER-1024: the flip verdicts the R2 hold makes wait and that count as DECIDED while held (R1a riders);
+    #: PARK_NO_SEAT is no flip begin (R5, ``_flip_decided``) and makes no rider
+    R2_HOLD_DECIDED_VERDICTS = (phase_policy.V_FLIP_P, phase_policy.V_REROUTE_P)
+
+    def _r2_hold_freeze(self, st: dict, rids: Sequence[str], site: str) -> List[str]:
+        """R4OVER-1024 (SOLL R4 + R1a, with R2/R6k): the hold waits ONLY for the kurz grants that were open when the flip
+        verdict first stood (``st["rids"]``, frozen at the hold's start). A kurz grant opened after it is a late grant: the
+        flip was decided, the kurz request rides it (R1a "Ist ein Flip beschlossen, prefillt P ALLE anstehenden Prefills,
+        auch kurze"; R5 "oder fährt mit einem beschlossenen Flip mit") -- it is named once, never waited on. Root (boot
+        int4ar 1023_223241, epochs 2/12): R2 granted new kurz arrivals D_NOW during the hold (the held verdict read COLLECT,
+        so ``_flip_decided`` / ``_set_flip_foreseeable`` saw no decided flip) and each was appended to the hold --
+        pdflip-12-116 (u=1222, granted 1,0 s after FLIP_P) kept the R4 flip of pdflip-12-113 back 3,9 s (waited_s=9.2)."""
+        late = st.setdefault("late", [])
+        for r in rids:
+            if r not in st["rids"] and r not in late:
+                late.append(r)
+                self.counters["r2_kurz_grant_hold_late"] += 1
+                logger.warning("PDFLIP R2-KURZ-BEFORE-FLIP outcome=late_grant site=%s rid=%s epoch=%d held_ms=%d -- a kurz grant "
+                               "opened AFTER the flip verdict stood: not waited on (SOLL R4 T_halb over = flip; R1a it rides "
+                               "the decided flip). A late grant means a kurz admission did not see the held flip as decided",
+                               site, r, self.epoch, int(round((time.time() - float(st.get("t0_wall", time.time()))) * 1000)))
+        return [r for r in rids if r in st["rids"]]
+
+    def _r2_flip_held(self) -> bool:
+        """R4OVER-1024 (SOLL R4 + R1a): True while a D->P flip verdict (FLIP_P / REROUTE_P) stands and waits ONLY for the kurz
+        grants opened before it (the R2 hold of ``_r2_kurz_grant_hold`` or of the ARRIVAL-SEAT P-bound site). Such a flip is
+        DECIDED -- R4's T_halb is over -- so ``_flip_decided`` / ``_set_flip_foreseeable`` / ``_d_direct_yields`` answer
+        "decided": a new kurz arrival rides it (R1a), it is not granted on D and cannot extend the hold. False when the
+        held set's members left the queue, the last verdict seen is no flip, or the phase moved."""
+        if not (self.awake == "D" and self.state == "serving"):
+            return False
+        live = None
+        for key in ("_r2_kurz_hold", "_r2_pbound_hold"):
+            st = self.__dict__.get(key)
+            if not st or st.get("closed") or st.get("epoch") != self.epoch:
+                continue
+            if st.get("last_verdict") not in Front.R2_HOLD_DECIDED_VERDICTS:
+                continue
+            if Front._reprobe_pending(self):
+                # review A5 (S63 F1): a flip whose members are being re-probed is not decided on D's current numbers
+                return False
+            if live is None:
+                # review A1 (R2): only members that are STILL P members count -- a member SET-REPROBE moved under halbX
+                # (d_eligible kurz now) or whose client left holds no flip; a kurz arrival must not yield to it
+                live = {p.rid for p in getattr(self, "queue", ()) if not p.fut.done() and Front._r2_still_p_member(self, p)}
+            if any(r in live for r in st.get("members") or ()):
+                return True
+        return False
+
+    def _r2_still_p_member(self, q: Any) -> bool:
+        """R4OVER-1024 review A1: the side-effect-free twin of ``_set_cands``' membership -- an entry that still needs P
+        (over its X, p_only, a measured halb member, or a by-state entry at/over halbX) or is committed to ``go_p``."""
+        try:
+            if q.rid in self._set_st()["go_p"]:
+                return True
+            if phase_policy.immediate_park_trigger([q], int(self.tp_prefill_max_tokens)) is not None:
+                return True
+            if Front._measured_halb_member(q):
+                return True
+            if (Front._state_p_flag(q) and not getattr(q, "skip_leg1", False) and not getattr(q, "leg1_done", False)
+                    and not getattr(q, "measure_class", "")):
+                u, xq = int(getattr(q, "est_uncached", 0) or 0), Front._set_x_of_entry(self, q)
+                return u >= phase_policy.half_x_of(xq, Front._set_cfg()[0])
+        except Exception:  # noqa: BLE001 -- a partial entry: it holds no flip (R2 wins, the safe direction for kurz)
+            return False
+        return False
+
+    def _r2_hold_void(self, key: str, why: str) -> None:
+        """R4OVER-1024 review A1/A5: end an open R2 hold whose flip verdict no longer stands (the set emptied, no P
+        candidate left, or a non-flip policy verdict). A held FLIP_P/REROUTE_P that ends without a flip is named
+        (``outcome=void``, counter ``r2_held_flip_no_flip``): its riders waited for a flip that did not come."""
+        st = self.__dict__.get(key)
+        if not st or st.get("closed") or st.get("epoch") != self.epoch:
+            return
+        st["closed"] = True
+        st["void"] = True
+        Front._r2_wait_add(self, st)
+        self.counters["r2_kurz_grant_hold_void"] += 1
+        if st.get("last_verdict") in Front.R2_HOLD_DECIDED_VERDICTS:
+            self.counters["r2_held_flip_no_flip"] += 1
+            logger.warning("PDFLIP R2-KURZ-BEFORE-FLIP outcome=void site=%s why=%s rids=%s held_ms=%d epoch=%d -- a held "
+                           "flip (%s) ended WITHOUT a flip: kurz arrivals that rode it go to D now (review A5 instrument)",
+                           key.strip("_"), why, ",".join(st.get("rids") or ()),
+                           int(round((time.time() - float(st.get("t0_wall", time.time()))) * 1000)), self.epoch,
+                           st.get("last_verdict"))
+
+    def _r2_wait_add(self, st: dict) -> None:
+        """Review A3: ``waited_on`` sums every hold piece of one decision (per epoch), not only the last one."""
+        ms = int(st["done_ms"]) if "done_ms" in st else int(round((time.time() - float(st.get("t0_wall", time.time()))) * 1000))
+        acc = self.__dict__.get("_r2_wait_acc")
+        if not acc or acc.get("epoch") != self.epoch:
+            acc = {"epoch": self.epoch, "ms": 0, "n": 0}
+            self.__dict__["_r2_wait_acc"] = acc
+        acc["ms"] += max(0, ms)
+        acc["n"] += 1
+
+    def _r2_kurz_grant_hold(self, sv: "phase_policy.SetVerdict", now: float,
+                            members: Optional[Sequence[Any]] = None) -> "phase_policy.SetVerdict":
         """SOLL R2 (user 23.10.; with R4/R8): a FLIP verdict (FLIP_P / PARK_NO_SEAT / REROUTE_P) taken while a kurz D grant is
         open waits -- COLLECT, the D-granted kurz requests prefill on D to their end before D quiesces for the D->P flip.
         Then the set is decided again on D's state: the kurz requests now DECODE, so a big member waits the rest of its
@@ -14468,32 +14572,48 @@ class Front:
         pdflip-20-119 (u=293, D_NOW 45,018) was granted and unstarted; the park's R6k hold (``_r6k_finish_hold``) sees only
         kurz prefills the D-EXTEND-BEACON proves RUNNING, so PARK-IMMEDIATE parked it and its decode stood 49 s.
         No time bound decides here (the book's own row liveness ends a grant D never takes); a hold longer than
-        ``R2_KURZ_HOLD_NAME_X_THALB`` x T_halb is named once."""
-        if sv.verdict not in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
-            return sv
-        rids = Front._r2_kurz_grants_open(self, now)
+        ``R2_KURZ_HOLD_NAME_X_THALB`` x T_halb is named once.
+        R4OVER-1024 (SOLL R4 + R1a): the hold waits only for the grants open when the verdict first stood
+        (``_r2_hold_freeze``); while it stands the flip is DECIDED (``_r2_flip_held``) -- a later kurz arrival rides it."""
         st = self.__dict__.get("_r2_kurz_hold")
         if st is not None and st.get("epoch") != self.epoch:
             st = None
-        if not rids:
+        if sv.verdict not in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
+            if st is not None and not st.get("closed"):
+                # R4OVER-1024 review: a non-flip POLICY verdict (the R6 commit hold sits behind this hold, review A3) ->
+                # nothing decided is held; the hold ends (void). A kurz grant made while no flip stood is R2's (not late)
+                # and is waited on by the next hold; only grants made while the flip stood decided stay late
+                Front._r2_hold_void(self, "_r2_kurz_hold", "verdict=%s" % sv.verdict)
+                st["last_verdict"] = sv.verdict
+            return sv
+        rids = Front._r2_kurz_grants_open(self, now)
+        if st is not None and not st.get("closed"):
+            wait = Front._r2_hold_freeze(self, st, rids, "set")
+        else:
+            # a re-opened hold in the same epoch: a grant that was late for the last one stays late (R4OVER-1024)
+            prev_late = set(st.get("late") or ()) if st is not None else set()
+            wait = [r for r in rids if r not in prev_late]
+        if not wait:
             if st is not None and not st.get("closed"):
                 st["closed"] = True
+                st["done_ms"] = int(round((now - st["t0"]) * 1000))
+                Front._r2_wait_add(self, st)   # review A3: waited_on sums every piece
                 self.counters["r2_kurz_grant_hold_done"] += 1
-                logger.info("PDFLIP R2-KURZ-BEFORE-FLIP outcome=done wait_ms=%d rids=%s epoch=%d -- the D-granted kurz "
+                logger.info("PDFLIP R2-KURZ-BEFORE-FLIP outcome=done wait_ms=%d rids=%s late=%s epoch=%d -- the D-granted kurz "
                             "request(s) finished their prefill on D; the set is decided again on D's state (SOLL R2, R4/R8): "
-                            "%s %s", int(round((now - st["t0"]) * 1000)), ",".join(st["rids"]), self.epoch, sv.verdict, sv.why)
+                            "%s %s", st["done_ms"], ",".join(st["rids"]), ",".join(st.get("late") or ()) or "-",
+                            self.epoch, sv.verdict, sv.why)
             return sv
         if st is None or st.get("closed"):
-            st = {"epoch": self.epoch, "t0": now, "rids": list(rids)}
+            st = {"epoch": self.epoch, "t0": now, "t0_wall": time.time(), "rids": list(wait),
+                  "late": list(st.get("late") or ()) if st is not None else []}
             self.__dict__["_r2_kurz_hold"] = st
             self.counters["r2_kurz_grant_hold"] += 1
             logger.info("PDFLIP R2-KURZ-BEFORE-FLIP outcome=hold rids=%s epoch=%d -- a flip verdict (%s: %s) waits: the kurz "
                         "request(s) D was granted prefill on D to their end before D quiesces (SOLL R2 \"sofort auf D ... nie "
-                        "ein Flip für einen kurzen Request\"; user 23.10.)", ",".join(rids), self.epoch, sv.verdict, sv.why)
+                        "ein Flip für einen kurzen Request\"; user 23.10.); the flip is decided, a later kurz arrival rides it "
+                        "(R4/R1a, R4OVER-1024)", ",".join(wait), self.epoch, sv.verdict, sv.why)
         else:
-            new = [r for r in rids if r not in st["rids"]]
-            if new:
-                st["rids"].extend(new)
             t_half = float(Front._set_cfg()[1])
             if (not st.get("long_named") and t_half > 0
                     and now - st["t0"] > Front.R2_KURZ_HOLD_NAME_X_THALB * t_half):
@@ -14501,12 +14621,51 @@ class Front:
                 self.counters["r2_kurz_grant_hold_long"] += 1
                 logger.warning("PDFLIP R2-KURZ-BEFORE-FLIP outcome=long wait_ms=%d rids=%s epoch=%d -- kurz grants keep D "
                                "prefilling past %.1f x T_halb; the flip still waits (SOLL R2), named for the monitor",
-                               int(round((now - st["t0"]) * 1000)), ",".join(rids), self.epoch,
+                               int(round((now - st["t0"]) * 1000)), ",".join(wait), self.epoch,
                                Front.R2_KURZ_HOLD_NAME_X_THALB)
+        st["last_verdict"] = sv.verdict
+        if members is not None:
+            st["members"] = [str(getattr(m, "rid", m)) for m in members]
         return phase_policy.SetVerdict(
             phase_policy.V_COLLECT,
-            "R2 kurz D grant(s) %s finish on D first (was %s: %s)" % (",".join(rids[:4]), sv.verdict, sv.why),
+            "R2 kurz D grant(s) %s finish on D first (was %s: %s)" % (",".join(wait[:4]), sv.verdict, sv.why),
             sv.left_s, sv.s_tokens, sv.half_x)
+
+    def _r2_waited_on(self, verdict: str) -> str:
+        """R4OVER-1024 (instrument): the DECISION record of a flip verdict that stood after an R2 hold names it --
+        ``waited_on=r2_kurz:<ms>`` -- so a waited_s past T_halb is read as the hold, not as a late timer (it was ``-``)."""
+        if verdict not in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
+            return "-"
+        acc = self.__dict__.get("_r2_wait_acc")
+        if not acc or acc.get("epoch") != self.epoch or acc.get("ms", 0) <= 0:
+            return "-"
+        ms, n = int(acc["ms"]), int(acc.get("n", 1))
+        acc["ms"], acc["n"] = 0, 0
+        return "r2_kurz:%d" % ms if n <= 1 else "r2_kurz:%dx%d" % (ms, n)
+
+    def _r2_pbound_wait(self, rids: Sequence[str], cands: Sequence[Any]) -> List[str]:
+        """R4OVER-1024 (SOLL R4 + R1a) for the ARRIVAL-SEAT P-bound flip: the same frozen wait as the set's R2 hold -- the
+        P-bound flip waits only for the kurz grants open when it first stood; a later grant is named, not waited on; while
+        it waits the flip is decided (``_r2_flip_held``: a new kurz arrival rides it)."""
+        st = self.__dict__.get("_r2_pbound_hold")
+        if st is not None and st.get("epoch") != self.epoch:
+            st = None
+        if st is not None and not st.get("closed"):
+            wait = Front._r2_hold_freeze(self, st, list(rids), "arrival-seat")
+        else:
+            prev_late = set(st.get("late") or ()) if st is not None else set()
+            wait = [str(r) for r in rids if r not in prev_late]
+        if not wait:
+            if st is not None and not st.get("closed"):
+                st["closed"] = True
+            return []
+        if st is None or st.get("closed"):
+            st = {"epoch": self.epoch, "t0_wall": time.time(), "rids": list(wait),
+                  "late": list(st.get("late") or ()) if st is not None else []}
+            self.__dict__["_r2_pbound_hold"] = st
+        st["last_verdict"] = phase_policy.V_FLIP_P
+        st["members"] = [str(getattr(c, "rid", c)) for c in cands]
+        return wait
 
     def _r6_redirect(self, why: str) -> List[str]:
         """S56 (SOLL R6 "auch ein laufender D prefill wird dann geflippt"): a REROUTE_P verdict MOVES the running D
@@ -15569,6 +15728,7 @@ class Front:
                 rid=members[0].rid if len(members) == 1 else None, members=tuple(_mem), s_tokens=int(sv.s_tokens),
                 s_p_tokens=max(0, int(sv.s_tokens)), x=int(x_tok), half_x=int(sv.half_x),
                 classes=tuple(classes), t_half_s=float(t_half), waited_s=float(waited),
+                waited_on=Front._r2_waited_on(self, verdict),  # R4OVER-1024: an R2 hold is named, not read as a late timer
                 numbers_age_ms_max=max([a.age_ms for a in _mem] or [0]), r6_rest=max(0, int(self._dc_carried_running())),
                 unstarted=int(unstarted), **_grp), edge=True)
         except Exception:  # noqa: BLE001 -- an instrument never breaks a verdict
@@ -15632,8 +15792,10 @@ class Front:
                 d_prefill_running_uncached=running,  # R6: what D REALLY prefills right now counts into S (S49)
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
             sv = Front._set_xsum_hold(self, sv, x_tok, running, decoding=decoding)
+        # R4OVER-1024 review A3: the R2 hold sees the POLICY verdict; the one-tick R6 commit hold (it can only ADD to S, never
+        # turn a flip into a non-flip) sits behind it and never voids a held flip
+        sv = Front._r2_kurz_grant_hold(self, sv, now, members=members)  # FLIPTIME-1023 SOLL R2 (+R4OVER-1024 frozen wait)
         sv = Front._r6_commit_hold(self, sv)  # review A1: no final verdict while a counted prefill's next chunk is COMMITTED
-        sv = Front._r2_kurz_grant_hold(self, sv, now)  # FLIPTIME-1023 SOLL R2: D-granted kurz requests finish on D first
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
@@ -15964,6 +16126,8 @@ class Front:
         if ev is not None and ev[1].verdict in Front.REPROBE_VERDICTS and (
                 Front._reprobe_pending(self) or Front._reprobe_stale(self, [m.rid for m in ev[0]])):
             return False  # S63 F1 (R2): a flip still waiting for D's current numbers is not decided
+        if ev is not None and ev[1].verdict == phase_policy.V_COLLECT and Front._r2_flip_held(self):
+            return True   # R4OVER-1024 (R4 + R1a): the COLLECT is an R2 hold of a decided flip, not a collecting set
         return ev is None or ev[1].verdict not in (phase_policy.V_COLLECT, phase_policy.V_D_AFTER_TIMER)
 
     def _decode_collect(self, now: float, live_q: Optional[List["Pending"]] = None) -> Optional[str]:
@@ -15987,6 +16151,7 @@ class Front:
         if ev is None:
             st["t_open"] = None
             st["seen"] = 0
+            Front._r2_hold_void(self, "_r2_kurz_hold", "set_empty")   # R4OVER-1024 review A1: no stale hold survives
             return None
         members, sv, kw = ev
         if sv.verdict not in (phase_policy.V_COLLECT, phase_policy.V_D_AFTER_TIMER):
@@ -16000,6 +16165,7 @@ class Front:
                 if ev is None:
                     st["t_open"] = None
                     st["seen"] = 0
+                    Front._r2_hold_void(self, "_r2_kurz_hold", "set_empty_repriced")   # review A1
                     return None
                 members, sv, kw = ev
         if sv.verdict in Front.REPROBE_VERDICTS and not Front._set_reprobe_gate(
@@ -16135,8 +16301,8 @@ class Front:
                                       t_open=min(m.t_arrive for m in members), d_decoding=decoding, seats_free=seats,
                                       d_prefill_running_uncached=_run, new_since_last=0,
                                       class_x_tokens=x_cls)
-        sv = Front._r6_commit_hold(self, sv)  # review A1
-        sv = Front._r2_kurz_grant_hold(self, sv, now)  # FLIPTIME-1023 SOLL R2
+        sv = Front._r2_kurz_grant_hold(self, sv, now, members=members)  # FLIPTIME-1023 SOLL R2 (+R4OVER-1024)
+        sv = Front._r6_commit_hold(self, sv)  # review A1 (behind the R2 hold, R4OVER-1024 review A3)
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1
@@ -16743,7 +16909,11 @@ class Front:
         if self.awake != "D" or self.state != "serving":
             return False
         st = self._set_st()
-        return bool(not self.admit_d or (st["go_p"] - (st.get("park_no_seat") or set())))
+        if not self.admit_d or (st["go_p"] - (st.get("park_no_seat") or set())):
+            return True
+        # R4OVER-1024 (SOLL R4 + R1a): a FLIP verdict that stands and only waits for the kurz grants opened before it (R2
+        # hold) is decided -- T_halb is over; a new kurz arrival rides it instead of extending the hold
+        return Front._r2_flip_held(self)
 
     def _d_direct_yields(self, rid: str, uncached: Optional[int] = None) -> bool:
         """FLIPCYCLE H5b (02.10.): no D-direct prefill when the D->P flip is
@@ -16768,7 +16938,9 @@ class Front:
                 # rides the decided flip (R1a/R5) -- it never waits behind it (review A6, the hang of N9)
                 if not Front._flip_decided(self):
                     return False
-                if self.admit_d:
+                # R4OVER-1024 (SOLL R4 + R1a): under an R2-held flip the open door is no D seat for a NEW kurz request --
+                # a grant now would be waited on (the hold grows: boot 1023_223241 epoch 12, +3,9 s) or parked mid-prefill
+                if self.admit_d and not Front._r2_flip_held(self):
                     _taken, _n = self._arrival_seat_taken(for_rid=rid)
                     if _asr.seat_free(_taken, _n):
                         return False
@@ -17196,6 +17368,7 @@ class Front:
         cands = ([q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None]
                  if live_q else [])
         if not cands:
+            Front._r2_hold_void(self, "_r2_pbound_hold", "no_p_cands")   # R4OVER-1024 review A1
             # y4y NET: the wait bound fires for EVERY queued entry, a
             # non-candidate too -- an entry no rule takes must not wait for
             # ever behind FLIP-ECONOMICS (300 s there); fired, the flip to P
@@ -17215,7 +17388,7 @@ class Front:
                 if Front._set_flip_justified(self, now):
                     return True, True, None
             return False, not self.admit_d, None
-        _r2_open = Front._r2_kurz_grants_open(self, now)
+        _r2_open = Front._r2_pbound_wait(self, Front._r2_kurz_grants_open(self, now), cands)
         if _r2_open:
             # FLIPTIME-1023 SOLL R2: no D->P flip for a P-bound entry while a D-granted kurz request still prefills on D
             self.counters["r2_kurz_grant_hold_pbound"] += 1

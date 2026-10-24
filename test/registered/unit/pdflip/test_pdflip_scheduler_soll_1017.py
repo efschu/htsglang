@@ -650,3 +650,320 @@ def test_r2_kurz_reserve_is_wired_at_the_continuation_seam():
     assert j - i < 200
     assert src.rfind("_lanes_p.chunk_scope(adder, self.chunked_req)", 0, i) > i - 200
     assert src.index("adder.chunked_req_outstanding = self.chunked_req is not None", j) > j
+
+
+# -- R4OVER-1024: R4 "Flip erst, wenn ... T_halb ablaeuft" -- a kurz grant opened AFTER the verdict never delays the flip ----
+def _r4over_scene(now, *, waited=4.6):
+    """Boot int4ar 1023_223241 epoch 12 (27B, X=4096, halbX=2048, T_halb=4,5 s): pdflip-12-113 (gross, u=4476) COLLECT (R4)
+    since 22:48:01,586, D decodes; at T_halb over the kurz pdflip-12-115 (u=181) is D-granted and prefilling -- the R2 hold
+    (FLIPTIME-1023) waits for it. Then pdflip-12-116 (u=1222) arrives 1,0 s after the verdict."""
+    from test_pdflip_arrival_seat_rule_0929 import _front, _pending
+
+    f = _front(running=["dec", "k1"], n=6, kv={"available": 400000, "evictable": 0})   # "dec" decodes on D (R4 waits)
+    f.tp_prefill_max_tokens = 4096
+    f.t_awake = now - 60.0
+    g = _pending("pdflip-12-113", 4476, now - waited)
+    f.queue = [g]
+    f._d_pf_book().grant(rid="k1", tokens=181, now=now - 0.2)
+    f._d_pf_book().enter_leg2(rid="k1")
+    f.groups["D"].outstanding["k1"] = now - 0.2
+    f._r6k_mark_kurz("k1")
+    f._d_ext_reading = lambda: {}
+    return f, g
+
+
+def _r4over_grant_late(f, now, rid="k2", tokens=1222):
+    f._d_pf_book().grant(rid=rid, tokens=tokens, now=now)
+    f._d_pf_book().enter_leg2(rid=rid)
+    f.groups["D"].outstanding[rid] = now
+    f._r6k_mark_kurz(rid)
+
+
+def test_r4_t_half_over_a_kurz_grant_after_the_verdict_never_delays_the_flip():
+    """R4 (SOLL v2: "Decodet D gerade: Flip erst, wenn ein weiterer Halb-/Gross-Request dazukommt oder T_halb ablaeuft") +
+    R1a ("Ist ein Flip nach R3/R4/R6 beschlossen, prefillt P ALLE anstehenden Prefills, auch kurze") + R5 ("oder faehrt mit
+    einem beschlossenen Flip mit"). Defect (boot 1023_223241, epochs 2/12): the R2 hold turned the decided FLIP_P into
+    COLLECT, a new kurz arrival saw no decided flip, was granted D_NOW and was APPENDED to the hold -- pdflip-12-116 kept the
+    R4 flip of pdflip-12-113 back 3,9 s (waited_s=9.2 instead of 4,6 + the rest of pdflip-12-115).
+    SOLL: T_halb over = the flip is decided; it waits only for the kurz grant open at the verdict (R2/R6k), a later kurz
+    arrival rides it; the flip stands at T_halb + that grant's rest + one tick."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    for decider in (True, False):
+        with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(decider):
+            now = _time.time()
+            # before T_halb: R4 COLLECT, nothing decided -- a kurz arrival is D's (R2)
+            f, _g = _r4over_scene(now, waited=4.0)
+            assert f._decode_collect(now) == "hold", decider
+            assert f.counters["r2_kurz_grant_hold"] == 0
+            assert not f._flip_decided()
+            # T_halb over (4,6 s): FLIP_P, held for the kurz granted BEFORE it (R2/R6k)
+            f, _g = _r4over_scene(now)
+            assert f._decode_collect(now) == "hold", decider
+            assert f.counters["r2_kurz_grant_hold"] == 1 and f.counters["set_flip_p"] == 0
+            # the flip is DECIDED while held: a new kurz arrival rides it (R1a), even with a free D seat
+            assert f._flip_decided(), decider
+            assert f._set_flip_foreseeable(now + 0.05), decider
+            assert f._d_direct_yields("pdflip-12-116", uncached=1222), decider
+            # a grant that slipped through anyway (race) is named, never waited on
+            _r4over_grant_late(f, now + 0.1)
+            assert f._decode_collect(now + 0.15) == "hold"            # k1 still prefills on D (R6k: it ends on D)
+            assert f.counters["r2_kurz_grant_hold_late"] == 1
+            f._d_pf_book().done(rid="k1")                               # k1's first content: its D prefill is over
+            assert f._decode_collect(now + 0.2) == "P", decider         # T_halb + k1's rest + one tick; k2 still open
+            assert f.counters["set_flip_p"] == 1
+            st = f.__dict__["_r2_kurz_hold"]
+            assert st["rids"] == ["k1"] and st["late"] == ["k2"] and st["closed"]
+
+
+def test_r4_held_flip_is_decided_only_while_its_set_stands():
+    """Danger direction of R4OVER-1024: "decided" must not outlive the held flip -- else a kurz arrival rides a flip that
+    never comes (R2 "sofort auf D"). The big member left the queue, or the epoch moved: no decided flip, R2 again."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, g = _r4over_scene(now)
+        assert f._decode_collect(now) == "hold" and f._flip_decided()
+        g.fut._d = True                                                 # the big request is gone (client closed)
+        assert not f._flip_decided() and not f._r2_flip_held()
+        f, g = _r4over_scene(now)
+        assert f._decode_collect(now) == "hold" and f._flip_decided()
+        f.epoch += 1                                                    # the phase moved
+        assert not f._r2_flip_held()
+        # switch off: the old hold (FLIPTIME-1023) as before -- no decided flip while held
+        with envs.FLLIPER_PDFLIP_R2_KURZ_GRANT_HOLD.override(False):
+            f, g = _r4over_scene(now)
+            assert f._decode_collect(now) == "P"
+
+
+def test_r4_arrival_seat_pbound_flip_waits_only_for_grants_open_at_its_start():
+    """R4OVER-1024 on the ARRIVAL-SEAT P-bound site (FLIPTIME-1023 hold outside a set): the same frozen wait."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, g = _r4over_scene(now)
+        assert f._r2_pbound_wait(["k1"], [g]) == ["k1"]
+        assert f._r2_flip_held() and f._flip_decided()
+        assert f._r2_pbound_wait(["k1", "k2"], [g]) == ["k1"]          # k2 opened after: named, not waited on
+        assert f.counters["r2_kurz_grant_hold_late"] == 1
+        assert f._r2_pbound_wait(["k2"], [g]) == []                     # k1 over: the P-bound flip goes
+        assert not f._r2_flip_held()
+
+
+def test_r4_an_r6_commit_tick_does_not_void_the_held_flip():
+    """R4OVER-1024 review A3: the one-tick R6 commit hold sits BEHIND the R2 hold -- it can only add to S, never turn a flip
+    into a non-flip, so it never voids a held flip: in that tick the flip stays decided and a kurz arrival rides it (R1a)."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+    from flliper.srt.pdflip import front as front_mod
+    from flliper.srt.pdflip import phase_policy as _pp
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, _g = _r4over_scene(now)
+        assert f._decode_collect(now) == "hold" and f._flip_decided()
+        with mock.patch.object(front_mod.Front, "_r6_commit_hold",
+                               lambda self, sv: _pp.SetVerdict(_pp.V_COLLECT, "test: R6 commit tick", 0.0, sv.s_tokens,
+                                                               sv.half_x)):
+            assert f._decode_collect(now + 0.05) == "hold"
+            assert f._flip_decided()                                   # still decided in the commit tick
+            assert f._d_direct_yields("pdflip-12-117", uncached=300)   # the kurz arrival rides
+            assert f.counters["r2_kurz_grant_hold_void"] == 0
+        f._d_pf_book().done(rid="k1")
+        assert f._decode_collect(now + 0.1) == "P"
+        assert f.counters["r2_kurz_grant_hold"] == 1                   # one hold piece, not restarted
+
+
+# -- R4OVER-1024 review probes P1-P3 (adopted from review/r4probe-1024, test_review_r4probe_1024.py) -------------------------
+def test_probe_p1_stale_hold_after_client_gone_is_not_reused_by_the_next_flip():
+    """Review A1 (SOLL R2/R6k): the held flip's member left (CLIENT-GONE) -> the set empties, the hold ends (void); a kurz
+    granted while NO flip stood is R2's and the NEXT flip of the same epoch waits for it -- never "late"."""
+    import time as _time
+    from unittest import mock
+
+    from test_pdflip_arrival_seat_rule_0929 import _pending
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, g = _r4over_scene(now)
+        assert f._decode_collect(now) == "hold" and f._flip_decided()
+        g.fut._d = True
+        assert f._decode_collect(now + 0.05) is None
+        assert not f._flip_decided()
+        assert f.counters["r2_kurz_grant_hold_void"] == 1 and f.counters["r2_held_flip_no_flip"] == 1
+        f._d_pf_book().done(rid="k1")
+        _r4over_grant_late(f, now + 0.1, rid="k3", tokens=300)
+        f.queue = [_pending("pdflip-12-200", 4476, now + 0.1 - 4.6)]
+        got = f._decode_collect(now + 0.2)
+        assert f.counters["r2_kurz_grant_hold_late"] == 0, (got, f.__dict__["_r2_kurz_hold"])
+        assert got == "hold"
+        assert f.__dict__["_r2_kurz_hold"]["rids"] == ["k3"]
+
+
+def test_probe_p2_held_park_no_seat_is_never_a_decided_flip():
+    """Review A4 (SOLL R5): a held PARK_NO_SEAT is no flip begin -- never a decided flip (kills mutant M1)."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+    from flliper.srt.pdflip import phase_policy as _pp
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, g = _r4over_scene(now)
+        st = {"epoch": f.epoch, "t0": now, "t0_wall": now, "rids": ["k1"], "late": [],
+              "last_verdict": _pp.V_PARK_NO_SEAT, "members": [g.rid]}
+        f.__dict__["_r2_kurz_hold"] = st
+        assert not f._r2_flip_held()
+        assert not f._flip_decided()
+        st["last_verdict"] = _pp.V_FLIP_P
+        assert f._r2_flip_held() and f._flip_decided()
+
+
+def test_probe_p3_member_reprobed_to_kurz_ends_the_decided_state():
+    """Review A1: SET-REPROBE moves the held big member under halbX (d_eligible kurz, no set member) -- the flip can never
+    come, "decided" ends (else every kurz arrival yields to a flip that never comes, R2)."""
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, g = _r4over_scene(now)
+        assert f._decode_collect(now) == "hold" and f._flip_decided()
+        g.est_uncached = 300
+        g.d_eligible = True
+        assert not f._flip_decided()                                    # the member alone ends it (A1, _r2_flip_held)
+        f._decode_collect(now + 0.05)
+        assert not f._flip_decided(), f.__dict__["_r2_kurz_hold"]
+
+
+def test_r4_held_flip_is_not_decided_while_its_members_are_reprobed():
+    """Review A5 (S63 F1): while a SET-REPROBE runs, the held flip is not decided on D's current numbers -- no rider."""
+    import time as _time
+    import types as _types
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, g = _r4over_scene(now)
+        assert f._decode_collect(now) == "hold" and f._flip_decided()
+        task = _types.SimpleNamespace(done=lambda: False)
+        f._set_st()["reprobe"] = _types.SimpleNamespace(task=task, rids=(g.rid,), t0=now, site="set-verdict")
+        assert not f._flip_decided()
+        task.done = lambda: True
+        assert f._flip_decided()
+
+
+def test_r4_a_running_late_grant_is_held_by_the_r6k_park_hold(monkeypatch, tmp_path):
+    """Review A4 (SOLL R6k "rechnet auf D zu Ende"): a late kurz grant that RUNS when the held flip goes is not waited on
+    by the R2 hold -- the park's R6k finish hold holds it (R6K_HOLD, no park RPC); the control is the frozen grant alone."""
+    import asyncio as _a
+
+    from flliper.srt.environ import envs
+    from flliper.srt.pdflip import front as F
+    from test_nf_r6_rest_exakt_1020 import REST_AFTER, RID_K, _park_rpc, add_running, end_forward
+
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=9875, klass="kurz", waited=4.6, ended=False)
+    calls = []
+    _park_rpc(f, calls)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._decode_collect(now) == "hold"                       # held for RID_K (open at the verdict)
+        add_running(f, now, tmp_path, "pdflip-12-279", rest_start=900, ext_len=512, ended=False, klass="kurz", key=37877)
+        ws, _ev = f._test_running[RID_K]
+        for w in ws:
+            w.note_extend(rids=[RID_K], rests=[REST_AFTER], extend_lens=[REST_AFTER])
+        end_forward(f, RID_K)
+        for w in ws:
+            w.note_extend_done(rids=[RID_K])
+        f._d_pf_book().done(rid=RID_K)
+        assert f._decode_collect(now + 0.1) == "P"                    # the late running grant is not waited on ...
+        assert f.counters["r2_kurz_grant_hold_late"] == 1
+    loop = _a.new_event_loop()
+    try:
+        # ... but the park holds it to its end on D (R6k), no park RPC
+        assert loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip")) == F.R6K_HOLD
+        assert calls == []
+    finally:
+        loop.close()
+
+
+def test_r4_a_request_at_the_seat_semaphore_when_the_flip_is_decided_rides_without_a_grant():
+    """Review A2 (SOLL R1a/R6k): a kurz arrival passed both yield checks (no flip yet) and waited at D's seat semaphore; the
+    R4 flip became decided (held) meanwhile -> it releases the permit and rides (None), no D grant (an UNBEGUN late grant
+    the R6k finish hold could not see)."""
+    import asyncio as _a
+    import time as _time
+    from unittest import mock
+
+    from flliper.srt.environ import envs
+    from flliper.srt.pdflip import front as front_mod
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "0"}
+    with mock.patch.dict(os.environ, env), envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        now = _time.time()
+        f, g = _r4over_scene(now, waited=4.0)                          # R4 still collecting: nothing decided
+
+        class _Sem:
+            released = 0
+
+            async def acquire(self):
+                g.t_arrive = now - 4.6                                 # T_halb runs out while it waits
+                assert f._decode_collect(time.time()) == "hold"        # FLIP_P held for k1: decided
+                return True
+
+            def release(self):
+                _Sem.released += 1
+
+        import time
+        f._d_seat = _Sem()
+
+        async def _no_reading(self, rid):
+            return None
+
+        with mock.patch.object(front_mod.Front, "_d_reading_kurz", _no_reading):
+            loop = _a.new_event_loop()
+            try:
+                got = loop.run_until_complete(f._acquire_short_seat_core(
+                    "pdflip-12-116", 110278, [], 64000, 1222, 4096, now))
+            finally:
+                loop.close()
+        assert got is None
+        assert _Sem.released == 1 and f.counters["short_seat_yield_after_sem"] == 1
+        assert "pdflip-12-116" not in f._d_pf_book().open_rids(now=time.time(), live=f.groups["D"].outstanding,
+                                                               idle=lambda r: False)

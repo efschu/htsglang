@@ -72,7 +72,8 @@ class AForeseeableFlipYields(unittest.TestCase):
     def test_default_on_and_wired_into_the_short_seat(self):
         self.assertTrue(envs.FLLIPER_PDFLIP_ENABLE_D_DIRECT_YIELD.get())
         src = inspect.getsource(front.Front._acquire_short_seat_core)  # h16u S1: body moved into the core (the wrapper only classifies + logs)
-        self.assertEqual(src.count("self._d_direct_yields(rid, uncached=uncached)"), 2)
+        # R4OVER-1024 review A2: a third check after the seat semaphore (a flip decided while it waited: ride, no grant)
+        self.assertEqual(src.count("self._d_direct_yields(rid, uncached=uncached)"), 3)
 
 
 class BFetchCostYield(unittest.TestCase):
