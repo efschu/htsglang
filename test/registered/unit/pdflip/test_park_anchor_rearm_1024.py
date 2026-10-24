@@ -193,12 +193,12 @@ class _Ops(par.TreeOps):
         if self.fail_issue:
             return False
         t = self.tree
-        t._pdflip_park_rearm_active = True
+        t._pdflip_park_rearm_active = n
         try:
             n.pdflip_park_anchor_dropped = False
             rows = t._pdflip_mamba_claim(n, self.mp, n.hash_value[-1])
         finally:
-            t._pdflip_park_rearm_active = False
+            t._pdflip_park_rearm_active = None
         if rows is None:
             return False
         n.component_data[M].host_value = rows
@@ -406,6 +406,7 @@ def test_mutant_rank_local_victim_choice_is_caught(tmp_path, w65, monkeypatch):
     n1.write_through_pending_id = 99         # rank 1 cannot offer old0 this pass
     W.run_pass()                            # the agreed form: old1 is common -> released on every rank
     assert W.anchor_on("old1") == [False, False, False] and W.anchor_on("old0") == [True, True, True]
+    (tmp_path / "m").mkdir()
     W2 = _World(tmp_path / "m", 2, off=2)
     W2.mark()
     n1 = next(x for x in W2.ranks[1].cache.root_node.children.values() if x.hash_value == ["old0"])
@@ -420,22 +421,18 @@ def test_mutant_rank_local_victim_choice_is_caught(tmp_path, w65, monkeypatch):
 @needs_gcc
 def test_mutant_unsecured_victim_is_caught(tmp_path, w65, monkeypatch):
     """LOSS: the victim filter without the L3 proof -- an anchor with no other copy is released. The invariant of
-    test_no_secured_victim_releases_nothing (nothing released) fails."""
-    monkeypatch.setattr(_l3s, "secured", lambda arena, slots, backend=None, evicting_ok=False:
-                        __import__("numpy").zeros(len(list(slots)), dtype=bool))
+    test_no_secured_victim_releases_nothing (nothing released) fails. (The proof answers "secured" to the victim
+    filter only -- thread-safe, by the caller's frame -- and "not secured" everywhere else.)"""
+    import sys
+
+    import numpy as np
+
+    def _proof(arena, slots, backend=None, evicting_ok=False):
+        n = len(list(slots))
+        return np.ones(n, dtype=bool) if sys._getframe(1).f_code.co_name == "victims" else np.zeros(n, dtype=bool)
+
+    monkeypatch.setattr(_l3s, "secured", _proof)
     monkeypatch.setattr(_l3s, "request", lambda arena, slots: len(slots))
-    orig_v = par.TreeOps.victims
-
-    def _no_proof(self):
-        saved = _l3s.secured
-        _l3s.secured = lambda arena, slots, backend=None, evicting_ok=False: \
-            __import__("numpy").ones(len(list(slots)), dtype=bool)
-        try:
-            return orig_v(self)
-        finally:
-            _l3s.secured = saved
-
-    monkeypatch.setattr(par.TreeOps, "victims", _no_proof)
     W = _World(tmp_path, 2, off=2)
     W.mark()
     W.run_pass()
@@ -516,3 +513,17 @@ def test_mark_names_a_priority_and_a_copy_already_there(monkeypatch, caplog):
     mark = [m for m in caplog.messages if "PARK-END-ANCHOR-FIRST MARK" in m]
     assert mark and "rid=pdflip-4-66 node=" in mark[0] and "prio=claim" in mark[0] and "not a backup" in mark[0]
     assert any("PARK-END-ANCHOR BACKED" in m and "via=before_mark" in m for m in caplog.messages)
+
+
+def test_direct_claim_during_a_rearm_gives_the_slot_to_the_target():
+    """During the issue of a re-arm target, every OTHER un-backed park chain intermediate of the write (write_backup's
+    parent recursion) goes KV-only without asking the arena -- the one slot the pass made is the target's; the target
+    itself (an END, or a class-1 intermediate) claims normally. Placed before the arena claim."""
+    import inspect
+
+    src = inspect.getsource(UnifiedRadixCache._pdflip_direct_claim)
+    i = src.index("PARK-REARM-1024: the group-agreed re-arm")
+    seg = src[i - 500:i + 700]
+    assert "node is not _prr_target" in seg and 'not getattr(node, "pdflip_park_end", False)' in seg
+    assert "comp_xfers.pop(mct, None)" in seg and "node.pdflip_park_anchor_dropped = True" in seg
+    assert i < src.index("mrows = self._pdflip_mamba_claim(node, mp, hashes[-1])")

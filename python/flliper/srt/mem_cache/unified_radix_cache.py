@@ -8199,7 +8199,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     pend = self._pdflip_direct_mamba_rows = {}
                 pend[node.id] = mrows
                 mxfer = None
-        if (mxfer is not None and self.__dict__.get("_pdflip_park_rearm_active", False)
+        _prr_target = self.__dict__.get("_pdflip_park_rearm_active")
+        if (mxfer is not None and _prr_target is not None and node is not _prr_target
                 and not kv_only_if_mamba_refused and not getattr(node, "pdflip_park_end", False)
                 and self._pdflip_park_first_node(node)):
             # PARK-REARM-1024: the group-agreed re-arm of a park END made room for ONE anchor -- an un-backed chain

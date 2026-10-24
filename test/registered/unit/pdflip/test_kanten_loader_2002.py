@@ -107,7 +107,7 @@ class RealCatalog(unittest.TestCase):
         self.assertTrue(d["effect"])                    # the curated sentence is untouched
         n_curated = sum(len(c.get("depends", [])) for c in CU.CURATED.values())
         n_all = sum(len(e["depends"]) for e in self.ent.values())
-        self.assertEqual(n_all, n_curated + 87)         # nothing deleted, 87 appended (57 + 8 AP-H1 + 15 Katalog-Neubau 07.10. + 3 VISION-WEIGHTS AP4 + 1 F0-H round 2 + 1 X-SUM-PRICE K136 10.10. + 2 Prio-Lanes L1 K137-K138, numbered behind K136 in the renamed tree (RC4))
+        self.assertEqual(n_all, n_curated + 88)         # nothing deleted, 88 appended (K140 PARK-REARM-1024 + 57 + 8 AP-H1 + 15 Katalog-Neubau 07.10. + 3 VISION-WEIGHTS AP4 + 1 F0-H round 2 + 1 X-SUM-PRICE K136 10.10. + 2 Prio-Lanes L1 K137-K138, numbered behind K136 in the renamed tree (RC4))
 
     def test_new_edges_are_appended_with_source_katalog(self):
         d = self.dep("--idle-layout", "--dual-layout")  # K44, not curated

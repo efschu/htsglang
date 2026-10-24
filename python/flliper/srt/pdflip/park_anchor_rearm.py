@@ -369,13 +369,13 @@ class TreeOps:
         """Write THIS rank's copy: anchor-only when the KV is backed, else the full backup. During the issue a park
         chain INTERMEDIATE above an END goes KV-only without asking the arena (the END is what the room is for)."""
         t = self.tree
-        t._pdflip_park_rearm_active = True
+        t._pdflip_park_rearm_active = n   # the target: every OTHER park chain intermediate of this write goes KV-only
         try:
+            n.pdflip_park_anchor_dropped = False   # PARK-REARM: given up for want of room -- room is there now
             if self._kv_backed(n):
-                n.pdflip_park_anchor_dropped = False   # PARK-REARM: given up for want of room -- room is there now
                 got = t.write_backup_anchor_only(n)
             else:
                 got = t.write_backup(n)
         finally:
-            t._pdflip_park_rearm_active = False
+            t._pdflip_park_rearm_active = None
         return int(got or 0) > 0
