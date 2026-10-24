@@ -225,5 +225,55 @@ class SchedulerDeathPath(unittest.TestCase):
         self.assertLess(q, src.index("os.killpg(pgid, signal.SIGKILL)", death))
 
 
+class TerminateBudget(unittest.TestCase):
+    """Review SOLL 1: a hung daemon costs the budget, not 3 x 10 s / (2 + N) x 10 s."""
+
+    def test_nothing_is_asked_once_the_budget_is_spent(self):
+        clock = [0.0]
+        cmds = []
+
+        def ctl(cmd):
+            cmds.append(cmd)
+            clock[0] += 5.0                        # every daemon call takes 5 s (a slow / hanging daemon)
+            if cmd == "get_server_list":
+                return "4242\n"
+            if cmd == "get_client_list 4242":
+                return "1238\n1240\n1242\n"
+            return ""
+
+        done = Q.terminate_clients([1238, 1240, 1242], why="t", ctl=ctl, budget_s=12.0, now=lambda: clock[0])
+        self.assertEqual(done, [1238])             # 0 s, 5 s, 10 s asked; at 15 s the 12 s budget is spent
+        self.assertEqual(len(cmds), 3)
+        self.assertLessEqual(clock[0], 12.0 + 5.0)
+
+    def test_the_real_control_gets_the_rest_of_the_budget_as_its_timeout(self):
+        clock = [0.0]
+        seen = []
+
+        def fake_control(cmd, timeout_s=None, **kw):
+            seen.append((cmd, timeout_s))
+            clock[0] += 9.0
+            return {"get_server_list": "4242\n", "get_client_list 4242": "1240\n"}.get(cmd, "")
+
+        with mock.patch.object(Q, "control", fake_control):
+            done = Q.terminate_clients([1240], why="t", budget_s=12.0, now=lambda: clock[0])
+        self.assertEqual([t for _c, t in seen], [Q.CONTROL_TIMEOUT_S, 3.0])
+        self.assertEqual(done, [])                 # the terminate would start at 18 s > 12 s: not asked
+
+
+class SchedulerBaseExceptionPath(unittest.TestCase):
+    def test_keyboardinterrupt_and_systemexit_quiesce_then_propagate(self):
+        from flliper.srt.managers import scheduler as SC
+
+        src = inspect.getsource(SC.run_scheduler_process)
+        b = src.index("except BaseException as scheduler_base_exc:")
+        fin = src.index("    finally:", b)
+        body = src[b:fin]
+        self.assertIn("_s7q.quiesce_self(", body)
+        self.assertIn("scheduler_base_exc.code in (0, None)", body)   # a graceful SystemExit stays untouched
+        self.assertTrue(body.rstrip().endswith("raise"))
+        self.assertLess(src.index("except Exception as scheduler_exc:"), b)
+
+
 if __name__ == "__main__":
     unittest.main()

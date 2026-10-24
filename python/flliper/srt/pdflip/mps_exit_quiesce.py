@@ -31,6 +31,13 @@ THE FIX (two call sites, one module):
     the launch-phase SIGTERM): every child that is a client of this daemon is terminated through the
     daemon BEFORE it gets SIGKILL. A SIGKILL is exactly the "signals" case above.
 
+TIME BOUND (review SOLL 1). ``quiesce_self`` lasts at most ``bound_s`` (the sync) + ``TERMINATE_BUDGET_S``
+(every daemon call of the fallback together); ``terminate_clients`` -- also before ``kill_process_tree``'s SIGKILL --
+at most ``TERMINATE_BUDGET_S``: each ``nvidia-cuda-mps-control`` call gets ``min(CONTROL_TIMEOUT_S, rest)`` and
+nothing is asked once the budget is spent (a hung daemon, NVIDIA forum 382783 "never returns", costs the budget,
+not 3 x 10 s or (2 + N) x 10 s). The two scheduler call sites (``except Exception`` and
+``except BaseException``) are siblings of one ``try``, so a rank quiesces at most once.
+
 Armed only for an MPS client process (``CUDA_MPS_PIPE_DIRECTORY`` set -- the dual layout's
 ``--dual-mps on`` is the only producer on this line) and switch ``FLLIPER_PDFLIP_MPS_EXIT_QUIESCE``
 (default ON, user order 14.10.; ``0`` = the pre-S7 exit). Bound ``FLLIPER_PDFLIP_MPS_EXIT_QUIESCE_S``
@@ -61,6 +68,7 @@ BOUND_ENV = "FLLIPER_PDFLIP_MPS_EXIT_QUIESCE_S"
 DEFAULT_BOUND_S = 5.0
 CONTROL = "nvidia-cuda-mps-control"
 CONTROL_TIMEOUT_S = 10.0
+TERMINATE_BUDGET_S = 12.0
 _FAIL_RX = re.compile(r"error|fail|invalid|unknown|not found|no such", re.IGNORECASE)
 
 
@@ -110,23 +118,45 @@ def mps_clients(*, ctl: Callable[[str], Optional[str]] = control) -> Dict[int, L
     return {s: _pids(ctl(f"get_client_list {s}")) for s in _pids(ctl("get_server_list"))}
 
 
+class _BudgetSpent(Exception):
+    pass
+
+
 def terminate_clients(pids: Iterable[int], *, why: str = "",
-                      ctl: Callable[[str], Optional[str]] = control) -> List[int]:
+                      ctl: Optional[Callable[[str], Optional[str]]] = None,
+                      budget_s: float = TERMINATE_BUDGET_S,
+                      now: Callable[[], float] = time.monotonic) -> List[int]:
     """``terminate_client <server> <pid>`` for every pid that is a client of a server of this daemon.
-    Returns the pids the daemon accepted. Never raises."""
+    Returns the pids the daemon accepted. All daemon calls together stay inside ``budget_s`` (the real
+    ``control`` gets ``min(CONTROL_TIMEOUT_S, rest)`` as its timeout). Never raises."""
     want = {int(p) for p in pids}
     done: List[int] = []
     if not want:
         return done
+    deadline = now() + max(0.0, float(budget_s))
+
+    def ask(cmd: str) -> Optional[str]:
+        rest = deadline - now()
+        if rest <= 0:
+            raise _BudgetSpent(cmd)
+        if ctl is None:
+            return control(cmd, timeout_s=min(CONTROL_TIMEOUT_S, rest))
+        return ctl(cmd)
+
+    clients: Dict[int, List[int]] = {}
     try:
-        clients = mps_clients(ctl=ctl)
+        clients = mps_clients(ctl=ask)
         for server, cl in clients.items():
             for c in cl:
-                if c in want and ctl(f"terminate_client {server} {c}") is not None:
+                if c in want and ask(f"terminate_client {server} {c}") is not None:
                     done.append(c)
         logger.warning("%s TERMINATE why=%s asked=%s clients=%s terminated=%s (MPS terminate_client: the client's "
                        "outstanding GPU work ends without a fault for the other clients on its card)",
                        MARK, why or "-", sorted(want), {s: sorted(c) for s, c in clients.items()}, sorted(done))
+    except _BudgetSpent as e:
+        logger.warning("%s TERMINATE why=%s BUDGET SPENT after %.1f s before %r: asked=%s terminated=%s (the "
+                       "rest gets the caller's next step unterminated)", MARK, why or "-", float(budget_s), str(e),
+                       sorted(want), sorted(done))
     except Exception as e:  # noqa: BLE001 - a teardown helper never raises
         logger.warning("%s TERMINATE why=%s raised %s: %s", MARK, why or "-", type(e).__name__, e)
     return done

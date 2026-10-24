@@ -26392,6 +26392,21 @@ def run_scheduler_process(
                     kill_process_tree(root_pid)
             except Exception:
                 pass
+    except BaseException as scheduler_base_exc:
+        # S7 (review MUSS 4): KeyboardInterrupt (SIGINT) and a non-zero SystemExit pass `except Exception`
+        # and leave the rank through `finally` alone -- under --dual-mps the same unclean MPS client exit
+        # as above. Quiesce (idempotent, a no-op without MPS), then let it propagate unchanged. A clean
+        # SystemExit (code 0/None) is a graceful exit and stays untouched.
+        if not (isinstance(scheduler_base_exc, SystemExit) and scheduler_base_exc.code in (0, None)):
+            try:
+                from flliper.srt.pdflip import mps_exit_quiesce as _s7q
+
+                _s7q.quiesce_self(
+                    f"scheduler {type(scheduler_base_exc).__name__} (tp{tp_rank} pp{pp_rank})"
+                )
+            except Exception:  # noqa: BLE001 - the quiesce may not mask the exit
+                pass
+        raise
     finally:
         if scheduler is not None:
             # #363: the verdict trace's summary line. THIS block is the one
