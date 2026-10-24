@@ -2163,19 +2163,6 @@ def _dmp_probe_locked_spans(tc, ids, extra_key, limit):
         return [], 0
 
 
-def _dmp_locked_agreed(locked, g_ok, g_min, g_max, rid):
-    """#215b (D-PROBE GROUP-MIN, SOLL R11): the group's locked device spans -- this rank's, when every rank read them
-    (``g_ok``) and the group's MIN of the locked rows equals its MAX (the ranks agree); else None (not read: the front
-    prices as before), the disagreement named rate-limited."""
-    if not int(g_ok):
-        return None
-    if int(g_min) != int(g_max):
-        from flliper.srt.pdflip import d_match_probe as _dmp
-
-        _dmp.note_locked_fallback("disagree", "rid=%s min=%d max=%d" % (rid, int(g_min), int(g_max)))
-        return None
-    return [list(x) for x in locked]
-
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -9433,7 +9420,7 @@ class Scheduler(
         ok, total, dev_l, key_l, err = 1, 0, 0, 0, ""
         ids: Any = array("q")
         spans: List[List[int]] = []
-        locked, lk_ok, lk_tot = [], 0, 0
+        locked, lk_ok, lk_tot, lk_fp = [], 0, 0, 0
         try:
             ids, spans = self._pdflip_match_probe_pad(rid, input_ids, mm_inputs, extra_key)
             n = len(ids)
@@ -9442,18 +9429,20 @@ class Scheduler(
                 dev_l, total = int(dev), int(dev) + int(host)
                 locked, lk_ok = _dmp_probe_locked_spans(tc, ids, extra_key, n - 1)
                 lk_tot = sum(int(b) - int(a) for a, b in locked)
+                lk_fp = sum(int(b) for _a, b in locked)   # review SOLL 3: the span ends, a fingerprint of WHERE
         except Exception as e:  # noqa: BLE001 -- named below; the reduce is still entered
             ok, err = 0, f"{type(e).__name__}: {str(e)[:160]}"
         # #215b (SOLL R11): the locked device rows ride the SAME MIN reduce -- read ok on every rank, and the group's
         # MIN equal to its MAX (one negated slot): the ranks agree, TP0's spans are the group's; else no number
-        vals = [int(ok), int(total), int(dev_l), int(key_l), int(lk_ok), int(lk_tot), -int(lk_tot)]
+        vals = [int(ok), int(total), int(dev_l), int(key_l), int(lk_ok), int(lk_tot), -int(lk_tot), int(lk_fp),
+                -int(lk_fp)]
         grp = getattr(self, "tp_cpu_group", None)
         if grp is not None and torch.distributed.get_world_size(grp) > 1:
             t = torch.tensor(vals, dtype=torch.int64)
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
             vals = [int(v) for v in t.tolist()]
-        g_ok, g_total, g_dev, g_key, g_lk_ok, g_lk_min, g_lk_negmax = vals
-        g_locked = _dmp_locked_agreed(locked, g_lk_ok, g_lk_min, -g_lk_negmax, rid)
+        g_ok, g_total, g_dev, g_key, g_lk_ok, g_lk_min, g_lk_negmax, g_fp_min, g_fp_negmax = vals
+        g_locked = _dmp.locked_agreed(locked, g_lk_ok, g_lk_min, -g_lk_negmax, rid, g_fp_min, -g_fp_negmax)
         if not g_ok:
             if err:
                 logger.warning("PDFLIP D-MATCH-PROBE FAILED rid=%s %s", rid, err)

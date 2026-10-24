@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from flliper.srt.pdflip.d_leaving_rows import _full_cell, _key_rows, _Unreadable
 
@@ -67,35 +67,51 @@ def credits_row(rows: Optional[int], lock: int) -> bool:
     return rows is not None and int(lock) >= 1
 
 
-def locked_device_gap(tree: Any, req: Any, extent: Optional[int]) -> int:
-    """Device rows of the match path below ``req.last_node`` that another holder keeps locked and the load-back of
-    ``extent`` rows maps without allocating (module doc). 0 without a load-back, without a gap, or unreadable."""
+def _credited(tree: Any, req: Any, extent: Optional[int]) -> Tuple[int, List[int]]:
+    """``(credit rows, credited node ids)`` of :func:`locked_device_gap` -- ONE walk for the price (#215) and for D's
+    displacement verdict (review MUSS 1: the nodes the head is credited are not "freed for it" by its victims)."""
     try:
         if not extent or int(extent) <= 0:
-            return 0
+            return 0, []
         extent = int(extent)
         top = getattr(req, "last_node", None)
         node = getattr(req, "best_match_node", None)
         if node is None or top is None or node is top:
-            return 0
+            return 0, []
         root = getattr(tree, "root_node", None) if tree is not None else None
-        path: List[Any] = []                   # (rows on the device or None, FULL lock, span) bottom-up
+        path: List[Any] = []                   # (rows on the device or None, FULL lock, span, id) bottom-up
         hops = 0
         while node is not top:
             if node is None or node is root or hops >= MAX_HOPS:
-                return _fallback("broken")     # the walk never meets last_node: not the load-back's path
+                return _fallback("broken"), [] # the walk never meets last_node: not the load-back's path
             rows, lock = _full_cell(node)      # read while walking: an unreadable class stops at its first node
-            path.append((rows, lock, _key_rows(node) if rows is None else rows))
+            path.append((rows, lock, _key_rows(node) if rows is None else rows, id(node)))
             node, hops = getattr(node, "parent", None), hops + 1
-        credit, cum = 0, 0
-        for rows, lock, span in reversed(path):  # top-down: the load-back's row order
+        credit, cum, ids = 0, 0, []
+        for rows, lock, span, nid in reversed(path):  # top-down: the load-back's row order
             if cum >= extent:
                 break
             if credits_row(rows, lock):
-                credit += max(0, min(cum + span, extent) - cum)
+                got = max(0, min(cum + span, extent) - cum)
+                if got:
+                    credit += got
+                    ids.append(nid)
             cum += span
-        return credit
+        return credit, ids
     except _Unreadable:
-        return _fallback("unreadable")
+        return _fallback("unreadable"), []
     except Exception:  # noqa: BLE001 -- a price term never breaks the gate: the old price
-        return _fallback("error")
+        return _fallback("error"), []
+
+
+def locked_device_gap(tree: Any, req: Any, extent: Optional[int]) -> int:
+    """Device rows of the match path below ``req.last_node`` that another holder keeps locked and the load-back of
+    ``extent`` rows maps without allocating (module doc). 0 without a load-back, without a gap, or unreadable."""
+    return _credited(tree, req, extent)[0]
+
+
+def credited_node_ids(tree: Any, req: Any, extent: Optional[int]) -> Set[int]:
+    """Review MUSS 1 (#215 x KVD): the ids of the nodes :func:`locked_device_gap` credits ``req`` -- its displacement
+    verdict passes them as ``blocked`` to ``joint_leaving_rows``: rows the head maps anyway are never also counted as
+    rows its victims free for it (once the victims alone held them, their leaving drops the credit, not the price)."""
+    return set(_credited(tree, req, extent)[1])

@@ -17073,9 +17073,12 @@ class Front:
         # Mamba cut) and are not in D's free reading -- the larger of the two credits. 27B ``_1024_003732`` 18-188:
         # need 104476 (shared 0, D-PROBE device=0 from the Mamba cut) instead of 86340 (18137 locked prompt rows).
         _locked = Front._asr_device_locked(self, rid)
+        _locked_credit = 0
         if _locked is not None and int(_locked) > shared:
             shared = min(max(0, int(est_prompt or 0)), int(_locked))
+            _locked_credit = shared
             self.counters["arrival_seat_kv_device_locked_credit"] += 1
+        basis["locked_credit"] = int(_locked_credit)   # review SOLL 1 (a): an AGE PLAN grant on it is counted
         # KVOFFSET-1024: + what D's gate adds to extend + clip (one page, the Mamba gap; ``pdflip_kv.price_extra``)
         need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode) + _asr.price_extra(reading)
         # KVOFFSET-1024 (class B, SOLL R5/R11): the burst debit for EVERY KV test, not only the D line's -- rows the
@@ -17319,6 +17322,11 @@ class Front:
                                   head_lane=Front._prio_lane(self, head_rid), **_kw_set(freed_of=freed_of))
         Front._asr_note_kvd_none(self, st, head_rid, plan, head_arrival, seat_is_free, deficit, running, arrivals,
                                  seat_tokens, basis)
+        if plan and int(basis.get("locked_credit", 0) or 0) > 0:
+            # review SOLL 1 (a) (#215b x KVD): a displacement planned on a need that credits D's locked device rows --
+            # if the victims alone hold those rows, the release counts them a second time; D's verdict excludes them
+            # (review MUSS 1) and answers "nobody leaves" (``pdflip_kv.displace_nobody_leaves``): set the two side by side
+            self.counters["arrival_seat_age_plan_locked_credit"] += 1
         plans = st.setdefault("age_plan", {})
         key = "none" if plan is None else ("fits" if not plan else "displace")
         if plans.get(head_rid) != key:

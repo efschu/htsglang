@@ -351,6 +351,26 @@ def locked_rows_within(spans: Sequence[Sequence[int]], end: int) -> int:
     return sum(max(0, min(int(b), int(end)) - int(a)) for a, b in spans if int(a) < int(end))
 
 
+def locked_rows_continued(spans: Sequence[Sequence[int]], covered: int) -> int:
+    """#215b review SOLL 2: the rows of the locked spans that END BEFORE ``covered`` -- only there does the priced cover
+    continue past them (a host/store tail D loads back, so its load-back MAPS the gap, #215 ``locked_device_gap``
+    counts only inside that extent). A span reaching ``covered`` has no continuation: D recomputes it (the first turn of
+    a new session whose cached part is just the shared prompt) -- it is not credited."""
+    return sum(int(b) - int(a) for a, b in spans if int(b) < int(covered))
+
+
+def locked_agreed(locked, g_ok, g_min, g_max, rid, fp_min=None, fp_max=None):
+    """#215b (D-PROBE GROUP-MIN, SOLL R11): the group's locked device spans -- this rank's, when every rank read them
+    (``g_ok``), the group's MIN of the locked rows equals its MAX, and (review SOLL 3) the fingerprint (the sum of the
+    span ends) agrees too; else None (not read: the front prices as before), the disagreement named rate-limited."""
+    if not int(g_ok):
+        return None
+    if int(g_min) != int(g_max) or (fp_min is not None and int(fp_min) != int(fp_max)):
+        note_locked_fallback("disagree", "rid=%s rows %d..%d fp %s..%s" % (rid, int(g_min), int(g_max), fp_min, fp_max))
+        return None
+    return [list(x) for x in locked]
+
+
 def match_numbers(match_result: Any) -> Tuple[int, int, int]:
     """(device tokens, host-tier tokens, key depth) of a ``MatchResult`` -- the admission's usable prefix is
     ``device + host`` (``Req.init_next_round_input``: prefix_indices + host_hit_length)."""
@@ -514,7 +534,7 @@ def exact_price(ans: ProbeAnswer, store_tokens: int) -> ExactPrice:
     past = [(int(a), int(b)) for a, b in ans.mm_spans if int(b) > covered]
     tail = any(s not in rows for s in past)
     src = "d_tree" if tree >= store and tree > 0 else ("store" if store > 0 else "none")
-    locked = (locked_rows_within(getattr(ans, "device_locked_spans", ()) or (), covered)
+    locked = (locked_rows_continued(getattr(ans, "device_locked_spans", ()) or (), covered)
               if getattr(ans, "device_locked_known", False) else None)
     return ExactPrice(uncached=max(0, n - covered), uncached_p=max(0, n - store), covered=covered,
                       tree_tokens=tree, store_tokens=store, image_in_tail=bool(tail), src=src,
