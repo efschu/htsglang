@@ -6338,11 +6338,45 @@ def append_measured_record(path: str, rec: Dict[str, object]) -> None:
     """Append one sample to the sidecar (append-only: history is evidence).
 
     A ``--force`` boot (pdflip/refusals.py) writes NO record: what it measures lies outside the promise the planner
-    made, and must never calibrate a later boot (PROFIL-EDITOR S1)."""
+    made, and must never calibrate a later boot (PROFIL-EDITOR S1) -- UNLESS every refusal it passed is a proof gap
+    of its own form (#227, ``refusals.records_verdict``): then the record is written with ``forced_past`` naming
+    those gaps.  A forced launcher HOLDS what it writes before its verdict is sealed (``refusals.records_pending``);
+    :func:`flush_held_records` writes or drops it then."""
     from flliper.srt.pdflip import refusals as _refusals
 
     if not _refusals.records_allowed():
+        if _refusals.records_pending():
+            _refusals.hold(path, rec)
         return
+    stamp = _refusals.forced_record_stamp()
+    if stamp is not None:
+        rec = dict(rec)
+        rec["forced_past"] = stamp
+    _append_measured_record_unchecked(path, rec)
+
+
+def flush_held_records(log: Optional[Callable[[str], None]] = None) -> Tuple[int, int]:
+    """#227: after ``refusals.seal_records``: write the records a forced launcher held (verdict WRITES) or drop
+    them (verdict NONE).  Returns ``(written, dropped)``; one line through ``log`` when anything was held."""
+    from flliper.srt.pdflip import refusals as _refusals
+
+    held = _refusals.take_held()
+    if not held:
+        return 0, 0
+    if not _refusals.records_allowed():
+        if log is not None:
+            log(f"FORCED-RECORDS held {len(held)} record(s) DROPPED (verdict NONE): "
+                + ", ".join(sorted({str(r.get('group') or r.get('kind') or '?') for _p, r in held})))
+        return 0, len(held)
+    for path, rec in held:
+        append_measured_record(path, rec)
+    if log is not None:
+        log(f"FORCED-RECORDS held {len(held)} record(s) WRITTEN (verdict WRITES): "
+            + ", ".join(sorted({str(r.get('group') or r.get('kind') or '?') for _p, r in held})))
+    return len(held), 0
+
+
+def _append_measured_record_unchecked(path: str, rec: Dict[str, object]) -> None:
     try:
         with open(path) as f:
             data = json.load(f)

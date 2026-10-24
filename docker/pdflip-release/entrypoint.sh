@@ -214,7 +214,11 @@ refuse() { say "REFUSED $1: $2"; exit 3; }
 # PROFIL-EDITOR S1: Wert-Ablehnung (Kapazitaet, Schwelle, Beweisstand, Kalibrierung) -- mit FLLIPER_FORCE=1 (HTSGLANG_FORCE) uebergangen
 # und laut gelistet (Boot-Log: FORCED-PAST <CODE> <Grund>); sonst genau wie refuse. NICHT hierher gehoeren Belegung der Karte, fehlendes
 # Modell, kaputte Datei, nicht unterstuetzte Architektur: die bleiben refuse (weg2/refusals.py, Klasse nicht_forcebar).
-refuse_value() { if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST $2 $3"; return 0; fi; refuse "$1" "$3"; }   # <TAG> <CODE> <Text>
+# #227: jede hier uebergangene Ablehnung landet zusaetzlich in FORCED_PAST_EP (eine Zeile <CODE>\t<Text>), die vor dem Launch als
+# FLLIPER_PDFLIP_FORCED_PAST_EP exportiert wird: der Launcher urteilt daraus, ob dieser Boot Records schreibt (refusals.records_verdict).
+FORCED_PAST_EP=""
+forced_past_ep() { FORCED_PAST_EP+="$1"$'\t'"${2//$'\n'/ }"$'\n'; }   # <CODE> <Text>
+refuse_value() { if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST $2 $3"; forced_past_ep "$2" "$3"; return 0; fi; refuse "$1" "$3"; }   # <TAG> <CODE> <Text>
 usage()  { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # --- Untermodus -----------------------------------------------------------------
@@ -472,11 +476,11 @@ gpu_identity_gate() {
     3) [ -n "$msg" ] || msg="card_identity rc=3 ohne benannte Meldung: ${out##*$'\n'}"
        case $msg in
          HW-COUNT:*) if [ "$esc" = 1 ]; then say "WARN: $msg -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}, Operator-Ausnahme)"; return 0; fi
-                     if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST HW-COUNT $msg"; return 0; fi ;;
+                     if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST HW-COUNT $msg"; forced_past_ep HW-COUNT "$msg"; return 0; fi ;;
        esac
        refuse GPU "$msg" ;;
     4) [ -n "$msg" ] || msg="HW-UNCALIBRATED: card_identity rc=4 ohne benannte Meldung: ${out##*$'\n'}"
-       if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST HW-UNCALIBRATED $msg"; return 0; fi
+       if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST HW-UNCALIBRATED $msg"; forced_past_ep HW-UNCALIBRATED "$msg"; return 0; fi
        if [ "$esc" = 1 ]; then say "WARN: $msg -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}, Operator-Ausnahme)"; return 0; fi
        refuse UNCALIBRATED "$msg (Operator-Ausnahme auf eigenes Risiko: HTSGLANG_EXPECT_GPUS=0)" ;;
     *) if [ "$esc" = 1 ]; then say "WARN: card_identity scheitert (rc=$rc) -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS})"; return 0; fi
@@ -846,7 +850,9 @@ fi
 LAUNCH=(-m "$LAUNCHER_MOD" --tree "$TREE" --tag "$HTSGLANG_TAG" --transport "$TRANSPORT" "${PROFILE_ARGS[@]}")
 if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then
   LAUNCH+=(--force)
-  say "FORCE: Wert-Ablehnungen werden uebergangen (FORCED-PAST im Log), dieser Boot schreibt keine Records; nicht uebergangen: Belegung, fehlendes Modell, Architektur"
+  export FLLIPER_PDFLIP_FORCED_PAST_EP="$FORCED_PAST_EP"
+  _ep_codes=$(printf '%s' "$FORCED_PAST_EP" | cut -f1 | tr '\n' ' ')
+  say "FORCE: Wert-Ablehnungen werden uebergangen (FORCED-PAST im Log); Records nur, wenn jede uebergangene Ablehnung eine Beweisluecke dieser Form ist (#227, Launcher-Zeile FORCED-RECORDS); im Entrypoint uebergangen: ${_ep_codes:-nichts}; nicht uebergangen: Belegung, fehlendes Modell, Architektur"
 fi
 # Build-Window-Cap (Operator 25.09., rc8b-Boot dkr27bbar109251735: D starb in der Graph-Capture, das JIT-Kaltbau-Fenster
 # stand 160 s offen bei Cap 60 s). Der Launcher SCHREIBT SGLANG_BARLINK_BUILD_WINDOW_CAP_S selbst aus seinem Flag

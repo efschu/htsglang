@@ -23631,7 +23631,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, "
              "card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed "
-             "is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation "
+             "is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records -- unless every refusal it "
+             "passed is a proof gap of its own form (#227: HW-COUNT [METAL-UNPROVEN] alone, the PP-CUT crossing-width "
+             "HW-UNCALIBRATED); then its records carry forced_past (line FORCED-RECORDS). NOT lifted: the occupation "
              "check (another process or window on a card), a missing or broken model/file, an unsupported "
              "architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, "
              "the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or "
@@ -26339,8 +26341,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if getattr(ns, "force", False):
         # PROFIL-EDITOR S1: one switch for all VALUE refusals (pdflip/refusals.py); the sink writes each one to state.json events
         refusals.arm(True, sink=lambda code, text: boot_state_write(log, event=("forced_past", {"code": code, "text": text})))
-        log("FORCED BOOT (--force): value refusals are lifted and listed as FORCED-PAST <CODE>; this boot writes NO records; "
-            "not lifted: card occupation, missing/broken files, unsupported architecture")
+        log("FORCED BOOT (--force): value refusals are lifted and listed as FORCED-PAST <CODE>; this boot writes NO records "
+            "unless every refusal it passed is a proof gap of its own form (#227, verdict line FORCED-RECORDS before the "
+            "front starts; records held until then); not lifted: card occupation, missing/broken files, unsupported architecture")
+        _ep_forced = refusals.entrypoint_forced()
+        log("FORCED-RECORDS entrypoint list (" + refusals.ENV_FORCED_PAST_EP + "): "
+            + ("ABSENT under " + refusals.ENV_FORCE_REQUEST + "=1 -> no records" if _ep_forced is None
+               else ("; ".join(f"{c} {' '.join(t.split())[:160]}" for c, t in _ep_forced) or "nothing passed")))
     # THE PIN RESOLVER'S CONTRACT LINE, and it must stay in exactly this shape:
     # `line_gate.BOOT_TREE_RE` is `^tree\s*:\s*\S+\s+@\s+([0-9a-f]{7,40})\b`, so
     # the header above -- which carries the same two facts -- does NOT match it.
@@ -29105,6 +29112,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         x_mode_argv=x_mode_launch.front_argv,
     )
     fenv = dict(os.environ)
+    # #227 FORCED-RECORDS: the front is the record writer and spawns LAST, after every refusal site of main --
+    # the verdict is final here. Held records (the launcher's own P image) are written or dropped by it, and the
+    # front gets it in its environment (no seal = no records in a forced child, as before).
+    refusals.seal_records()
+    if refusals.forced_boot():
+        log(refusals.records_verdict_line())
+    host_ledger.flush_held_records(log)
+    refusals.export_records_verdict(fenv)
+    if refusals.forced_boot():
+        boot_state_write(log, event=("forced_records", {"allow": refusals.records_allowed(),
+                                                        "line": refusals.records_verdict_line()}))
     fenv["PYTHONPATH"] = f"{tree}/python"
     # L3-INDEX PRICE (02.10.): the front asks the shared L3 stem index with the
     # groups' own page-key scheme and arena dir (group_env's values, so the

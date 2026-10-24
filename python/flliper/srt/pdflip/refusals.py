@@ -9,6 +9,13 @@ der values aufhebt und trotzdem startet".
   each lifted refusal is printed as ``FORCED-PAST <CODE> <reason>``; and a forced boot WRITES NO RECORDS
   (``host_ledger.append_measured_record`` returns without writing): what it measures lies outside the
   promise the planner made, and must never calibrate a later boot.
+  #227 (24.10.) narrows that last rule to what it protects: a forced boot whose EVERY passed refusal is a
+  PROOF GAP of its own form (:data:`RECORD_NEUTRAL`: HW-COUNT with the sole blocker METAL-UNPROVEN, the PP-CUT
+  crossing-width HW-UNCALIBRATED) runs its own checkpoint, form, inventory and tree -- the non-forceable
+  refusals (MODELL-FEHLT, FORMAT, TREE, HW-ARCH) and the unforced inventory check guarantee that -- and its
+  measurement is exactly what closes the gap, so it writes records (stamped ``forced_past``).  Any other
+  passed refusal (a foreign inventory's borrowed records, a borrowed residue/census/anchor/overshoot, a
+  capacity verdict, an entrypoint threshold) keeps the boot record-free.  See :func:`records_verdict`.
 * Three classes, each with its reason (see :data:`REGISTER`; ``warnt`` is HOSTWARN2, 13.10.2026: a code that used to
   refuse host RAM and now only prints ``HOST-RAM-WARN``, never consulted by :func:`refuse_value`):
     - ``value``            a VALUE refusal: the planner or the launcher judges numbers (capacity, VRAM, host
@@ -42,6 +49,17 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 ENV_FORCED_BOOT = "FLLIPER_PDFLIP_FORCED_BOOT"
 #: container side: the entrypoint turns ``FLLIPER_FORCE=1`` (mapped to this) into ``--force``
 ENV_FORCE_REQUEST = "HTSGLANG_FORCE"
+#: both spellings the entrypoint mirrors onto each other (entrypoint.sh compat block, ``FORCE`` in its key list)
+ENV_FORCE_REQUEST_NAMES: Tuple[str, ...] = (ENV_FORCE_REQUEST, "FLLIPER_FORCE")
+#: #227: what the ENTRYPOINT passed before the launcher existed, one ``<CODE>\t<text>`` per line (entrypoint.sh
+#: exports it, possibly empty, whenever it runs with ``HTSGLANG_FORCE=1``).  Absent under ``HTSGLANG_FORCE=1`` =
+#: unknown = the boot writes no records (an entrypoint that does not list what it passed cannot be judged).
+ENV_FORCED_PAST_EP = "FLLIPER_PDFLIP_FORCED_PAST_EP"
+#: #227: the launcher's records verdict, handed to the FRONT's environment at its spawn (``allow;<classes>``);
+#: anything else -- or nothing -- in a forced child is "no records".  Never trusted from the launcher's own
+#: environment (:func:`arm` drops an inherited value).
+ENV_FORCED_RECORDS = "FLLIPER_PDFLIP_FORCED_RECORDS"
+RECORDS_ALLOW = "allow"
 MARKER = "FORCED-PAST"
 
 CLASS_VALUE = "value"
@@ -227,6 +245,10 @@ def warn_codes() -> List[str]:
 
 _FORCED: List[List[object]] = []        # [code, text, logged]
 _ARMED: Dict[str, object] = {"on": False, "sink": None}
+#: #227: records a forced launcher wanted to write before its verdict was final (``(path, record)``)
+_HELD: List[Tuple[str, Dict[str, object]]] = []
+#: #227: the launcher's final records verdict (:func:`seal_records`)
+_SEAL: Dict[str, object] = {"sealed": False, "allow": False, "why": "", "classes": ()}
 _UNSET = object()
 
 
@@ -237,7 +259,10 @@ def arm(on: bool, sink: Optional[Callable[[str, str], None]] = None) -> None:
     _ARMED["sink"] = sink if on else None
     if on:
         os.environ[ENV_FORCED_BOOT] = "1"
+    os.environ.pop(ENV_FORCED_RECORDS, None)    # #227: the launcher seals; an inherited verdict is never trusted
     _FORCED.clear()
+    _HELD.clear()
+    _SEAL.update(sealed=False, allow=False, why="", classes=())
 
 
 def forced_boot() -> bool:
@@ -266,6 +291,11 @@ def refuse_value(code: str, text: str, make_exc: Callable[[str], BaseException],
         raise make_exc(text) from cause         # type: ignore[misc]
     entry: List[object] = [code, str(text), False]
     _FORCED.append(entry)
+    if _SEAL["sealed"] and _SEAL["allow"] and records_class(code, str(text)) is None:
+        # #227: main() spawns the front last, after every refusal site; a pass after the seal is a wiring change
+        # that must not ride on a verdict already handed out -- this process stops writing and says why
+        _SEAL.update(allow=False, why="%s passed AFTER the records seal (%s) -- no further records from this "
+                     "process; a front spawned before it holds the earlier verdict" % (code, _one_line(text, 160)))
     sink = _ARMED.get("sink")
     if sink is not None:
         try:
@@ -289,8 +319,183 @@ def flush(log: Callable[[str], None]) -> int:
 
 
 def records_allowed() -> bool:
-    """False in a forced boot: it measures outside the promise, so nothing it measures becomes a record."""
-    return not forced_boot()
+    """May this process write a measured record NOW?  True in an unforced boot (unchanged).  In a forced boot
+    (#227): the launcher only after :func:`seal_records` judged every passed refusal record-neutral; a child
+    (front, groups) only when the launcher handed it ``ENV_FORCED_RECORDS=allow;...``.  Everything else -- a
+    forced boot that passed a non-neutral refusal, an unsealed launcher, a child without the seal -- writes none:
+    what it measures lies outside the promise."""
+    if not forced_boot():
+        return True
+    if _ARMED["on"]:
+        return bool(_SEAL["sealed"]) and bool(_SEAL["allow"])
+    return _env_seal() is not None
+
+
+def records_pending() -> bool:
+    """#227: a forced LAUNCHER before its seal -- a record it writes now is HELD (:func:`hold`) and written or
+    dropped by the verdict, never written on a verdict that is not final yet."""
+    return forced_boot() and bool(_ARMED["on"]) and not bool(_SEAL["sealed"])
+
+
+def hold(path: str, rec: Dict[str, object]) -> None:
+    _HELD.append((str(path), dict(rec)))
+
+
+def take_held() -> List[Tuple[str, Dict[str, object]]]:
+    out = list(_HELD)
+    _HELD.clear()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# #227 FORCED-RECORDS: which forced passes leave the form identity intact
+#
+# Measured 24.10.: every rotation boot since 23.10. 05:18Z (45 of 45, int8/dual/int4ar/duo; nf likewise) runs with
+# HTSGLANG_FORCE=1 and passed exactly two refusals -- HW-COUNT [METAL-UNPROVEN] (2-card forms) and the PP-CUT
+# crossing-width HW-UNCALIBRATED (the PCIe switch gives x16, the crossing table holds x4/x8).  Both say "this has
+# not been measured on this rig yet"; the second literally says "a crossing measurement of this rig writes the
+# table".  With "forced = no records" no boot could ever write that measurement: the 27B sidecar has no sample
+# since 22.10. 02:04Z and int4ar's D residue stayed the 2652 MiB constant against 1258 MiB measured at its sleep.
+
+_RX_BLOCKERS = re.compile(r"not yet runnable, (\d+) blocker\(s\): (.*?)(?: \|\| visible: .*)?$", re.S)
+_RX_BLOCKER_TAG = re.compile(r"(?:^|; )\[([A-Z][A-Z0-9-]*)\] ")
+_RX_CROSSING = re.compile(
+    r"HW-UNCALIBRATED: PP-CUT crossing prices are measured at PCIe widths x\d+(?:, x\d+)* only; "
+    r"ordinal \d+ \([^()]*\) x(?:\d+|\?) -> x\d+(?:; ordinal \d+ \([^()]*\) x(?:\d+|\?) -> x\d+)*"
+    r" -- --force prices these at the nearest measured width not faster than their own: UNMEASURED "
+    r"on this board \(a crossing measurement of this rig writes the table\)")
+
+
+def _hw_count_metal_only(text: str) -> bool:
+    """HW-COUNT whose blocker list is exactly N x ``[METAL-UNPROVEN]`` (topology.plan_topology's text): the card
+    count is runnable, only no release boot on N cards exists yet.  A profile/visible count mismatch
+    (card_identity ``--expect-count``, order_cards) or any further blocker is a foreign configuration."""
+    m = _RX_BLOCKERS.search(str(text))
+    if m is None:
+        return False
+    tags = _RX_BLOCKER_TAG.findall(m.group(2))
+    return bool(tags) and len(tags) == int(m.group(1)) and all(t == "METAL-UNPROVEN" for t in tags)
+
+
+def _hw_uncal_crossing_only(text: str) -> bool:
+    """HW-UNCALIBRATED of ``launcher.forced_lane_borrow`` alone (full match, no ``||`` join with an inventory
+    message): only the TIME price of a PP crossing is borrowed, from a width not faster than the card's own; no
+    VRAM budget, residue, record or vector of another inventory enters the boot."""
+    return _RX_CROSSING.fullmatch(" ".join(str(text).split())) is not None
+
+
+#: ``(code, class name, predicate on the refusal text)``: a forced pass that is a PROOF GAP of this very form.
+#: Deliberately two entries; extend only with a reason why the pass changes nothing the boot then measures.
+RECORD_NEUTRAL: Tuple[Tuple[str, str, Callable[[str], bool]], ...] = (
+    ("HW-COUNT", "METAL-UNPROVEN", _hw_count_metal_only),
+    ("HW-UNCALIBRATED", "pp-crossing-width", _hw_uncal_crossing_only),
+)
+
+
+def records_class(code: str, text: str) -> Optional[str]:
+    """``<CODE>/<class>`` when this forced pass leaves the boot's form identity intact, None otherwise."""
+    for c, name, pred in RECORD_NEUTRAL:
+        if str(code) == c and pred(str(text)):
+            return f"{c}/{name}"
+    return None
+
+
+def _one_line(text: object, n: int) -> str:
+    t = " ".join(str(text).split())
+    return t if len(t) <= n else t[: n - 3] + "..."
+
+
+def entrypoint_forced(environ: Optional[Dict[str, str]] = None) -> Optional[List[Tuple[str, str]]]:
+    """What the entrypoint passed (``[(code, text)]``); None = unknown (``HTSGLANG_FORCE=1`` without the list);
+    ``[]`` = nothing, or no entrypoint (no ``HTSGLANG_FORCE=1``: a bare launcher call)."""
+    env = os.environ if environ is None else environ
+    raw = env.get(ENV_FORCED_PAST_EP)
+    if raw is None:
+        asked = any(str(env.get(k, "")).strip() == "1" for k in ENV_FORCE_REQUEST_NAMES)
+        return None if asked else []
+    out: List[Tuple[str, str]] = []
+    for line in str(raw).splitlines():
+        if not line.strip():
+            continue
+        code, _, text = line.partition("\t")
+        out.append((code.strip(), text))
+    return out
+
+
+def records_verdict(environ: Optional[Dict[str, str]] = None) -> Tuple[bool, str, Tuple[str, ...]]:
+    """``(allow, why, classes)`` of the forced passes so far (launcher) -- every one record-neutral, the
+    entrypoint's included; ``classes`` the sorted record-neutral classes passed.  Unforced: ``(True, ..., ())``."""
+    if not forced_boot():
+        return True, "not forced", ()
+    if not _ARMED["on"]:
+        v = _env_seal(environ)
+        if v is None:
+            return False, "forced child without the launcher's records seal", ()
+        return True, "sealed by the launcher", v
+    passed = [(str(c), str(t), "launcher") for c, t, _l in _FORCED]
+    ep = entrypoint_forced(environ)
+    if ep is None:
+        return False, ("the entrypoint ran with %s=1 but did not list what it passed (%s absent): cannot be judged"
+                       % (ENV_FORCE_REQUEST, ENV_FORCED_PAST_EP)), ()
+    passed += [(c, t, "entrypoint") for c, t in ep]
+    bad = [(c, t, w) for c, t, w in passed if records_class(c, t) is None]
+    classes = tuple(sorted({records_class(c, t) for c, t, _w in passed} - {None}))
+    if bad:
+        return False, "; ".join("%s (%s): %s" % (c, w, _one_line(t, 140)) for c, t, w in bad), classes
+    return True, ("every passed refusal is a proof gap of this form: " + (", ".join(classes) or "none passed")), classes
+
+
+def seal_records(environ: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
+    """#227: the launcher's FINAL verdict, taken once right before the front (the record writer) spawns, after
+    every refusal site of ``main``.  Returns ``(allow, why)``; then :func:`records_allowed` answers by it and
+    ``host_ledger.flush_held_records`` writes or drops what was held."""
+    allow, why, classes = records_verdict(environ)
+    if not forced_boot():
+        _SEAL.update(sealed=True, allow=True, why=why, classes=())
+        return True, why
+    _SEAL.update(sealed=True, allow=bool(allow), why=why, classes=tuple(classes))
+    return bool(allow), why
+
+
+def records_verdict_line() -> str:
+    """The launcher's one line about it (``FORCED-RECORDS WRITES|NONE ...``)."""
+    if not forced_boot():
+        return "FORCED-RECORDS n/a: not a forced boot -- records as always"
+    if not _SEAL["sealed"]:
+        return "FORCED-RECORDS PENDING: verdict not sealed yet -- records held"
+    if _SEAL["allow"]:
+        return ("FORCED-RECORDS WRITES: " + str(_SEAL["why"]) + " -- identity: checkpoint, form, card inventory and "
+                "tree are this boot's own (non-forceable MODELL-FEHLT/FORMAT/TREE/HW-ARCH, inventory check not "
+                "forced); records carry forced_past=[" + ", ".join(_SEAL["classes"]) + "]")
+    return ("FORCED-RECORDS NONE: this boot writes NO records -- " + str(_SEAL["why"])
+            + " (a measurement outside the promise must not calibrate a later boot)")
+
+
+def export_records_verdict(env: Dict[str, str]) -> None:
+    """Hand the sealed verdict to a child's environment (the front): ``allow;<classes>`` or nothing."""
+    if forced_boot() and _SEAL["sealed"] and _SEAL["allow"]:
+        env[ENV_FORCED_RECORDS] = RECORDS_ALLOW + ";" + ",".join(_SEAL["classes"])
+    else:
+        env.pop(ENV_FORCED_RECORDS, None)
+
+
+def forced_record_stamp() -> Optional[List[str]]:
+    """The ``forced_past`` stamp of a record written by a forced boot (its record-neutral classes); None unforced."""
+    if not forced_boot():
+        return None
+    if _ARMED["on"]:
+        return list(_SEAL["classes"])
+    v = _env_seal()
+    return list(v) if v is not None else []
+
+
+def _env_seal(environ: Optional[Dict[str, str]] = None) -> Optional[Tuple[str, ...]]:
+    env = os.environ if environ is None else environ
+    v = str(env.get(ENV_FORCED_RECORDS, "") or "")
+    if v != RECORDS_ALLOW and not v.startswith(RECORDS_ALLOW + ";"):
+        return None
+    rest = v[len(RECORDS_ALLOW) + 1:] if v.startswith(RECORDS_ALLOW + ";") else ""
+    return tuple(x for x in rest.split(",") if x)
 
 
 # ---------------------------------------------------------------------------
