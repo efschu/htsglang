@@ -136,6 +136,7 @@ class Meter:
     _open: Optional[List] = None                               # [rows, post, end, trimmed, rate] of the open reading
     ver: int = 0                # bumps on every reading change
     persisted_f: Optional[float] = None   # F at the last store write (extend_trim persists on a rise)
+    _memo: Optional[Tuple[Tuple[int, float], Optional[float]]] = None
 
     # -- events ------------------------------------------------------------------------------------------------
     def on_vote(self, post_mib: float, rate: float) -> Optional[str]:
@@ -195,7 +196,13 @@ class Meter:
 
     # -- reading -----------------------------------------------------------------------------------------------
     def fixed_mib(self, rate: float) -> Optional[float]:
-        return fixed_at(self.readings.items(), rate)
+        """F at ``rate``, memoised per (readings version, rate): the reduce reads it every scheduler iteration."""
+        key = (self.ver, float(rate))
+        if self._memo is not None and self._memo[0] == key:
+            return self._memo[1]
+        f = fixed_at(self.readings.items(), rate)
+        self._memo = (key, f)
+        return f
 
     def snapshot(self, rate: float, **meta) -> dict:
         doc = {"schema": SCHEMA, "rank": int(self.rank), "counted": int(self.counted), "paired": int(self.paired),
