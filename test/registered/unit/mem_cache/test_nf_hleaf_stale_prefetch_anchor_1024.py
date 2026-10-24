@@ -37,6 +37,7 @@ and S39 deletes exactly those. TWO repairs, both here:
 
 import logging
 import os
+import threading
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -108,20 +109,119 @@ def test_hleaf_repro_s39_never_drops_the_anchor_of_an_inflight_read(roles):
         assert not _attached(t, t._t_nodes[1]) and not t.root_node.children
 
 
-def test_hleaf_a_workers_own_read_keeps_the_drop_pending_until_it_completed(roles):
-    """A read in flight only on the worker (TP0 has none): TP0 drops, the worker keeps the drop PENDING (a holder of
-    its own, like a lock) and applies it at the broadcast after its read completed."""
-    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
-    _register_read(worker, "pdflip-4-108", worker._t_nodes[1])
+class _Arena:
+    def __init__(self, path):
+        self.path = path
+
+
+def _arena_dir(monkeypatch, tmp_path):
+    """The worker's S22/S41 key files go next to the arena (here: tmp) -- the channel TP0 reads at its broadcast."""
+    arena = _Arena(str(tmp_path / "arena-0.bin"))
+    monkeypatch.setattr(R12, "_tree_arena", lambda tree: arena)
+
+
+def _as(roles, role):
+    roles.now[threading.current_thread().name] = role
+
+
+def _round(roles, tp0, worker):
+    """One pass: the peel on both ranks (TP0 queues), TP0's broadcast, the worker's consume (its refresh publishes)."""
     _peel(roles, tp0), _peel(roles, worker)
     _broadcast(roles, tp0, worker)
+
+
+def test_hleaf_a1_a_workers_own_read_is_vetoed_at_tp0_through_insert_pin_and_load_back(roles, monkeypatch, tmp_path):
+    """MUSS A1 (review): only the WORKER has a read anchored on the leaf L (Form A HP1-END: TP0's anchor is another
+    node). The real course: the read registers (publishes its anchor at once), completes -- its span C is inserted
+    below L and pinned (#1417) --, the admission loads C back onto the device, the request ends and C goes back to the
+    host. RED on 6f673b4dd6: TP0 drops L at the first broadcast, the worker holds it pending, C is pinned
+    (child_host_locked), loaded back (child_on_device) -> S39 DIVERGED, L stays on the worker's device and is gone on
+    TP0. GREEN: TP0 leaves the drop alone as long as the worker could not follow (``s39`` veto set), no DIVERGED, and
+    once C is a plain host-only node again the drop is taken on BOTH ranks (C with it)."""
+    from flliper.srt.pdflip import forma_l3_subtree as s39
+
+    _arena_dir(monkeypatch, tmp_path)
+    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
+    lw = worker._t_nodes[1]
+    trail = []
+
+    def _state(step):
+        trail.append((step, _attached(tp0, tp0._t_nodes[1]), _attached(worker, lw), int(s39._ST.n["diverged"])))
+
+    _as(roles, "worker")
+    _register_read(worker, "pdflip-4-108", lw)
+    reg = getattr(R12, "worker_read_registered", None)  # the registration publishes the anchor at once
+    (reg or R12._dev_refresh)(worker)
+    _as(roles, "host")
+
+    _round(roles, tp0, worker)
+    _state("read in flight")
+
+    # the read completes on the worker: its 4 tokens become host node C below L, pinned until the admission
+    _as(roles, "worker")
+    res = worker._insert_helper_host(lw, RadixKey([13, 14, 15, 16], None),
+                                     torch.tensor([80, 81, 82, 83], dtype=torch.int64), ["r13", "r14", "r15", "r16"])
+    c = res.inserted_host_node
+    assert c is not None and c.parent is lw
+    c.l3_present = True
+    pin = worker.inc_host_lock_ref(c).to_dec_params()
+    worker.ongoing_prefetch.clear()
+    _as(roles, "host")
+    _round(roles, tp0, worker)
+    _state("C inserted + pinned")
+
+    # the admission loads C back onto the device and lets the pin go
+    _as(roles, "worker")
+    c.component_data[FULL].value = worker._t_alloc.alloc(4).to(dtype=torch.int64)
+    worker.dec_host_lock_ref(c, pin)
+    worker._update_evictable_leaf_sets(lw)
+    _as(roles, "host")
+    _round(roles, tp0, worker)
+    _state("C loaded back")
+
+    # the request ended: C back to the host only (store-backed) -- now the worker can follow
+    _as(roles, "worker")
+    worker._t_alloc.free(c.component_data[FULL].value)
+    c.component_data[FULL].value = None
+    worker._update_evictable_leaf_sets(c)
+    worker._update_evictable_leaf_sets(lw)
+    _as(roles, "host")
+    _round(roles, tp0, worker)                          # publishes the cleared veto
+    _round(roles, tp0, worker)                          # TP0 decides on it
+    _state("C host-only again")
+
+    assert s39._ST.n["diverged"] == 0, ("S39 DIVERGED: L stays on the worker's device, gone on TP0", trail)
+    for step, on_tp0, on_worker, _d in trail[:-1]:
+        assert on_tp0 and on_worker, ("TP0 dropped the leaf while the worker could not follow", step, trail)
+    assert s39._ST.n["worker_veto"] >= 3, s39._ST.n
+    for t in (tp0, worker):
+        assert not t.root_node.children, ("both ranks dropped L with its subtree", t._t_tag, trail)
+
+
+def test_hleaf_a1_without_published_sets_the_worker_still_holds_the_drop_pending(roles):
+    """The fallback when no worker file is readable (``_worker_files_live`` 0): TP0 decides alone, the worker whose
+    own read anchors the leaf keeps the drop PENDING instead of deleting the anchor under its read."""
+    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
+    _register_read(worker, "pdflip-4-108", worker._t_nodes[1])
+    _round(roles, tp0, worker)
     assert not _attached(tp0, tp0._t_nodes[1])
     assert _attached(worker, worker._t_nodes[1]), "the worker dropped the anchor of its own in-flight read"
-    _broadcast(roles, tp0, worker)                                  # still in flight: still pending
-    assert _attached(worker, worker._t_nodes[1])
-    worker.ongoing_prefetch.clear()
-    _broadcast(roles, tp0, worker)
-    assert not _attached(worker, worker._t_nodes[1]) and not worker.root_node.children
+
+
+def test_hleaf_s1_tp0_never_queues_the_anchor_of_its_own_read(roles):
+    """SOLL S1: TP0's in-flight read anchors the leaf -- the peel does not queue it, room_pending() promises nothing
+    (PW-R / D-WALL-HEAD would hold the head for room S39 does not deliver)."""
+    from flliper.srt.pdflip import forma_l3_subtree as s39
+
+    tp0 = _rank(roles, "tp0")
+    _register_read(tp0, "pdflip-4-108", tp0._t_nodes[1])
+    _peel(roles, tp0)
+    assert s39.room_pending(tp0) == 0 and not s39._ST.queue
+    assert s39._ST.n["anchor_skipped"] >= 1
+    assert s39.queue_for_room(tp0, [tp0._t_nodes[1]]) == 0
+    tp0.ongoing_prefetch.clear()
+    _peel(roles, tp0)
+    assert s39.room_pending(tp0) == 8                  # CAN-FAIL: the same leaf without the read is queued
 
 
 def test_hleaf_a_read_anchored_elsewhere_does_not_hold_the_leaf(roles):
@@ -237,3 +337,150 @@ def test_hleaf_the_attached_predicate_reads_the_whole_chain_and_this_trees_root(
     old_root = cache.root_node
     cache.root_node = type(old_root)(cache.tree_components)     # a new tree: the old chain ends at another root
     assert not f(cache, x)
+
+
+# --------------------------------------------------------------------------- review S2 / S3
+
+
+class _Group3:
+    """Three ranks in threads, one collective sequence: every ``_all_reduce_attn_groups`` is an element-wise MIN /
+    MAX / SUM over the three tensors (what gloo hands back), every barrier a barrier."""
+
+    def __init__(self, world=3):
+        self.world = world
+        self.bar = threading.Barrier(world, timeout=20)
+        self.slots = {}
+        self.labels = {r: [] for r in range(world)}
+
+    def bind(self, cache, rank):
+        def _reduce(t, op, label="hicache"):
+            self.labels[rank].append((label, int(t.numel())))
+            self.slots[rank] = t.clone()
+            self.bar.wait()
+            stack = torch.stack([self.slots[r] for r in range(self.world)])
+            if op == torch.distributed.ReduceOp.MAX:
+                red = stack.max(dim=0).values
+            elif op == torch.distributed.ReduceOp.SUM:
+                red = stack.sum(dim=0)
+            else:
+                red = stack.min(dim=0).values
+            self.bar.wait()
+            t.copy_(red.to(t.dtype))
+
+        cache._all_reduce_attn_groups = _reduce
+        cache._barrier_attn_groups = lambda label="hicache": self.bar.wait()
+        cache.tp_world_size = self.world
+
+
+def _released(cache):
+    out = []
+    q = cache.cache_controller.host_mem_release_queue
+    while not q.empty():
+        out.extend(int(x) for x in q.get_nowait().tolist())
+    return sorted(out)
+
+
+def test_hleaf_s2_three_ranks_one_detached_every_rank_refuses_and_returns_its_rows_once():
+    """SOLL S2: three ranks, the anchor left the tree on rank 2 only (the boot's TP0 dropped 310 first). RED on
+    40b569aee8: ranks 0/1 insert below their anchor, rank 2 hangs the span below the removed node (the stale host leaf).
+    GREEN: every rank refuses alike, the same collective sequence on all three, and per rank: nothing below the
+    anchor, ``ongoing_prefetch`` empty, ``prefetch_tokens_occupied`` back to 0, the release queue holds exactly the
+    read's 16 host rows, once."""
+    ranks = []
+    for r in range(3):
+        cache, x = _completion_on_device_anchor(detach=(r == 2))
+        rows = sorted(int(v) for v in cache.ongoing_prefetch[REAP_REQ].host_indices.tolist())
+        ranks.append((cache, x, rows))
+    g = _Group3()
+    for r, (cache, _, _) in enumerate(ranks):
+        g.bind(cache, r)
+    errs = []
+
+    def _run(r):
+        try:
+            assert ranks[r][0].check_prefetch_progress(REAP_REQ)
+        except BaseException as e:  # noqa: BLE001
+            errs.append((r, e))
+            g.bar.abort()
+
+    th = [threading.Thread(target=_run, args=(r,)) for r in range(3)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join(30)
+    assert not errs, errs
+    assert g.labels[0] == g.labels[1] == g.labels[2], g.labels
+    for r, (cache, x, rows) in enumerate(ranks):
+        assert not x.children, ("rank", r, "inserted below its anchor while a peer refused")
+        assert not (cache.evictable_host_leaves - _reachable(cache)), ("rank", r, "stale host leaf")
+        assert REAP_REQ not in cache.ongoing_prefetch
+        assert cache.cache_controller.prefetch_tokens_occupied == 0
+        assert _released(cache) == rows, ("rank", r, "release queue != the read's rows once")
+        assert int(cache.prefetch_loaded_tokens_by_reqid[REAP_REQ]) == 0
+
+
+def test_hleaf_s2_the_refusals_insert_result_releases_the_reads_mamba_anchor_and_hangs_nothing():
+    """SOLL S2, the ``+lru={314}`` half: the REAL ``MambaComponent.commit_hicache_transfer`` PREFETCH branch fed with the
+    refusal's InsertResult (``host_span_unclaimed``, no inserted node, no matched end) releases the read's anchor slot
+    to the pool and puts nothing on the mamba host LRU. The pre-fix shape (the inserted node 314 as target) is what put
+    314 there -- shown as the counterweight."""
+    import types
+
+    from flliper.srt.mem_cache.base_prefix_cache import InsertResult
+    from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+    from flliper.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import CacheTransferPhase
+
+    MAMBA = ComponentType.MAMBA
+
+    class _Lru:
+        def __init__(self):
+            self.ids = set()
+
+        def in_list(self, n):
+            return id(n) in self.ids
+
+        def insert_mru(self, n):
+            self.ids.add(id(n))
+
+    def _stub():
+        released = []
+        cc = types.SimpleNamespace(append_host_mem_release=lambda **kw: released.append(kw))
+        cache = types.SimpleNamespace(cache_controller=cc, host_lru_lists={MAMBA: _Lru()}, root_node=object())
+        comp = types.SimpleNamespace(component_type=MAMBA, cache=cache)
+        comp._prefetch_anchor_target = MambaComponent._prefetch_anchor_target.__get__(comp)
+        return comp, released
+
+    def _xfer():
+        return PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([7], dtype=torch.int64))
+
+    hit = types.SimpleNamespace(extra_pool_hit_pages={PoolName.MAMBA: 1})
+    comp, released = _stub()
+    t = _xfer()
+    res = InsertResult(prefix_len=0, host_span_unclaimed=True)
+    MambaComponent.commit_hicache_transfer(comp, object(), CacheTransferPhase.PREFETCH, [t],
+                                           insert_result=res, pool_storage_result=hit)
+    assert released == [{"extra_pools": [t]}] and not comp.cache.host_lru_lists[MAMBA].ids
+    # counterweight: the pre-fix completion named the node it hung below the removed anchor
+    comp, released = _stub()
+    n314 = types.SimpleNamespace(component_data={
+        ComponentType.FULL: types.SimpleNamespace(host_value=torch.tensor([1]), value=None),
+        MAMBA: types.SimpleNamespace(host_value=None, value=None)}, id=314)
+    MambaComponent.commit_hicache_transfer(comp, object(), CacheTransferPhase.PREFETCH, [_xfer()],
+                                           insert_result=InsertResult(prefix_len=0, inserted_host_node=n314),
+                                           pool_storage_result=hit)
+    assert not released and comp.cache.host_lru_lists[MAMBA].ids == {id(n314)}
+
+
+def test_hleaf_s3_a_refused_read_does_not_end_the_handoffs_protection(monkeypatch):
+    """SOLL S3: the full read the group refused for its detached anchor took nothing over -- ``_pdflip_handoff_consumed``
+    stays silent (P's hand-off keeps its #243 protection for the re-read). CAN-FAIL: the same read on an attached
+    anchor ends it."""
+    calls = []
+    monkeypatch.setattr(urc, "_pdflip_handoff_consumed", lambda rid, where, **kv: calls.append((rid, where)))
+    cache, _ = _completion_on_device_anchor(detach=True)
+    assert cache.check_prefetch_progress(REAP_REQ)
+    assert not calls, calls
+    cache, _ = _completion_on_device_anchor(detach=False)
+    assert cache.check_prefetch_progress(REAP_REQ)
+    assert calls == [(REAP_REQ, "fetch")], calls
