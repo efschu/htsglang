@@ -9,7 +9,20 @@ all of it D's own doing. The watchdog stays on; the exception is the hold:
 
 * held (scheduler's notice names the rid) -> no reaping, however long;
 * the clock restarts at the resumption -> a resumed stream silent for > 90 s is reaped;
-* a running stream that is never held -> reaped after 90 s exactly as before.
+* a running stream that is never held -> reaped after 90 s exactly as before
+  (ConsumerWatchdog alone, which knows nothing about the producer).
+
+NF-STALL-1024 (rc36p boot ``..._cebd0da264_1024_195853``, 20:31-20:46Z, 9 streams):
+``guarded_stream`` charged the PRODUCER's silence to the consumer. D decoded
+(62-187: 4392 tokens, 62-186: 4357) while the qwen3_coder tool-call parser held a
+long ``<parameter=...>`` value back until ``</parameter>`` -- no SSE byte for > 90 s,
+the front reading all the time (front sent 6179 / 3568 bytes). The watchdog
+declared the consumer dead, aborted, the client got a truncated 503 and retried the
+same turn into the same death. The clock now runs only while a chunk is OFFERED and
+not taken -- which is what "the consumer accepted no bytes" means:
+
+* producer silent, consumer reading -> no reaping, however long;
+* a chunk offered after the silence and not taken -> reaped after the limit.
 """
 
 import asyncio
@@ -244,9 +257,97 @@ class GuardGenerateStreamHoldTest(CustomTestCase):
         self.assertEqual(aborted, [])
         self.assertEqual(got, [b"data: tok0\n\n", b"data: tok1\n\n"])
 
-    def test_unheld_rid_is_aborted_as_before(self):
-        aborted, _ = self._run("pdflip-run-1", hold=False)
-        self.assertEqual(aborted, ["pdflip-run-1"])
+    def test_unheld_silent_producer_is_not_aborted(self):
+        """NF-STALL-1024: D silent inside a buffered tool-call parameter, the
+        front reading all the time -- the silence is the producer's (this test
+        asserted the abort before; that abort WAS the defect)."""
+        aborted, got = self._run("pdflip-62-187", hold=False)
+        self.assertEqual(aborted, [])
+        self.assertEqual(got, [b"data: tok0\n\n", b"data: tok1\n\n"])
+
+
+async def silent_then_flowing_producer(gate: asyncio.Event):
+    """tok0, a long producer silence (a buffered tool-call parameter), then frames."""
+    yield b"data: tok0\n\n"
+    await gate.wait()
+    for i in range(1, 1000):
+        yield f"data: tok{i}\n\n".encode()
+
+
+class GuardGenerateStreamProducerSilenceTest(CustomTestCase):
+    """NF-STALL-1024: the clock counts the OFFER, never the producer's silence."""
+
+    TIMEOUT = 0.3
+
+    def test_offered_chunk_not_taken_after_a_producer_silence_is_aborted(self):
+        async def run():
+            global_hold_registry().replace([])
+            manager = FakeTokenizerManager()
+            gate = asyncio.Event()
+            response = guard_generate_stream(
+                FakeResponse(silent_then_flowing_producer(gate)), tokenizer_manager=manager,
+                obj=FakeObj("pdflip-dead-1"),
+                config=LivenessConfig(timeouts_s={EndpointClass.LLM_STREAM.value: self.TIMEOUT},
+                                      poll_interval_s=0.02))
+            got = []
+
+            async def consume_then_stall():
+                async for chunk in response.body_iterator:
+                    got.append(chunk)
+                    if len(got) == 2:
+                        await asyncio.sleep(3600)  # takes tok1, then never reads again
+
+            task = asyncio.create_task(consume_then_stall())
+            await asyncio.sleep(self.TIMEOUT * 3)  # producer silent 3x the limit
+            self.assertEqual(manager.aborted, [])
+            gate.set()
+            for _ in range(100):  # the offer after the silence starts the clock
+                if manager.aborted:
+                    break
+                await asyncio.sleep(0.02)
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001
+                pass
+            return list(manager.aborted), got
+
+        aborted, got = asyncio.run(run())
+        self.assertEqual(aborted, ["pdflip-dead-1"])
+        self.assertEqual(got[:2], [b"data: tok0\n\n", b"data: tok1\n\n"])
+
+
+class SourceWaitWatchdogTest(CustomTestCase):
+    """The watchdog side of the producer flag, on the fake clock."""
+
+    def test_source_wait_pins_the_clock_and_the_offer_restarts_it(self):
+        clock = FakeClock()
+
+        async def run():
+            released = Released()
+            wd = ConsumerWatchdog(job_id="stream-pdflip-62-186", policy=llm_policy(),
+                                  release=released, clock=clock)
+            wd.start()
+            clock.advance(30.0)  # 30 s undelivered offer: grace
+            await settle()
+            self.assertTrue(wd.in_grace)
+            wd.note_source_wait(True)  # the chunk was taken, D is silent now
+            await settle()
+            self.assertFalse(wd.in_grace)
+            for _ in range(6):  # 360 s producer silence
+                clock.advance(60.0)
+                await settle()
+            self.assertEqual(released.calls, 0)
+            self.assertTrue(wd.state.awaiting_source)
+            wd.note_source_wait(False)  # next chunk offered
+            clock.advance(89.0)
+            await settle()
+            self.assertEqual(released.calls, 0)
+            clock.advance(2.0)  # 91 s offered and not taken: a dead consumer
+            await asyncio.wait_for(released.event.wait(), timeout=2.0)
+            self.assertTrue(wd.state.declared_dead)
+
+        asyncio.run(run())
 
 
 class _Sender:
