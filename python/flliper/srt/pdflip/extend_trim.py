@@ -738,6 +738,8 @@ def flip_trim_thresholds(rates_text: str, configured: int, page_size: int, line_
 # --------------------------------------------------------------------------
 
 LAW_LIFT_MARKER = "TRIM-LAW-LIFT"
+#: review SOLL 1: the lift check could not run (the line was unreadable) -- WARNING, so metal sees the gap
+LAW_LIFT_UNCHECKED_MARKER = "TRIM-LAW-LIFT-UNCHECKED"
 
 
 def law_bound_threshold(rank: int, start_rate: float, configured: int, page_size: int) -> Optional[float]:
@@ -763,7 +765,9 @@ def lift_threshold_to_law(rank: int, start_rate: float, configured: int, page_si
     try:
         need = law_bound_threshold(int(rank), start_rate, configured, page_size)
     except Exception as exc:  # noqa: BLE001 -- no line, no lift (the launcher's value stands)
-        logger.debug("%s skipped: %s", LAW_LIFT_MARKER, exc)
+        # review SOLL 1: WARNING, named -- metal check "TRIM-LAW-LIFT soll 0" must also see a check that never ran
+        logger.warning(f"{LAW_LIFT_UNCHECKED_MARKER} rank={int(rank)} threshold={thr:.0f} stays: this card's line is "
+                       f"unreadable ({type(exc).__name__}: {exc}) -- no lift, the launcher's value stands unchecked")
         return thr
     if need is None or thr >= need:
         return thr

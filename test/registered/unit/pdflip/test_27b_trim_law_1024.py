@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
 import pytest  # noqa: E402
 
 from flliper.srt.managers import corridor_guard as CG
+from flliper.srt.pdflip import budget_rest as BR
 from flliper.srt.pdflip import extend_trim as ET
 from flliper.test.test_utils import CustomTestCase
 
@@ -114,6 +115,15 @@ class Derivation(CustomTestCase):
         self.assertEqual(ET.flip_trim_thresholds(f"{RATE},0,{RATE}", 4096, 1, [767, 701, 700]), "847,0,780")
 
 
+@pytest.fixture
+def basis_released():
+    """The ADMIT-BASIS released (as after an admission census re-measured under the card-law threshold): the card-law
+    mechanics alone. The bound itself is pinned in :class:`AdmitBasis`."""
+    with mock.patch.object(BR, "ADMIT_TRIM_BASIS", (TRIM_ENV, 0)):
+        yield
+
+
+@pytest.mark.usefixtures("basis_released")
 class LauncherCardLaw(CustomTestCase):
     @pytest.fixture(autouse=True)
     def _tmp(self, tmp_path):
@@ -308,6 +318,22 @@ class RankLift(CustomTestCase):
         self.assertFalse(any(ET.LAW_LIFT_MARKER in m for m in cm.output), cm.output)
         self.assertEqual(ET.threshold_for(1, ET.thresholds()), 1104.0)
 
+    def test_unreadable_line_is_a_named_warning(self):
+        """Review SOLL 1: when the card's line cannot be read the lift is skipped -- at WARNING, named
+        (TRIM-LAW-LIFT-UNCHECKED), so the metal check 'TRIM-LAW-LIFT soll 0' also sees a check that never ran."""
+
+        def boom(rank):
+            raise RuntimeError("no floor pointer")
+
+        with mock.patch.object(ET, "corridor_line_mib", boom), \
+                mock.patch.dict(os.environ, {TRIM_ENV: "1104,1104"}, clear=False), \
+                self.assertLogs(ET.logger, level="WARNING") as cm:
+            thr = ET.lift_threshold_to_law(1, RATE, 4096, 1)
+        self.assertEqual(thr, 1104.0)
+        self.assertTrue(any(ET.LAW_LIFT_UNCHECKED_MARKER in m and "rank=1" in m and "RuntimeError" in m
+                            for m in cm.output), cm.output)
+        self.assertEqual(ET.thresholds(), [1104.0, 1104.0])
+
     def test_nothing_armed_where_nothing_was(self):
         """No env threshold: no trim, no lift (other profiles byte for byte); ``0`` stays never-trims."""
         vote, cuda = self._vote(None, 1300, 1200, 300)
@@ -317,6 +343,150 @@ class RankLift(CustomTestCase):
         vote, cuda = self._vote("0,0", 1300, 1200, 300)
         self.assertEqual(cuda.emptied, 0)
         self.assertEqual(ET.thresholds(), [0.0, 0.0])
+
+
+# --------------------------------------------------------------------------
+# Review MUSS 1 (ADMIT-BASIS): the same parsed threshold list is the admission trim's (extend_trim.before_admission,
+# #217 ADMIT-TRIM: ``maybe_trim(cuda, rank, threshold_for(rank, thresholds()))``), and the admission records were
+# measured with it at 1104. A computed card-law threshold under 1104 would let an untrimmed pass enter the admission
+# under ``400 + A_peak`` -- the review's example: 900 MiB driver free with returnable cache, A_peak 522.
+# --------------------------------------------------------------------------
+
+NEAR_OOM = 400.0
+A_PEAK = 522.0  # D_ADMIT_NEED_MIB's A_peak (NVFP4 duo, 5 handbacks; the all-form max over the 27B handback path)
+
+
+def _int4ar_cards():
+    from flliper.srt.pdflip import launcher as L
+
+    return [L.Card(nvml_index=i, uuid=UUIDS[1 + i], name="NVIDIA GeForce RTX 3080", total_mib=20480) for i in range(2)]
+
+
+class AdmitBasis(CustomTestCase):
+    @pytest.fixture(autouse=True)
+    def _tmp(self, tmp_path):
+        self.tmp = tmp_path
+
+    def _int4ar_measured(self, env_d=""):
+        """int4ar 2x3080 with a footprint store of its OWN form measuring floor 700 on both cards (the next natural
+        step, review §3): card-law threshold ceil(700 + 79.13) = 780 per rank."""
+        from flliper.srt.pdflip import launcher as L
+
+        ns = _ns(env_d=env_d)
+        cards = _int4ar_cards()
+        path = _store(self.tmp, [c.uuid for c in cards], tp=2)
+        lines = []
+        with mock.patch.object(L.corridor_budget, "floors_for_cards", _floors((700, 700), "MEASURED-D", path)):
+            now = L._d_extend_flip_trim_env(ns, lines.append, "D", f"{RATE},{RATE}", cards)
+        return ns, now, lines
+
+    def test_basis_is_the_measured_regime_of_the_records(self):
+        self.assertEqual(BR.ADMIT_TRIM_BASIS, (TRIM_ENV, 1104))
+        # the same number the record boots logged: ceil(stated law 1024 + floor chunk 256 x 0.3091)
+        self.assertEqual(ET.flip_trim_thresholds(f"{RATE},{RATE}", 4096, 1, 1024), "1104,1104")
+
+    def test_measured_floor_under_the_basis_is_held_named(self):
+        ns, now, lines = self._int4ar_measured()
+        self.assertEqual(now, "1104,1104")
+        ln = [x for x in lines if "EXTEND-TRIM-FLIP" in x]
+        self.assertEqual(len(ln), 1, lines)
+        self.assertIn("rang0 nvml0: Kartengesetz 700 (MEASURED-D:700) -> 780; ADMIT-BASIS 1104 haelt", ln[0])
+        self.assertIn("rang1 nvml1: Kartengesetz 700 (MEASURED-D:700) -> 780; ADMIT-BASIS 1104 haelt", ln[0])
+        self.assertIn("neu messen", ln[0])
+
+    def test_review_example_admission_stays_over_near_oom(self):
+        """Review MUSS 1: 900 MiB driver free with 300 MiB wholly free cache, admission peak 522. At the written
+        threshold 1104 the admission trim returns the cache first: 1200 - 522 = 678 >= 400. Without the basis the
+        card-law threshold 780 does not trim at 900 and the admission lands at 900 - 522 = 378 < 400. RED there."""
+        _ns_, now, _ = self._int4ar_measured()
+        with mock.patch.dict(os.environ, {TRIM_ENV: now}, clear=False):
+            ET.reset_for_tests()
+            cuda = _Cuda(900, 300)
+            thr = ET.threshold_for(1, ET.thresholds())
+            ET.maybe_trim(cuda, 1, thr)
+        self.assertEqual(cuda.emptied, 1)
+        self.assertGreaterEqual(cuda.free - A_PEAK, NEAR_OOM)
+
+    def test_card_law_over_the_basis_still_raises(self):
+        """The basis is a floor, never a cap: a measured line 1300 still gives 1380 (the OOM direction of #201)."""
+        from flliper.srt.pdflip import launcher as L
+
+        ns, cards = _ns(), _int4ar_cards()
+        path = _store(self.tmp, [c.uuid for c in cards], tp=2)
+        lines = []
+        with mock.patch.object(L.corridor_budget, "floors_for_cards", _floors((1300, 700), "MEASURED-D", path)):
+            now = L._d_extend_flip_trim_env(ns, lines.append, "D", f"{RATE},{RATE}", cards)
+        self.assertEqual(now, "1380,1104")
+        ln = [x for x in lines if "EXTEND-TRIM-FLIP" in x]
+        self.assertEqual(len(ln), 1, lines)
+        self.assertIn("rang0 nvml0: Kartengesetz 1300 (MEASURED-D:1300) -> 1380 | rang1", ln[0])
+        self.assertIn("rang1 nvml1: Kartengesetz 700 (MEASURED-D:700) -> 780; ADMIT-BASIS 1104 haelt", ln[0])
+
+    def test_hand_value_and_never_trims_untouched(self):
+        """INT8 hand value 1200,1100,800 (the INT8 census' own regime) stays byte for byte; a rank without a rate
+        (0 = never trims) is not armed by the basis."""
+        ns, now, _ = self._int4ar_measured(env_d=f"{TRIM_ENV}=1200,800")
+        self.assertEqual(now, "1200,800")
+        self.assertEqual(BR.admit_trim_bound([0.0, 780.0, 1380.0]), [(0.0, False), (1104.0, True), (1380.0, False)])
+
+    def test_metal_values_unchanged(self):
+        """int4ar / duo today: card law UNMEASURED-FALLBACK 1024 -> 1104,1104, no ADMIT-BASIS line (nothing held)."""
+        from flliper.srt.pdflip import launcher as L
+
+        ns, cards = _ns(), _int4ar_cards()
+        lines = []
+        with mock.patch.object(L.corridor_budget, "floors_for_cards",
+                               _floors((1024, 1024), CG.FLOOR_SOURCE_FALLBACK, "")):
+            now = L._d_extend_flip_trim_env(ns, lines.append, "D", f"{RATE},{RATE}", cards)
+        self.assertEqual(now, "1104,1104")
+        self.assertFalse(any("ADMIT-BASIS" in x for x in lines), lines)
+
+
+# --------------------------------------------------------------------------
+# Review SOLL 2: the line is the rank's OWN card's by NVML UUID, not the floor at the rank's list index / NVML index.
+# duo with the 3080 on D rank 0 and the 5090 on D rank 1; the fake floor reader is keyed by UUID and answers in NVML
+# order (independent of the rank order), so an assignment by position or by NVML index reads the other card's floor.
+# --------------------------------------------------------------------------
+
+
+def _floors_by_uuid(by_uuid, source, store_path=""):
+    def fake(cards, group, user_reserve_mib=None):
+        return {c.uuid: CG.CorridorFloor(card_uuid=c.uuid, group="D", transient_mib=int(by_uuid[c.uuid]),
+                                         reserve_mib=0, source=source,
+                                         provenance=f"{store_path}#cards.{c.uuid}.activation_mib="
+                                                    f"{int(by_uuid[c.uuid])}MiB")
+                for c in sorted(cards, key=lambda c: c.nvml_index)}
+    return fake
+
+
+class PermutedCards(CustomTestCase):
+    @pytest.fixture(autouse=True)
+    def _tmp(self, tmp_path):
+        self.tmp = tmp_path
+
+    def _duo_swapped(self, by_uuid):
+        from flliper.srt.pdflip import launcher as L
+
+        cards = [L.Card(nvml_index=1, uuid=UUIDS[1], name="NVIDIA GeForce RTX 3080", total_mib=20480),  # D rank 0
+                 L.Card(nvml_index=0, uuid=UUIDS[0], name="NVIDIA GeForce RTX 5090", total_mib=32607)]  # D rank 1
+        path = _store(self.tmp, [c.uuid for c in cards], tp=2)
+        ns, lines = _ns(), []
+        with mock.patch.object(L.corridor_budget, "floors_for_cards", _floors_by_uuid(by_uuid, "MEASURED-D", path)):
+            now = L._d_extend_flip_trim_env(ns, lines.append, "D", f"{RATE},{RATE}", cards)
+        return now, lines
+
+    def test_floors_follow_the_uuid_not_the_order(self):
+        """Lines over the basis (5090 1300, 3080 1100): rank 0 (3080, nvml1) 1180, rank 1 (5090, nvml0) 1380."""
+        now, lines = self._duo_swapped({UUIDS[0]: 1300, UUIDS[1]: 1100})
+        self.assertEqual(now, "1180,1380")
+        self.assertTrue(any("rang0 nvml1: Kartengesetz 1100 (MEASURED-D:1100) -> 1180" in x for x in lines), lines)
+        self.assertTrue(any("rang1 nvml0: Kartengesetz 1300 (MEASURED-D:1300) -> 1380" in x for x in lines), lines)
+
+    def test_floors_follow_the_uuid_basis_released(self):
+        """The drei floors 767 (5090) / 701 (3080) under the basis, basis released: 781 on rank 0, 847 on rank 1."""
+        with mock.patch.object(BR, "ADMIT_TRIM_BASIS", (TRIM_ENV, 0)):
+            now, _ = self._duo_swapped({UUIDS[0]: 767, UUIDS[1]: 701})
+        self.assertEqual(now, "781,847")
 
 
 if __name__ == "__main__":

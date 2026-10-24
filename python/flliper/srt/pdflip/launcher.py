@@ -20627,7 +20627,9 @@ def _d_extend_flip_trim_env(ns, log, label: str, rtext: str,
     line is the rank's OWN card's (:func:`d_flip_trim_lines`, D rank -> card UUID from ``cards``), not the stated law
     for every rank: a MEASURED card whose line is under 1024 trims no earlier than its law needs, one over 1024 is no
     longer priced under its line (the OOM direction). Unmeasured / foreign-form / no cards: the stated law, named.
-    No reserve, no new term: the line, the floor chunk and the rate are the ones the vote itself uses. Dual layout /
+    Review MUSS 1 (ADMIT-BASIS): the written value is never under ``budget_rest.ADMIT_TRIM_BASIS`` (1104, the
+    threshold the admission records were measured under -- the admission trim reads this same list), named per rank,
+    until a re-measurement under the lower threshold replaces the records. No reserve, no new term: the line, the floor chunk and the rate are the ones the vote itself uses. Dual layout /
     P0 / Next Flash never reach this (they never reach :func:`_d_extend_flip_rate_env`'s armed branch)."""
     from flliper.srt.pdflip import extend_trim as _et
 
@@ -20635,9 +20637,15 @@ def _d_extend_flip_trim_env(ns, log, label: str, rtext: str,
     if n <= 0:
         return None
     lines, srcs = d_flip_trim_lines(ns, cards, n)
-    value = _et.flip_trim_thresholds(rtext, CHUNKED_PREFILL_TOKENS, 1, lines)
-    if not value:
+    law_value = _et.flip_trim_thresholds(rtext, CHUNKED_PREFILL_TOKENS, 1, lines)
+    if not law_value:
         return None
+    # #201 review MUSS 1 (ADMIT-BASIS): the same list is the admission trim's threshold, and the admission records
+    # (D_ADMIT_NEED_MIB, the duo non-booking) were measured with it at 1104 -- never WRITE a computed value under that
+    # basis (budget_rest.ADMIT_TRIM_BASIS; measured regime, not a reserve) until a re-measurement replaces it
+    _bound = _budget_rest.admit_trim_bound([float(x) for x in law_value.split(",")])
+    value = ",".join(str(int(v)) for v, _held in _bound)
+    _basis_name, _basis_mib = _budget_rest.ADMIT_TRIM_BASIS
     _env_d = getattr(ns, "env_d", "") or ""
     _have = parse_group_env(_env_d)
     # a value other than our own came from the user (a second solve pass sees its own write)
@@ -20648,7 +20656,11 @@ def _d_extend_flip_trim_env(ns, log, label: str, rtext: str,
     _rows = _et.floor_rows(CHUNKED_PREFILL_TOKENS, 1)
     _per = " | ".join(
         f"rang{r}" + (f" nvml{cards[r].nvml_index}" if cards is not None and len(list(cards)) == n else "")
-        + f": {srcs[r]} -> {value.split(',')[r]}" for r in range(n))
+        + f": {srcs[r]} -> {law_value.split(',')[r]}"
+        + (f"; {_budget_rest.ADMIT_TRIM_BASIS_MARKER} {_basis_mib} haelt (Admissions-Records unter {_basis_name}="
+           f"{_basis_mib} gemessen -- neu messen, bevor die Schwelle darunter darf) -> {value.split(',')[r]}"
+           if _bound[r][1] else "")
+        for r in range(n))
     log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_TRIM_FLIP_MARKER} {EXTEND_TRIM_ENV}={_now}"
         f"{' (aus --env-d gesetzt, unveraendert; berechnet ' + value + ')' if _given else ''} (je Rang ceil(Linie der "
         f"eigenen Karte + Bodenchunk {_rows} x Rate); darunter gibt D vor dem Extend die ganz freien Cache-Segmente an "
