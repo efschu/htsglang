@@ -826,6 +826,23 @@ _PDFLIP_CHUNK_ADMIT: Optional[bool] = None
 _PDFLIP_PARK_ON: Optional[bool] = None
 
 
+def _lifetime_load_back_terms(req) -> Tuple[object, object]:
+    """``(host_hit, load_back)`` for the lifetime refusal stamp (27B 24.10., SOLL R5/R7 reading aid).
+
+    The lifetime price charges ``extend = len(fill) - len(prefix_indices)``: ``prefix_indices`` is the
+    DEVICE prefix. A host-tier hit (handback store, L2, L3) is part of ``extend`` on purpose -- the
+    load-back writes those rows INTO the device pool at admission, so they occupy device KV exactly
+    like computed rows. int4ar ``_1023_223241`` pdflip-30-274: ``price=63008 extend=58911 prefix=0
+    uncached=1`` against ``available=42809`` was read as a mis-price; 58910 of the 58911 rows were a
+    host load-back (front: ``cached_device=0 cached_l2=17966 cached_l3=40529``) and the pool could not
+    take them. The stamp names both terms so ``extend - load_back`` (compute) and ``load_back`` (rows
+    the host read occupies) stand on the line. Observation only; never raises."""
+    try:
+        return int(getattr(req, "host_hit_length", 0) or 0), int(_pp_load_back_extent(req) or 0)
+    except Exception:  # noqa: BLE001 -- an instrument on the gate path never raises
+        return "?", "?"
+
+
 def _pdflip_chunk_admit() -> bool:
     """Punkt 2: per-chunk admission (group P, rides with the park). Read once."""
     global _PDFLIP_CHUNK_ADMIT
@@ -3178,6 +3195,11 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
+        # 27B 24.10. (SOLL R5/R7): `prefix_indices` is the DEVICE prefix. A host-tier hit (handback
+        # store / L2 / L3, `host_hit_length`, the load-back extent) stays IN this extend on purpose:
+        # the load-back writes those rows into the device pool at admission. Crediting it would admit
+        # rows the pool does not have (pdflip-30-274: 58910 load-back rows vs available=42809) -- the
+        # KV-OOM direction. The refusal stamp names host_hit/load_back (`_lifetime_load_back_terms`).
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -3256,11 +3278,12 @@ class PrefillAdder:
                 _gate = AddReqResult.NO_TOKEN
                 self._note_lifetime_refusal(req, total_tokens, _rem_total)
                 _gate_why = "lifetime"
+                _lb_host_hit, _lb_load_back = _lifetime_load_back_terms(req)
                 _gate_nums = dict(
                     price=int(total_tokens), budget=_rem_total,
                     born=int(born_input_tokens), extend=int(cand_extend_input_len),
                     max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
-                    prefix=prefix_len,
+                    prefix=prefix_len, host_hit=_lb_host_hit, load_back=_lb_load_back,
                 )
 
         if _gate is None and self.is_hybrid_swa:
@@ -3312,11 +3335,12 @@ class PrefillAdder:
                     self._note_lifetime_refusal(req, total_tokens, _rem_total)
                     self._pdflip_note_budget_parts(req, total_tokens, _rem_total)
                     _gate_why = "lifetime_locked"
+                    _lb_host_hit, _lb_load_back = _lifetime_load_back_terms(req)
                     _gate_nums = dict(
                         price=int(total_tokens), budget=_rem_total,
                         born=int(born_input_tokens), extend=int(cand_extend_input_len),
                         max_new=int(max_new), mamba_gap=int(mamba_gap_reserve),
-                        prefix=prefix_len,
+                        prefix=prefix_len, host_hit=_lb_host_hit, load_back=_lb_load_back,
                     )
 
             if _gate is None and self.is_hybrid_swa:
