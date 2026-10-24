@@ -150,7 +150,7 @@ class GroupEnvCarriesTheReserve(unittest.TestCase):
     def test_t5_mutant_group_without_reserve_is_red(self):
         """Mutant: build_env stops publishing the reserve to the group."""
         _check_group_env_carries_the_reserve()  # green on the real code
-        with mock.patch.object(launcher, "user_reserve_rank_env", lambda _d: {}):
+        with mock.patch.object(launcher, "user_reserve_rank_env", lambda *_a, **_k: {}):
             with self.assertRaises(AssertionError):
                 _check_group_env_carries_the_reserve()
 
