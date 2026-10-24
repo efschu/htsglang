@@ -1640,6 +1640,8 @@ def _pdflip_device_idle(sched) -> bool:
         return False
     if getattr(sched, "enable_overlap", False) and len(getattr(sched, "result_queue", ()) or ()):
         return False
+    if getattr(sched, "__dict__", {}).get(_pp_seat.DISPLACED_ATTR):
+        return False  # 27B-PP-SKIPOUT-1024 review S2: a displaced continuation still holds rows
     return getattr(sched, "chunked_req", None) is None
 
 
@@ -11329,12 +11331,19 @@ class Scheduler(
         executing that, not a park of its own choosing."""
         if not self.__dict__.get(_pp_seat.DISPLACED_ATTR):
             return 0
+        def _requeue(req):  # review S3: a live displaced request without rows -- no release, but back in the queue
+            req.reset_for_retract()
+            self._add_request_to_queue(req, is_retracted=True)
+            return True
+
         return _pp_seat.drain_displaced(
             self,
             lambda req: Scheduler._pdflip_give_back_continuation(
                 self, req, lane_park=getattr(req, "pdflip_lane_parked", False) is True,
                 clear_slot=False, follower=True,
             ),
+            abort=lambda req: Scheduler._pp_abort_displaced(self, req),
+            requeue=_requeue,
         )
 
     def _pdflip_defer_waiting_abort(self, recv_req) -> bool:
@@ -11490,6 +11499,30 @@ class Scheduler(
                 else "PP0's forwarded schedule no longer names it",
             )
 
+        Scheduler._pdflip_chunked_abort_release(self, req)
+
+        if _displaced_abort:
+            _pp_seat.forget_displaced(self, req)
+        if self.chunked_req is req:
+            self.chunked_req = None
+        self._pending_chunked_abort_req = None
+        self._pending_chunked_abort_delay = 0
+        # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
+        # every other chunked abort answers as before.
+        _reason = getattr(self, "_pending_chunked_abort_reason", None)
+        self._pending_chunked_abort_reason = None
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(rid=req.rid) if _reason is None else AbortReq(rid=req.rid, finished_reason=_reason), req
+        )
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _pdflip_chunked_abort_release(self, req) -> None:
+        """The chunked-abort teardown of one request (prepare_abort, the store
+        records, its rows WITHOUT a tree insert). One body for the slot's
+        chunked abort and a displaced continuation's (27B-PP-SKIPOUT-1024
+        review A1); the caller clears its own route and answers the tokenizer."""
+        from flliper.srt.pdflip import dual_old_instance as _q695
+
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
@@ -11508,20 +11541,28 @@ class Scheduler(
         ) and not req.kv_committed_freed:
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
-        if _displaced_abort:
-            _pp_seat.forget_displaced(self, req)
-        if self.chunked_req is req:
-            self.chunked_req = None
-        self._pending_chunked_abort_req = None
-        self._pending_chunked_abort_delay = 0
-        # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
-        # every other chunked abort answers as before.
-        _reason = getattr(self, "_pending_chunked_abort_reason", None)
-        self._pending_chunked_abort_reason = None
+    def _pp_abort_displaced(self, req) -> bool:
+        """27B-PP-SKIPOUT-1024 review A1: apply an abort recorded for a
+        displaced continuation (``pp_continuation_seat.mark_aborts``). PP0 holds
+        the same request in its waiting queue (PDFLIP-PARK) and aborts it there
+        at receipt, so it is never named again: the follower tears it down
+        instead of queueing a zombie. True = done."""
+        marked = getattr(req, _pp_seat.ABORT_ATTR, None) or (None,)
+        try:
+            Scheduler._pdflip_chunked_abort_release(self, req)
+        except Exception:  # noqa: BLE001 -- keep it listed and loud rather than lose it
+            logger.warning("PP-SLOT DISPLACED ABORT rid=%s: teardown raised, retried next step",
+                           getattr(req, "rid", "?"), exc_info=True)
+            return False
+        _reason = marked[0]
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(rid=req.rid) if _reason is None else AbortReq(rid=req.rid, finished_reason=_reason), req
         )
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        logger.info(
+            "PP-SLOT DISPLACED ABORT applied rid=%s pp_rank=%s: rows released without insert, no requeue "
+            "(27B-PP-SKIPOUT-1024 review A1)", req.rid, getattr(getattr(self, "ps", None), "pp_rank", "?"),
+        )
+        return True
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -20052,7 +20093,7 @@ class Scheduler(
             # already let go; it leaves the slot here, its rows go back at the
             # head of a later step (`_pp_drain_displaced_continuations`).
             if getattr(adder, "displaced_resident_continuation", False):
-                _pp_seat.displace_resident(self, adder.new_chunked_req)
+                _pp_seat.displace_resident(self, adder.new_chunked_req, can_run_list=can_run_list)  # review A2: never a seated one
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
@@ -20086,6 +20127,14 @@ class Scheduler(
                 tails=self.anchor_tails,
                 pp_rank=getattr(self.ps, "pp_rank", 0),
             )
+
+        # 27B-PP-SKIPOUT-1024 review S4: every member running a NOT-LAST chunk is
+        # tracked (chunked_req or an anchor tail) -- the watcher the old slot
+        # question in contains_last_prefill_chunk held by accident, stated (PP only).
+        _pp_seat.assert_no_unannounced_middle_chunk(
+            self, can_run_list, self.chunked_req, getattr(self, "anchor_tails", None) or (),
+            adder._told_last_chunk,
+        )
 
         _wk_t2 = time.perf_counter()  # admission done
         # DUAL-TP3PP3 stage 2 (pdflip/dual_decode_join.py, FLLIPER_PDFLIP_DUAL_DECODE_JOIN,
@@ -25267,6 +25316,13 @@ class Scheduler(
                                 chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
         # fnFL2 H42: an END-ANCHOR tail is finished with abort after its final
         # 1-grain forward (the running-request route), on every rank alike.
+        # 27B-PP-SKIPOUT-1024 review A1: a continuation displaced from the slot
+        # is in no queue, slot or batch -- every scan below misses it, and the
+        # #1180-W hold may return before them. Marked here (before that return),
+        # applied by the displaced drain once no launched chunk still writes.
+        _pp_seat.mark_aborts(
+            self, recv_req.rid, recv_req.abort_all, getattr(recv_req, "finished_reason", None)
+        )
         for _tail in _anchor_tails.abort_targets(
             getattr(self, "anchor_tails", None) or (),
             rid=recv_req.rid,

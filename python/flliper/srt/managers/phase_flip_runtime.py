@@ -1336,6 +1336,13 @@ def _live_reqs(scheduler) -> List:
         if id(tail) not in seen:
             seen.add(id(tail))
             out.append(tail)
+    # 27B-PP-SKIPOUT-1024 review S2: a continuation displaced from the slot on
+    # PP0's word holds committed KV and a mamba slot until the displaced drain
+    # gives them back -- in no batch, no slot, no queue: the same route again.
+    for req in getattr(scheduler, "__dict__", {}).get("_pp_displaced_continuations") or ():
+        if id(req) not in seen:
+            seen.add(id(req))
+            out.append(req)
     return out
 
 
@@ -2164,6 +2171,11 @@ def consume_retracted_from_live_universe(scheduler, reqs) -> int:
         keep = [t for t in tails if id(t) not in targets]
         retired += len(tails) - len(keep)
         scheduler.anchor_tails = keep
+    disp = getattr(scheduler, "__dict__", {}).get("_pp_displaced_continuations")
+    if disp:  # 27B-PP-SKIPOUT-1024 review S2: the displaced route, retired the same way
+        keep = [r for r in disp if id(r) not in targets]
+        retired += len(disp) - len(keep)
+        disp[:] = keep
     return retired
 
 

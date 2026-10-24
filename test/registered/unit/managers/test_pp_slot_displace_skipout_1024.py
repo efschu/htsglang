@@ -227,13 +227,15 @@ class Stage:
         # scheduler.py, right before `assert self.chunked_req is None`
         if adder.new_chunked_req is not None:
             if getattr(adder, "displaced_resident_continuation", False):
-                seat.displace_resident(self, adder.new_chunked_req)
+                seat.displace_resident(self, adder.new_chunked_req, can_run_list=can)
                 self.displaces += 1
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
         if not can:
             return None, OrderedDict()
         self._acct(self, can)
+        if seat is not None:  # review S4, as the scheduler calls it right after the tail adoption
+            seat.assert_no_unannounced_middle_chunk(self, can, self.chunked_req, (), adder._told_last_chunk)
         self.waiting = [r for r in self.waiting if not any(r is x for x in can)]
         batch = SimpleNamespace(
             reqs=can,
@@ -399,7 +401,7 @@ class TestDisplaceAndDrain:
         c, x = _req("C", 10), _req("X", 10)
         s = _ns_stage(c)
         with caplog.at_level("INFO", logger=seat.__name__):
-            assert seat.displace_resident(s, x) is c
+            assert seat.displace_resident(s, x, can_run_list=[x]) is c
         assert s.chunked_req is None and seat.displaced(s) == [c]
         assert any("PP-SLOT DISPLACE n=1 pp_rank=1 resident=C" in m for m in caplog.messages)
 
@@ -407,7 +409,7 @@ class TestDisplaceAndDrain:
         x = _req("X", 10)
         for chunked in (None, x):
             with pytest.raises(RuntimeError, match="DISPLACE WITHOUT A RESIDENT"):
-                seat.displace_resident(_ns_stage(chunked), x)
+                seat.displace_resident(_ns_stage(chunked), x, can_run_list=[x])
 
     def test_drain_waits_for_the_launched_chunk(self):
         c = _req("C", 10)
@@ -496,7 +498,7 @@ class TestDisplacedAbort:
 class TestSourcePin:
     def test_the_scheduler_displaces_right_before_its_assert(self):
         src = textwrap.dedent(inspect.getsource(sch.Scheduler._get_new_batch_prefill_raw))
-        i = src.index("_pp_seat.displace_resident(self, adder.new_chunked_req)")
+        i = src.index("_pp_seat.displace_resident(self, adder.new_chunked_req, can_run_list=can_run_list)")
         j = src.index("assert self.chunked_req is None", i)
         assert "displaced_resident_continuation" in src[i - 200: i]
         assert j - i < 200
@@ -505,3 +507,203 @@ class TestSourcePin:
         src = inspect.getsource(sp.PrefillAdder._add_scheduled_req)
         assert 'note_second_continuation_refused(req, "_add_scheduled_req")' not in src
         assert 'self._mint_chunked(req, "_add_scheduled_req/displace")' in src
+
+
+# ======================================================================================== review conditions (af40b9561f)
+from flliper.srt.managers.io_struct import AbortReq  # noqa: E402
+
+
+class _AbortStage:
+    """A follower stage as ``_abort_request_now`` / ``process_pending_pdflip_park`` read it (the fix5 stand-in shape)."""
+
+    def __init__(self, pp_rank=1, pp_size=2):
+        self.ps = SimpleNamespace(pp_rank=pp_rank, pp_size=pp_size, tp_size=1)
+        self.enable_hicache_storage = False
+        self.waiting_queue = []
+        self.chunked_req = None
+        self.anchor_tails = ()
+        self.ipc_channels = MagicMock()
+        self.disaggregation_mode = None
+        self.grammar_manager = MagicMock()
+        self.running_mbs = []
+        self.mbs = []
+        self.kv_session_offload = None
+        self._pdflip_intake_watch = None
+        self._pending_chunked_abort_req = None
+        self.tree_cache = SimpleNamespace(supports_mamba=lambda: False, release_aborted_request=lambda rid: None)
+        self.queued = []
+
+    def _pdflip_abort_dormant_hold(self, recv_req):
+        pass
+
+    def _pdflip_d_park_abort(self, recv_req):
+        pass
+
+    def _add_request_to_queue(self, req, is_retracted=False):
+        self.queued.append((req.rid, is_retracted))
+        self.waiting_queue.append(req)
+
+
+def _live(rid, n=40, prefix=25):
+    r = _req(rid, n, prefix=prefix)
+    r.kv_committed_freed = False
+    r.reset_for_retract = MagicMock()
+    r.time_stats = SimpleNamespace(trace_ctx=SimpleNamespace(abort=lambda **k: None), wait_queue_entry_time=0)
+    return r
+
+
+@pytest.fixture
+def _released(monkeypatch):
+    log = []
+    monkeypatch.setattr(sch, "release_kv_cache", lambda req, tree, is_insert=True: log.append((req.rid, is_insert)))
+    monkeypatch.setattr(sch, "prepare_abort", lambda req, why: setattr(req, "aborted_why", why))
+    return log
+
+
+def _displaced_stage():
+    st = _AbortStage()
+    c, x = _live("pdflip-3-7"), _live("pdflip-3-8")
+    st.chunked_req = c
+    seat.displace_resident(st, x, can_run_list=[x])
+    st.chunked_req = x  # the scheduler adopts the minted continuation
+    return st, c, x
+
+
+def _sent_aborts(st):
+    return [call.args[0].rid for call in st.ipc_channels.send_to_tokenizer.send_output.call_args_list
+            if isinstance(call.args[0], AbortReq)]
+
+
+class TestA1AbortAfterDisplacement:
+    """MUSS A1: an AbortReq that reaches a follower AFTER the displacement goes through the REAL ``_abort_request_now``; the
+    continuation is torn down at the next head of step -- not queued as a zombie PP0 never names."""
+
+    def test_the_real_abort_route_reaches_the_displaced_continuation(self, _released):
+        st, c, x = _displaced_stage()
+        sch.Scheduler._abort_request_now(st, AbortReq(rid="pdflip-3-7"))
+        assert st.waiting_queue == [] and st.chunked_req is x, "the abort touched nothing else"
+        sch.Scheduler.process_pending_pdflip_park(st)  # the head of the next step: the displaced drain
+        assert st.queued == [], "no zombie in the follower's waiting queue"
+        assert seat.displaced(st) == []
+        assert _released == [("pdflip-3-7", False)], "rows released WITHOUT a tree insert (an abort, not a park)"
+        assert _sent_aborts(st) == ["pdflip-3-7"] and c.aborted_why == "Aborted"
+        assert st.chunked_req is x
+
+    def test_abort_all_reaches_it_too(self, _released):
+        st, c, _x = _displaced_stage()
+        sch.Scheduler._abort_request_now(st, AbortReq(abort_all=True))
+        sch.Scheduler.process_pending_pdflip_park(st)
+        assert st.queued == [] and seat.displaced(st) == []
+        assert "pdflip-3-7" in _sent_aborts(st)
+
+    def test_the_abort_waits_for_a_launched_chunk(self, _released):
+        st, c, _x = _displaced_stage()
+        c.inflight_middle_chunks = 1
+        sch.Scheduler._abort_request_now(st, AbortReq(rid="pdflip-3-7"))
+        sch.Scheduler.process_pending_pdflip_park(st)
+        assert seat.displaced(st) == [c] and _released == [] and st.queued == []
+        c.inflight_middle_chunks = 0
+        sch.Scheduler.process_pending_pdflip_park(st)
+        assert seat.displaced(st) == [] and _released == [("pdflip-3-7", False)] and st.queued == []
+
+    def test_an_abort_for_another_rid_leaves_it_to_the_give_back(self, _released):
+        st, c, _x = _displaced_stage()
+        sch.Scheduler._abort_request_now(st, AbortReq(rid="pdflip-9-9"))
+        sch.Scheduler.process_pending_pdflip_park(st)
+        assert st.queued == [("pdflip-3-7", True)] and _released == [("pdflip-3-7", True)]
+
+
+class TestA2SeatedResident:
+    """MUSS A2: the resident runs a chunk in this very batch (#996 fallback / H42 tail corners): stop by name, never displace."""
+
+    def test_a_seated_resident_is_a_named_stop(self):
+        c, x = _req("C", 10), _req("X", 10)
+        s = _ns_stage(c)
+        with pytest.raises(RuntimeError, match="DISPLACE OF A SEATED RESIDENT: rid=C .* mints rid=X"):
+            seat.displace_resident(s, x, can_run_list=[c, x])
+        assert s.chunked_req is c and seat.displaced(s) == [], "nothing moved"
+
+    def test_the_scheduler_passes_its_batch(self):
+        src = inspect.getsource(sch.Scheduler._get_new_batch_prefill_raw)
+        assert "displace_resident(self, adder.new_chunked_req, can_run_list=can_run_list)" in src
+
+
+class TestA3RestoredToTheSlot:
+    """MUSS A3: an own-void restore (``chunked_req = chunked_before``) puts the displaced continuation back into the slot while it
+    is still listed -- the drain must leave it alone (no give-back, no reset: the stash reads its extend_range) and unlist it."""
+
+    def test_restore_then_head_of_step_leaves_it_in_the_slot(self, _released, caplog):
+        st, c, _x = _displaced_stage()
+        c.extend_range = Range(22015, 25157)
+        st.chunked_req = c  # the void restore of this pass
+        with caplog.at_level("WARNING", logger=seat.__name__):
+            sch.Scheduler.process_pending_pdflip_park(st)
+        assert st.chunked_req is c and seat.displaced(st) == []
+        assert _released == [] and st.queued == []
+        c.reset_for_retract.assert_not_called()
+        assert c.extend_range == Range(22015, 25157), "the head-of-step stash still reads it (instr19)"
+        assert any("PP-SLOT DISPLACE UNDONE rid=pdflip-3-7" in m for m in caplog.messages)
+
+    def test_an_abort_recorded_while_displaced_moves_to_the_slot(self, _released):
+        st, c, _x = _displaced_stage()
+        sch.Scheduler._abort_request_now(st, AbortReq(rid="pdflip-3-7"))
+        st.chunked_req = c
+        sch.Scheduler._pp_drain_displaced_continuations(st)
+        assert st._pending_chunked_abort_req is c and st._pending_chunked_abort_delay == 0
+        assert seat.displaced(st) == [] and _released == []
+
+
+class TestS2ResidencyAuthorities:
+    def test_live_reqs_and_the_retirement_see_the_list(self):
+        from flliper.srt.managers import phase_flip_runtime as pfr
+
+        st, c, x = _displaced_stage()
+        live = pfr._live_reqs(st)
+        assert any(r is c for r in live) and any(r is x for r in live)
+        assert pfr.consume_retracted_from_live_universe(st, [c]) >= 1
+        assert seat.displaced(st) == []
+
+    def test_the_device_is_not_idle_while_a_displaced_continuation_holds_rows(self):
+        st, _c, _x = _displaced_stage()
+        st.chunked_req = None
+        assert sch._pdflip_device_idle(st) is False
+        seat.displaced(st).clear()
+        assert sch._pdflip_device_idle(st) is True
+
+
+class TestS3NoSilentLoss:
+    def test_a_live_request_without_rows_is_queued_loudly(self, _released, caplog):
+        st, c, _x = _displaced_stage()
+        c.req_pool_idx = None
+        with caplog.at_level("WARNING", logger=seat.__name__):
+            sch.Scheduler._pp_drain_displaced_continuations(st)
+        assert st.queued == [("pdflip-3-7", True)] and _released == [] and seat.displaced(st) == []
+        assert any("PP-SLOT DISPLACED WITHOUT ROWS rid=pdflip-3-7" in m for m in caplog.messages)
+
+
+class TestS4UnannouncedMiddleChunk:
+    def _sched(self, pp_size=2):
+        return SimpleNamespace(ps=SimpleNamespace(pp_rank=1, pp_size=pp_size))
+
+    def test_an_untracked_not_last_chunk_is_a_named_stop(self):
+        x = _req("X", 100)
+        x.extend_range = Range(0, 40)
+        with pytest.raises(RuntimeError, match="UNANNOUNCED MIDDLE CHUNK rid=X"):
+            seat.assert_no_unannounced_middle_chunk(self._sched(), [x], None, (), lambda r: None)
+        with pytest.raises(RuntimeError, match="UNANNOUNCED MIDDLE CHUNK rid=X"):
+            seat.assert_no_unannounced_middle_chunk(self._sched(), [x], None, (), lambda r: False)
+
+    def test_tracked_last_or_non_pp_is_quiet(self):
+        x, t, y = _req("X", 100), _req("T", 100), _req("Y", 100)
+        x.extend_range, t.extend_range, y.extend_range = Range(0, 40), Range(0, 99), Range(60, 100)
+        ok = seat.assert_no_unannounced_middle_chunk
+        ok(self._sched(), [x], x, (), lambda r: None)  # the chunked request
+        ok(self._sched(), [t], None, (t,), lambda r: None)  # an anchor tail
+        ok(self._sched(), [y], None, (), lambda r: None)  # a last chunk by the local fill
+        ok(self._sched(), [x], None, (), lambda r: True)  # #996: the carried verdict says last (follower fill longer)
+        ok(self._sched(pp_size=1), [x], None, (), lambda r: None)  # no PP: no skip, no hang direction
+
+    def test_the_batch_builder_calls_it(self):
+        src = inspect.getsource(sch.Scheduler._get_new_batch_prefill_raw)
+        i = src.index("_pp_seat.assert_no_unannounced_middle_chunk(")
+        assert src.index("_anchor_tails.log_pass(") < i < src.index("_wk_t2 = time.perf_counter()")
