@@ -74,4 +74,8 @@ def test_the_adder_passes_the_load_back_extent():
 
     src = open(sp.__file__).read()
     i = src.index("chunk_admit_tokens as _cat")
-    assert "load_back=int(_pp_load_back_extent(req) or 0)" in src[i:i + 600]
+    # D-PREFIX-PRICE #215 (rc42b seam): the load-back extent is still passed whole; only the locked device rows the
+    # load-back maps (``dev_gap``, already on the device) leave it -- and the extend -- alike, never below zero.
+    win = src[i:i + 600]
+    assert "load_back=max(0, int(_pp_load_back_extent(req) or 0) - dev_gap)" in win
+    assert "_cat(cand_extend_input_len - dev_gap, self.rem_chunk_tokens," in win
