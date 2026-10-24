@@ -13750,6 +13750,12 @@ class Front:
                 _wn.clear()
         _unc = int(uncached) if uncached is not None else 0
         _x = int(x_set) if x_set else int(self.tp_prefill_max_tokens)
+        if not getattr(self, "dual_layout", False):
+            # SHORT-NOWAIT-1024 (#234, SOLL R2): a SHORT the set released to D as kurz on its re-probed number -- its line is
+            # written on that number (the arrival's was halb)
+            _kn = (self._set_st().get("kurz_now") or {}).pop(rid, None)
+            if _kn is not None:
+                _unc, _x = int(_kn[0]), int(_kn[1])
         # EZ-S1: a MEASURE_ON_D request has no number (``_unc`` 0 is only the ROUTE to D's admission): the front does not
         # write ``D_NOW`` with a member ``u=0`` for it -- that line would be an R2 claim on a number nobody measured.
         # Its record is the ``DECISION kind=measure`` of the arrival and D's report after it.
@@ -16614,6 +16620,9 @@ class Front:
                 members, sv, kw = ev
         if sv.verdict in Front.REPROBE_VERDICTS and not Front._set_reprobe_gate(
                 self, [m.rid for m in members], "set-verdict", sv.verdict):
+            # SHORT-NOWAIT-1024 (#234, SOLL R2): a flip still waiting for D's current numbers is not decided -- a SHORT kurz on
+            # its own figure does not wait for it (a fresh kurz arrival does not either, ``_set_flip_foreseeable``)
+            Front._set_kurz_shorts_now(self, st, members, kw, live_q, now, "reprobe-hold")
             return "hold"  # S63 F1: the verdict is made again on D's current numbers once they land
         st["seen"] = len(members)
         _pu = st.get("urgent")
@@ -16626,6 +16635,11 @@ class Front:
                         _prio_age.MARK_URGENT, _pu.rid, Front._prio_lane(self, _pu), kw["waited"], kw["t_half"],
                         self.epoch)
         if sv.verdict == phase_policy.V_COLLECT:
+            if not Front._r2_flip_held(self):
+                # SHORT-NOWAIT-1024 (#234, SOLL R2 "auch während ein Set sammelt"): the set collects -- a SHORT kurz on its own
+                # figure goes to D NOW, not with the set's verdict. A COLLECT that is the R2 hold of a DECIDED flip
+                # (R4OVER-1024) is no collecting set: the SHORT rides that flip (R1a), as a fresh kurz arrival does
+                Front._set_kurz_shorts_now(self, st, members, kw, live_q, now, "collect")
             key = (st["set_id"], tuple(m.rid for m in members))
             if st["logged"] != key:
                 st["logged"] = key
@@ -16697,6 +16711,54 @@ class Front:
         _keep_shorts = {r: t for r, t in st["shorts"].items() if r in (st.get("rider_hold") or {})}
         st.update(shorts=_keep_shorts, t_open=None, set_id=st["set_id"] + 1, seen=0, logged=None)
         return route
+
+    def _set_kurz_shorts_now(self, st: dict, members: Sequence["phase_policy.SetMember"], kw: dict,
+                             live_q: List["Pending"], now: float, site: str) -> frozenset:
+        """SHORT-NOWAIT-1024 (#234; SOLL R2 verbatim "u < halbX: sofort auf D prefillen, keine Wartezeit, auch während ein Set
+        sammelt. Nie ein Flip für einen kurzen Request"; R6k, R11): a SHORT in ``st["shorts"]`` whose OWN figure is kurz at
+        its own X -- a halb arrival the S63 re-probe moved under halbX, or a rider whose re-probed rest is kurz -- is released to
+        D at once while the set collects (or while a flip verdict still waits for D's numbers); before, it waited on its seat
+        path for the set's verdict (up to T_halb). Exactly :func:`phase_policy.set_riders`' ``kurz_left_out`` (the R2 own-figure
+        filter of ``decide``), so the verdict and this release stand on ONE presence set.
+
+        NOT released (planner decision 24.10., variant (a)): a RIDER -- kurz only on its R1u rest behind an anchor not computed
+        yet, its own figure is not kurz -- is no R2 case; it stays a member (rider) of the set, and a rider whose anchor is a
+        kurz SHORT released here waits behind that D anchor (``_rider_hold_begin``, the MUSS-1 mechanism; R1/R7). A SHORT already
+        waiting behind its anchor (``rider_hold``) stays there.
+
+        The released SHORT went to D as kurz: its class is noted for R6k (its running D prefill stays on D, its rest is never in
+        S) and for the R2 grant hold (a later flip waits for its prefill); its tokens are booked (X-SUM-PRICE) like every D
+        release. Its seat path writes the ``D_NOW`` line on this number (``kurz_now``). The front decides (R11)."""
+        if not st["shorts"]:
+            return frozenset()
+        frac = kw["frac"]
+        _xc = int(kw.get("x_cls") or kw.get("x_tok") or 0)
+        keep, out, riders = phase_policy.set_riders(members, _xc, frac)
+        held = st.get("rider_hold") or {}
+        go = [r for r in out if r in st["shorts"] and r not in held]
+        if not go:
+            return frozenset()
+        busy = envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get()
+        for rid in go:
+            tup = st["shorts"].pop(rid)
+            u = int(tup[1])
+            xo = int(tup[2]) if len(tup) > 2 and tup[2] else int(self.tp_prefill_max_tokens)
+            hx = phase_policy.half_x_of(xo, frac)
+            st["released"][rid] = "D"
+            st.setdefault("kurz_now", {})[rid] = (u, xo)
+            if busy:
+                self._d_pf_book().grant(rid=rid, tokens=u, now=now)  # X-SUM-PRICE
+            Front._r6k_note_class(self, rid, phase_policy.CLASS_KURZ, "set_short_r2", hx)   # SOLL R6k + the R2 grant hold
+            self.counters["set_short_kurz_now"] += 1
+            logger.info("PDFLIP SET-SHORT-KURZ-NOW rid=%s u=%d X=%d halfX=%d site=%s waited_s=%.2f set=%d epoch=%d -- a SHORT kurz "
+                        "on its own figure goes to D now, not with the set's verdict (SOLL R2: \"sofort auf D ... auch während ein "
+                        "Set sammelt\"; R6k: its running D prefill stays on D)", rid, u, xo, hx, site,
+                        max(0.0, float(now) - float(tup[0])), int(st.get("set_id", 0)), int(getattr(self, "epoch", 0)))
+        gone = frozenset(go)
+        behind = [m for m in keep if m.rid in riders and m.anchor in gone]
+        if behind:
+            Front._rider_hold_begin(self, st, behind, live_q, now)   # variant (a): the rider waits behind its kurz D anchor
+        return gone
 
     # -- SIBLING-U-1024 review MUSS-1 / SOLL-1: a RIDER waits behind its D anchor (planner decision 24.10., variant (a)) ------
     @staticmethod
