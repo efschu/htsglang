@@ -22725,6 +22725,19 @@ class Scheduler(
                     " -- B1 NONBLOCK: issued, not joined here; the sleep leg drains them "
                     "before its reset" if _b1_nowait else "")
         _fsub.mark("sweep")
+        if (tp_group_verdict or sleep_group_verdict) and self.enable_hierarchical_cache:
+            # PARK-REARM-1024 (auftrag #203, parts 1+2): the group-agreed re-arm of the park anchors a full mamba arena
+            # refused -- every rank of the group, here, in the same pass (the idle verdict below posts its own
+            # collective at the same point under the same gate); the tree's gate (switch, pure TP sharing the slot,
+            # PP off) is rank-uniform. Never raises.
+            _prr = getattr(self.tree_cache, "pdflip_park_rearm_group", None)
+            _pp1 = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1) <= 1
+            if callable(_prr) and _pp1:
+                try:
+                    _prr(busy=(not self.running_batch.is_empty()) or self.chunked_req is not None
+                         or bool(getattr(self, "anchor_tails", None)))
+                except Exception:  # noqa: BLE001 - a raise inside a collective sequence is named, never the flush
+                    logger.warning("PDFLIP PARK-REARM pass raised", exc_info=True)
         # QUIESCE-LOADBACK-1023 (NF rc36p ..._1023_215911, D epoch 4): the vote
         # is about the group NOW -- a finished load-back ack counts as finished.
         # loading_check runs only in a planned prefill pass, and a parked D plans

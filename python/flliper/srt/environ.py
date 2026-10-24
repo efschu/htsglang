@@ -3217,6 +3217,13 @@ class Envs:
     # END anchor behind it is not cut off by ``parent_unbacked``. Acts only on
     # nodes marked by ``park_running``; no park = byte for byte as before.
     FLLIPER_PDFLIP_PARK_END_ANCHOR_FIRST = EnvBool(True)
+    # PARK-REARM-1024 (auftrag #203, 27B rc39a 1024_080355 08:17:01: mamba arena 112/112, park END anchors refused,
+    # the W65 skip left them un-backed on every rank, the reset dropped them): the park anchors a full arena refused
+    # are secured again, group-agreed, at every group-verdict flush of a pure TP group sharing the mamba slot --
+    # free room re-arms them, else every rank spills the SAME agreed L3-secured victim and then claims
+    # (pdflip/park_anchor_rearm.py); single rank / Form A host: the dropped chain intermediate is re-armed
+    # rank-locally once a slot is free. 0 = the old W65 skip and "given up on purpose, not retried".
+    FLLIPER_PDFLIP_PARK_ANCHOR_REARM = EnvBool(True)
     # AUX-HOST-LAW (NF h17 38c6d40239, D TP0 15:51:02, "node 248/243/251
     # mamba host present but Full.host_value=None" killed D from on_idle):
     # construction, never repair -- the Full host copy leaving a node takes its
