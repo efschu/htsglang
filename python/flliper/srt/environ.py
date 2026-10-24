@@ -2650,6 +2650,14 @@ class Envs:
     # T_halb, the half flip time in seconds -- how long a halb/big request waits for company while D decodes.
     # Never computed, only reported against the measured p90s (HALF-FLIP-CHECK, R10). 0 = no wait (decide at once).
     FLLIPER_PDFLIP_HALF_FLIP_S = EnvFloat(4.5)
+    # SIBLING-U-1024 review MUSS-1 (planner decision 24.10., variant (a); SOLL R1/R2/R7, R1a, R11): a sibling RIDER (kurz only
+    # on its rest behind an anchor of its set) is kurz only AFTER the anchor is computed. On a D verdict of its set it is NOT
+    # released with the anchor in the same tick: it waits behind its D anchor (no member, no trigger, no S share) until the
+    # anchor's d_pf_book row is closed -- then the S63 re-probe reads its real rest -- or the anchor is gone (classed on its
+    # own figure at once). The wait is bounded by T_halb (FLLIPER_PDFLIP_HALF_FLIP_S; no number of its own), then the own
+    # figure classes it. Line 'PDFLIP SIBLING-RIDER-WAIT'. New feature -> default ON; 0 = the rider is released to D with its
+    # anchor (the pre-review behaviour, named once per set by 'PDFLIP SIBLING-RIDER-WAIT off').
+    FLLIPER_PDFLIP_SIBLING_RIDER_WAIT = EnvBool(True)
     # SET SCHEDULER (SOLL v2 section 2): F_halb, halbX = F_halb x X(depth). A request with halbX <= uncached < X is
     # "halb" (collects, R3); below it is "kurz" (D at once, R2).
     FLLIPER_PDFLIP_HALF_X_FRAC = EnvFloat(0.5)

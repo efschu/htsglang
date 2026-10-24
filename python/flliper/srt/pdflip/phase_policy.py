@@ -415,6 +415,8 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
         for p in queue:
             if getattr(p, "measure_reoffer", False):
                 continue      # S2b: D measures it (MEASURE barrier): its price is no number yet -- never a P trigger
+            if getattr(p, "sibling_hold", ""):
+                continue      # SIBLING-U-1024 MUSS-1: a rider waits behind its D anchor -- no P trigger (R2/R7)
             _xo = int(getattr(p, "x_set", 0) or 0) or int(x_tokens)
             if needs_p_class(int(getattr(p, "est_uncached", 0) or 0), _xo,
                              skip_leg1=bool(getattr(p, "skip_leg1", False)),
@@ -425,6 +427,8 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
                 return p
         return None
     for p in queue:
+        if getattr(p, "sibling_hold", ""):
+            continue          # SIBLING-U-1024 MUSS-1: a rider waits behind its D anchor -- no P trigger (R2/R7)
         # EZ-S1 review B1: a MEASURE returnee D measured under X (kurz/halb) is not "P-only by the state requeued" -- it is
         # executed by what D measured (a halb member of the set, R3; a kurz one goes back to D, R2); over X it needs P as ever
         _xr = int(getattr(p, "x_requeues", 0) or 0)
@@ -668,8 +672,10 @@ def sibling_riders(members: Sequence[SetMember], x_class: int, half_frac: float)
     Request dazukommt", R1a, R1u): the rids of the members that are KURZ on their rest behind an anchor in the set while
     their own figure is not kurz. Such a member is no trigger (no R4 company, not big) and its rest is NOT in S (R2 "nie
     ein Flip fuer einen kurzen Request", R3 "halbX <= u < X kommt ins Set": a kurz request is no S-counting member --
-    planner decision 24.10.; R1u's dedupe stays for halb/big members), but it stays in the set and rides its verdict: it cannot go to D at once (R2) because on D, before its anchor is computed, its u is the
-    own figure (4677 > X in the metal case) -- its rest exists only behind the anchor. Anchors must be members of
+    planner decision 24.10.; R1u's dedupe stays for halb/big members), but it stays in the set and rides a FLIP verdict (R1a).
+    It cannot go to D with its anchor (R2) because on D, before its anchor is computed, its u is the own figure (4677 > X in
+    the metal case) -- its rest exists only behind the anchor: on a D verdict it waits behind the D anchor
+    (:func:`rider_hold_step`, review MUSS-1 / planner variant (a)). Anchors must be members of
     ``members`` (a running D prefill is no anchor here: its overlap stays in the rest as before)."""
     present = {m.rid for m in members}
     out = set()
@@ -778,6 +784,60 @@ class SetDecision:
     kurz_left_out: Tuple[str, ...]
 
 
+def set_keep(members: Sequence[SetMember], x_class: int, half_frac: float) -> Tuple[List[SetMember], List[str]]:
+    """``(keep, kurz_left_out)``: the R2 own-figure filter of :func:`decide` -- a member kurz on its OWN figure (at ITS X, not
+    p_only) is no member (R2); a sibling kurz only on its rest (SIBLING-U-1024) stays as a rider, because its anchor must stay
+    in the set for that, so the own-figure filter comes first. SIBLING-U-1024 review SOLL-2: the ONE presence set -- the
+    front's ``SET-VERDICT`` line and its rider hold class against exactly these members, as :func:`decide` does (an
+    instrument that classed against all members could name a rider the verdict did not have)."""
+    keep: List[SetMember] = []
+    out: List[str] = []
+    for m in members:
+        if classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or int(x_class), half_frac, m.p_only) == CLASS_KURZ:
+            out.append(m.rid)
+            continue
+        keep.append(m)
+    return keep, out
+
+
+#: SIBLING-U-1024 review MUSS-1 (planner decision 24.10., variant (a)): the outcomes of one look at a rider held behind its
+#: D anchor (:func:`rider_hold_step`)
+RIDER_HOLD = "hold"
+RIDER_RELEASE_REST = "release_rest"   # the anchor's D prefill is over: the S63 re-probe reads the rider's real rest
+RIDER_RELEASE_OWN = "release_own"     # the anchor is gone / the bound ran out: the rider is classed on its own figure
+#: the anchor states the front reads (``Front._rider_anchor_state``)
+ANCHOR_PENDING = "pending"   # handed to D, its D prefill not over (queued for D, in D's line, an open d_pf_book row)
+ANCHOR_DONE = "done"         # its D prefill is over: D holds it (it decodes) -- the shared prefix is computed on D
+ANCHOR_GONE = "gone"         # neither: aborted, client gone, parked, rerouted, dead
+
+
+def rider_hold_step(anchor_state: str, waited_s: float, bound_s: float) -> Tuple[str, str]:
+    """SIBLING-U-1024 review MUSS-1 / SOLL-1, planner decision 24.10. variant (a) (SOLL R1/R2/R7, R1a, R11): a RIDER (kurz on
+    its rest only behind its anchor, :func:`sibling_riders`) is kurz only AFTER the anchor is computed -- before that its D
+    figure is its own one. So a D verdict of its set does NOT release it in the same tick: it waits behind its D anchor
+    (no member, no trigger, no S share, no D release) and this pure step says when the wait ends:
+
+    * anchor ``done`` (its d_pf_book row closed, D holds it) -> ``release_rest``: the S63 re-probe reads the rider's real
+      rest (kurz -> R2 D at once; else the ordinary classes R3/R4);
+    * anchor ``gone`` (abort, park, death, reroute) -> ``release_own`` at once: classed on its own figure (R3/R4) -- a
+      bound, no hang;
+    * the wait reached ``bound_s`` (``FLLIPER_PDFLIP_SIBLING_RIDER_WAIT``: T_halb, no SOLL number of its own) ->
+      ``release_own``;
+    * else ``hold``.
+
+    Danger directions: (i) a rider released with its anchor in one tick puts its own figure on D uncounted (D over X, R1/R7);
+    (ii) a wait without the anchor-loss or the time bound hangs the rider."""
+    if anchor_state == ANCHOR_DONE:
+        return RIDER_RELEASE_REST, "anchor's D prefill is over: the re-probe reads the rest (R2 if kurz, else R3/R4)"
+    if anchor_state != ANCHOR_PENDING:
+        return RIDER_RELEASE_OWN, "anchor gone (%s): classed on the own figure (R3/R4)" % (anchor_state or "?")
+    if float(waited_s) >= float(bound_s):
+        return RIDER_RELEASE_OWN, "bound %.1f s over with the anchor still on D: classed on the own figure (R3/R4)" % (
+            float(bound_s))
+    return RIDER_HOLD, "waits behind its D anchor %.1f/%.1f s (R1/R2/R7: kurz only after the anchor)" % (
+        float(waited_s), float(bound_s))
+
+
 def decide(kind: str, **kw) -> "SetDecision":
     """ONE decision site of the scheduler (plan B2). S2a: ``kind="set"`` -- :func:`set_verdict` on the members that BELONG to
     the set. R2: a kurz member (own u < halbX at ITS X, not p_only) never counts in S and never makes a flip (it is left
@@ -789,14 +849,7 @@ def decide(kind: str, **kw) -> "SetDecision":
     members = list(kw.pop("members"))
     half_frac = kw["half_frac"]
     xc = int(kw.get("class_x_tokens") or kw["x_tokens"])
-    keep, out = [], []
-    for m in members:
-        # a member kurz on its OWN figure is no member (R2); a sibling kurz only on its rest (SIBLING-U-1024) stays as a
-        # rider -- its anchor must stay in the set for that, so the own-figure filter comes first
-        if classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or xc, half_frac, m.p_only) == CLASS_KURZ:
-            out.append(m.rid)
-            continue
-        keep.append(m)
+    keep, out = set_keep(members, xc, half_frac)
     present = {m.rid for m in keep}
     classes = [member_class(m, xc, half_frac, present) for m in keep]
     sv = set_verdict(keep, **kw)
@@ -879,8 +932,10 @@ def shared_prefix_discount(entries: Sequence[Tuple[str, int, int, float, str]],
 
     H16V A5 (review): the figure is what P prefills (P matches the shared prefix once, P-log 913/912). It is NOT
     assumed for D: D's in-batch prefix dedupe (``schedule_policy._compute_prefix_matches``) only runs for the
-    cache-aware policies and a cached match <= 32 tokens, so a D set after T_halb is priced at the members' own
-    figures (``set_verdict`` sums ``SetMember.own_uncached``); the discount rides the set to P only (``S_P``)."""
+    cache-aware policies and a cached match <= 32 tokens. Since R1u (user decision 20.10.) ``set_verdict`` sums the
+    discounted ``SetMember.uncached`` (the union figure), and SIBLING-U-1024 (planner 24.10.) leaves a RIDER's kurz rest out
+    of S altogether -- on a D verdict that rider waits behind its D anchor (:func:`rider_hold_step`), so D never computes a
+    rest S did not count before its anchor is computed (R1/R7)."""
     return {rid: u for rid, (u, _a) in shared_prefix_discount_anchored(entries, common).items()}
 
 
