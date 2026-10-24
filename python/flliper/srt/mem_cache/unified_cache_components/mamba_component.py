@@ -1073,9 +1073,60 @@ class MambaComponent(TreeComponent):
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
+        # END-ANCHOR-GUARD-1024 (#231, pdflip/end_anchor_guard.py; SOLL R7): pass 1 holds a turn-end anchor (END mark
+        # or S108 anchor-deferred) whose device state has no copy -- the leaf branch through _evict_device_leaf, the
+        # interior branch here; pass 2 (only when pass 1 ended short) evicts the held ones, old order, named.
+        from flliper.srt.pdflip import end_anchor_guard as _eag
+
         request = params.mamba_num
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
+        prev = _eag.begin(self.cache)
+        try:
+            # (unbound calls: hermetic tests borrow drive_eviction onto bare namespaces)
+            MambaComponent._drive_eviction_pass(self, request, tracker, lru)
+            if prev is False:
+                return
+            held = _eag.take(self.cache)
+            if not held:
+                return
+            got1 = tracker[ct]
+            for x in held:
+                if tracker[ct] >= request:
+                    break
+                if not lru.in_list(x) or x.component_data[ct].value is None:
+                    continue
+                if x in self.cache.evictable_device_leaves:
+                    self.cache._evict_device_leaf(x, tracker)
+                else:
+                    MambaComponent._tombstone_interior(self, x, tracker, lru)
+            _eag.note_pass(self.cache, held, got1, request, tracker[ct], "mamba")
+        finally:
+            _eag.end(self.cache, prev)
+
+    def _tombstone_interior(self, x, tracker: dict[ComponentType, int], lru) -> bool:
+        """K15 save (once per pass) + tombstone + cascade of an interior node. False = the save pinned it (off the
+        LRU, #904 guard) -- never tombstoned."""
+        from flliper.srt.pdflip import end_anchor_guard as _eag
+
+        ct = self.component_type
+        _save = getattr(self.cache, "pdflip_save_anchor_before_tombstone", None)
+        if (callable(_save) and x.component_data[ct].host_value is None
+                and not _eag.already_tried(self.cache, x)):
+            _save(x)
+            if not lru.in_list(x) or x.component_data[ct].value is None:
+                return False
+        _eag.note_interior_loss(self.cache, x, x.component_data[ct])
+        self.cache._evict_component_and_detach_lru(
+            x, self, target=EvictLayer.DEVICE, tracker=tracker
+        )
+        self.cache._cascade_evict(x, self, tracker)
+        return True
+
+    def _drive_eviction_pass(self, request: int, tracker: dict[ComponentType, int], lru) -> None:
+        from flliper.srt.pdflip import end_anchor_guard as _eag
+
+        ct = self.component_type
         x = lru.get_lru_no_lock()
         # M1s rc12z30j: the D-leaf branch restarts at the LRU end whenever its
         # successor left the list -- and at the list head (get_prev -> None)
@@ -1122,19 +1173,21 @@ class MambaComponent(TreeComponent):
                     _1469_note("HOLD-END-ANCHOR", node=x.id)
                     x = x_next
                     continue
+                # END-ANCHOR-GUARD-1024: a BACKED (KV-only) turn-end anchor without a mamba copy -- the case the
+                # #1481 hold above let through -- is held in pass 1 (pass 2 below the walk evicts it if it must)
+                if _eag.interior_hold(self.cache, x, x.component_data[ct]):
+                    x = x_next
+                    continue
+                if not lru.in_list(x) or x.component_data[ct].value is None:
+                    # the guard's save pinned it (#904): never tombstone
+                    x = x_next if lru.in_list(x_next) else lru.get_lru_no_lock()
+                    continue
                 # K15: an internal anchor without a host copy is backed up
                 # before its device state goes (pdflip-56-530: 73984 lost here)
-                _save = getattr(self.cache, "pdflip_save_anchor_before_tombstone", None)
-                if callable(_save) and x.component_data[ct].host_value is None:
-                    _save(x)
-                    if not lru.in_list(x) or x.component_data[ct].value is None:
-                        # #904 guard: the save pinned it (off the LRU) -- never tombstone
-                        x = x_next if lru.in_list(x_next) else lru.get_lru_no_lock()
-                        continue
-                self.cache._evict_component_and_detach_lru(
-                    x, self, target=EvictLayer.DEVICE, tracker=tracker
-                )
-                self.cache._cascade_evict(x, self, tracker)
+                if not MambaComponent._tombstone_interior(self, x, tracker, lru):
+                    # #904 guard: the save pinned it (off the LRU) -- never tombstone
+                    x = x_next if lru.in_list(x_next) else lru.get_lru_no_lock()
+                    continue
                 # K15 review A4/B4: refresh the successor AFTER the tombstone (as the
                 # leaf branch does) -- a save that took it off the LRU restarts the
                 # walk at the LRU end, which is no longer x itself

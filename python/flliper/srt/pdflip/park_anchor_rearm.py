@@ -353,6 +353,17 @@ class TreeOps:
                 if not getattr(n, "pdflip_park_end", False) and not n.evicted and self._has_anchor(n):
                     _put(target_key(1, t.pdflip_node_depth(n), n.hash_value[-1]), n)
                 n = n.parent
+        # END-ANCHOR-GUARD-1024 (#231, SOLL R7): turn-end anchors (END registry, S108 anchor-deferred) are class 0
+        # targets too -- the eviction guard holds them on the device until a copy exists, and on a shared-slot TP
+        # group THIS pass is the one rank-agreed way to make that copy (agreed L3-secured victim, existing votes)
+        try:
+            from flliper.srt.pdflip import end_anchor_guard as _eag
+
+            for n in _eag.rearm_candidates(t):
+                if self._has_anchor(n):
+                    _put(target_key(0, t.pdflip_node_depth(n), n.hash_value[-1]), n)
+        except Exception:  # noqa: BLE001 - no turn-end candidates readable: the park list alone (the old pass)
+            pass
         for k in bad:
             out.pop(k, None)
         self._map = out

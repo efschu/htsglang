@@ -219,6 +219,7 @@ from flliper.srt.observability.metrics_collector import (
 from flliper.srt.session.streaming_session import StreamingSession
 from flliper.srt.pdflip import mamba_arena_displace as _mad
 from flliper.srt.pdflip import park_anchor_rearm as _park_rearm  # PARK-REARM-1024
+from flliper.srt.pdflip import end_anchor_guard as _end_anchor_guard  # END-ANCHOR-GUARD-1024 (#231)
 from flliper.srt.pdflip import dual_anchor_release as _dar  # Q-610
 from flliper.srt.pdflip import dual_told_anchor_hold as _tah  # told-anchor hold (y9d4)
 
@@ -5167,6 +5168,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     node._k21_orphan_ack = False
                     UnifiedRadixCache._k21_note_skip(self, node)
                     return
+                # END-ANCHOR-GUARD-1024 (#231, SOLL R7): the backup above may have gone KV-only (P-FUND: the anchor
+                # had no arena slot) -- a turn-end anchor without a mamba copy is held in the peel's pass 1 instead
+                # of being demoted with its state (the arena was just asked: no second claim, ``just_tried``)
+                if _end_anchor_guard.before_demote(self, node, just_tried=True):
+                    return
                 self._evict_to_host(node, tracker)
                 return
             else:
@@ -5209,6 +5215,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
+        # END-ANCHOR-GUARD-1024 (#231, SOLL R7; 22-194, boot 1024_012625: the S108 KV-only turn end of pdflip-22-176
+        # left node 124928 backed WITHOUT a mamba copy and this demotion freed its state with no save and no line):
+        # the K15 save runs first; a turn-end anchor still without a copy is held in pass 1 (pdflip/end_anchor_guard.py)
+        if _end_anchor_guard.before_demote(self, node):
+            return
         self._evict_to_host(node, tracker)
 
     def _ud_dual_d_order_drop(
@@ -9951,6 +9962,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _n = getattr(mr, "last_device_node", None)
             if ok and _n is not None and _n is not self.root_node:
                 _n._pdflip_end_anchor = True
+                _end_anchor_guard.register_end(self, _n)   # END-ANCHOR-GUARD-1024: the re-arm pass's candidate registry
                 self._pdflip_dual_note_end_anchor(str(getattr(req, "rid", "") or ""), _n)   # Q-610
         except Exception:  # noqa: BLE001 -- an instrument never kills a rank
             pass
