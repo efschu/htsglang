@@ -323,6 +323,8 @@ def test_s39_tp0_never_drops_a_subtree_a_worker_holds_on_its_device(roles, monke
     tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
     key = R12.node_key(tp0._t_child)
     monkeypatch.setattr(R12, "worker_nodelete_keys", lambda tree: {key})
+    # HLEAF-STALE-1024 S6: the flush reads all worker sets in ONE pass (``worker_key_sets``)
+    monkeypatch.setattr(R12, "worker_key_sets", lambda tree: ({key}, set(), set()), raising=False)
     _peel(roles, tp0), _peel(roles, worker)
     _broadcast(roles, tp0, worker)
     for t in (tp0, worker):
