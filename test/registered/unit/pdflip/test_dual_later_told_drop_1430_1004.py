@@ -128,6 +128,7 @@ def test_default_off_is_unchanged():
     """No env: zombie stays, no record written (old behaviour byte for byte)."""
     with mock.patch.dict(os.environ, DUAL_P_ENV), mock.patch.dict(os.environ, {}, clear=False):
         os.environ[ENV_ON] = "0"  # #DPJ-S1: default ON now, OFF is explicit
+        os.environ[DU.POP_TWIN_ENV] = "0"  # #1470 records holds too (default ON since #DPJ-S1)
         with mock.patch.object(p_row_authority, "applies", lambda s: True):
             f, zombie, inst2 = _held_zombie()
             _run_to_later_told(f)

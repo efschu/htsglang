@@ -231,7 +231,7 @@ def dual_p_env():
         yield
 
 
-def _specimen(monkeypatch, stamp):
+def _abort_specimen(monkeypatch, stamp):
     """09:09:36: PP0 reads the P-PAUSE abort of pdflip-0-28 (granted, told on the wire at
     09:09:34, NOT admitted -> stamp False; admitted in a launched frame -> True; no stamp ->
     None). PP2 still queues instance 1 and holds its told from that EARLIER list."""
@@ -262,7 +262,7 @@ def _resume(fol):
 
 def test_a1_stamp_false_pops_at_receipt_no_hold(monkeypatch, dual_p_env):
     """RED on 1ecda02a58 (PP2 'PDFLIP-PP-WAITING-ABORT held rid=pdflip-0-28')."""
-    fol, inst1 = _specimen(monkeypatch, False)
+    fol, inst1 = _abort_specimen(monkeypatch, False)
     assert inst1 not in fol.waiting_queue
     assert not getattr(fol, "_pdflip_pending_waiting_aborts", None)
     assert not getattr(fol, pp_abort.HELD_ATTR, None)
@@ -272,14 +272,14 @@ def test_a1_stamp_false_pops_at_receipt_no_hold(monkeypatch, dual_p_env):
 
 
 def test_a1_stamp_true_goes_to_the_k14_hold(monkeypatch, dual_p_env):
-    fol, inst1 = _specimen(monkeypatch, True)
+    fol, inst1 = _abort_specimen(monkeypatch, True)
     assert fol.waiting_queue == [inst1]
     assert RID in (getattr(fol, pp_abort.HELD_ATTR, None) or {})
     assert not getattr(fol, "_pdflip_pending_waiting_aborts", None), "K14, not #1180-W"
 
 
 def test_a1_unstamped_keeps_the_1180w_hold(monkeypatch, dual_p_env):
-    fol, inst1 = _specimen(monkeypatch, None)
+    fol, inst1 = _abort_specimen(monkeypatch, None)
     assert fol.waiting_queue == [inst1]
     assert sorted(fol._pdflip_pending_waiting_aborts) == [RID]
     assert not getattr(fol, pp_abort.HELD_ATTR, None)
