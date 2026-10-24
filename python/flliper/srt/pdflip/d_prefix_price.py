@@ -61,6 +61,12 @@ def _fallback(kind: str) -> int:
     return 0
 
 
+def credits_row(rows: Optional[int], lock: int) -> bool:
+    """THE credit rule (#215, and #215b for the front's probe -- ``d_match_probe.peek_locked_device_spans``): a node's
+    rows cost no new allocation when they are on the device AND another holder keeps the node FULL-locked."""
+    return rows is not None and int(lock) >= 1
+
+
 def locked_device_gap(tree: Any, req: Any, extent: Optional[int]) -> int:
     """Device rows of the match path below ``req.last_node`` that another holder keeps locked and the load-back of
     ``extent`` rows maps without allocating (module doc). 0 without a load-back, without a gap, or unreadable."""
@@ -85,7 +91,7 @@ def locked_device_gap(tree: Any, req: Any, extent: Optional[int]) -> int:
         for rows, lock, span in reversed(path):  # top-down: the load-back's row order
             if cum >= extent:
                 break
-            if rows is not None and lock >= 1:
+            if credits_row(rows, lock):
                 credit += max(0, min(cum + span, extent) - cum)
             cum += span
         return credit

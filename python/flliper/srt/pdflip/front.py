@@ -8249,12 +8249,13 @@ class Front:
                 self.counters["d_probe_image_in_tail"] += 1
             logger.info("PDFLIP D-PROBE rid=%s n=%d device=%d host=%d store=%d tier=%s covered=%d uncached_d=%d "
                         "uncached_p=%d image_in_tail=%d tail_rows=%d images=%d class_u=%d ledger_pending=%d ledger_src=%s "
-                        "front_n=%s tokenize_ms=%.1f handle_ms=%.1f probe_ms=%.1f (S56: the class from D's exact "
-                        "numbers, R11 -- the front decides)",
+                        "front_n=%s device_locked=%s tokenize_ms=%.1f handle_ms=%.1f probe_ms=%.1f (S56: the class "
+                        "from D's exact numbers, R11 -- the front decides)",
                         rid, int(c.n), int(_probe.device_tokens), int(_probe.host_tokens), int(_xp.store_tokens),
                         tier, int(_xp.covered), int(_xp.uncached), int(_xp.uncached_p), int(_xp.image_in_tail),
                         int(_xp.tail_rows), len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
-                        (int(_c_front.n) if _c_front is not None else "-"), _probe.tokenize_ms,
+                        (int(_c_front.n) if _c_front is not None else "-"),
+                        ("-" if _xp.device_locked is None else int(_xp.device_locked)), _probe.tokenize_ms,
                         _probe.handle_ms, _probe.total_ms)
         # STOREREAD-1023: a request that asks input logprobs from position s is computed on D from s on, whatever
         # the store holds (Req._compute_max_prefix_len) -- the exact uncached count (order 19.10. "nichts schaetzen")
@@ -17006,6 +17007,18 @@ class Front:
             running = False
         return _asr.shared_prefix_credit(est_prompt, uncached, common, running)
 
+    def _asr_device_locked(self, rid: Optional[str]) -> Optional[int]:
+        """#215b: D's locked device rows of ``rid``'s prompt inside its priced covered depth, from the D-PROBE answer the
+        price was taken on (``_probe_price``, ``d_match_probe.ExactPrice.device_locked``: group-agreed on D, R11).
+        None: no probe price, or a D build without the field -- the front prices as before."""
+        if rid is None:
+            return None
+        xp = (self.__dict__.get("_probe_price") or {}).get(str(rid))
+        v = getattr(xp, "device_locked", None) if xp is not None else None
+        if v is None or isinstance(v, bool) or not isinstance(v, int):
+            return None
+        return max(0, int(v))
+
     async def _arrival_seat_kv(self, est_prompt: int, max_tokens: Optional[int],
                                rid: Optional[str] = None,
                                uncached: Optional[int] = None) -> Tuple[bool, str, int]:
@@ -17055,6 +17068,14 @@ class Front:
         }
         _d_has = (None if basis["running"] is None else basis["running"] | basis["admitted"])
         shared = self._asr_shared_credit(rid, est_prompt, uncached, _d_has)
+        # #215b FRONT-DEVICE-LOCKED (SOLL R7, R11): D's device rows another holder keeps FULL-locked inside the price's
+        # covered depth cost D's admission no allocation (#215 ``locked_device_gap``: the load-back maps them below the
+        # Mamba cut) and are not in D's free reading -- the larger of the two credits. 27B ``_1024_003732`` 18-188:
+        # need 104476 (shared 0, D-PROBE device=0 from the Mamba cut) instead of 86340 (18137 locked prompt rows).
+        _locked = Front._asr_device_locked(self, rid)
+        if _locked is not None and int(_locked) > shared:
+            shared = min(max(0, int(est_prompt or 0)), int(_locked))
+            self.counters["arrival_seat_kv_device_locked_credit"] += 1
         # KVOFFSET-1024: + what D's gate adds to extend + clip (one page, the Mamba gap; ``pdflip_kv.price_extra``)
         need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode) + _asr.price_extra(reading)
         # KVOFFSET-1024 (class B, SOLL R5/R11): the burst debit for EVERY KV test, not only the D line's -- rows the

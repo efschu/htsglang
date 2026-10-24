@@ -1744,6 +1744,9 @@ class PdFlipMatchProbeReqOutput(BaseReq, kw_only=True):
     key_match_depth: int = 0
     #: [start, end) of every image item's pad run in ``input_ids``
     mm_spans: List[List[int]] = []
+    #: #215b: [start, end) depth spans whose rows are on the device and FULL-locked by another holder (group-agreed);
+    #: None: not read (the front then prices as before)
+    device_locked_spans: Optional[List[List[int]]] = None
     handle_ms: float = 0.0
     tokenize_ms: float = 0.0
     #: S56r A3: the answers of the input's ``batch``, in its order (pickled list of dicts with the fields above)

@@ -2150,6 +2150,32 @@ def _s88_deferred_reachability(scheduler, scanned_ids) -> None:
         said.clear()
 
 
+
+def _dmp_probe_locked_spans(tc, ids, extra_key, limit):
+    """#215b: ``(spans, ok)`` -- ``d_match_probe.peek_locked_device_spans``; a failure is ``([], 0)``, named
+    (rate-limited) and never the probe's failure (the front then prices as before)."""
+    from flliper.srt.pdflip import d_match_probe as _dmp
+
+    try:
+        return [tuple(x) for x in _dmp.peek_locked_device_spans(tc, ids, extra_key, limit)], 1
+    except Exception as e:  # noqa: BLE001
+        _dmp.note_locked_fallback("error", f"{type(e).__name__}: {str(e)[:120]}")
+        return [], 0
+
+
+def _dmp_locked_agreed(locked, g_ok, g_min, g_max, rid):
+    """#215b (D-PROBE GROUP-MIN, SOLL R11): the group's locked device spans -- this rank's, when every rank read them
+    (``g_ok``) and the group's MIN of the locked rows equals its MAX (the ranks agree); else None (not read: the front
+    prices as before), the disagreement named rate-limited."""
+    if not int(g_ok):
+        return None
+    if int(g_min) != int(g_max):
+        from flliper.srt.pdflip import d_match_probe as _dmp
+
+        _dmp.note_locked_fallback("disagree", "rid=%s min=%d max=%d" % (rid, int(g_min), int(g_max)))
+        return None
+    return [list(x) for x in locked]
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -9333,7 +9359,7 @@ class Scheduler(
                                                  it.get("extra_key"), it.get("tokenize_ms"))
                 answers.append({f: getattr(o, f) for f in (
                     "rid", "success", "message", "input_ids", "device_tokens", "host_tokens", "key_match_depth",
-                    "mm_spans", "handle_ms", "tokenize_ms")})
+                    "mm_spans", "device_locked_spans", "handle_ms", "tokenize_ms")})
             out.batch = wrap_as_pickle(answers)
         return out
 
@@ -9407,21 +9433,27 @@ class Scheduler(
         ok, total, dev_l, key_l, err = 1, 0, 0, 0, ""
         ids: Any = array("q")
         spans: List[List[int]] = []
+        locked, lk_ok, lk_tot = [], 0, 0
         try:
             ids, spans = self._pdflip_match_probe_pad(rid, input_ids, mm_inputs, extra_key)
             n = len(ids)
             if n > 1:
                 dev, host, key_l = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
                 dev_l, total = int(dev), int(dev) + int(host)
+                locked, lk_ok = _dmp_probe_locked_spans(tc, ids, extra_key, n - 1)
+                lk_tot = sum(int(b) - int(a) for a, b in locked)
         except Exception as e:  # noqa: BLE001 -- named below; the reduce is still entered
             ok, err = 0, f"{type(e).__name__}: {str(e)[:160]}"
-        vals = [int(ok), int(total), int(dev_l), int(key_l)]
+        # #215b (SOLL R11): the locked device rows ride the SAME MIN reduce -- read ok on every rank, and the group's
+        # MIN equal to its MAX (one negated slot): the ranks agree, TP0's spans are the group's; else no number
+        vals = [int(ok), int(total), int(dev_l), int(key_l), int(lk_ok), int(lk_tot), -int(lk_tot)]
         grp = getattr(self, "tp_cpu_group", None)
         if grp is not None and torch.distributed.get_world_size(grp) > 1:
             t = torch.tensor(vals, dtype=torch.int64)
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
             vals = [int(v) for v in t.tolist()]
-        g_ok, g_total, g_dev, g_key = vals
+        g_ok, g_total, g_dev, g_key, g_lk_ok, g_lk_min, g_lk_negmax = vals
+        g_locked = _dmp_locked_agreed(locked, g_lk_ok, g_lk_min, -g_lk_negmax, rid)
         if not g_ok:
             if err:
                 logger.warning("PDFLIP D-MATCH-PROBE FAILED rid=%s %s", rid, err)
@@ -9440,6 +9472,7 @@ class Scheduler(
             host_tokens=int(g_total - g_dev),
             key_match_depth=int(g_key),
             mm_spans=spans,
+            device_locked_spans=g_locked,
             handle_ms=(time.perf_counter() - t0) * 1000.0,
             tokenize_ms=float(tokenize_ms or 0.0),
         )
@@ -9454,11 +9487,16 @@ class Scheduler(
             ids, spans = self._pdflip_match_probe_pad(rid, input_ids, mm_inputs, extra_key)
             n = len(ids)
             dev = host = key_depth = 0
+            locked = None
             tc = getattr(self, "tree_cache", None)
             if n > 1 and tc is not None:
                 if not this_rank_follows():  # a Form A worker's anchors are bookkeeping: it adopts the host's depth
                     # the admission's key: the whole ids, limit = _compute_max_prefix_len (n - 1)
                     dev, host, key_depth = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
+                    # #215b: TP0's locked spans ARE the group's here, by the rule that makes its dev/host the group's
+                    # (Form A: the host's tree decides; symmetric tier: replicated trees and lock walks)
+                    _lk, _lk_ok = _dmp_probe_locked_spans(tc, ids, extra_key, n - 1)
+                    locked = [list(x) for x in _lk] if _lk_ok else None
             return PdFlipMatchProbeReqOutput(
                 rid=rid,
                 success=True,
@@ -9467,6 +9505,7 @@ class Scheduler(
                 host_tokens=int(host),
                 key_match_depth=int(key_depth),
                 mm_spans=spans,
+                device_locked_spans=locked,
                 handle_ms=(time.perf_counter() - t0) * 1000.0,
                 tokenize_ms=float(tokenize_ms or 0.0),
             )
