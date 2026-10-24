@@ -571,6 +571,16 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
             _et.measure_close(runner, forward_batch, cuda, rank=getattr(runner, "tp_rank", None))
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
         logger.debug("EXTEND-RATE skipped: %s", exc)
+    # VOTE-FIXED-LIVE (pdflip/vote_fixed_live.py): a DRAFT forward after the target extend (the draft extend of the
+    # same pass) lowers the open reading's end -- one cudaMemGetInfo, only while a reading is open
+    if getattr(runner, "is_draft_model_runner", False):
+        try:
+            from flliper.srt.pdflip import extend_trim as _et
+
+            if _et._CACHE["live"] is not None and _et._CACHE["live"]._open is not None and not _capturing(cuda):
+                _et.live_note_draft(cuda)
+        except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+            logger.debug("VOTE-FIXED-LIVE draft skipped: %s", exc)
     try:
         from flliper.srt.model_executor import vram_peak_window
 

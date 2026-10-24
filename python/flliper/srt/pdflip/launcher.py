@@ -89,6 +89,7 @@ from flliper.srt.pdflip import admin_key as admin_key_mod
 from flliper.srt.pdflip import bar1_windows as bar1_windows_mod
 from flliper.srt.pdflip import inventory_view as inventory_view_mod
 from flliper.srt.pdflip import budget_rest as _budget_rest
+from flliper.srt.pdflip import vote_fixed_live as _vfl
 from flliper.srt.pdflip import rank_state as rank_state_mod
 from flliper.srt.pdflip import shared_cache_release as shared_cache_release_mod
 from flliper.srt.pdflip import state_file as state_file_mod
@@ -14853,14 +14854,117 @@ def d_extend_vote_fixed_record(profile: Optional[str] = None, n: Optional[int] =
     except Exception:  # noqa: BLE001 -- an unreadable inventory is not this form (fail closed)
         inventory = ()
     why = _budget_rest.vote_fixed_form_mismatch(boots, pdflip_form.model_key(model or ""), inventory)
+    # VOTE-FIXED-LIVE (24.10., pdflip/vote_fixed_live.py): the form's PERSISTED run-time readings -- they raise a
+    # static record (rule 2: every reading counts upward) and, once the gate holds (rule 3: MIN_BOOTS boots of
+    # MIN_PASSES_PER_BOOT passes), stand in for a record the form never had. Same reader for ranks and budget.
+    _digest, live, live_why = d_extend_vote_fixed_live_verdict(profile, cards, model)
     if why is not None:
-        return None, why
+        if live is None or not live.gate_open:
+            return None, why + ("" if live is None else f"; {_vfl.MARKER} form {_digest}: {live.describe()}")
+        k = int(n) if n is not None else max(1, len(inventory))
+        return ([float(live.fixed_mib)] * k,  # type: ignore[arg-type]
+                f"{_vfl.MARKER} form {_digest}: {live.describe()} (no static record of this form)")
     if n is not None and len(vals) not in (1, int(n)):
         return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} does not fit {n} cards"
     out = [float(v) for v in vals]
     if n is not None and len(out) == 1:
         out = out * int(n)
-    return out, _pconst_boots(_budget_rest.VOTE_FIXED_RECORD, profile)
+    src = _pconst_boots(_budget_rest.VOTE_FIXED_RECORD, profile)
+    if live is not None and live.fixed_mib is not None and any(float(live.fixed_mib) > v for v in out):
+        out = [max(v, float(live.fixed_mib)) for v in out]
+        src = f"{src}; raised by {_vfl.MARKER} form {_digest}: {live.describe()}"
+    return out, src
+
+
+def vote_fixed_live_root() -> str:
+    """VOTE-FIXED-LIVE: the store root (``FLLIPER_PDFLIP_VOTE_FIXED_DIR``, else the rig cache dir of the footprint
+    and card-probe files); the launcher hands the resolved path to the ranks, so both read one directory."""
+    got = str(os.environ.get(_vfl.ENV_DIR, "") or "").strip()
+    if got:
+        return got
+    try:
+        from flliper.srt.rigmon.card_probe import CACHE_DIR
+    except Exception:  # noqa: BLE001 -- rigmon import shape
+        CACHE_DIR = os.path.expanduser("~/.cache/flliper")
+    return CACHE_DIR
+
+
+#: VOTE-FIXED-LIVE (review S3): group D's effective --kv-cache-dtype as main resolved it from --extra-d ("" = the
+#: profile row's); set once in main, read by the form
+_VFL_ARGV: Dict[str, str] = {}
+
+
+def _vfl_effective_draft(row) -> str:
+    """Review S3: D's EFFECTIVE draft (the spec form main resolved, with an --extra-d draft-token override), not the
+    profile row's; the row's draft kind:steps only where the spec form cannot be read."""
+    try:
+        extra = _SPEC_FORM.get("d_extra_draft_tokens")
+        if spec_form_is_dflash():
+            return (f"DFLASH:block={int(_SPEC_FORM['block'])}:window={int(_SPEC_FORM['window'])}"
+                    + (f":tokens={extra}" if extra else ""))
+        return f"{SPEC_ALGORITHM}:steps={SPEC_NUM_STEPS}:tokens={extra or SPEC_NUM_DRAFT_TOKENS}"
+    except Exception:  # noqa: BLE001
+        dr = getattr(row, "draft", None) if row is not None else None
+        return "" if dr is None else f"{getattr(dr, 'kind', '')}:{getattr(dr, 'steps', '')}"
+
+
+def d_extend_vote_fixed_live_form(profile: Optional[str], cards: Optional[Sequence[Card]],
+                                  model: Optional[str]) -> Tuple[Optional[str], str]:
+    """``(digest, why)`` -- :func:`d_extend_vote_fixed_live_material` without the material."""
+    dig, _mat, why = d_extend_vote_fixed_live_material(profile, cards, model)
+    return dig, why
+
+
+def d_extend_vote_fixed_live_material(profile: Optional[str], cards: Optional[Sequence[Card]],
+                                      model: Optional[str]) -> Tuple[Optional[str], Optional[dict], str]:
+    """VOTE-FIXED-LIVE rule 5: ``(digest, material, why)`` of the D form -- profile, the H87 footprint key of the
+    checkpoint (config + quant sidecars + (name, dtype, shape) of every tensor: the quant format is IN it), the D
+    inventory, D's effective KV dtype and draft (review S3). NOT in the form (named): the code revision, the chunk
+    width, the seats, the torch cache cap, the HiCache configuration. ``(None, None, why)`` with the switch off,
+    without cards or without a readable checkpoint (fail closed: no store, the static record alone)."""
+    if not _vfl.switch_on():
+        return None, None, f"{_vfl.ENV_ON}=0"
+    if not cards:
+        return None, None, "no D cards"
+    prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
+    if model is None:
+        form = pdflip_form.current_form()
+        model = form.model if form is not None else ""
+    try:
+        fp, fp_why = pdflip_form.footprint_key(model or "")
+    except Exception as exc:  # noqa: BLE001 -- unreadable checkpoint: not a form
+        fp, fp_why = None, f"footprint unreadable ({type(exc).__name__})"
+    if not fp:
+        return None, None, f"no footprint ({fp_why})"
+    row = pdflip_form.profile_row(prof)
+    try:
+        inventory = card_identity.inventory_signature(list(cards))
+    except Exception as exc:  # noqa: BLE001
+        return None, None, f"inventory unreadable ({type(exc).__name__})"
+    kv = str(_VFL_ARGV.get("kv") or "") or (str(getattr(row, "kv_dtype", "") or "") if row is not None else "")
+    draft = _vfl_effective_draft(row)
+    mat = _vfl.form_material(prof, fp, pdflip_form.model_key(model or ""), inventory, kv, draft)
+    dig = _vfl.form_digest(mat)
+    return (dig, mat, f"form {dig} = {mat}") if dig else (None, None, "no form material")
+
+
+def d_extend_vote_fixed_live_verdict(profile: Optional[str], cards: Optional[Sequence[Card]],
+                                     model: Optional[str]):
+    """VOTE-FIXED-LIVE: ``(digest, StoreVerdict | None, why)`` -- the form's persisted readings priced at the
+    profile's START rate (``D_EXTEND_CAP_PER_ROW_MIB``, its smallest value: the larger, safe F; none = rate 0)."""
+    dig, why = d_extend_vote_fixed_live_form(profile, cards, model)
+    if dig is None:
+        return None, None, why
+    try:
+        rates = [float(x) for x in _pconst(D_EXTEND_CAP_RATE_RECORD, profile) if x is not None]
+        rate = min(rates) if rates else 0.0
+    except Exception:  # noqa: BLE001 -- no start rate: F = the largest cost (rate 0)
+        rate = 0.0
+    try:
+        v = _vfl.aggregate(_vfl.load_docs(vote_fixed_live_root(), dig), rate)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable store is no store
+        return dig, None, f"store unreadable ({type(exc).__name__})"
+    return dig, v, why
 
 
 def _d_extend_vote_fixed_env(ns, log, label: str, cards: Optional[Sequence[Card]] = None) -> Optional[str]:
@@ -14871,6 +14975,7 @@ def _d_extend_vote_fixed_env(ns, log, label: str, cards: Optional[Sequence[Card]
     (:func:`booked_rest_vote_line_deltas`). A value named in --env-d wins; no record / switch off = nothing written."""
     vals, src = d_extend_vote_fixed_record(getattr(ns, "profile", None), None if cards is None else len(cards),
                                            cards, getattr(ns, "model", None))
+    _d_extend_vote_fixed_live_env(ns, log, label, cards, src)
     if vals is None:
         if src.startswith("F unmeasured") or "name no form" in src:
             log(f"{D_RANK_SOLVE_MARKER} {label} {_budget_rest.VOTE_FIXED_MARKER} off: {src} -- no "
@@ -14889,6 +14994,48 @@ def _d_extend_vote_fixed_env(ns, log, label: str, cards: Optional[Sequence[Card]
         f"mit dem Boden ab (der Boden ist die Aktivierung, die Rate x Zeilen schon bepreist) und trimmt vor dem "
         f"Forward unter Linie + Rate x Zeilen")
     return _now
+
+
+def _d_extend_vote_fixed_live_env(ns, log, label: str, cards: Optional[Sequence[Card]], record_src: str) -> None:
+    """VOTE-FIXED-LIVE: wherever the width vote is armed on a profile with the record, hand the ranks the meter's
+    store target -- form digest, D inventory, boot tag, store root -- so every boot of the form measures and persists
+    (cold start included: the floor line holds until the gate opens, the meter still reads). Unreadable form / switch
+    off: nothing written, named. A value named in --env-d wins."""
+    try:
+        _pconst(_budget_rest.VOTE_FIXED_RECORD, getattr(ns, "profile", None))
+    except (KeyError, TypeError):
+        return   # a profile without the single line (Next Flash: VOTE-MEASURED-LINE on its own branch)
+    dig, mat, why = d_extend_vote_fixed_live_material(getattr(ns, "profile", None), cards, getattr(ns, "model", None))
+    if dig is None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} {_vfl.MARKER} store off: {why} -- the ranks' meter raises the line "
+            f"within the boot only, nothing persists")
+        return
+    # review M1: the FULL boot name (main: ns.boot_name = boot_weg2_<tag>_<rev>_<date>_<time>), the tag only where
+    # main did not run (desk)
+    boot = str(getattr(ns, "boot_name", "") or getattr(ns, "tag", "") or "")
+    root = vote_fixed_live_root()
+    env = {_vfl.ENV_FORM: dig, _vfl.ENV_CARDS: ",".join(card_identity.inventory_signature(list(cards or ()))),
+           _vfl.ENV_BOOT: boot, _vfl.ENV_DIR: root}
+    if not getattr(ns, "dry_run", False):
+        try:   # review M3: the yardstick --import checks old logs against
+            # the totals a D rank's torch sees (NVML total - driver reserved), what PDFLIP-VRAM-PEAK logs as
+            # card_total_mib (5090 32607 - 499 = 32108, 3080 20480 - 425 = 20055)
+            _vfl.write_form(root, dig, mat or {}, [int(getattr(c, "total_mib", 0) or 0)
+                                                   - int(getattr(c, "reserved_mib", 0) or 0) for c in (cards or ())])
+        except Exception as exc:  # noqa: BLE001 -- no sidecar: --import of old logs stays unverified
+            log(f"{D_RANK_SOLVE_MARKER} {label} {_vfl.MARKER} {_vfl.FORM_FILE} not written ({type(exc).__name__})")
+    _d, _v, _w = d_extend_vote_fixed_live_verdict(getattr(ns, "profile", None), cards, getattr(ns, "model", None))
+    if _v is not None:
+        for q in _v.quarantined:   # review M2: loud, never a seed
+            log(f"{D_RANK_SOLVE_MARKER} {label} WARN {_vfl.MARKER} QUARANTINED reading (no seed): {q}")
+        for k in _v.skipped:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {_vfl.MARKER} store doc left out: {k}")
+    _have = parse_group_env(getattr(ns, "env_d", "") or "")
+    for k, v in env.items():
+        if k not in _have and v:
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", k, v)
+    log(f"{D_RANK_SOLVE_MARKER} {label} {_vfl.MARKER} {_vfl.ENV_FORM}={dig} store={env[_vfl.ENV_DIR]} "
+        f"({why}); record: {record_src}")
 
 
 def torch_cache_cap_armed(ns) -> bool:
@@ -26380,6 +26527,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dirty = subprocess.run(["git", "-C", tree, "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
     stamp = time.strftime("%m%d_%H%M%S", time.gmtime())
     base = f"{EVIDENCE_DIR}/boot_weg2_{ns.tag}_{tip}_{stamp}"
+    # VOTE-FIXED-LIVE (review M1/S3): the FULL boot name (the store's boot identity, also what --import reads off a
+    # log name) and D's effective KV dtype for the form
+    ns.boot_name = os.path.basename(base)
+    _VFL_ARGV["kv"] = _argv_scalar(str(getattr(ns, "extra_d", "") or ""), "--kv-cache-dtype") or ""
     dry = ns.dry_run
     global _ANCHOR_INDEX_MODE
     _ANCHOR_INDEX_MODE = "ro" if dry else "rw"  # S68 review: a dry run reads the W65 index, never writes it
