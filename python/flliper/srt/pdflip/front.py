@@ -14922,6 +14922,21 @@ class Front:
                     return True   # #234 review MUSS-2 (R1a): a halb SHORT member of the held flip still stands
         return False
 
+    def _r2_helper_failed(self, name: str, effect: str) -> None:
+        """#234 Nachzug (risk 2): a failed #234 helper is NAMED, never silent -- ``logger.exception`` with the stable id
+        ``#234 <NAME> FAILED`` and the counter ``short_nowait_helper_failed`` / ``short_nowait_helper_failed_<name>``. Must be
+        called inside the ``except`` block (the traceback is the current exception). The read helpers run per tick: the first 5
+        failures and every 1000th are logged with the traceback, the counters count every one. Behaviour is the caller's."""
+        try:
+            key = "short_nowait_helper_failed_" + name.lower().replace("-", "_")
+            self.counters["short_nowait_helper_failed"] += 1
+            self.counters[key] += 1
+            n = self.counters[key]
+            if n <= 5 or n % 1000 == 0:
+                logger.exception("PDFLIP #234 %s FAILED n=%d epoch=%d -- %s", name, n, int(getattr(self, "epoch", 0)), effect)
+        except Exception:  # noqa: BLE001 -- the naming itself must never raise out of a scheduler tick
+            pass
+
     def _r2_short_p_members(self) -> frozenset:
         """#234 review MUSS-2: the SHORTs of the set that are still P members by their own number -- in ``st["shorts"]``, not
         released, not waiting behind a D anchor (``rider_hold``), and not kurz on their own (re-probed) figure at their own X
@@ -14939,6 +14954,7 @@ class Front:
                     out.add(str(rid))
             return frozenset(out)
         except Exception:  # noqa: BLE001 -- a partial state: no SHORT holds a flip (R2 wins, the safe direction for kurz)
+            Front._r2_helper_failed(self, "R2-SHORT-P-MEMBERS", "no SHORT holds the flip: a kurz SHORT / arrival goes to D (R2)")
             return frozenset()
 
     def _r2_short_triggers(self, members: Sequence[Any], x_class: int) -> List[str]:
@@ -14954,6 +14970,7 @@ class Front:
             keep, _out, riders = phase_policy.set_riders(sm_all, xc, Front._set_cfg()[0])
             return [m.rid for m in keep if m.rid in shorts and m.rid not in riders]
         except Exception:  # noqa: BLE001 -- a partial member list: no SHORT trigger (R2 wins, the safe direction for kurz)
+            Front._r2_helper_failed(self, "R2-SHORT-TRIGGERS", "no SHORT trigger frozen: a SHORT-only flip reads not decided (R2)")
             return []
 
     def _r2_still_p_member(self, q: Any) -> bool:
@@ -15067,7 +15084,13 @@ class Front:
         st["last_verdict"] = sv.verdict
         if members is not None:
             st["members"] = [str(getattr(m, "rid", m)) for m in members]
-            st["short_trig"] = Front._r2_short_triggers(self, members, x_class)   # #234 review MUSS-2 (R1a)
+            if x_class:
+                st["short_trig"] = Front._r2_short_triggers(self, members, x_class)   # #234 review MUSS-2 (R1a)
+            # else (#234 Nachzug R1a, risk 1): the queue-sum site passes QUEUE entries only (no ``x_class``) -- they are never
+            # ``st["shorts"]``, so recomputing here would store [] and overwrite the SHORT triggers the set's hold froze
+            # (``_r2_flip_held`` read "not decided" until the next ``_decode_collect`` tick: a kurz SHORT / kurz arrival left for
+            # D instead of riding the decided flip, R1a). The frozen triggers stay; ``_r2_short_p_members`` still filters them
+            # by the live state (released / riding behind an anchor / re-probed kurz hold no flip).
         return phase_policy.SetVerdict(
             phase_policy.V_COLLECT,
             "R2 kurz D grant(s) %s finish on D first (was %s: %s)" % (",".join(wait[:4]), sv.verdict, sv.why),
@@ -16770,6 +16793,17 @@ class Front:
 
     def _set_kurz_shorts_now(self, st: dict, members: Sequence["phase_policy.SetMember"], kw: dict,
                              live_q: List["Pending"], now: float, site: str, hold_riders: bool = True) -> frozenset:
+        """#234 Nachzug (risk 2): a failure is NAMED (``#234 SET-SHORT-KURZ-NOW FAILED site=...``, ``logger.exception``, counter
+        ``short_nowait_helper_failed_set_short_kurz_now``) and then RAISES as before -- behaviour unchanged, no silent path.
+        The work is :meth:`_set_kurz_shorts_now_body`."""
+        try:
+            return Front._set_kurz_shorts_now_body(self, st, members, kw, live_q, now, site, hold_riders)
+        except Exception:
+            Front._r2_helper_failed(self, "SET-SHORT-KURZ-NOW", "site=%s; the exception propagates as before" % site)
+            raise
+
+    def _set_kurz_shorts_now_body(self, st: dict, members: Sequence["phase_policy.SetMember"], kw: dict,
+                                  live_q: List["Pending"], now: float, site: str, hold_riders: bool = True) -> frozenset:
         """SHORT-NOWAIT-1024 (#234; SOLL R2 verbatim "u < halbX: sofort auf D prefillen, keine Wartezeit, auch während ein Set
         sammelt. Nie ein Flip für einen kurzen Request"; R6k, R11): a SHORT in ``st["shorts"]`` whose OWN figure is kurz at
         its own X -- a halb arrival the S63 re-probe moved under halbX, or a rider whose re-probed rest is kurz -- is released to
