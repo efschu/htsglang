@@ -5872,6 +5872,8 @@ class GroupSpec:
     env: Dict[str, str]
     pid: int = 0
     proc: Optional[subprocess.Popen] = None
+    #: S7b P-RESTART: the cwd the group was exec'd in (launch_group), for the respawn record.
+    cwd: str = ""
 
 
 @dataclass
@@ -13743,6 +13745,7 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
                          start_new_session=True)
     spec.pid = p.pid
     spec.proc = p
+    spec.cwd = str(_cwd or "")
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log} cwd {_cwd}")
     if spec.name in ("P", "D"):
         # Nutzer 29.09.: rigdash liest daraus „aktiv“ je Schalter (argv redigiert wie im Log).
@@ -13750,6 +13753,50 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
             "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": [],
             "launch": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(spec.argv), spec.env),
             "form": group_form_block(spec.env)}})
+
+
+def p_planned_need(cards, budgets_p, ns, log: Log) -> Optional[Dict[int, int]]:
+    """S7b review MUSS 1: P's PLANNED peak per NVML card -- budget + overhead, exactly the number
+    ``dual_share_planned_dc`` sizes D against (specimen 10240650: 9110/7550/7700 MiB, the argv budget alone
+    6610/5050/5200). None = not derivable (the front's restart then refuses to spawn, by name)."""
+    if not getattr(ns, "dual_layout", False):
+        return None
+    try:
+        plan = dual_share_planned_dc(cards, list(budgets_p or []), getattr(ns, "extra_p", ""),
+                                     int(getattr(ns, "dual_p_overhead_mib", 1500)))
+        return {int(c.nvml_index): int(plan[c.uuid]) for c in cards}
+    except Exception as e:  # noqa: BLE001 -- named; no plan = no spawn
+        log(f"S7B P-RESPAWN-SPEC: P's planned peak not derivable ({type(e).__name__}: {e})")
+        return None
+
+
+def write_p_respawn_spec(spec: GroupSpec, ns, log: Log, dry: bool,
+                         card_need_mib: Optional[Dict[int, int]] = None) -> str:
+    """S7b P-RESTART (Auftrag #214): the exec record of group P -- the argv/env/cwd launch_group actually
+    exec'd, never re-planned -- for the front's P restart (pdflip/dual_p_restart.py, stage 2): same cards, same
+    planner cut. Dual layout only; '' = not written (the front's restart is then unarmed and says so). The file
+    is mode 0600 (the env is the group's real one, the log copy is the redacted one)."""
+    if dry or not getattr(ns, "dual_layout", False) or not spec.pid:
+        return ""
+    from flliper.srt.pdflip import dual_p_restart as _s7b
+
+    if not _s7b._on(os.environ, _s7b.RESTART_ENV):
+        log(f"{_s7b.MARK} P-RESPAWN-SPEC not written: {_s7b.RESTART_ENV}=0 (stage 1 only, P is not restarted)")
+        return ""
+
+    path = _s7b.respawn_path(GPU_ARB, getattr(ns, "tag", "") or "untagged")
+    try:
+        _s7b.write_spec(path, argv=list(spec.argv), env=dict(spec.env), cwd=spec.cwd, log=spec.log,
+                        port=int(spec.port), tag=str(getattr(ns, "tag", "") or ""), pid=int(spec.pid),
+                        card_need_mib=card_need_mib)
+    except OSError as e:
+        log(f"{_s7b.MARK} P-RESPAWN-SPEC not written ({type(e).__name__}: {e}) -- the front's P restart is unarmed")
+        return ""
+    log(f"{_s7b.MARK} P-RESPAWN-SPEC {path}: argv {len(spec.argv)} items, env {len(spec.env)} keys (secrets "
+        f"masked), cwd {spec.cwd or '-'}, mode 0600, P's planned peak per card (budget + overhead, MiB) "
+        f"{card_need_mib or 'NONE -- the restart will refuse to spawn'} -- the front's P restart (stage 2) "
+        f"re-execs exactly this")
+    return path
 
 
 def group_form_block(env) -> Optional[dict]:
@@ -28730,6 +28777,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec_p.env.update(dual_share_env(ns, "P"))
     spec_p.env.update(dual_priority_env(ns, "P", log))  # DUAL-SHARE: {} unless a switch is on
     launch_group(spec_p, tree, log, dry)
+    ns._s7b_spec_path = write_p_respawn_spec(spec_p, ns, log, dry, p_planned_need(cards, state.budgets.get("P"), ns, log))
     ns._dual_spec_d = None
     if getattr(ns, "dual_share", False):
         # DUAL-TP3PP3 1b: D boots NOW as the union owner; P holds before its
@@ -29338,6 +29386,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
     # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
     fenv["PYTHONUNBUFFERED"] = "1"
+    if getattr(ns, "_s7b_spec_path", ""):
+        from flliper.srt.pdflip import dual_p_restart as _s7b
+
+        fenv[_s7b.SPEC_ENV] = ns._s7b_spec_path  # S7b: the front's P restart reads P's exec record here
     # FH (b1): the front's health poller finds a held rank (#1223) by its dump;
     # hand it the dir the groups write to (read only by front_health).
     if env_p.get("FLLIPER_DEBUG_HOLD_DIR") and not fenv.get("FLLIPER_DEBUG_HOLD_DIR"):
@@ -29806,6 +29858,10 @@ def teardown(path: str, report: dict | None = None) -> int:
     # module global is empty here and the recorded path is the only source.
     set_admin_key(None, st.get("admin_key_file", ""))
     print(f"PDFLIP-TEARDOWN admin key file: {drop_admin_key_file()}")
+    if st.get("tag"):  # S7b review SOLL 7: P's exec record dies with the boot
+        from flliper.srt.pdflip import dual_p_restart as _s7b
+
+        print(f"PDFLIP-TEARDOWN S7B respawn record: {_s7b.remove_spec(GPU_ARB, st['tag'])}")
     pids = set()
     for name, pid in st.get("pids", {}).items():
         if pid:
