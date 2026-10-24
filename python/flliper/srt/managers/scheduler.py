@@ -11368,6 +11368,26 @@ class Scheduler(
         held = [r for r in self.waiting_queue if str(r.rid).startswith(rid)]
         if not held:
             return False
+        # #DPJ-W (24.10., 27B NVFP4 dual rc39a b9cddabda1, P log ..._1024_085659):
+        # PP0 stamped this abort pp0_admitted=False (K14: no frame of PP0 names
+        # it, PP0 popped it at receipt -- 'PDFLIP-PP-ABORT-VERDICT rid=pdflip-0-28
+        # pp0_admitted=False ... every stage applies it at receipt'), yet a told of
+        # an EARLIER list stood here (Q-693/Q-697 did not apply), so this #1180-W
+        # hold kept the instance: PP1 popped it on misses=3, PP2 (idle, no frames)
+        # did not before the front's RESUME sent the next instance under the SAME
+        # rid -- PP0's frames then named the rid for the new instance ('keep' for
+        # ever), the zombie stayed queued, and the adder minted pdflip-0-28 twice
+        # in one pass ('#996 SECOND CHUNKED MINT', PP2 09:09:46, group death).
+        # PP0's stamped verdict is the group's decision (SCHEDULER-SOLL v2 R11):
+        # an explicit False is applied at receipt here as well. Unstamped (None)
+        # keeps the #1180-W hold byte for byte.
+        if getattr(recv_req, "pdflip_pp0_admitted", None) is False:
+            logger.info(
+                "PDFLIP-PP-WAITING-ABORT at-receipt rid=%s pp_rank=%s queued=%d: PP0 stamped "
+                "pp0_admitted=False (no frame names it, PP0 popped it at receipt) -- applied "
+                "here at receipt too, no #1180-W hold (#DPJ-W, K14)",
+                rid, getattr(ps, "pp_rank", 0), len(held))
+            return False
         # Q-693 (dual P only): no told of it ever reached this follower, so PP0
         # had not admitted it -- applied at receipt like PP0 does (y8y PP1 zombie);
         # Q-697: nor did a told that rode the SAME PP0 list as this abort (y9 PP1)

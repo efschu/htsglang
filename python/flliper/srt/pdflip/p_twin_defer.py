@@ -108,6 +108,33 @@ THE RULE (PP0 only; switch ``FLLIPER_PDFLIP_P_TWIN_DEFER``, default off):
      ... reason=source_gone'), the same plain told the Frist would publish.
      The flip form (no dual layout) is unchanged byte for byte.
 
+  7. SOURCE UNGRANTED (#DPJ, 24.10., DUAL LAYOUT ONLY). 27B NVFP4 dual rc39a
+     (b9cddabda1) P log ..._1024_085659, PP0: 09:02:51 '#TW TWIN-DEFER
+     rid=pdflip-0-10 ... sources=['pdflip-0-6']' one line AFTER 'P-KV PP0
+     GRANT rid=pdflip-0-10 tokens=86016' (Q-670 GRANT-BYPASS past the head
+     pdflip-0-6, which waited for its OWN card grant). The twin's group grant
+     pre-charges every follower card until a follower adopts it from the told
+     (Q-630) -- and the deferral holds exactly that told. 0-6's grant was
+     short on card 1 by the twin's pre-charge ('#1640 GRANT-INFEASIBLE ... the
+     grant waits for the return of the followers' pre-charge of just-taken
+     grants', P=2894069760 = PP1 mapping 2013265920 + 0-10's 880803840): the
+     source waited for the twin's grant, the twin for the source's finish --
+     a circular wait broken only by the Frist ('TWIN-RELEASE reason=deadline
+     waited_s=120.00' 09:04:51, 'P-KV PP0 GRANT rid=pdflip-0-6 ... after 5164
+     waits over 122.1 s' 09:04:52): ADMISSION-WEDGE CLASS=P-KV-WAIT, 4 queued,
+     0 running, P idle. Same shape 09:05:37 (0-23 behind 0-21/0-22, both
+     waiting for their grant, 0-23's charge held until its abort 09:07:25).
+     In the dual layout a source still waiting for its card grant
+     (``_dual_kv_wait``) is no source: it computes nothing before it holds a
+     grant, and the twin -- which holds one -- may be what keeps it short. At
+     intake such sources are not waited for ('#TW TWIN-SOURCE-UNGRANTED
+     at=intake', no source left -> the twin registers at once); a held twin
+     whose remaining sources all wait for their grant is released as an
+     ordinary request ('#TW TWIN-RELEASE ... reason=source_ungranted'), the
+     same plain told the Frist would publish 120 s later. PP0 decides alone
+     (SCHEDULER-SOLL v2 R11): the release only moves WHEN PP0 puts the told on
+     the wire. The flip form (no dual layout) is unchanged byte for byte.
+
 RANK AGREEMENT. Nothing new is decided off PP0. A follower already holds
 every request until PP0's told arrives on the request wire (#1400,
 ``declined:pdflip_held``) and skips it at admission until then
@@ -151,6 +178,9 @@ REL_DEADLINE = "deadline"
 REL_NO_GAIN = "no_gain"
 #: Q-690 (dual layout only): every source left P unfinished (abort / requeue)
 REL_SOURCE_GONE = "source_gone"
+#: rule 7 (#DPJ, dual layout only): every remaining source waits for its own
+#: P card grant -- it computes nothing first, the twin's grant may hold it short
+REL_SOURCE_UNGRANTED = "source_ungranted"
 
 _ATTR = "_pdflip_twin_state"
 _LOG_FIRST = 8
@@ -250,6 +280,8 @@ class _State:
     n_deadline: int = 0
     n_no_gain: int = 0
     n_source_gone: int = 0
+    #: rule 7 (#DPJ): sources dropped because they wait for their card grant
+    n_source_ungranted: int = 0
     #: rule 6 (S79): a twin released in a pass re-waits behind an older sibling
     #: that will compute deeper (``FLLIPER_PDFLIP_P_TWIN_CHAIN``)
     chain: bool = False
@@ -405,6 +437,28 @@ def _gone(src, present: set) -> bool:
     if callable(fin) and fin():
         return False
     return id(src) not in present
+
+
+def _grant_waiting(src) -> bool:
+    """Rule 7 (#DPJ, dual layout only): ``src`` is held on PP0 for its own P
+    card grant (``pdflip_store_told.intake`` / ``_dual_kv_retry`` set and clear
+    ``_dual_kv_wait``) -- it holds no grant and computes nothing yet."""
+    fin = getattr(src, "finished", None)
+    if callable(fin) and fin():
+        return False
+    return bool(getattr(src, "_dual_kv_wait", False))
+
+
+def _say_ungranted(st: "_State", rid: str, dropped, left: int, at: str) -> None:
+    st.n_source_ungranted += 1
+    if _say(st.n_source_ungranted):
+        logger.info(
+            "#TW TWIN-SOURCE-UNGRANTED rid=%s at=%s dropped=%s left=%d (n=%d): the source "
+            "waits for its own P card grant -- it computes nothing first, and this twin's "
+            "grant (pre-charged on the follower cards until its told leaves, Q-630) may be "
+            "what keeps it short; no reason to wait (dual layout, rule 7).",
+            rid, at, [_rid(s) for s in dropped], left, st.n_source_ungranted,
+        )
 
 
 # 27B port 20.10.: the NF S79r closure ``_gone(s)`` inside ``release_ready``
@@ -716,6 +770,12 @@ def intake_defer(scheduler, req) -> bool:
         and _rid(s) not in st.waits
         and is_twin(s, req, st.min_tokens)
     ]
+    if st.dual and sources:
+        # rule 7 (#DPJ): a source still waiting for its card grant is no source
+        _ungr = [s for s in sources if _grant_waiting(s)]
+        if _ungr:
+            sources = [s for s in sources if not _grant_waiting(s)]
+            _say_ungranted(st, rid, _ungr, len(sources), "intake")
     # #56: siblings that finished within the settle window count too; their
     # finish is the start of the settle (not this intake).
     recent = [
@@ -858,6 +918,26 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
                             [_rid(s)[:12] for s in gone], st.n_source_gone,
                         )
                     out.append((w.req, False))
+                    continue
+        if st.dual:
+            # rule 7 (#DPJ): sources still waiting for their own card grant
+            # compute nothing before this twin's grant returns -- circular wait
+            ungr = [s for s in w.sources if _grant_waiting(s)]
+            if ungr:
+                w.sources = [s for s in w.sources if not _grant_waiting(s)]
+                _say_ungranted(st, rid, ungr, len(w.sources), "release")
+                if not w.sources:
+                    st.waits.pop(rid, None)
+                    logger.info(
+                        "#TW TWIN-RELEASE rid=%s reason=%s waited_s=%.2f shared=%d "
+                        "pending_sources=0 ungranted=%s (n=%d): every remaining source "
+                        "waits for its own P card grant -- registered as an ordinary "
+                        "request",
+                        rid[:12], REL_SOURCE_UNGRANTED, now - w.since, w.shared,
+                        [_rid(s)[:12] for s in ungr], st.n_source_ungranted,
+                    )
+                    out.append((w.req, False))
+                    older.append(w.req)
                     continue
         # 27B port: the dual layout keeps its own Q-690 rule 6 above (dual
         # path unchanged); the S79r prune runs on the flip layout only.
