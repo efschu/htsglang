@@ -12285,6 +12285,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # SHORT-FLIP-REPRICE-1024 review MUSS-1 (the #943 pattern: bound to the OPERATION, written once): the absolute
+        # start of THIS registration's span, carried to the record this read terminates into (both record writes below).
+        try:
+            _ss = span_base if span_base is not None else key_base
+            operation._pdflip_span_start = None if _ss is None else int(_ss)
+        except (TypeError, ValueError, AttributeError):
+            pass
         # #1442: D takes P's page-key chain for this request instead of
         # re-hashing the tokens; the chain is indexed from the request start,
         # the prefetch starts after the locally matched prefix.
@@ -13356,6 +13363,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # scheduler names a short read a CAPACITY-CUT only on arena_full, not on 'the probe covered it' alone
             cut_cause=_s23_cut_cause(operation),
         )
+        # SHORT-FLIP-REPRICE-1024 review MUSS-1: the record carries its own span start (from its operation)
+        self.prefetch_loaded_tokens_by_reqid[req_id].span_start = getattr(operation, "_pdflip_span_start", None)
         if _eb_rec is not None:
             # HFB (rc12z21 D 13:35:14, pdflip-8-34): under the Form A END vote
             # every rank's `synced`/`materialized` counts from ITS OWN span
@@ -14265,6 +14274,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # honestly, and the front re-routes to P. Deferring here
                     # would be waiting on a read that was never issued.
                 )
+                # SHORT-FLIP-REPRICE-1024 review MUSS-1: the revoke record carries its operation's span start too
+                self.prefetch_loaded_tokens_by_reqid[req_id].span_start = getattr(
+                    _operation, "_pdflip_span_start", None)
             return drained
 
         def _drain_backup():

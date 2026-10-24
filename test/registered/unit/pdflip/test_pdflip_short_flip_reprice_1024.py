@@ -68,12 +68,17 @@ def _env(monkeypatch):
     monkeypatch.delenv(rc12y.MAX_CYCLES_ENV, raising=False)
 
 
-def _arm(record, base=BASE, n=N):
-    """The REAL ``Scheduler._pdflip_note_store_shortfall`` on the rc12y stand-in with ``record`` as the drain sees it."""
+def _arm(record, base=BASE, n=N, stamp=None):
+    """The REAL ``Scheduler._pdflip_note_store_shortfall`` on the rc12y stand-in with ``record`` as the drain sees it.
+    ``base`` is the span start the record's OPERATION carried (review MUSS-1: ``record.span_start``); ``stamp`` the
+    request's own ``_prefetch_registered_prefix_len`` (default: the same value, as at the first observation)."""
     s, r = rc12y._sched(n, 0, 1, X)
-    s.tree_cache.prefetch_loaded_tokens_by_reqid[RID] = record
     if base is not None:
-        r._prefetch_registered_prefix_len = base
+        record.span_start = base
+    s.tree_cache.prefetch_loaded_tokens_by_reqid[RID] = record
+    st = base if stamp is None else stamp
+    if st is not None:
+        r._prefetch_registered_prefix_len = st
     return s, r, s._pdflip_note_store_shortfall(r)
 
 
@@ -128,11 +133,45 @@ def test_an_end_vote_record_keeps_its_reduced_end():
     assert r._pdflip_store_delivered == 70841 and r._pdflip_store_deliverable == 70994
 
 
-def test_a_stamp_that_cannot_be_this_reads_start_is_not_used():
-    """base + deliverable beyond the request's ids: not this read's start -- the old reading, never an invented depth."""
+def test_a_start_that_cannot_be_this_reads_is_not_used():
+    """start + deliverable beyond the request's ids: not this read's start -- the old reading, never an invented depth."""
     _s, r, _out = _arm(_rec215(), base=60000)
     assert r._pdflip_store_delivered == GOT
     assert dn.span_base(types.SimpleNamespace(_prefetch_registered_prefix_len=BASE), 17091) == 0   # bare int record
+
+
+def test_review_muss1_the_request_stamp_alone_is_never_a_base():
+    """MUSS-1: a record without its operation's start keeps the span-relative reading, whatever the request carries."""
+    _s, r, _out = _arm(_rec215(), base=None, stamp=BASE)
+    assert r._pdflip_store_delivered == GOT
+
+
+def test_review_muss1_rank_skew_two_stale_stamps_one_record_one_witness():
+    """R11: two ranks re-stamped by a rank-local re-match (W65 skew) to different depths; the record (group-agreed
+    span, its operation's start) is the same -> the witness is the same on both."""
+    outs = []
+    for stamp in (70841, 70266):
+        _s, r, _out = _arm(_rec215(), stamp=BASE)
+        r._prefetch_registered_prefix_len = stamp          # the next _prefetch_kvcache call on this rank
+        _s._pdflip_note_store_shortfall(r)
+        outs.append((r._pdflip_store_delivered, dn.d_would_compute(r)))
+    assert outs == [(70841, 158), (70841, 158)]
+
+
+def test_review_muss1_the_record_carries_its_operations_start():
+    """MUSS-1 wiring: the start is stamped once on the operation at registration and copied at BOTH record writes."""
+    import inspect
+
+    from flliper.srt.mem_cache import unified_radix_cache as urc
+
+    assert PrefetchOutcome(5).span_start is None
+    src = inspect.getsource(urc.UnifiedRadixCache.prefetch_from_storage)
+    assert "operation._pdflip_span_start = None if _ss is None else int(_ss)" in src
+    assert "_ss = span_base" in src      # 27B: else key_base; NF: span_base only (the tree takes no key_base)
+    full = inspect.getsource(urc)
+    assert full.count('.span_start = getattr(operation, "_pdflip_span_start", None)') == 1      # termination
+    assert full.count('"_pdflip_span_start", None)') == 2                                          # + revoke
+    assert "_prefetch_registered_prefix_len" not in inspect.getsource(dn.span_base).split('"""')[-1]
 
 
 def test_refresh_after_a_whole_reread_follows_the_absolute_depth():
@@ -140,6 +179,7 @@ def test_refresh_after_a_whole_reread_follows_the_absolute_depth():
     req = types.SimpleNamespace(rid="pdflip-21-215", full_untruncated_fill_ids=list(range(N)),
                                 _prefetch_registered_prefix_len=BASE, _pdflip_store_delivered=BASE + GOT)
     whole = PrefetchOutcome(ASKED - GOT, matched=GOT, deliverable=ASKED, synced=ASKED)
+    whole.span_start = BASE
     assert not whole.is_incomplete
     assert dn.refresh_delivered(req, whole) is True and req._pdflip_store_delivered == BASE + ASKED
 
@@ -148,13 +188,16 @@ def test_mutant_refresh_without_the_span_start_never_raises(monkeypatch):
     monkeypatch.setattr(dn, "span_base", lambda req, record: 0)
     req = types.SimpleNamespace(rid="pdflip-21-215", full_untruncated_fill_ids=list(range(N)),
                                 _prefetch_registered_prefix_len=BASE, _pdflip_store_delivered=BASE + GOT)
-    assert dn.refresh_delivered(req, PrefetchOutcome(ASKED - GOT, matched=GOT, deliverable=ASKED, synced=ASKED)) is False
+    whole = PrefetchOutcome(ASKED - GOT, matched=GOT, deliverable=ASKED, synced=ASKED)
+    whole.span_start = BASE
+    assert dn.refresh_delivered(req, whole) is False
 
 
 def test_the_settle_remainder_and_the_cohort_price_read_the_depth():
     req = types.SimpleNamespace(rid="r", full_untruncated_fill_ids=list(range(N)), _prefetch_span_tokens=ASKED,
                                 _prefetch_registered_prefix_len=BASE, origin_input_ids=list(range(N)), output_ids=[])
     rec = _rec215()
+    rec.span_start = BASE
     assert sw.remainder(req, {"r": rec}) == 158
     assert wc.new_tokens(req, {"r": rec}) == 158
     # a bare int record (an admission site) keeps the old reading
@@ -192,7 +235,7 @@ def _take(f):
 
 def test_215_the_front_keeps_the_arrival_kurz_no_set_member_no_flip_reason(d_env, caplog):
     f = _front()
-    f.__dict__.setdefault("_probe_price", {})["pdflip-21-215"] = _price(N, 70134)       # D-PROBE u=865
+    f.__dict__.setdefault("_arrival_price", {})["pdflip-21-215"] = _price(N, 70134)       # D-PROBE u=865
     rvp.write_request("pdflip-21-215", list(range(N)), 53908, X, dn.REASON)
     with caplog.at_level(logging.INFO):
         assert _take(f) == 1
@@ -209,7 +252,7 @@ def test_215_the_front_keeps_the_arrival_kurz_no_set_member_no_flip_reason(d_env
 def test_mutant_without_the_guard_the_front_classes_215_gross(d_env, monkeypatch):
     monkeypatch.setattr(F.Front, "_rvp_unrun_kurz_u", lambda self, rid, rec, d_ext: None)
     f = _front()
-    f.__dict__.setdefault("_probe_price", {})["pdflip-21-215"] = _price(N, 70134)
+    f.__dict__.setdefault("_arrival_price", {})["pdflip-21-215"] = _price(N, 70134)
     rvp.write_request("pdflip-21-215", list(range(N)), 53908, X, dn.REASON)
     assert _take(f) == 1
     p = f.queue[-1]
@@ -220,7 +263,7 @@ def test_a_parked_decode_keeps_ds_real_extent(d_env):
     """pdflip-8-58: arrival u=372 on D's device copy, decoded 468 tokens, parked for a flip, the sleep dropped the copy,
     the store holds the Mamba anchor at 37852 only: d_extent 20076 is real (P computed 20076) -- gross as before."""
     f = _front()
-    f.__dict__.setdefault("_probe_price", {})["pdflip-8-58"] = _price(57460, 57088)
+    f.__dict__.setdefault("_arrival_price", {})["pdflip-8-58"] = _price(57460, 57088)
     rvp.write_request("pdflip-8-58", list(range(57928)), 20076, X, dn.REASON)
     assert _take(f) == 1
     assert f.queue[-1].est_uncached == 20076 and f.counters.get("rvp_unrun_kurz_kept", 0) == 0
@@ -233,7 +276,7 @@ def test_a_parked_decode_keeps_ds_real_extent(d_env):
 ])
 def test_the_guard_is_narrow(d_env, covered, d_ext, reason):
     f = _front()
-    f.__dict__.setdefault("_probe_price", {})["r1"] = _price(N, covered)
+    f.__dict__.setdefault("_arrival_price", {})["r1"] = _price(N, covered)
     rvp.write_request("r1", list(range(N)), d_ext, X, reason)
     assert _take(f) == 1
     assert f.queue[-1].est_uncached == d_ext and f.counters.get("rvp_unrun_kurz_kept", 0) == 0
@@ -261,3 +304,180 @@ def test_the_batch_queued_line_names_where_the_entry_stands():
     assert F.Front._arrival_placed(f, p) == "queue"
     f.queue = []
     assert F.Front._arrival_placed(f, p) == "none"
+
+
+# ------------------------------------------------------------------------------------------------ review SOLL-2
+# Three readers of the witness change behaviour whenever a read's span starts above 0 (named in the commit): each
+# moves to its documented absolute intent. Pinned here on the 215 numbers, with the pre-fix reading as the mutant.
+
+def _witnessed(mutant, monkeypatch):
+    if mutant:
+        monkeypatch.setattr(dn, "span_base", lambda req, record: 0)
+    _s, r, _out = _arm(_rec215())
+    return r
+
+
+@pytest.mark.parametrize("mutant,expect", [(False, True), (True, False)])
+def test_review_soll2_capacity_park_candidate_reads_the_absolute_deliverable(monkeypatch, mutant, expect):
+    """#248h: the store holds [0, 70994) of 70999 -- a whole re-read is admitted (5 <= X): capacity park, no P leg.
+    Span-relative (deliverable 17244) it read 53755 > X: not a candidate."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
+    monkeypatch.delenv(rvp.ENV, raising=False)
+    r = _witnessed(mutant, monkeypatch)
+    r.stream, r.multimodal_inputs, r.priority, r._pdflip_store_short_fallback = True, None, 0, True
+    assert rvp.capacity_park_candidate(r, X, now=0.0) is expect
+
+
+@pytest.mark.parametrize("mutant,expect", [(False, True), (True, False)])
+def test_review_soll2_p_span_delivered_reads_the_absolute_depth(monkeypatch, mutant, expect):
+    """S75 P-span label: P wrote 70841 tokens (1106 pages); the read reached 70841 -> nothing left for P to write."""
+    from flliper.srt.pdflip.handoff_keys import P_PAGES_ATTR, P_TOKENS_ATTR
+
+    r = _witnessed(mutant, monkeypatch)
+    setattr(r, P_PAGES_ATTR, 70841 // 64)
+    setattr(r, P_TOKENS_ATTR, 70841)
+    assert sw.p_span_delivered(r, 64) is expect
+
+
+@pytest.mark.parametrize("mutant,expect", [(False, False), (True, True)])
+def test_review_soll2_window_above_delivered_reads_the_absolute_depth(monkeypatch, mutant, expect):
+    """ZR-2: an agreed END window at page 70784 lies BELOW the delivered 70841 -- no wait for a re-read.
+    Span-relative (17091) the settle waited for a re-read that could add nothing."""
+    from flliper.srt.pdflip import tail_adopt as ta
+
+    r = _witnessed(mutant, monkeypatch)
+    ta._AGREED[str(r.rid)] = types.SimpleNamespace(
+        agreed=True, staged=types.SimpleNamespace(spec=types.SimpleNamespace(page_prefix=70784)))
+    try:
+        assert ta.window_above_delivered(r) is expect
+    finally:
+        ta._AGREED.pop(str(r.rid), None)
+
+
+# ------------------------------------------------------------------------------------------------ review SOLL-3
+
+def test_review_soll3_a_second_p_leg_keeps_ds_extent(d_env):
+    """attempt=2: a P leg already ran for this rid -- D's extent after it is no arrival question."""
+    f = _front()
+    f.__dict__.setdefault("_arrival_price", {})["pdflip-21-215"] = _price(N, 70134)
+    rvp.write_request("pdflip-21-215", list(range(N)), 53908, X, dn.REASON, attempt=2)
+    assert _take(f) == 1
+    assert f.queue[-1].est_uncached == 53908 and f.counters.get("rvp_unrun_kurz_kept", 0) == 0
+
+
+def test_review_soll3_a_repriced_latest_price_is_not_the_arrival_price(d_env):
+    """A decoded request: its arrival price is on the PROMPT (57460), a later ``_rvp_reprice`` put the LEG ids' price
+    (57928, 372 uncached) into ``_probe_price``. Its next store_short leg (ids == the repriced ids) must not read as
+    'never ran': only the write-once arrival book counts."""
+    f = _front()
+    f.__dict__.setdefault("_probe_price", {})["pdflip-8-58"] = _price(57928, 57556)          # latest, leg ids
+    F.Front._note_arrival_price(f, "pdflip-8-58", _price(57460, 57088))                       # the arrival
+    F.Front._note_arrival_price(f, "pdflip-8-58", _price(57928, 57556))                       # write-once: ignored
+    assert f._arrival_price["pdflip-8-58"].covered == 57088
+    rvp.write_request("pdflip-8-58", list(range(57928)), 20076, X, dn.REASON)
+    assert _take(f) == 1
+    assert f.queue[-1].est_uncached == 20076
+
+
+def test_review_soll3_the_arrival_sites_write_the_arrival_book():
+    import inspect
+
+    src = inspect.getsource(F)
+    assert src.count("Front._note_arrival_price(self, rid, _xp)") == 2     # arrival D-PROBE + its NF-1b late answer
+    assert '(self.__dict__.get("_arrival_price") or {}).get(str(rid))' in inspect.getsource(F.Front._rvp_unrun_kurz_u)
+
+
+# ------------------------------------------------------------------------------------------------ review SOLL-4
+
+def _settle_sched(tmp_path, monkeypatch, record):
+    """A bare Scheduler with the REAL settle tick / refetch / #1324 arm / D-NORECOMPUTE release; the store is the one
+    record of 215's first read (its operation's start 53750); ``_prefetch_kvcache`` is the metal's DECLINED re-issue
+    (D 11:41:02 ``#1456 HOLD-REFETCH ... declined:vote_negative``) that re-stamps the request from a fresh re-match
+    and registers nothing -- the record stays."""
+    S = sched_mod.Scheduler
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_DIR", str(tmp_path))
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
+    (tmp_path / "handoff").mkdir()
+    base, r = rc12y._sched(N, 0, 1, X)
+    s = S.__new__(S)
+    for k, v in vars(base).items():
+        if not callable(v) or k in ("tree_cache", "server_args", "ipc_channels"):
+            setattr(s, k, v)
+    s.ps = types.SimpleNamespace(tp_size=1, pp_size=1, tp_rank=0)
+    s.page_size = 64
+    s.pdflip_dormant_hold = []
+    s._pdflip_wake_seq = 1
+    s.pdflip_d_parked = []
+    record.span_start = BASE
+    s.tree_cache.prefetch_loaded_tokens_by_reqid = {r.rid: record}
+    s.tree_cache.ongoing_prefetch = {}
+    s.tree_cache.check_prefetch_progress = lambda rid: rid not in s.tree_cache.ongoing_prefetch
+    s.tree_cache.cache_controller = types.SimpleNamespace(pdflip_hold_rids=set(), prefetch_rate_limited=lambda: False,
+                                                          host_role="staging")
+    calls = []
+
+    def _declined(req, limit_tokens=None):
+        req._prefetch_registered_prefix_len = BASE + GOT      # the re-match of the re-issue
+        calls.append(req.rid)
+        return "declined:vote_negative"
+
+    s._prefetch_kvcache = _declined
+    r._prefetch_registered_prefix_len = BASE
+    r._prefetch_span_tokens = ASKED
+    r.output_ids, r.stream, r.multimodal_inputs = [], True, None
+    r.weg2_front_x, r.weg2_front_priced = X, 865             # FRONT-X 11:40:19.597
+    r._1471_since = time.monotonic()
+    r._1471_short = True
+    r._1456_n, r._1456_last = 0, 0.0
+    s.waiting_queue = []
+    s.pdflip_post_wake_settle = [r]
+    return s, r, calls
+
+
+def _tick(s, r):
+    r._1471w_t = 0.0
+    return s._pdflip_post_wake_settle_tick()
+
+
+def test_review_soll4_215_through_the_settle_cohort_hold_and_a_declined_reissue(tmp_path, monkeypatch, caplog):
+    """215 not released at the first tick: P's tail is published (the ack -> one re-read), the re-issue is DECLINED
+    (re-stamp, record kept), the cohort holds one tick; then the settle releases it. D-NORECOMPUTE must price it on the
+    record's own start: 158 -> D's own extend under the front X, no needs-p, no P leg."""
+    from flliper.srt.pdflip import wake_cohort as _wc
+
+    monkeypatch.setattr(sw, "_tail_facts", lambda rid: ("complete", False))
+    holds = [1]
+    monkeypatch.setattr(_wc, "asks", lambda settle, env=None: True)
+    # the hold is voted the first time a member is READY (a sibling read in flight on the metal)
+    monkeypatch.setattr(_wc, "hold_vote", lambda members, *a, **k: (
+        holds.pop() if holds and any(flag for _r, _st, flag in members) else 0))
+    s, r, calls = _settle_sched(tmp_path, monkeypatch, _rec215())
+    released = 0
+    with caplog.at_level(logging.INFO):
+        for _ in range(6):
+            released += _tick(s, r)
+            if s.waiting_queue:
+                break
+    assert calls == [r.rid], "the metal's one declined re-issue"
+    assert r._prefetch_registered_prefix_len == BASE + GOT, "the request stamp moved"
+    assert not holds and any("PDFLIP-WAKE-COHORT HOLD" in m for m in caplog.messages), "the cohort held one tick"
+    assert s.waiting_queue == [r], [m[:160] for m in caplog.messages if "SETTLE" in m or "NORECOMPUTE" in m]
+    assert r._pdflip_store_delivered == 70841 and dn.d_would_compute(r) == 158
+    assert any("D-DIRECT-EXTEND rid=" + str(r.rid) in m for m in caplog.messages)
+    assert not rvp.take_requests(rvp.needs_p_dir()), "no needs-p: no P leg for a kurz request (R2/R7)"
+
+
+def test_mutant_soll4_with_the_request_stamp_the_settle_sends_215_to_p(tmp_path, monkeypatch):
+    """The pre-MUSS-1 reading (start from the re-stamped request): 70841 + 17244 > 70999 -> base 0 -> 53908 -> needs-p."""
+    monkeypatch.setattr(sw, "_tail_facts", lambda rid: ("complete", False))
+    monkeypatch.setattr(dn, "span_base", lambda req, record: (
+        int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0)
+        if int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0) + int(record.deliverable)
+        <= len(req.full_untruncated_fill_ids) else 0))
+    s, r, _calls = _settle_sched(tmp_path, monkeypatch, _rec215())
+    for _ in range(6):
+        _tick(s, r)
+        if not s.pdflip_post_wake_settle:
+            break
+    recs = rvp.take_requests(rvp.needs_p_dir())
+    assert s.waiting_queue == [] and len(recs) == 1 and recs[0]["d_extent"] == 53908

@@ -6061,6 +6061,24 @@ class Front:
             return u_arr, RVP_U_SRC_ARRIVAL
         return d_ext, "d_extent"
 
+    #: SHORT-FLIP-REPRICE-1024 review SOLL-3: arrival prices kept (bounded, oldest out)
+    ARRIVAL_PRICES_KEPT = 4096
+
+    def _note_arrival_price(self, rid: str, xp: Any) -> None:
+        """SHORT-FLIP-REPRICE-1024 review SOLL-3: D's exact price of ``rid`` AT ITS ARRIVAL, written once (the arrival
+        D-PROBE, or the NF-1b late answer of that same probe). ``_probe_price`` is the LATEST price (SET-REPROBE and
+        ``_rvp_reprice`` overwrite it); the arrival class (SOLL R1, the one single-request decision) needs this one.
+        Never raises."""
+        try:
+            book = self.__dict__.setdefault("_arrival_price", collections.OrderedDict())
+            if str(rid) in book:
+                return
+            book[str(rid)] = xp
+            while len(book) > Front.ARRIVAL_PRICES_KEPT:
+                book.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- an instrument book
+            pass
+
     def _arrival_placed(self, p: "Pending") -> str:
         """SHORT-FLIP-REPRICE-1024 question (1): where an arrival that fell through the seat path STANDS, for the
         ``PDFLIP-ROUTE ... BATCH queued`` line, which is written after every placement branch -- also after SHORT-IN-FLIP
@@ -6089,7 +6107,8 @@ class Front:
         produced a token is no class number: the arrival u stands (kurz: no set member, no flip reason) and D's exact
         number NOW follows (``_rvp_reprice``, started by the caller) -- the S63 rule, the verdict on D's number now.
 
-        Only for: reason ``store_short_after_flip``; the rid's arrival D price known, kurz at its X, no image in the
+        Only for: reason ``store_short_after_flip``; the FIRST P leg (``attempt == 1``); the rid's ARRIVAL D price
+        (``_arrival_price``, write-once -- not ``_probe_price``) known, kurz at its X, no image in the
         uncached tail; the leg's context ids exactly the probed prompt (nothing decoded: a PARKED decode resumed after a
         flip is the other family -- its device copy is gone with the sleep and its extent is real, measured: P computed
         the d_extent in 18 of 18 such legs on 24.10.); and d_extent at or above that request's halbX (a d_extent that
@@ -6099,7 +6118,11 @@ class Front:
 
             if str(rec.get("reason", "")) != _dnr.REASON:
                 return None
-            xp = (self.__dict__.get("_probe_price") or {}).get(str(rid))
+            if int(rec.get("attempt") or 1) != 1:
+                return None   # review SOLL-3: a second P leg follows a P leg that ran -- D's extent stands
+            # review SOLL-3: the ARRIVAL price (write-once), never ``_probe_price`` -- SET-REPROBE and ``_rvp_reprice``
+            # overwrite that one with the latest price on the latest ids (a decoded request's leg ids would then match)
+            xp = (self.__dict__.get("_arrival_price") or {}).get(str(rid))
             if xp is None or bool(getattr(xp, "image_in_tail", False)):
                 return None
             n_ctx = len(rec.get("input_ids") or ())
@@ -8068,6 +8091,7 @@ class Front:
                 _pbook[str(rid)] = _xp
                 while len(_pbook) > 4096:
                     _pbook.popitem(last=False)
+                Front._note_arrival_price(self, rid, _xp)  # SHORT-FLIP-REPRICE-1024 review SOLL-3 (NF-1b late arrival)
                 Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
                     ids=ans.ids, spans=tuple(ans.mm_spans), rows=tuple(ans.mm_rows), extra_key=ans.extra_key,
                     extra_key_known=bool(ans.extra_key_known), path=str(path),
@@ -8337,6 +8361,7 @@ class Front:
             _pbook[str(rid)] = _xp  # a later D refusal of this rid knows P's exact number (W123 requeue)
             while len(_pbook) > 4096:
                 _pbook.popitem(last=False)
+            Front._note_arrival_price(self, rid, _xp)  # SHORT-FLIP-REPRICE-1024 review SOLL-3: write-once
             # S63 F1: the key of this price, for the re-probe right before a set verdict that flips or assigns P
             Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
                 ids=_probe.ids, spans=tuple(_probe.mm_spans), rows=tuple(_probe.mm_rows), extra_key=_probe.extra_key,
