@@ -68,8 +68,16 @@ MARK = "R2-KURZ-CHUNK"
 ENV = "FLLIPER_PDFLIP_R2_KURZ_CHUNK_RESERVE"
 #: Req attribute: how many passes this request was reserved for (group-agreed: admission outcomes are)
 ATTR_TRIES = "_pdflip_r2kurz_reserve_n"
+#: review H2: the (continuation rid, X-gate reading) the tries were counted under -- a new continuation or a new D
+#: pricing of the request is a new attempt, so the count restarts there (the waste stays bounded per continuation)
+ATTR_TRIES_KEY = "_pdflip_r2kurz_reserve_key"
+#: review A2: the need reserved for this request in the pass it was last reserved for (0 = none outstanding)
+ATTR_LAST_NEED = "_pdflip_r2kurz_reserve_need"
 MAX_TRIES = 3
 _COUNTS = {"reserve": 0, "nofit": 0}
+#: review A2: cumulative census of this rank (counting only, no collective)
+CENSUS = {"reserve_passes": 0, "reserved_tokens": 0, "wasted": 0, "wasted_tokens": 0, "nofit_passes": 0,
+          "consec_floor": 0, "max_consec_floor": 0, "floor_cont": ""}
 
 
 def enabled() -> bool:
@@ -120,7 +128,27 @@ class Plan:
     nofit: List[Tuple[str, int]] = field(default_factory=list)
 
 
-def plan_reserve(queue: Iterable[Any], rem_chunk: int, cont_floor: int, page_size: int) -> Plan:
+def _tries_key(req: Any, cont_rid: str) -> Tuple[str, Any]:
+    try:
+        from flliper.srt.pdflip import d_admit_refusal
+
+        xg = getattr(req, d_admit_refusal.XGATE_ATTR, None)
+        return (str(cont_rid), tuple(xg) if xg else None)
+    except Exception:  # noqa: BLE001
+        return (str(cont_rid), None)
+
+
+def tries(req: Any, cont_rid: str = "") -> int:
+    """Reserved passes of ``req`` under the current (continuation, X-gate reading); 0 when either changed (H2)."""
+    try:
+        if getattr(req, ATTR_TRIES_KEY, None) != _tries_key(req, cont_rid):
+            return 0
+        return int(getattr(req, ATTR_TRIES, 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def plan_reserve(queue: Iterable[Any], rem_chunk: int, cont_floor: int, page_size: int, cont_rid: str = "") -> Plan:
     """Pure: greedy in queue order, the kurz needs that fit next to the continuation's floor."""
     plan = Plan(floor=int(cont_floor))
     room = int(rem_chunk) - int(cont_floor)
@@ -131,7 +159,7 @@ def plan_reserve(queue: Iterable[Any], rem_chunk: int, cont_floor: int, page_siz
         if need is None:
             continue
         rid = str(getattr(req, "rid", "?"))
-        if int(getattr(req, ATTR_TRIES, 0) or 0) >= MAX_TRIES:
+        if tries(req, cont_rid) >= MAX_TRIES:
             continue
         if plan.reserve + need <= room:
             plan.reserve += need
@@ -167,20 +195,62 @@ def plan_for_pass(adder: Any, sched: Any, cont: Any) -> Optional[Plan]:
     rem = getattr(adder, "rem_chunk_tokens", None)
     if rem is None or getattr(adder, "scheduled_extents", None):
         return None
+    # review H1: with the END-ANCHOR cut armed and no multi-anchor tails, a reserved kurz request would be cut at its
+    # anchor and refused ``second_continuation_end_anchor`` next to the continuation -- reserving would only idle
+    try:
+        from flliper.srt.managers import schedule_policy as _sp
+
+        if getattr(_sp, "_PDFLIP_END_ANCHOR", False) and not getattr(adder, "multi_anchor_tails", False):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
     queue = list(getattr(sched, "waiting_queue", None) or ())
     if not queue:
         return None
-    return plan_reserve(queue, int(rem), _cont_floor(adder), int(getattr(adder, "page_size", 1) or 1))
+    return plan_reserve(queue, int(rem), _cont_floor(adder), int(getattr(adder, "page_size", 1) or 1),
+                        str(getattr(cont, "rid", "")))
+
+
+def note_waste(sched: Any) -> None:
+    """Review A2: a request reserved for in an earlier pass that still waits = that reservation was wasted."""
+    for r in list(getattr(sched, "waiting_queue", None) or ()):
+        try:
+            ln = int(getattr(r, ATTR_LAST_NEED, 0) or 0)
+        except Exception:  # noqa: BLE001
+            ln = 0
+        if ln > 0:
+            CENSUS["wasted"] += 1
+            CENSUS["wasted_tokens"] += ln
+            try:
+                setattr(r, ATTR_LAST_NEED, 0)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _note_floor(cont_rid: str, at_floor: bool) -> None:
+    if not at_floor:
+        if CENSUS["floor_cont"] == cont_rid:
+            CENSUS["consec_floor"] = 0
+        return
+    if CENSUS["floor_cont"] == cont_rid:
+        CENSUS["consec_floor"] += 1
+    else:
+        CENSUS["floor_cont"], CENSUS["consec_floor"] = cont_rid, 1
+    CENSUS["max_consec_floor"] = max(CENSUS["max_consec_floor"], CENSUS["consec_floor"])
 
 
 @contextmanager
 def reserve_scope(adder: Any, sched: Any, cont: Any):
     """Lower the chunk budget for the continuation by the kurz reservation; afterwards charge only what it took."""
+    cont_rid = str(getattr(cont, "rid", "?"))
     try:
+        if enabled() and _group_d(sched):
+            note_waste(sched)
         plan = plan_for_pass(adder, sched, cont)
     except Exception:  # noqa: BLE001 -- a reservation may never break admission
         plan = None
     if plan is not None and plan.nofit and not plan.rids:
+        CENSUS["nofit_passes"] += 1
         _COUNTS["nofit"] += 1
         n = _COUNTS["nofit"]
         if n <= 8 or n % 64 == 0:
@@ -191,6 +261,7 @@ def reserve_scope(adder: Any, sched: Any, cont: Any):
                 ",".join(f"{r}:{n_}" for r, n_ in plan.nofit[:6]), n,
             )
     if plan is None or plan.reserve <= 0:
+        _note_floor(cont_rid, False)
         yield
         return
     before = int(adder.rem_chunk_tokens)
@@ -202,16 +273,29 @@ def reserve_scope(adder: Any, sched: Any, cont: Any):
         taken = lowered - int(adder.rem_chunk_tokens)
         adder.rem_chunk_tokens = before - taken
         by_rid = {str(getattr(r, "rid", "")): r for r in (getattr(sched, "waiting_queue", None) or ())}
-        for rid, _need in plan.rids:
+        for rid, need in plan.rids:
             r = by_rid.get(rid)
             if r is not None:
                 try:
-                    setattr(r, ATTR_TRIES, int(getattr(r, ATTR_TRIES, 0) or 0) + 1)
+                    n_tries = tries(r, cont_rid) + 1
+                    setattr(r, ATTR_TRIES_KEY, _tries_key(r, cont_rid))
+                    setattr(r, ATTR_TRIES, n_tries)
+                    setattr(r, ATTR_LAST_NEED, int(need))
                 except Exception:  # noqa: BLE001 -- a slotted stand-in
                     pass
+        CENSUS["reserve_passes"] += 1
+        CENSUS["reserved_tokens"] += int(plan.reserve)
+        _note_floor(cont_rid, taken <= before // 4)
         _COUNTS["reserve"] += 1
         n = _COUNTS["reserve"]
         if n <= 8 or n % 64 == 0:
+            logger.info(
+                "PDFLIP %s-CENSUS reserve_passes=%d reserved_tokens=%d wasted=%d wasted_tokens=%d nofit_passes=%d "
+                "max_consec_floor=%d (cumulative on this rank; wasted = a reserved request that still waited the next "
+                "pass; consec_floor = passes in a row the same continuation got <= 1/4 of the chunk)",
+                MARK, CENSUS["reserve_passes"], CENSUS["reserved_tokens"], CENSUS["wasted"], CENSUS["wasted_tokens"],
+                CENSUS["nofit_passes"], CENSUS["max_consec_floor"],
+            )
             logger.info(
                 "PDFLIP %s-RESERVE cont=%s chunk=%d reserve=%d cont_took=%d left=%d kurz=%s nofit=%s occurrence=%d "
                 "soll=R2/R7 -- the kurz requests get their share of this pass before the continuation (R6k: nothing "

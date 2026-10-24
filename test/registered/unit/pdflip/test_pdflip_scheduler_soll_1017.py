@@ -349,7 +349,7 @@ _K_CHUNK = 256
 _K_HALFX = 2048
 
 
-def _k_adder(rem_chunk=_K_CHUNK, page_size=1):
+def _k_adder(rem_chunk=_K_CHUNK, page_size=1, num_mixed=0):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -371,10 +371,11 @@ def _k_adder(rem_chunk=_K_CHUNK, page_size=1):
     for name in ("available_size", "full_available_size", "swa_available_size"):
         getattr(alloc, name).return_value = 10**6
     running = MagicMock()
-    running.reqs = []
+    running.reqs = [SimpleNamespace(rid=f"run-{i}", output_ids=[], sampling_params=SimpleNamespace(max_new_tokens=512))
+                    for i in range(num_mixed)]
     return PrefillAdder(
         page_size=page_size, tree_cache=tc, token_to_kv_pool_allocator=alloc, running_batch=running,
-        new_token_ratio=1.0, rem_input_tokens=10**9, rem_chunk_tokens=rem_chunk, num_mixed_decode_tokens=0,
+        new_token_ratio=1.0, rem_input_tokens=10**9, rem_chunk_tokens=rem_chunk, num_mixed_decode_tokens=num_mixed,
         priority_scheduling_preemption_threshold=0,
     )
 
@@ -551,3 +552,133 @@ def test_r2_kurz_reserve_is_wired_at_the_continuation_seam():
     assert j - i < 200
     assert src.rfind("_lanes_p.chunk_scope(adder, self.chunked_req)", 0, i) > i - 200
     assert src.index("adder.chunked_req_outstanding = self.chunked_req is not None", j) > j
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Review review-27b-r2kurz-mixeddflash-1024 (Opus, JA MIT AUFLAGEN): A1 -- the three combinations that MIXED-D under DFLASH
+# makes live or that were only read (probe P1/P1b/P2/P3); A2 census; H1 END-ANCHOR riegel; H2 tries restart.
+# ---------------------------------------------------------------------------------------------------------------------
+def test_r2_kurz_a1a_reservation_after_the_mixed_decode_deduction_no_double_charge():
+    """(a) MIXED-D armed: 6 decode rows take 6 of the 256 at the adder's init (250); the reservation works on the rest,
+    the continuation gets 250 - 189, the kurz request rides, exactly the one-page slack is left; the largest kurz that
+    still fits (need 249 = 250 - floor) leaves the continuation its floor of one page."""
+    adder = _k_adder(num_mixed=6)
+    assert adder.rem_chunk_tokens == 250
+    cont = _k_cont()
+    kurz = _k_req("pdflip-2-22", 188, priced=700, xgate=(188, 4097))
+    assert _k_pass(adder, _k_sched([kurz]), cont) is cont
+    assert kurz in adder.can_run_list
+    assert cont.extend_range.end - cont.extend_range.start == 250 - 189
+    assert adder.rem_chunk_tokens == 1
+    adder = _k_adder(num_mixed=6)
+    cont = _k_cont()
+    big = _k_req("k248", 248, priced=248, xgate=(248, 4097))
+    _k_pass(adder, _k_sched([big]), cont)
+    assert big in adder.can_run_list and cont.extend_range.end - cont.extend_range.start == 1
+
+
+def test_r2_kurz_a1b_two_ranks_with_different_plans_heal_through_the_shared_chunk_min():
+    """(b) rank A carries the X-gate reading (reserves 189), rank B does not (plans the whole chunk): the CHUNKGEOM group
+    MIN gives both continuations 67 rows, both ranks restore the same budget and admit the kurz request alike."""
+    seen = {"A": 256 - 189, "B": 256}   # the gather: both locals known before either reads the MIN
+
+    def run(xgate):
+        adder = _k_adder()
+
+        class _Agree:
+            def __call__(self, req, gate, total_tokens, rem_total):
+                return "ADMIT" if gate is None else gate
+
+            def chunk_min(self, rid, v):
+                return min(seen.values())
+
+        adder.tp_admission_agree = _Agree()
+        cont = _k_cont()
+        kurz = _k_req("pdflip-20-190", 188, priced=188, xgate=xgate)
+        _k_pass(adder, _k_sched([kurz]), cont)
+        return adder, cont, kurz
+
+    a, ca, ka = run((188, 4097))
+    b, cb, kb = run(None)
+    assert ca.extend_range.end - ca.extend_range.start == cb.extend_range.end - cb.extend_range.start == 67
+    assert a.rem_chunk_tokens == b.rem_chunk_tokens
+    assert (ka in a.can_run_list) and (kb in b.can_run_list)
+
+
+def test_r2_kurz_a1c_nested_in_the_lane_cap_composes_to_outer_minus_taken():
+    """(c) ``lanes_p.chunk_scope`` outside (lane cap 128 while a higher lane waits), the reservation inside: the
+    continuation gets 128 - 51, the outer budget is charged exactly what it took."""
+    from flliper.srt.pdflip import lanes_p
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    adder = _k_adder()
+    adder.lane_chunk_cap_tokens = 128
+    adder.lane_higher_waiting = 5
+    cont = _k_cont()
+    kurz = _k_req("c", 50, priced=50, xgate=(50, 4097))
+    with lanes_p.chunk_scope(adder, cont), k.reserve_scope(adder, _k_sched([kurz]), cont):
+        adder.add_chunked_req(cont)
+    assert cont.extend_range.end - cont.extend_range.start == 128 - 51
+    assert adder.rem_chunk_tokens == 256 - (128 - 51)
+
+
+def test_r2_kurz_a2_census_counts_reserved_wasted_and_the_floor_streak():
+    """A2: a reserved request that still waits the next pass is counted wasted (with its need, once); a continuation
+    held at <= 1/4 of the chunk pass after pass is the floor streak."""
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    for key in ("reserve_passes", "reserved_tokens", "wasted", "wasted_tokens", "consec_floor", "max_consec_floor"):
+        k.CENSUS[key] = 0
+    k.CENSUS["floor_cont"] = ""
+    kurz = _k_req("w", 230, priced=230, xgate=(230, 4097))     # need 231: the continuation keeps 25 <= 64
+    sched = _k_sched([kurz])
+    for _ in range(2):   # reserved, but nobody admits it (another gate): still waiting
+        adder = _k_adder()
+        with k.reserve_scope(adder, sched, _k_cont()):
+            adder.add_chunked_req(_k_cont())
+    assert k.CENSUS["reserve_passes"] == 2 and k.CENSUS["reserved_tokens"] == 2 * 231
+    assert k.CENSUS["wasted"] == 1 and k.CENSUS["wasted_tokens"] == 231
+    assert k.CENSUS["max_consec_floor"] == 2
+    adder = _k_adder()
+    cont = _k_cont()
+    fresh = _k_req("v", 100, priced=100, xgate=(100, 4097))
+    sched2 = _k_sched([fresh])
+    _k_pass(adder, sched2, cont)                     # admitted in its pass
+    sched2.waiting_queue = []                        # the batch took it out of the queue
+    with k.reserve_scope(_k_adder(), sched2, _k_cont()):
+        pass
+    assert k.CENSUS["wasted"] == 1 and k.CENSUS["wasted_tokens"] == 231   # 'v' was admitted and left: no waste
+    assert k.CENSUS["consec_floor"] == 0 and k.CENSUS["max_consec_floor"] == 2   # 'v' left the continuation 155 rows
+
+
+def test_r2_kurz_h1_no_reservation_when_the_end_anchor_cut_would_refuse_it(monkeypatch):
+    """H1: END-ANCHOR armed without multi-anchor tails -> the reserved request would be refused
+    ``second_continuation_end_anchor``; no reservation at all."""
+    from flliper.srt.managers import schedule_policy as sp
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    kurz = _k_req("e", 100, priced=100, xgate=(100, 4097))
+    monkeypatch.setattr(sp, "_PDFLIP_END_ANCHOR", True)
+    adder = _k_adder()
+    adder.multi_anchor_tails = False
+    assert k.plan_for_pass(adder, _k_sched([kurz]), _k_cont()) is None
+    adder.multi_anchor_tails = True
+    assert k.plan_for_pass(adder, _k_sched([kurz]), _k_cont()).reserve == 101
+
+
+def test_r2_kurz_h2_tries_restart_behind_a_new_continuation_or_a_new_pricing():
+    """H2: MAX_TRIES counts per (continuation, X-gate reading); behind the next continuation, or after D re-priced the
+    request, it is reserved for again (the waste stays bounded per continuation)."""
+    from flliper.srt.pdflip import r2_kurz_chunk as k
+
+    kurz = _k_req("t", 100, priced=100, xgate=(100, 4097))
+    sched = _k_sched([kurz])
+    for _ in range(k.MAX_TRIES):
+        with k.reserve_scope(_k_adder(), sched, _k_cont()):
+            pass
+    assert k.plan_for_pass(_k_adder(), sched, _k_cont()).reserve == 0
+    other = _k_req("pdflip-2-23", 64993 + 3805, prefix=64993)
+    assert k.plan_for_pass(_k_adder(), sched, other).reserve == 101
+    kurz._pdflip_xgate_priced = (120, 4097)
+    assert k.plan_for_pass(_k_adder(), sched, _k_cont()).reserve == 121
+
