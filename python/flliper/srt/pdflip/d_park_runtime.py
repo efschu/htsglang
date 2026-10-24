@@ -2125,7 +2125,12 @@ def _resume_need_of(sched):
     from flliper.srt.pdflip import d_lifetime_reading as _dlr
 
     def _need(req):
-        return _dlr.resume_price(req, sched)
+        # Qwen-RISK (KVOFFSET-1024): evaluated in ``d_seats.admission_gate`` BEFORE the group MIN (``_avail``) --
+        # never raises: an unpriceable request falls back to the bare context (the test's former need)
+        try:
+            return _dlr.resume_price(req, sched)
+        except Exception:  # noqa: BLE001 -- a raise here would leave this rank out of the collective
+            return len(getattr(req, "origin_input_ids", None) or ()) + len(getattr(req, "output_ids", None) or ())
 
     return _need
 

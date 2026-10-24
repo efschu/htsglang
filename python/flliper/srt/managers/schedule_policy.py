@@ -1368,11 +1368,27 @@ def _chunk_after_mixed_decode(rem_chunk: int, mixed_decode_tokens: int, page_siz
 # ---------------------------------------------------------------------------
 
 
+#: ``max_new_tokens=None`` means "the rest of the context" -- the scheduler's own normalisation reads it as this
+#: before clamping to the context (``Scheduler``: ``max_new_tokens if not None else 1 << 30``); every term below is
+#: clipped at ``CLIP_MAX_NEW_TOKENS`` anyway, so a None prices the full clip.
+_MAX_NEW_UNSET = 1 << 30
+
+
+def _max_new_minus_out(req) -> int:
+    """``max_new_tokens - len(output_ids)``, armed against an unnormalised request (KVOFFSET-1024 Qwen-RISK: the
+    pressure-park resume test prices parked requests BEFORE the group MIN collective; ``max_new_tokens`` is
+    ``Optional[int]``): None max_new = the context rest (``_MAX_NEW_UNSET``), None output_ids = 0. Byte-identical
+    for every normalised request."""
+    mx = req.sampling_params.max_new_tokens
+    out = req.output_ids
+    return (_MAX_NEW_UNSET if mx is None else mx) - (0 if out is None else len(out))
+
+
 def decode_clip_of(req) -> int:
     """The decode term a NEW request is charged at admission: ``min(max(max_new - out, 0), CLIP)``
     (``add_one_req``'s ``max_new``)."""
     return min(
-        max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+        max(_max_new_minus_out(req), 0),
         CLIP_MAX_NEW_TOKENS,
     )
 
@@ -1383,7 +1399,7 @@ def running_request_reserve(req, new_token_ratio: float) -> float:
     ``_get_running_request_total_token_offset``, byte for byte (no clamp at 0, as upstream)."""
     return (
         min(
-            (req.sampling_params.max_new_tokens - len(req.output_ids)),
+            _max_new_minus_out(req),
             CLIP_MAX_NEW_TOKENS,
         )
         * new_token_ratio

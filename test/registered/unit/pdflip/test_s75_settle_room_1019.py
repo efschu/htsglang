@@ -357,8 +357,8 @@ def test_2_1b_a_rank_whose_budget_terms_raise_still_enters_the_min_exactly_once(
     def _boom():
         raise RuntimeError("deficit gone")
 
-    bad_req = types.SimpleNamespace(rid="bad", output_ids=None, finished=lambda: False,
-                                    sampling_params=types.SimpleNamespace(max_new_tokens=100))
+    bad_req = types.SimpleNamespace(rid="bad", output_ids=[], finished=lambda: False,       # a corrupt reserve term
+                                    sampling_params=types.SimpleNamespace(max_new_tokens="corrupt"))
     entered, sent = {}, {}
 
     def make(i):
