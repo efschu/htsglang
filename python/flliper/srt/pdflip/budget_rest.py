@@ -368,16 +368,59 @@ def vote_line_deltas(rests: Sequence[Optional[int]], lines_now: Sequence[float],
 # held as line too, it was counted twice and VOTE-LINE-BOOK made the KV pool pay for the second copy. What rate x rows
 # does NOT pay is measured here from a boot's own D log (:func:`extend_passes`, :func:`vote_fixed_from_passes`):
 # per extend, the forward phase from the vote's post down to the chunk's end free (reserved is monotone between
-# trims), minus rate x rows = the admission rest the forward trim could not return plus the forward's own fixed part.
+# trims; the end is a boundary read, not a continuous minimum, and the draft extend of the same pass falls into the
+# next window -- named, A1 checks it on the 100 ms trace), minus rate x rows = the admission rest the forward trim
+# could not return plus the forward's own fixed part.
+#
+# MEASURED on the six INT8-drei boots whose vote logged DRIVER free as post (041a871f4b, 0798c91fcd, a4f4b8fec1 x3,
+# b9cddabda1; the 121e4bf3f2..a4f4b8fec1 boots logged driver + cache and are left out by name): 618 passes with a
+# forward trim, max 238 MiB (boot _1022_003738 TP1 00:42:45, a 6-request post-wake handback, 61 rows, admission 508,
+# trim back 278, end 828). The rest grows with the number of handback requests (bs <= 6, the capture set), _080355
+# alone said 155. -> line 638, delta ceil8(638 - 300) = 344 per card (was 472 / 408 / 400): KV back 128 / 64 / 56 MiB.
+# IN-SAMPLE: the record is the max over exactly these passes, a regression lock, not a bound -- the A1 boot is the
+# first out-of-sample check (``--vote-fixed`` <= record, else the record is raised before the next boot).
+#
 # The admission PEAK before the forward trim is not a line post (it is released before the forward and no width
-# removes it); it is reported as ``post - card_free_before >= 400`` -- the budget's condition. 27B INT8 drei boot
-# _080355: max 155 MiB over 481 trimmed extends -> line 555, delta ceil8(555 - 300) = 256 per card (was 472 / 408 /
-# 400): KV back 216 / 152 / 144 MiB.
+# removes it). Its condition ``post - card_free_before >= 400`` is NOT structurally secured: the admission runs before
+# the forward-need trim, and before it only the vote's STATIC trim acts (TP2 800 -> structurally 800 - 468 = 332).
+# Measured on INT8 drei min 542 (six boots); on int4ar already violated (376 / 390, pre-existing, own ticket).
+#
+# FORM GATE (review M1 24.10.): the record holds only for the forms of its boots (:data:`VOTE_FIXED_FORMS`: checkpoint
+# and D card inventory). Other forms of the same profile measured 223-252 (int4ar, NVFP4 duo) -- there the floor line
+# stays, byte for byte, and the launcher names it.
 #
 # The value travels as the profile record ``D_EXTEND_VOTE_FIXED_MIB`` (launcher -> rank env
 # ``FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB``), the budget reads the same record: rank line and booked line are one
 # formula. ``FLLIPER_PDFLIP_VOTE_LINE_SINGLE=0`` = the floor line again (both sides; default ON, user order 14.10.).
 # --------------------------------------------------------------------------
+
+#: the record's boots (D logs with driver-free post, INT8 drei) and the forms they ran -- (checkpoint key, D card
+#: inventory). A record re-measured on other boots books nothing until its forms are named here (never guessed).
+BOOTS_VOTE_FIXED: Tuple[str, ...] = (
+    "dkr27bbar1drei10210018",
+    "dkr27bbar1drei10210043",
+    "dkr27bbar1drei10220037",
+    "dkr27bbar1drei10220104",
+    "dkr27bbar1drei10220153",
+    "dkr27bbar1drei10240803",
+)
+VOTE_FIXED_FORMS: Dict[Tuple[str, ...], Tuple[Tuple[str, Tuple[str, ...]], ...]] = {
+    BOOTS_VOTE_FIXED: (("Qwen3.8-27B-INT8-gdncov-vocabembed", ("RTX5090", "RTX3080", "RTX3080")),),
+}
+
+
+def vote_fixed_form_mismatch(boots: Sequence[str], model_key: str, inventory: Sequence[str]) -> Optional[str]:
+    """Review M1: ``None`` when (``model_key``, ``inventory``) is a form the record's ``boots`` ran, else why the
+    measured fixed part does not hold here (the floor line then stays). Pure."""
+    forms = VOTE_FIXED_FORMS.get(tuple(boots or ()))
+    if forms is None:
+        return f"the record's boots {','.join(boots or ()) or '-'} name no form"
+    want = (str(model_key or ""), tuple(inventory or ()))
+    if want in forms:
+        return None
+    return (f"F unmeasured for form {want[0] or '?'} on {','.join(want[1]) or '?'} (measured on "
+            + "; ".join(f"{m} on {','.join(i)}" for m, i in forms) + ")")
+
 
 VOTE_FIXED_RECORD = "D_EXTEND_VOTE_FIXED_MIB"
 VOTE_FIXED_MARKER = "VOTE-LINE-SINGLE"
@@ -510,7 +553,7 @@ def vote_fixed_from_passes(passes: Mapping[int, Sequence[ExtendPass]]) -> Tuple[
             lines.append(f"{VOTE_FIXED_MARKER} rank={r} trimmed={len(tr)} max excess {w.excess:.1f} MiB at "
                          f"{w.vote_ts} rows={w.rows} post={w.post:.0f} end={w.end:.0f}; admission peak max "
                          f"{max(p.admission for p in tr):.0f} MiB, min post - admission {adm:.0f} MiB "  # type: ignore
-                         f"(the budget's condition, >= 400)")
+                         f"(should be >= 400; not structurally secured)")
             if worst is None or w.excess > worst.excess:
                 worst = w
         if nt:

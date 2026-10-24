@@ -305,7 +305,8 @@ LINE_MARKER = "EXTEND-CORRIDOR-LINE"
 def _read_corridor_line() -> "tuple[float, str]":
     """(line MiB, source) -- the guard's derived floor for THIS card: its TARGET (``CorridorFloor.mib``, the same
     number ``corridor_trace`` measures its margin to). On a MEASURED card that is the measured transient peak of the
-    awake group and equals the verdict floor the trace grades a breach against (no band under a measured peak); else
+    awake group and equals the verdict floor the trace grades a breach against (with VOTE-LINE-SINGLE the vote holds
+    near-OOM + the measured fixed part instead, the trace keeps grading this floor) (no band under a measured peak); else
     the stated law. Port of NF rc33 bc9dcc7520 / review 91e56eeec1 (``_read_corridor_line``).
 
     NACHT2 review 22.10.: the TARGET, not the verdict floor. For an UNMEASURED-FALLBACK / ENV-OVERRIDE / stated card
@@ -340,34 +341,43 @@ def _read_corridor_line() -> "tuple[float, str]":
 # >= 701). Kept as line AND priced per row, it was counted twice; with PDFLIP-VOTE-LINE-BOOK (b130e9dab4) the KV pool
 # paid for the second copy (delta 472 / 408 / 400 MiB).
 #
-# WHAT AN EXTEND REALLY NEEDS ABOVE rate x rows, measured (boot boot_weg2_dkr27bbar1drei10240803_b9cddabda1_1024_080355,
-# D.log, every logged vote paired with its chunk -- budget_rest.extend_passes; report deskq/done/vote-line-single-1024.md):
+# WHAT AN EXTEND REALLY NEEDS ABOVE rate x rows, measured (every logged vote paired with its chunk --
+# budget_rest.extend_passes; six INT8-drei boots whose vote logged driver free as post, 618 passes with a forward
+# trim; report deskq/done/vote-line-single-1024.md):
 #
 #   post            the vote's driver free (PDFLIP-EXTEND-STUECKELUNG post=, after the vote's trim)
 #   admission peak  A = post - card_free_before of the FORWARD trim: the admission/load-back of the pass (Mamba
-#                   restore, KV load-back staging of a post-wake handback) -- up to 508 / 474 / 468 MiB, in post-wake
-#                   passes only (16 of 16 TP1 passes with excess > 150 MiB). Released by the forward trim BEFORE the
-#                   forward; it does not stack onto the rows and no width removes it (one 1-row handback carries it):
-#                   NOT a line post. Its condition is post - A >= 400 -- the budget's, measured min 716 / 568 / 580.
+#                   restore, KV load-back staging of a post-wake handback) -- up to ~510 MiB, in post-wake passes.
+#                   Released by the forward trim BEFORE the forward; it does not stack onto the rows and no width
+#                   removes it (one 1-row handback carries it): NOT a line post. Its condition post - A >= 400 is NOT
+#                   structurally secured (the admission runs before the forward-need trim; only the vote's STATIC trim
+#                   precedes it: TP2 800 - 468 = 332 structurally). Measured: INT8 drei min 542 (six boots); int4ar
+#                   376 / 390 -- violated, pre-existing, own ticket.
 #   forward phase   post - (card free at the chunk's end): torch reserved is monotone between trims, so the chunk's
-#                   end IS the forward phase's driver-free minimum. Above rate x rows it is the admission REST the trim
-#                   could not return (fragmented segments, <= 192 MiB) plus the forward's own fixed part (<= 77 MiB),
-#                   jointly <= 155 MiB over all 481 extends whose forward ran after a trim (TP1 08:19:01 385 rows
-#                   155.0, TP0 08:44:07 133 rows 154.9) -> D_EXTEND_VOTE_FIXED_MIB = 155.
+#                   end is the forward phase's driver-free reading (a boundary read, not a continuous minimum; the
+#                   draft extend of the same pass falls into the next window -- A1 checks both on the 100 ms trace).
+#                   Above rate x rows it is the admission REST the trim could not return (fragmented segments; it grows
+#                   with the handback's request count, bs <= 6) plus the forward's own fixed part: max 238 MiB (boot
+#                   _1022_003738 TP1 00:42:45, 6-request handback, 61 rows) -> D_EXTEND_VOTE_FIXED_MIB = 238.
+#                   IN-SAMPLE (the max over the very passes the truth test checks): a regression lock, not a bound.
 #   the edge        corridor_guard.NEAR_OOM_MIB = 400 (one allocation from OOM): the fixed rest.
 #
-#   line = NEAR_OOM_MIB + D_EXTEND_VOTE_FIXED_MIB = 400 + 155 = 555 MiB      (was the floor 767 / 701 / 700)
+#   line = NEAR_OOM_MIB + D_EXTEND_VOTE_FIXED_MIB = 400 + 238 = 638 MiB      (was the floor 767 / 701 / 700)
 #
 # The split holds only while the admission is released before the forward. :func:`need_trim_threshold` makes that
 # true by construction: before the forward the rank trims when the card is under ``line + rate x rows`` (the forward's
 # own need), not only under the hand-set static threshold (27b.env 1200 / 1100 / 800 -- TP2's 800 let a post-wake
-# handback's admission sit in the cache over the forward: 6 TP2 passes 186-336 MiB above rate x rows, the SAME passes
-# trimmed on TP0 / TP1 at <= 60 MiB). Over the need nothing changes (the card holds the forward anyway).
+# handback's admission sit in the cache over the forward; the SAME passes trimmed on TP0 / TP1 stay under the record).
+# Over the need nothing changes (the card holds the forward anyway).
 #
-# Only on a MEASURED floor (the double-count case); an unmeasured card keeps its stated law (NACHT2 rule: never a
-# wider vote on a number nobody measured), and without the record (other profiles, NF forms) the floor line holds,
-# byte for byte. Nothing counted twice, no reserve (keine-korridor-reserve-nie): the edge is the law's own near-OOM
-# number, the fixed part a measurement, the rows the rate.
+# Named limit (review MX3): under ``line + rate x floor_rows`` driver free the Q-710 cap floor raises the width above
+# the card's funding (EXTEND-CAP-FLOOR, pre-existing): there the forward can end under the edge whatever the line.
+#
+# Only on a MEASURED floor (the double-count case) AND a form of the record's boots (launcher form gate, review M1:
+# int4ar / NVFP4 duo measured 223-252 -- the floor line stays there); an unmeasured card keeps its stated law (NACHT2
+# rule: never a wider vote on a number nobody measured), and without the env (other profiles, NF forms, other forms)
+# the floor line holds, byte for byte. Nothing counted twice, no reserve (keine-korridor-reserve-nie): the edge is the
+# law's own near-OOM number, the fixed part a measurement, the rows the rate.
 # --------------------------------------------------------------------------
 
 SINGLE_LINE_MARKER = "VOTE-LINE-SINGLE"
