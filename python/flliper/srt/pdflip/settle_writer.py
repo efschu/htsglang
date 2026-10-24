@@ -299,8 +299,62 @@ def reset_for_wake(req) -> None:
     """A new wake follows a P phase in which P may have written this rid again
     (RESUME-VIA-P publishes the same tail files anew): the writer view of the
     previous wake -- state, spent ack -- does not carry over."""
-    for attr in ("_1471w_state", "_1471w_ack", "_1471w_t", WHY_ATTR):
+    for attr in ("_1471w_state", "_1471w_ack", "_1471w_t", WHY_ATTR, HELD_N_ATTR, "_1471h_said"):
         setattr(req, attr, None)
+
+
+# ---------------------------------------------------------------------------
+# REPRICE-REST-1024 (#224, SOLL R2/R7; 27B nvfp4duo 93eae72472, boot ..._1024_012625, D TP0, pdflip-26-232): the
+# settle bound released a parked decode on a SUPERSEDED record while the re-read that would replace it was in flight.
+#
+#   02:05:59  #248 WAKE-READ issued=1 ['pdflip-26-232']             (the wake; the #1471 settle clock starts ~02:06:00.7)
+#   02:06:20  #1157 PREFETCH REAPED ... requested_pages=146176 hit_pages=146176 completed=119552 elapsed=21.30s
+#             PDFLIP-SHORT-READ HELD ... completed=119552 of 146176 pages hit=146176 -- the store holds the span
+#             #1324 STORE READ HELD-CUT delivered=119552 deliverable=146176 hit_tokens=146176 cut_cause=late_complete
+#             #1456 HOLD-REFETCH rid=pdflip-26-232 n=1 reason=deferred verdict=issued
+#   02:06:21  #1471 SETTLE-RELEASE rid=pdflip-28-250 state=reading lapsed=True held_after_wake_s=20.5   (same tick)
+#             PDFLIP W50-REROUTE rid=pdflip-26-232 d_extent=26844 X=12288 reason=store_short_after_flip
+#             PDFLIP D-NORECOMPUTE rid=pdflip-26-232 would_compute=26844 -> RESUME-VIA-P
+#   02:06:42  PDFLIP-READ-STAGES req=pdflip-26-232 pages=26624 ...   (the re-read landed the whole rest)
+#   front     RESUME-VIA-P CLASS u=26844 class=gross -> SET-VERDICT FLIP_P R4 -> PARK-RUNNING 3 decodes
+#             PDFLIP-USAGE-TRUE rid=pdflip-26-232 prompt=146395 p_computed=220
+#
+# The read had been slow (L3 fill 17.7 s), not short of a writer: the store held all 146176 pages. The 20 s bound
+# lapsed one second after the re-read was issued, and D-NORECOMPUTE priced 146396 - 119552 = 26844 off the first
+# read's record -- a number the in-flight read was about to supersede (146396 - 146176 = 220, under the front's halbX:
+# D-RESUME-EXTEND, SOLL R2/R7). A whole D->P->D flip pair and three parked decodes for 220 tokens.
+#
+# The law: a read reaped short with its WHOLE span HELD by the store (short_read.span_held, the group-MIN hit) is a
+# read that will complete, not a missing writer -- the bound waits for the re-read in flight, ONCE (the hold is spent
+# the moment that read answers, i.e. when a further re-issue counts past it), like the SC carry above. The read
+# itself is bounded by the prefetch reaper. No switch: the bound's release on a superseded record is an arithmetic
+# defect (the price of a read about to be replaced), not a behaviour to choose.
+# ---------------------------------------------------------------------------
+
+#: the #1456 re-issue count at which the held-read hold was armed (the read it waits for)
+HELD_N_ATTR = "_1471h_n"
+#: the settle states in which a re-read is in flight on this rank (the tick's own re-issue included)
+IN_FLIGHT = frozenset({"reading", "reissued"})
+
+
+def held_read_holds_lapse(req, state: str) -> bool:
+    """True while the lapsed settle bound must wait for ``req``'s in-flight re-read: the last read was reaped short
+    with its whole span held by the store, and the re-read issued for it (the #1456 count at the first hold) has not
+    answered yet. Once a later re-issue counts past it, the hold is spent for this wake (reset_for_wake re-arms it).
+    Rank-local inputs that are group-uniform where they decide: the held verdict is the reap's group-MIN hit, the
+    in-flight state the progress check's collective; the release is the group MIN of the flags anyway."""
+    if state not in IN_FLIGHT:
+        return False
+    from flliper.srt.pdflip import short_read as _sr
+
+    if not _sr.span_held(getattr(req, "rid", None)):
+        return False
+    n_now = int(getattr(req, "_1456_n", 0) or 0)
+    armed = getattr(req, HELD_N_ATTR, None)
+    if armed is None:
+        setattr(req, HELD_N_ATTR, n_now)
+        return True
+    return n_now <= int(armed)
 
 
 def _tail_facts(rid: str) -> Tuple[str, bool]:

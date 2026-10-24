@@ -100,6 +100,12 @@ def note_reap(rid: str, requested_pages: int, hit_pages: int, completed_tokens: 
         _HELD.pop(rid, None)
 
 
+def span_held(rid) -> bool:
+    """The last read of ``rid`` was reaped short while the group's probe held its WHOLE span (group-MIN hit count:
+    rank-uniform). REPRICE-REST-1024 (#224): the settle bound waits for such a read's re-read (settle_writer)."""
+    return bool(_HELD.get(str(rid), False))
+
+
 def reread_now(req, have: int) -> bool:
     """True when the settle may re-read ``req`` now instead of waiting for
     the 2 s timer: its last read was reaped short with the span held, and

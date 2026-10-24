@@ -7684,6 +7684,17 @@ class Scheduler(
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.PDFLIP_POST_WAKE_SETTLE_S
             if _sw_nw.carry_holds_lapse(req, state):
                 lapsed = False  # SC (#1210): a carried clock awaits this wake's own read once
+            if lapsed and _sw_nw.held_read_holds_lapse(req, state):
+                # REPRICE-REST-1024 (#224, SOLL R2/R7; 26-232: 26844 priced off the superseded read, P computed 220):
+                # the store holds the whole span and its re-read is in flight -- the bound waits for that read once
+                lapsed = False
+                if not getattr(req, "_1471h_said", False):
+                    req._1471h_said = True
+                    logger.info("#1471h SETTLE-HELD-READ rid=%s state=%s held_after_wake_s=%.1f re_reads=%d -- the "
+                                "store holds the whole span and its re-read is in flight: the bound waits for it once "
+                                "(a release now would price the superseded record)", str(getattr(req, "rid", "?")),
+                                state, now - float(getattr(req, "_1471_since", now)),
+                                int(getattr(req, "_1456_n", 0) or 0))
             # P4b: no writer and no read in flight = decided now (the bound would
             # release the same request "as it is" 20 s later).
             # a re-read the group issued this tick is a read in flight, on this rank too
