@@ -69,6 +69,10 @@ class _State:
         self.wpend: Dict[Tuple[str, int], int] = {}
         self.n = {"queued": 0, "dropped": 0, "kept": 0, "anchor_save": 0, "worker_dropped": 0,
                   "worker_pending": 0, "diverged": 0, "anchor_skipped": 0, "worker_veto": 0}
+        #: HLEAF-STALE-1024 S5/S6 (review): the workers' key sets, read once per flush and per tree and reused by the
+        #: peel's queueing until the next flush (the workers republish at the consume that follows it)
+        self.sets_epoch: int = 0
+        self.sets_memo: Dict[int, Tuple[int, Any]] = {}
 
 
 _ST = _State()
@@ -346,6 +350,26 @@ def room_pending(tree: Any = None) -> int:
     return sum(len(getattr(ent[1], "key", ()) or ()) for ent in _ST.queue.values() if tree is None or ent[0] is tree)
 
 
+def _worker_sets(tree: Any) -> Tuple[set, set, set]:
+    """S6: ``(nd, dv, s39)`` of the workers for ``tree``, read ONCE per flush epoch (a failed read = no veto: TP0
+    decides as before S22, a worker that cannot follow holds the drop pending)."""
+    got = _ST.sets_memo.get(id(tree))
+    if got is not None and got[0] == _ST.sets_epoch:
+        return got[1]
+    try:
+        sets = tuple(_r12().worker_key_sets(tree))
+    except Exception:  # noqa: BLE001 - the workers' facts never break the peel or the broadcast
+        sets = (set(), set(), set())
+    _ST.sets_memo[id(tree)] = (_ST.sets_epoch, sets)
+    return sets
+
+
+def _worker_vetoed(tree: Any, node: Any) -> bool:
+    """S5: a worker's ``s39`` set holds this leaf -- the next broadcast would dequeue it unpaid."""
+    veto = _worker_sets(tree)[2]
+    return bool(veto) and _r12().node_key(node) in veto
+
+
 def note_refused(tree: Any, node: Any, why: str) -> bool:
     """The peel (every rank) refused a store-backed leaf for its children or its device anchor. TP0 queues it for
     its next broadcast, at most the tokens the peel still asked for (``tree._s39_peel`` = [need, queued])."""
@@ -355,6 +379,11 @@ def note_refused(tree: Any, node: Any, why: str) -> bool:
         # HLEAF-STALE-1024 S1 (review): the anchor of TP0's in-flight read cannot leave at the next broadcast -- not
         # queued, so room_pending() promises no room S39 will not deliver and the peel pays with the next leaf
         _ST.n["anchor_skipped"] += 1
+        return False
+    if _worker_vetoed(tree, node):
+        # HLEAF-STALE-1024 S5 (review): a leaf a worker vetoes is not queued either -- room_pending() would count it
+        # until the next broadcast's veto dequeue and D-WALL-HEAD would hold the head every pass the veto stands
+        _ST.n["worker_veto"] += 1
         return False
     key = id(node)
     if key in _ST.queue:
@@ -387,6 +416,9 @@ def queue_for_room(tree: Any, nodes: List[Any], why: str = "kv_compact") -> int:
         if _prefetch_anchor(tree, node):
             _ST.n["anchor_skipped"] += 1     # HLEAF-STALE-1024 S1: see note_refused
             continue
+        if _worker_vetoed(tree, node):
+            _ST.n["worker_veto"] += 1        # HLEAF-STALE-1024 S5: see note_refused
+            continue
         key = id(node)
         if key not in _ST.queue:
             _ST.queue[key] = [tree, node, 0, why]
@@ -412,7 +444,10 @@ def _kept(tree: Any, node: Any, ent: list, why: str, extra: str = "") -> None:
 def flush_at_broadcast(tree: Any = None) -> int:
     """TP0, in ``form_a_host_shadow.attach`` right before the broadcast: every queued leaf that still qualifies is
     dropped here (subtree first) and its ``L3DROP`` verdict rides THIS broadcast. Returns device tokens freed."""
-    if not _ST.queue or not on():
+    if not on():
+        return 0
+    _ST.sets_epoch += 1          # S6: the workers' files are read afresh, once, by the first entry that needs them
+    if not _ST.queue:
         return 0
     r12 = _r12()
     if r12.role() != "host":
@@ -439,8 +474,7 @@ def flush_at_broadcast(tree: Any = None) -> int:
                 # cannot be deleted there -- TP0 leaves the drop alone (the K23 rule). S41 (review S39): the same for
                 # an INTERIOR node of the subtree a worker holds on its device (``dv``): the worker's apply would
                 # answer ``child_on_device`` with DIVERGED and keep a node TP0 deleted for good
-                nd = r12.worker_nodelete_keys(t)
-                dv = r12.worker_device_keys(t)
+                nd, dv, _veto = _worker_sets(t)
                 stuck = next((d for d in order
                               if (not d.children and r12.node_key(d) in nd) or r12.node_key(d) in dv),
                              None) if (nd or dv) else None
@@ -452,7 +486,7 @@ def flush_at_broadcast(tree: Any = None) -> int:
             # anchors the leaf or a node below it, or its subtree holds a node on its device / un-backed / with a
             # live aux state (what its apply_drop answers with DIVERGED) -- publishes the key (``s39``). TP0 leaves
             # the drop alone, one decision for the group; dequeued (no room promised), the peel asks again.
-            veto = r12.worker_s39_veto_keys(t)
+            veto = _worker_sets(t)[2]
             if veto:
                 held = next((d for d in [node] + list(order) if r12.node_key(d) in veto), None)
                 if held is not None:

@@ -484,3 +484,70 @@ def test_hleaf_s3_a_refused_read_does_not_end_the_handoffs_protection(monkeypatc
     cache, _ = _completion_on_device_anchor(detach=False)
     assert cache.check_prefetch_progress(REAP_REQ)
     assert calls == [(REAP_REQ, "fetch")], calls
+
+
+# --------------------------------------------------------------------------- review Nachtrag 2: S5 / S6 / N1
+
+
+def _three_leaves(roles, tag):
+    """Three childless store-backed device leaves (spans 1.., 100.., 200..), no host copy, no anchor."""
+    from test_pdflip_read_room_d_1015 import _real_d_tree, _WbController
+
+    _as(roles, "host" if tag == "tp0" else "worker")
+    t = _real_d_tree([(1, list(range(8))), (100, list(range(8, 16))), (200, list(range(16, 24)))], None, tag)
+    t.cache_controller = _WbController()
+    for n in t._t_nodes.values():
+        n.component_data[FULL].host_value = None
+        n.l3_present = True
+    t.write_backup = lambda *a, **k: 0
+    _as(roles, "host")
+    return t
+
+
+def test_hleaf_s5_a_leaf_a_worker_vetoes_is_not_queued(roles, monkeypatch, tmp_path):
+    """SOLL S5: the worker's ``s39`` set holds the leaf (its own read anchors it) -- TP0's peel does not queue it and
+    queue_for_room skips it: room_pending() stays 0 (D-WALL-HEAD would hold the head every pass). CAN-FAIL: once the
+    worker's read ended and its consume republished, the same leaf is queued."""
+    from flliper.srt.pdflip import forma_l3_subtree as s39
+
+    _arena_dir(monkeypatch, tmp_path)
+    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
+    _as(roles, "worker")
+    _register_read(worker, "pdflip-4-108", worker._t_nodes[1])
+    R12.worker_read_registered(worker)
+    _as(roles, "host")
+    _peel(roles, tp0)
+    assert s39.room_pending(tp0) == 0 and not s39._ST.queue, s39._ST.queue
+    assert s39.queue_for_room(tp0, [tp0._t_nodes[1]]) == 0
+    worker.ongoing_prefetch.clear()
+    _broadcast(roles, tp0, worker)                      # the worker's consume republishes without the veto
+    _peel(roles, tp0)
+    assert s39.room_pending(tp0) == 8
+
+
+def test_hleaf_s6_the_flush_reads_the_worker_files_once(roles, monkeypatch, tmp_path):
+    """SOLL S6: three queued leaves, one flush -- ONE read of the workers' files (it was one per accessor per entry)."""
+    from flliper.srt.pdflip import forma_l3_subtree as s39
+
+    _arena_dir(monkeypatch, tmp_path)
+    tp0, worker = _three_leaves(roles, "tp0"), _three_leaves(roles, "worker")
+    _as(roles, "worker")
+    R12._dev_refresh(worker)
+    _as(roles, "host")
+    assert s39.queue_for_room(tp0, list(tp0._t_nodes.values())) == 3
+    real = R12._read_worker_sets
+    reads = []
+    monkeypatch.setattr(R12, "_read_worker_sets", lambda tree: (reads.append(1), real(tree))[1])
+    _broadcast(roles, tp0, worker)
+    assert len(reads) == 1, ("worker-file reads in one flush of 3 entries", len(reads))
+    assert s39._ST.n["dropped"] == 3 and not tp0.root_node.children and not worker.root_node.children
+
+
+def test_hleaf_n1_a_raising_role_never_breaks_the_reads_registration(roles, monkeypatch):
+    """NIT N1: ``worker_read_registered`` runs after the read entered ``ongoing_prefetch`` -- even a raising role()
+    stays inside the guard (a raise would take this rank out of its peers' collectives for that read)."""
+    def _boom():
+        raise RuntimeError("role read failed")
+
+    monkeypatch.setattr(R12, "role", _boom)
+    R12.worker_read_registered(object())

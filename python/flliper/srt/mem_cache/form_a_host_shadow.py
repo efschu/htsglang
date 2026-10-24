@@ -1169,10 +1169,12 @@ def _s39_veto_keys(tree: Any, walk: List[Any], base: int) -> set:
 def worker_read_registered(tree: Any) -> None:
     """HLEAF-STALE-1024 A1: a worker registered a storage read -- its anchor is published NOW, not at the next
     consume: TP0's next broadcast may otherwise decide the drop before this worker's refresh (the read was registered
-    after this pass's consume). The pass's own HiCache control collective orders the write before TP0's attach."""
-    if role() != "worker":
-        return
+    after this pass's consume). The pass's own HiCache control collective orders the write before TP0's attach.
+    N1 (review): ``role()`` inside the guard too -- this runs AFTER the read entered ``ongoing_prefetch``; a raise here
+    would leave this rank out of the collectives its peers enter for that read."""
     try:
+        if role() != "worker":
+            return
         register_tree(tree)
         _dev_refresh(tree)
     except Exception as exc:  # noqa: BLE001 - the applicability publish never breaks the read's registration
@@ -1246,6 +1248,13 @@ def worker_device_keys(tree: Any) -> set:
     is one that worker cannot delete -- TP0 leaves such a drop alone instead of sending a verdict the worker answers
     with DIVERGED. ``nd`` cannot say it for an interior node (every interior node has children)."""
     return _read_worker_sets(tree)[2]
+
+
+def worker_key_sets(tree: Any) -> Tuple[set, set, set]:
+    """TP0: ``(nd, dv, s39)`` of every live worker from ONE read of their files (S6, review: S39's flush asked three
+    accessors per queued leaf, each a full glob + json pass)."""
+    _ev, nd, dv, s39 = _read_worker_sets(tree)
+    return nd, dv, s39
 
 
 def worker_s39_veto_keys(tree: Any) -> set:
