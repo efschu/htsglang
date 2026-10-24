@@ -1151,21 +1151,75 @@ def fit_cost_line(rows: Iterable[Tuple[int, int, float]], *, min_tokens: int,
             "prefix_med": int(statistics.median(x[1] for x in pts) * 1000.0)}, why
 
 
+#: LIVE-X-FWDCOST 1024: the solve walks D's request forward by forward; a
+#: request this large (far past any ceiling and context) without a crossing
+#: names the absence (``inf``, the ceiling decides) instead of walking on.
+X_COST_MAX_TOKENS = 1 << 20
+
+
+def d_request_ms(line: dict, n: float, prefix_tokens: float,
+                 forward_tokens: Optional[float]) -> float:
+    """D's cost in ms of prefilling ``n`` uncached tokens behind a cached
+    prefix of ``prefix_tokens``, priced as D RUNS it (LIVE-X-FWDCOST 1024):
+    forwards of at most ``forward_tokens`` tokens, EACH paying the line's
+    fixed cost ``a`` (the line is fitted per forward, ``ms = a + b*n +
+    c*n*p_k``), forward ``j`` reading the prefix ``p + j*W``. ``forward_tokens``
+    None/<= 0: one forward (the line's own domain question, named by the
+    caller)."""
+    if n <= 0.0:
+        return 0.0
+    a, b, c = float(line["a_ms"]), float(line["b_ms"]), float(line["c_ms"])
+    w = float(forward_tokens) if forward_tokens and forward_tokens > 0 else float(n)
+    total, done = 0.0, 0.0
+    while done < n:
+        piece = min(w, n - done)
+        total += a + (b + c * (float(prefix_tokens) + done) / 1000.0) * piece
+        done += piece
+    return total
+
+
 def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: Optional[float],
                       prefix_tokens: float,
-                      line_p: Optional[dict] = None) -> Tuple[Optional[float], str]:
+                      line_p: Optional[dict] = None,
+                      d_forward_tokens: Optional[float] = None) -> Tuple[Optional[float], str]:
     """``X*`` of the model above, in tokens (the caller clamps it to its
     measured floor and the ceiling), or ``(None, why)`` without a price or an
-    r_P. When D's marginal token at this depth is not dearer than P's there
-    is no crossing: the round trip never pays back per token, so D is the
-    cheaper route for EVERY size while its fixed cost stays under the price
-    share (``inf``, the ceiling decides) and P for every size otherwise
-    (0, the floor decides). A price share below D's fixed cost gives 0 too.
+    r_P. When D never becomes dearer than the flip (its marginal token plus
+    its per-forward fixed cost spread over a forward is not dearer than P's
+    token) there is no crossing: D is the cheaper route for EVERY size while
+    its first forward stays under the price share (``inf``, the ceiling
+    decides) and P for every size otherwise (0, the floor decides). A price
+    share below D's first forward's fixed cost gives 0 too.
 
     ``line_p`` (P's own cost line on its bottleneck stage PP0, same
     instrument) replaces the drain rate ``r_p`` when given: P's side is then
     ``a_P + (b_P + c_P*p) * n`` -- compute-honest, where the drain rate also
-    counts P's waits (27B 09290020: drain 1437 tok/s, PP0 9180)."""
+    counts P's waits (27B 09290020: drain 1437 tok/s, PP0 9180). ``a_P`` is
+    paid ONCE per request: right on NF, whose P chunk is wider than the
+    ceiling (P forwards up to 16384 against the 12288 ceiling). NOT on 27B:
+    its P chunk is 4096 (``--chunked-prefill-size 4096``, 126 full 4096-token
+    forwards in boot 1024_003732), so above 4096 P pays ``a_P`` per forward
+    too and this side under-prices P -- X comes out too LOW (N4p a_P=53 ms:
+    1-2 %), the safe direction for R7 (more flips, never D over X). Pricing
+    P per forward (P's chunk / its line's n_hi) is a follow-up, not done here.
+
+    LIVE-X-FWDCOST 1024 (SOLL v2 R7 / KEIN-D-PREFILL-UEBER-X: X is the size
+    up to which D is the cheaper route, so an X priced too cheap for D lets D
+    prefill above the true crossing). The line is fitted PER FORWARD, and D
+    prefills a request in forwards of at most ``d_forward_tokens`` (W, the
+    #794 corridor width, NF after the PCIe switch ~1984): D's cost of ``u``
+    tokens is :func:`d_request_ms` = ``ceil(u/W)*a + sum_j (b + c*(p+j*W))*n_j``,
+    not ``a + (b + c*p)*u``. The break-even itself is unchanged,
+
+        D(u) = price / k + P(u),
+
+    X* is its FIRST crossing (every size up to X* is cheaper on D). D(u)-P(u)
+    jumps by ``a`` at every new forward and is linear inside one, so the
+    solve walks the forwards and solves the linear piece exactly; a jump over
+    the price share puts X* on the forward edge (the last size that still
+    fits the forwards before it). ``d_forward_tokens`` None/<= 0 falls back
+    to ``line['n_hi']`` (the widest forward the line was measured on); a line
+    without either is priced as one forward and the ``why`` says so."""
     if not price_s > 0.0:
         return None, "no-price"
     pk = float(prefix_tokens) / 1000.0
@@ -1177,14 +1231,43 @@ def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: Optional[flo
         p_fixed, p_marg = 0.0, 1000.0 / float(r_p)
     else:
         return None, "no-r_p"
-    marg_ms = float(line["b_ms"]) + float(line["c_ms"]) * pk
-    denom = marg_ms - p_marg
-    num = per_req_ms + p_fixed - float(line["a_ms"])
-    if denom <= 0.0:
-        side = "d-never-dearer" if num > 0.0 else "p-always-cheaper"
-        return (float("inf") if num > 0.0 else 0.0), (
-            f"{side}(d={marg_ms:.3f}ms/tok<=p={p_marg:.3f})")
-    return max(0.0, num / denom), "ok"
+    a = float(line["a_ms"])
+    b, c = float(line["b_ms"]), float(line["c_ms"])
+    w = d_forward_tokens if d_forward_tokens and d_forward_tokens > 0 else line.get("n_hi")
+    w = float(w) if isinstance(w, (int, float)) and w > 0 else None
+    one_fwd = "" if w is not None else "(one-forward:no-D-width)"
+    marg_ms = b + c * pk
+    budget = per_req_ms + p_fixed          # what D may spend, minus P's per-token share
+    if w is None:                          # legacy single forward, named
+        denom, num = marg_ms - p_marg, budget - a
+        if denom <= 0.0:
+            side = "d-never-dearer" if num > 0.0 else "p-always-cheaper"
+            return (float("inf") if num > 0.0 else 0.0), (
+                f"{side}(d={marg_ms:.3f}ms/tok<=p={p_marg:.3f}){one_fwd}")
+        return max(0.0, num / denom), "ok" + one_fwd
+    # g(u) = D(u) - P_marg*u - budget; forward m covers ((m-1)W, mW].
+    d_marg_at_base = 0.0                   # sum of the marginal terms of the full forwards before
+    m = 0
+    while True:
+        m += 1
+        base = (m - 1) * w
+        if base >= X_COST_MAX_TOKENS:
+            return float("inf"), (f"d-never-dearer(no crossing below {X_COST_MAX_TOKENS} "
+                                  f"tokens in forwards of {int(w)})")
+        slope = b + c * (float(prefix_tokens) + base) / 1000.0 - p_marg
+        g_left = m * a + d_marg_at_base - p_marg * base - budget
+        if g_left > 0.0:
+            if m == 1:             # D's first forward alone is dearer than the flip
+                return 0.0, ("ok" if slope > 0.0 else
+                             f"p-always-cheaper(d={marg_ms:.3f}ms/tok<=p={p_marg:.3f})")
+            return base, "ok"
+        g_right = g_left + slope * w
+        if g_right > 0.0:                  # slope > 0 here: g_left <= 0 < g_right
+            return base + (-g_left) / slope, "ok"
+        if a + slope * w <= 0.0 and c <= 0.0:
+            # one more forward never raises g: no crossing at any size
+            return float("inf"), f"d-never-dearer(d={marg_ms:.3f}ms/tok+a/W<=p={p_marg:.3f})"
+        d_marg_at_base += (b + c * (float(prefix_tokens) + base) / 1000.0) * w
 
 
 # ---------------------------------------------------------------------------

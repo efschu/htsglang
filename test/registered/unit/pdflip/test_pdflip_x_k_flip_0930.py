@@ -8,6 +8,9 @@ agent request of 2087-2940 new tokens (ARRIVAL-SEAT flip_now / PARK-IMMEDIATE
 cause=over-x: pdflip-8-13, 30-46, 33-48, 40-60, 42-62, 48-74, 60-88, 62-89),
 each carrying k=1-2 in reality. On y5a's lines (D a=1728 ms b=1.018 ms/tok,
 P a=1403 ms b=0.068 ms/tok, round trip ~4.3 s) k=1 puts X near 4200.
+LIVE-X-FWDCOST 1024: that 4200 priced D's a=1728 ms ONCE; D ran y5a in
+forwards of <= 2353 (LINE_D n_hi), so a 4.2k request is two forwards and the
+lone X is ~2365 (a lone 2.9k request costs D 6.41 s vs 5.90 s via the flip).
 
 Pinned: the X in force is the lone request's (k=1) under the switch; the
 boot's mean is printed display-only; an arrival is routed on the X of the
@@ -73,7 +76,7 @@ def _route(ns, uncached):
 def test_the_model_reproduces_y5a():
     x1, _ = pp.solve_x_cost_line(price_s=4.3, k=1.0, line=LINE_D, r_p=None, prefix_tokens=0, line_p=LINE_P)
     x25, _ = pp.solve_x_cost_line(price_s=4.3, k=2.5, line=LINE_D, r_p=None, prefix_tokens=0, line_p=LINE_P)
-    assert 4100 < x1 < 4300                      # the lone request's break-even
+    assert 2300 < x1 < 2400                      # the lone request's break-even: 2 D forwards of <= 2353
     assert 1400 < x25 < 1600                     # the live X y5a ran on (1440-1900)
 
 
@@ -93,7 +96,7 @@ def test_switch_off_keeps_the_mean(caplog):
     assert _route(ns, 2900)[0] == "long"
 
 
-def test_a_lone_2_9k_request_goes_to_d(caplog):
+def test_a_lone_2k_request_goes_to_d(caplog):
     ns = _front()
     # RELEASE-INTEG: the X-K-FLIP k_src line is pinned with PDFLIP-X's excursion price off (on, the
     # same lone X is named 'not-divided(...)' -- test_pdflip_x_excursion_1002)
@@ -101,9 +104,12 @@ def test_a_lone_2_9k_request_goes_to_d(caplog):
             envs.FLLIPER_PDFLIP_ENABLE_X_COST_LINE.override(True), \
             envs.FLLIPER_PDFLIP_X_COST_MAX_STEP.override(10.0), caplog.at_level(logging.INFO):
         x = F.Front._resolve_x_cost_line(ns)
-        route, x_route = _route(ns, 2900)
-    assert 4100 < x < 4300 and x_route == x
-    assert route == "short"                       # base: long, a flip for one request
+        route, x_route = _route(ns, 2000)
+        route_29k, _ = _route(ns, 2900)
+    assert 2300 < x < 2400 and x_route == x
+    assert route == "short"                       # base: long, a flip for one request (mean-k X ~1470)
+    # LIVE-X-FWDCOST 1024: a lone 2.9k request is two D forwards of a=1728 ms -- dearer on D
+    assert route_29k == "long"
     msg = next(m for m in caplog.messages if "RE-SOLVE" in m)
     assert "k=1.00 [flip:1(lone) hist=2.50[live:mean-of-10] display-only]" in msg
 

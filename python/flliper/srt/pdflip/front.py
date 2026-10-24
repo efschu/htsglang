@@ -22383,6 +22383,22 @@ class Front:
         except Exception:  # noqa: BLE001 -- an instrument never breaks routing
             pass
 
+    def _d_forward_tokens(self, line: dict) -> Tuple[Optional[int], str]:
+        """LIVE-X-FWDCOST 1024: W, the widest prefill forward D runs -- what one
+        fixed cost ``a`` of D's per-forward line buys. MEASURED: the widest of
+        this boot's D forwards (the #794 corridor caps every forward; NF after
+        the PCIe switch 1984-2038, D's nominal chunk 4096 is never reached), as
+        long as one reached :data:`phase_policy.FIT_BIG_TOKENS`; else the
+        widest forward the line itself was fitted on (``n_hi``, a record's
+        too). Neither: ``None`` -- the solve prices one forward and says so."""
+        widest = max((int(n) for n, _p, _ms in self._d_cost_all), default=0)
+        if widest >= phase_policy.FIT_BIG_TOKENS:
+            return widest, f"live:widest-of-{len(self._d_cost_all)}"
+        n_hi = line.get("n_hi")
+        if isinstance(n_hi, (int, float)) and n_hi > 0:
+            return int(n_hi), f"line:n_hi(boot widest {widest} < {phase_policy.FIT_BIG_TOKENS})"
+        return None, "none"
+
     def _resolve_x_cost_line(self) -> Optional[int]:
         """X-COST-LINE's re-solve (see phase_policy): X* from D's cost line at
         the depth D prefills at, the ski round trip amortised over k, and P's
@@ -22416,10 +22432,13 @@ class Front:
                        if n >= envs.FLLIPER_PDFLIP_X_COST_FIT_MIN_TOKENS.get()]
         prefix = (statistics.median(live_prefix) if live_prefix
                   else float(line.get("prefix_med", 0) or 0))
+        # LIVE-X-FWDCOST 1024 (SOLL v2 R7): D pays the line's fixed cost per FORWARD.
+        d_fwd, d_fwd_src = Front._d_forward_tokens(self, line)  # class-bound: tests drive it on a namespace
 
         def _solve(depth: float) -> Tuple[Optional[float], str]:
             return phase_policy.solve_x_cost_line(
-                price_s=price, k=k, line=line, r_p=r_p, prefix_tokens=depth, line_p=line_p)
+                price_s=price, k=k, line=line, r_p=r_p, prefix_tokens=depth, line_p=line_p,
+                d_forward_tokens=d_fwd)
 
         x_star, why = _solve(prefix)
         prev = self.tp_prefill_max_tokens
@@ -22441,7 +22460,8 @@ class Front:
         if self._x_min_work_follows:
             self.flip_min_work_tokens = x
         self._x_solve_ctx = {"price": price, "line": line, "line_p": line_p, "r_p": r_p,
-                             "prefix": prefix, "floor": floor, "ceiling": self.x_ceiling_tokens}
+                             "prefix": prefix, "floor": floor, "ceiling": self.x_ceiling_tokens,
+                             "d_fwd": d_fwd}
         self.counters["x_resolves"] += 1
         bands = ", ".join(
             "%dk:%s" % (d // 1000, "-" if xb is None else "inf" if xb == float("inf") else int(xb))
@@ -22449,10 +22469,13 @@ class Front:
         logger.info(
             "PDFLIP X COST-LINE RE-SOLVE X=%d <- X_prev=%d X*=%.0f (%s) clamp=%s floor=%d (fitted "
             "range n %d..%d) ceiling=%d | D line a=%.0fms b=%.3fms/tok c=%.4fms/tok/kprefix "
-            "[%s] at prefix=%d | price=%.2fs [%s] / k=%.2f [%s] | %s | X* by depth {%s}",
+            "[%s] at prefix=%d, a per D forward of <=%s tok [%s] | price=%.2fs [%s] / k=%.2f [%s] "
+            "| %s | X* by depth {%s}",
             x, prev, x_star, why, clamp, floor, int(line["n_lo"]), int(line["n_hi"]),
             self.x_ceiling_tokens, float(line["a_ms"]), float(line["b_ms"]),
-            float(line["c_ms"]), line_src, int(prefix), price, price_src, k, k_src, p_src, bands)
+            float(line["c_ms"]), line_src, int(prefix),
+            "?" if d_fwd is None else int(d_fwd), d_fwd_src,
+            price, price_src, k, k_src, p_src, bands)
         k_rec = getattr(self, "_x_k_hist", (k, k_src))[0]  # the sidecar keeps the measured mean
         self._note_x_cost_line(line, line_src, k_rec, "D")
         if line_p is not None:
@@ -22566,7 +22589,7 @@ class Front:
         k = float(k_flip)
         x_star, why = phase_policy.solve_x_cost_line(
             price_s=ctx["price"], k=k, line=ctx["line"], r_p=ctx["r_p"],
-            prefix_tokens=ctx["prefix"], line_p=ctx["line_p"])
+            prefix_tokens=ctx["prefix"], line_p=ctx["line_p"], d_forward_tokens=ctx.get("d_fwd"))
         if x_star is None:
             return x1
         xk = int(min(max(x_star, ctx["floor"]), ctx["ceiling"], x1))
