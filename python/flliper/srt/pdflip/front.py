@@ -23724,6 +23724,119 @@ class Front:
         Front._dec_gate(self, "Gate-W193", rid, "x-curves refused the depth (%s)" % exc.code)  # EZ-S1 #91
         return refusal_response(path, exc.code, detail, 503, {"x_mode": self.x_mode})
 
+    #: KALIB-LIVE-X #235: the depths the reload line names (X@0k / X@32k / X@128k).
+    X_RELOAD_DEPTHS: Tuple[int, ...] = (0, 32768, 131072)
+
+    def _x_source_now(self) -> Tuple[str, str, int, int]:
+        """KALIB-LIVE-X #235: ``(mode, source, X@0k, boot-level X)`` of the X in force -- the reload line's OLD side."""
+        setup = getattr(self, "_x_setup", None)
+        mode = str(getattr(self, "x_mode", _xcurves.X_MODE_LIVE))
+        if setup is not None and setup.curves is not None:
+            src = str(setup.source)
+        elif mode == _xcurves.X_MODE_LIVE:
+            src = "live re-solve (no curve file at start)"
+        else:
+            src = f"--x-mode {mode} (start X)"
+        return mode, src, int(Front._x_at_depth(self, 0)), int(self.tp_prefill_max_tokens)
+
+    def reload_x_curves(self, path: str, *, who: str = "") -> Dict[str, Any]:
+        """KALIB-LIVE-X #235 (user order 24.10., memory kalibrierung-je-boot-p-kurve-x-1024: "fuer jedes unserer boots
+        vorher nochmal einmal p kurve und X durchgemessen"; SOLL v2 section 2, R7, R11): take the curve file that the
+        rotation's calibration step (kalib_boot.py) measured on THIS boot and wrote after SERVING, while serving.
+
+        Before #235 the front read X only at start (``_init_x_mode``, ``--x-mode curve --x-curves``); the curve is
+        written minutes after SERVING, and the next boot of the slot runs another image, so KALIB-GUARD shelved the
+        curve before it was ever read (24.10.: 0 boots in curve mode, every boot re-solved live up to the ceiling).
+
+        Validated first (:func:`x_curves.reload_setup`: file, schema, model/form, same boot + tree; dual and an
+        explicit ``--x-mode fixed`` are refused by name). A refusal changes nothing: the old X source stays, one named
+        line says so. Accepted: the boot switches to ``curve`` exactly as a curve-started boot runs (boot-level X = the
+        envelope under D's W50 riegel, which stays; no live sample or re-solve from here on). Set members already
+        priced keep the X of their arrival (``st["xs"]``); every new arrival is priced on the new curve."""
+        old_mode, old_src, old_x0, old_x = Front._x_source_now(self)
+        try:
+            if getattr(self, "dual_layout", False):
+                _xcurves.refuse_in_dual(mode=_xcurves.X_MODE_CURVE, curves_path=path or "(none)", beyond=None)
+            if old_mode == _xcurves.X_MODE_FIXED:
+                raise _xcurves.XCurvesRefused(_xcurves.W_X_CURVES_WITHOUT_MODE, (
+                    "this boot runs --x-mode fixed (the operator's pin of X for the whole boot); a curve reload "
+                    "would override it silently"))
+            old_setup = getattr(self, "_x_setup", None)
+            setup = _xcurves.reload_setup(
+                curves_path=path, beyond=(old_setup.beyond if old_setup is not None else None),
+                form_key=park_form_key(), x_ceiling=int(self.x_ceiling_tokens),
+                boot_tag=str(getattr(self, "tag", "") or ""), boot_commit=str(getattr(self, "commit", "") or ""))
+        except _xcurves.XCurvesRefused as exc:
+            self.counters["x_curves_reload_refused"] += 1
+            line = (f"PDFLIP X-CURVES RELOAD REFUSED {exc.code}: {exc.detail} -- X stays {old_mode} ({old_src}), "
+                    f"X@0k={old_x0}, boot-level X={old_x} [{who or 'unnamed caller'}]")
+            logger.error("%s", line)
+            return {"switched": False, "code": exc.code, "detail": exc.detail, "line": line,
+                    "x_mode": old_mode, "x_source": old_src, "x_at_0": old_x0, "x_boot": old_x}
+        self.x_mode = setup.mode
+        self._x_setup = setup
+        self._x_curve_last = None
+        self.tp_prefill_max_tokens = int(setup.envelope)
+        if getattr(self, "_x_min_work_follows", False):
+            self.flip_min_work_tokens = int(setup.envelope)
+        self.counters["x_curves_reloads"] += 1
+        xs = {d: int(Front._x_at_depth(self, d)) for d in Front.X_RELOAD_DEPTHS}
+        xs_txt = " ".join(f"X@{d // 1024}k={x}" for d, x in xs.items())
+        line = (f"PDFLIP X-CURVES RELOAD #{self.counters['x_curves_reloads']}: X source {old_mode} ({old_src}, "
+                f"X@0k={old_x0}, boot-level X={old_x}) -> curve {setup.source} ({xs_txt}, envelope X={setup.envelope}); "
+                f"{setup.line}; from now on X PER REQUEST from this curve, no live X sample, no re-solve; set members "
+                f"already priced keep their arrival X [{who or 'unnamed caller'}]")
+        logger.info("%s", line)
+        return {"switched": True, "line": line, "old": {"x_mode": old_mode, "x_source": old_src, "x_at_0": old_x0,
+                                                        "x_boot": old_x},
+                "new": {"x_mode": setup.mode, "x_source": setup.source, "envelope": int(setup.envelope),
+                        "cap": setup.cap, "x_by_depth": {str(d): x for d, x in xs.items()}}}
+
+    def _admin_refusal(self, request: web.Request, *, write: bool = False) -> Optional[web.Response]:
+        """KALIB-LIVE-X #235 admin gate. With an admin key the bearer must match (401 otherwise, loopback too). Without
+        one: a WRITE (``write=True``, the POST) is refused outright (403, SOLL-3 of review #235: the protection must not
+        hang on network topology / docker's userland proxy); a read is served to loopback callers only. Every refusal is
+        named in a log line. None = admitted."""
+        if self.admin_key:
+            import hmac
+
+            got = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(got.encode(), f"Bearer {self.admin_key}".encode()):
+                logger.warning("PDFLIP X-CURVES %s REFUSED 401: no valid admin key in the request (remote=%s, %s) -- X "
+                               "source unchanged", request.method, request.remote,
+                               "bearer missing" if not got else "bearer does not match this boot's admin key")
+                return web.json_response({"error": "unauthorized"}, status=401)
+        elif write:
+            logger.warning("PDFLIP X-CURVES %s REFUSED 403: this boot has no admin key, the route's write is refused for "
+                           "every caller incl. loopback (remote=%s) -- X source unchanged", request.method, request.remote)
+            return web.json_response({"error": "no admin key on this boot: x-curves write refused"}, status=403)
+        elif (request.remote or "") not in ("127.0.0.1", "::1", "localhost"):
+            logger.warning("PDFLIP X-CURVES %s REFUSED 403: loopback-only read (no admin key on this boot, remote=%s)",
+                           request.method, request.remote)
+            return web.json_response({"error": "loopback-only (no admin key on this boot)"}, status=403)
+        return None
+
+    async def handle_x_curves(self, request: web.Request) -> web.Response:
+        """KALIB-LIVE-X #235 admin route ``/pdflip/x-curves``: GET = the X source in force; POST {"path": <curve file
+        as the front sees it>, "who"?: <caller>} = :meth:`reload_x_curves` (200 switched, 409 refused by name, the old
+        X source kept). Called by the rotation's kalib_boot.py right after it activated this boot's curve."""
+        refused = Front._admin_refusal(self, request, write=request.method != "GET")
+        if refused is not None:
+            return refused
+        if request.method == "GET":
+            mode, src, x0, xb = Front._x_source_now(self)
+            return web.json_response({"x_mode": mode, "x_source": src, "x_at_0": x0, "x_boot": xb,
+                                      "reloads": int(self.counters.get("x_curves_reloads", 0)),
+                                      "refused": int(self.counters.get("x_curves_reload_refused", 0))})
+        try:
+            body = await request.json()
+            path = str(body.get("path") or "")
+            who = str(body.get("who") or f"POST from {request.remote}")
+        except (ValueError, TypeError, AttributeError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        res = Front.reload_x_curves(self, path, who=who)
+        return web.json_response(res, status=200 if res["switched"] else 409)
+
     def _x_flip_decided(self) -> bool:
         """X-K-FLIP x PDFLIP-X role split: is a flip to P already decided or
         running, so that a new arrival RIDES it (True) rather than triggering
@@ -26736,6 +26849,9 @@ def main():
     app.router.add_get("/pdflip/state", front.handle_state)
     app.router.add_get("/metrics_summary", front.handle_state)
     app.router.add_post("/pdflip/flip", front.handle_manual_flip)
+    # KALIB-LIVE-X #235: the same boot's calibration curve into the running front (kalib_boot.py POSTs it)
+    app.router.add_get("/pdflip/x-curves", front.handle_x_curves)
+    app.router.add_post("/pdflip/x-curves", front.handle_x_curves)
     if getattr(front, "_dual_share", None) is not None:  # DUAL-SHARE admin switch (dual only)
         app.router.add_get("/pdflip/dual-priority", front.handle_dual_priority)
         app.router.add_post("/pdflip/dual-priority", front.handle_dual_priority)

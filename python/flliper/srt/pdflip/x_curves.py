@@ -784,3 +784,62 @@ def front_setup(*, mode: Optional[str], curves_path: Optional[str], beyond: Opti
             f"launcher sets it = min(envelope, manual ceiling), else the start X) envelope X={env} (the boot-level X: lone request, max over the measured "
             f"depths); beyond the reach: {pol}; no live X samples, no re-solve")
     return XFrontSetup(m, curves, source, pol, cap, env, line)
+
+
+# ---------------------------------------------------------------------------
+# KALIB-LIVE-X #235 (24.10.): the SAME boot's freshly measured curve into the RUNNING front
+# ---------------------------------------------------------------------------
+
+
+def same_boot_problems(source: str, *, boot_tag: str, boot_commit: str) -> List[str]:
+    """What keeps a curve file from being THIS boot's own measurement: the kalib
+    source names the boot log (``kalib:boot_weg2_<tag>_<rev>_<stamp>``), so the
+    boot tag and the tree commit must both appear in it. Same boot = same image,
+    same cards, same form -- the identity KALIB-GUARD checks per image, here per
+    boot. ``[]`` = this boot's own."""
+    src = str(source or "")
+    tag = str(boot_tag or "")
+    commit = str(boot_commit or "")[:10]
+    wrong: List[str] = []
+    if not tag:
+        wrong.append("this front carries no boot tag, so no curve can be shown to be this boot's own")
+    elif f"_{tag}_" not in src:
+        wrong.append(f"source {src!r} names another boot than this one (tag {tag!r})")
+    if commit and commit not in src:
+        wrong.append(f"source {src!r} was measured on another tree than this boot's {commit}")
+    return wrong
+
+
+def reload_setup(*, curves_path: Optional[str], beyond: Optional[str], form_key: str,
+                 x_ceiling: int, boot_tag: str, boot_commit: str) -> XFrontSetup:
+    """KALIB-LIVE-X #235: the front's half of a curve RELOAD while serving
+    (user order 24.10.: "fuer jedes unserer boots vorher nochmal einmal p kurve
+    und X durchgemessen" -- the measured X goes into the boot, not a fixed
+    profile value; SOLL v2 section 2: X = D-Prefill-Max at the cache depth from
+    the curves).
+
+    Raises :class:`XCurvesRefused` by name, before anything changes: W190 no
+    path / no file, W191 malformed, W192 another model / form (the form this boot
+    published) OR another boot / tree (:func:`same_boot_problems`). The cap is
+    ``x_ceiling`` = D's W50 riegel as this boot runs it (H84: no per-request X
+    above what D admits); the riegel itself is not touched -- every X of the
+    reloaded curve stays under it, so the front alone decides (R11) and D never
+    sees a prefill above its bound (R7)."""
+    if not curves_path:
+        raise XCurvesRefused(W_X_CURVES_MISSING, "curve reload without a file path")
+    curves = load(curves_path)
+    model, form = split_form_key(form_key)
+    ident = check_identity(curves, model=model, form=form, hardware=None)
+    wrong = same_boot_problems(curves.identity.source, boot_tag=boot_tag, boot_commit=boot_commit)
+    if wrong:
+        raise XCurvesRefused(W_X_CURVES_FOREIGN, (
+            "; ".join(wrong) + " -- a reload takes only the curve measured on THIS boot "
+            "(the next boot reads an older one through --x-curves and KALIB-GUARD)"))
+    pol = beyond or BEYOND_CLAMP
+    cap = int(x_ceiling) if int(x_ceiling) > 0 else None
+    env = max(1, x_envelope(curves, cap=cap))
+    source = f"{os.path.basename(str(curves_path))}@{curves.identity.source}"
+    line = (f"X PER REQUEST from {os.path.abspath(str(curves_path))} {describe(curves)} {ident}; "
+            f"cap={cap} (D's W50 riegel as this boot runs it, unchanged) envelope X={env}; "
+            f"beyond the reach: {pol}")
+    return XFrontSetup(X_MODE_CURVE, curves, source, pol, cap, env, line)

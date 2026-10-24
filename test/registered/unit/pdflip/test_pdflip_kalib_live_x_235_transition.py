@@ -1,0 +1,111 @@
+"""KALIB-LIVE-X #235 rule tests of the TRANSITION (review #235 MUST-1, danger direction 2: the switch while a set has
+collected; origin: the reviewer's probes of desk/27b-kalib-live-x-review-1024 @ 1dec061d15, taken over by cherry-pick).
+
+Chosen semantics (SOLL R1 "Einstufung bei Ankunft", R2a each request its own X): a set member already priced keeps its ARRIVAL
+X across the reload (P1-P3), but every HAND-OVER to D (queued SHORT, D-short drain) is checked against the X IN FORCE -- an
+entry whose u is above the new X never goes to D (Q1, Q2).
+
+Green = the asserted behaviour is what the head does. P1 asserts the TRANSITIONAL danger (SOLL R7 direction): a halb
+member priced at the old live X keeps that X across the reload, so the timer verdict sends it to D although its u is above the
+newly loaded curve X; P2 asserts that the D leg then carries the OLD decision X (D's W50 limit admits it, no W31/W50 bounce);
+P3 asserts the bound: nothing above D's static riegel (the old X is <= x_ceiling_tokens)."""
+from __future__ import annotations
+
+import logging
+import os
+import time
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+import sys  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_pdflip_set_scheduler_1017 import _fx, _on, _verdicts  # noqa: E402
+from test_pdflip_kalib_live_x_235 import CEILING, COMMIT, FORM_ENV_VALUE, TAG, _curves, _write  # noqa: E402
+
+from flliper.srt.pdflip import front_x as _fxm  # noqa: E402
+from flliper.srt.pdflip import x_curves as xc  # noqa: E402
+from flliper.srt.pdflip.front import Front  # noqa: E402
+
+
+def _live_front_with_open_set(monkeypatch, tmp_path, t0):
+    _on(monkeypatch)
+    monkeypatch.setenv("FLLIPER_PDFLIP_FORM", FORM_ENV_VALUE)
+    f = _fx()
+    f.tag, f.commit, f.x_ceiling_tokens = TAG, COMMIT, CEILING
+    f.tp_prefill_max_tokens = CEILING                 # the live re-solve stood at the ceiling (metal: X=12288)
+    curves = _curves()
+    env = xc.x_envelope(curves, cap=CEILING)
+    u = min(CEILING - 1, env + 500)
+    assert CEILING // 2 <= u < CEILING and u > env    # halb under the old X, above the new envelope
+    st = f._set_st()
+    st["shorts"]["h"] = (t0, u, CEILING)              # priced at arrival on the old X (tup[2])
+    Front._note_x_decision(f, "h", CEILING, u)        # the arrival's FRONT-X record (old X)
+    res = Front.reload_x_curves(f, _write(tmp_path, curves), who="review probe")
+    assert res["switched"] and f.tp_prefill_max_tokens == env
+    return f, st, u, env
+
+
+def test_p1_old_member_keeps_its_arrival_x_and_goes_to_d_above_the_new_x(monkeypatch, tmp_path, caplog):
+    t0 = time.time() - 5.0                            # T_halb 4.5 s has run out, D decodes
+    f, st, u, env = _live_front_with_open_set(monkeypatch, tmp_path, t0)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        route = f._decode_collect(time.time())
+    (line,) = _verdicts(caplog)
+    assert route == "D" and "verdict=D_AFTER_TIMER" in line and f"X={CEILING} " in line, line
+    assert f"S={u} " in line and u > env
+
+
+def test_p2_the_d_leg_carries_the_old_decision_x(monkeypatch, tmp_path):
+    f, st, u, env = _live_front_with_open_set(monkeypatch, tmp_path, time.time())
+    hdr = Front._front_x_headers(f, "h", None, False)
+    assert int(hdr[_fxm.HEADER_X]) == CEILING and int(hdr[_fxm.HEADER_PRICED]) == u
+    assert _fxm.limit_for(CEILING, CEILING, 64) == CEILING >= u   # D's limit = min(static riegel, front X + page)
+
+
+def test_p3_a_new_arrival_after_the_reload_is_priced_on_the_curve(monkeypatch, tmp_path):
+    f, st, u, env = _live_front_with_open_set(monkeypatch, tmp_path, time.time())
+    assert Front._x_at_depth(f, 0) <= env < CEILING
+    assert Front._front_x_headers(f, "new", None, False)[_fxm.HEADER_X] == str(env)   # no record: the X in force
+
+
+# ------------------------------------------------------------------ the hand-overs check the X in force (MUST-1, Q1/Q2)
+
+
+def _entry(rid, u, t):
+    import types
+    return types.SimpleNamespace(
+        rid=rid, est_uncached=u, t_arrive=t, d_eligible=True, intake_stalled=False, leg1_done=False, reroutes=0,
+        x_requeues=0, p_only=False, x_deferred=False, d_direct=False, skip_leg1=False, est_prompt=u)
+
+
+def _reloaded_front_with_queue(monkeypatch, tmp_path, us):
+    import collections
+    f, st, u, env = _live_front_with_open_set(monkeypatch, tmp_path, time.time())
+    f.admit_d, f.state, f.awake = True, "serving", "D"
+    f.x_split = False
+    f.d_short_drain_tokens = CEILING
+    f.queue = collections.deque(_entry(f"q{i}", v, float(i)) for i, v in enumerate(us))
+    f._ready_for_d = []
+    f._sync_batch_gate = lambda: None
+    f._d_holds_work = lambda: False
+    return f, env
+
+
+def test_q1_a_queued_short_above_the_new_x_is_not_handed_to_d(monkeypatch, tmp_path):
+    f, env = _reloaded_front_with_queue(monkeypatch, tmp_path, [0, 0])     # u set below
+    env_u = env + 500                                                      # priced (d_eligible) at the OLD X 12288
+    assert env < env_u <= CEILING
+    f.queue[0].est_uncached, f.queue[1].est_uncached = env_u, env - 500
+    live = list(f.queue)
+    moved = Front._asr_queued_short_to_d(f, live, 10.0)
+    assert [p.rid for p in moved] == ["q1"], [p.rid for p in moved]         # only the one under the NEW X goes to D
+    assert [p.rid for p in f.queue] == ["q0"] and [p.rid for p in f._ready_for_d] == ["q1"]
+
+
+def test_q2_the_short_drain_does_not_take_an_entry_above_the_new_x(monkeypatch, tmp_path):
+    f, env = _reloaded_front_with_queue(monkeypatch, tmp_path, [0])
+    f.queue[0].est_uncached = env + 500                                    # fits the OLD X, not the new one
+    assert Front._d_short_drain(f, time.time()) == 0
+    assert len(f.queue) == 1 and f._ready_for_d == []
+    f.queue[0].est_uncached = env - 500                                    # under the new X: drained
+    assert Front._d_short_drain(f, time.time()) == 1 and f._ready_for_d[0].rid == "q0"
