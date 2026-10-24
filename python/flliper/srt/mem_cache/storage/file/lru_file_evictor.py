@@ -141,6 +141,33 @@ def _kv_sidecar_twins(stem: str) -> Tuple[str, ...]:
 
 
 
+
+#: WAKE-OUTLIERS-1024 instrument: journaled T lines by call path, one line per 2^17 lines and writer. The 27B int8 D
+#: phase 08:44-08:47 read 1.03 M pages per rank with l3fill_pages=0 (all from the L2 arena) -- the T-line mass is not
+#: the disk read path; this names which path it is (read / _touch_present caller / _l3_refresh_kept).
+_T_SOURCE_EVERY = 1 << 17
+
+
+def _t_source_note(ev, read: bool) -> None:
+    try:
+        import sys as _sys
+
+        f = _sys._getframe(3)            # _t_source_note <- _journal_touch <- touch <- caller
+        name = f.f_code.co_name
+        if name == "_touch_present" and f.f_back is not None:
+            name = "_touch_present<" + f.f_back.f_code.co_name
+        c = ev.__dict__.setdefault("_t_source", {})
+        key = ("read:" if read else "") + name
+        c[key] = c.get(key, 0) + 1
+        n = ev.__dict__.get("_t_source_n", 0) + 1
+        ev._t_source_n = n
+        if n % _T_SOURCE_EVERY == 0:
+            logger.info("L3-T-SOURCE n=%d by_path=%s (WAKE-OUTLIERS-1024: journaled T lines of this writer by call "
+                        "path, cumulative)", n, dict(sorted(c.items(), key=lambda kv: -kv[1])[:8]))
+    except Exception:  # noqa: BLE001 -- an instrument never fails a read
+        pass
+
+
 class PdFlipL3EvictorPauseRefused(RuntimeError):
     """NF review 3 (B): the background L3 evictor could not be parked at the sleep entry (named stop)."""
 
@@ -1327,6 +1354,7 @@ class LRUFileEvictor:
             while len(seen) > 65536:
                 seen.popitem(last=False)
             jn.write("T", now, 0, suffixed_key)
+            _t_source_note(self, read)
         except Exception:  # noqa: BLE001 -- a recency line is never a reason to fail a read
             return
 
