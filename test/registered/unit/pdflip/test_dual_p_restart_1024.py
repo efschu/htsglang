@@ -33,6 +33,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -751,6 +752,43 @@ class ReapRanksSecrets(unittest.TestCase):
         from flliper.srt.pdflip import launcher as L
 
         self.assertIn("_s7b.remove_spec(GPU_ARB", inspect.getsource(L.teardown))
+
+    def test_the_record_never_holds_a_secret_in_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = S.write_spec(os.path.join(d, "r.json"), argv=["x", "--admin-api-key=s3cr3t"],
+                                env={"HF_TOKEN": "hf_abc", "A": "1"}, cwd="/", log="/l", port=1, tag="t", pid=2)
+            raw = open(path).read()
+        self.assertNotIn("s3cr3t", raw)
+        self.assertNotIn("hf_abc", raw)
+
+    def test_spawn_puts_secrets_back_and_names_the_new_p_for_teardown(self):
+        from flliper.srt.pdflip import launcher as L
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(L, "GPU_ARB", d), \
+                mock.patch.object(L, "EVIDENCE_DIR", d), mock.patch.dict(os.environ, {"S7B_TEST_TOKEN": "tok"}):
+            boot = L._operator_dir(d, "boot_t.json")
+            os.makedirs(os.path.dirname(boot), exist_ok=True)
+            with open(boot, "w") as fh:
+                json.dump({"pids": {"P": 11, "D": 12}, "tag": "t"}, fh)
+            out = os.path.join(d, "env.txt")
+            code = "import os,sys; open(sys.argv[1],'w').write(os.environ.get('S7B_TEST_TOKEN','-')); import time; time.sleep(30)"
+            spec = {"argv": [sys.executable, "-c", code, out], "env": S.mask_env({"S7B_TEST_TOKEN": "tok", "PATH": os.environ.get("PATH", "")}),
+                    "log": os.path.join(d, "P.log"), "tag": "t", "cwd": d}
+            f = _front()
+            io = S.RealIO(f, spec, {})
+            pid = io.spawn()
+            try:
+                self.assertEqual(json.load(open(boot))["pids"]["P"], pid)
+                self.assertIsNone(io.spawned_exited())
+                for _ in range(100):
+                    if os.path.exists(out) and open(out).read():
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(open(out).read(), "tok")                     # the masked value came back
+                self.assertIn("RE-launched by the front (S7B)", open(spec["log"]).read())
+            finally:
+                os.kill(pid, signal.SIGKILL)
+                f._s7b_proc.wait(10)
 
     def test_boot_json_names_the_new_p(self):
         with tempfile.TemporaryDirectory() as d:
