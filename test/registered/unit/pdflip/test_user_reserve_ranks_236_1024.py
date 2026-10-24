@@ -135,17 +135,17 @@ class GroupEnvCarriesTheReserve(unittest.TestCase):
 
     def test_t4c_the_parser_form_without_the_flag_publishes_nothing(self):
         stated = launcher.parse_user_reserve("0", CARDS)
-        self.assertEqual(launcher.user_reserve_group_env(stated), {})
+        self.assertEqual(launcher.user_reserve_rank_env(stated), {})
         stated = launcher.parse_user_reserve("1800,1400,1400", CARDS)
         self.assertEqual(
-            json.loads(launcher.user_reserve_group_env(stated)[cg.USER_RESERVE_ENV]),
+            json.loads(launcher.user_reserve_rank_env(stated)[cg.USER_RESERVE_ENV]),
             {CARDS[0].uuid: 1800, CARDS[1].uuid: 1400, CARDS[2].uuid: 1400},
         )
 
     def test_t5_mutant_group_without_reserve_is_red(self):
         """Mutant: build_env stops publishing the reserve to the group."""
         _check_group_env_carries_the_reserve()  # green on the real code
-        with mock.patch.object(launcher, "user_reserve_group_env", lambda _d: {}):
+        with mock.patch.object(launcher, "user_reserve_rank_env", lambda _d: {}):
             with self.assertRaises(AssertionError):
                 _check_group_env_carries_the_reserve()
 

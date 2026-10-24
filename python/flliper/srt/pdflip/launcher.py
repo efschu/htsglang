@@ -11484,7 +11484,7 @@ def user_reserve_env_value(user_reserve_by_card: Dict[str, int]) -> str:
     return json.dumps({u: int(v) for u, v in user_reserve_by_card.items()})
 
 
-def user_reserve_group_env(user_reserve_by_card: Optional[Dict[str, int]]) -> Dict[str, str]:
+def user_reserve_rank_env(user_reserve_by_card: Optional[Dict[str, int]]) -> Dict[str, str]:
     """The group-env entry that carries the operator's reserve to the ranks.
 
     Empty unless the operator stated a reserve on at least one card:
@@ -12021,7 +12021,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # NO NEW MARGIN: the value is the operator's, serialised by the same
     # function the front uses.
     env.pop(corridor_guard.USER_RESERVE_ENV, None)
-    env.update(user_reserve_group_env(user_reserve_by_card))
+    env.update(user_reserve_rank_env(user_reserve_by_card))
     return env
 
 
