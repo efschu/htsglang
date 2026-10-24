@@ -1577,6 +1577,59 @@ class SemSet:
             raise OSError(err, f"sem_trywait(pair={pair} slot={slot} "
                                f"kind={kind}) failed: {os.strerror(err)}")
 
+    # -- PD-LEGS-1024: the non-blocking take WITHOUT dropping the GIL ---------
+    #
+    # MEASURED (boot dkr27bint4arbar1int4ar10240037, D TP0, P->D legs): the
+    # on-card SEQ collect of one weight tag (224 units, 787 MB) spends p50 66 ms
+    # / p90 158 ms OUTSIDE its waits (wait_ms p50 4 ms -- the deposit is ahead,
+    # the tokens are already posted) while its copies take 4 ms. Per unit it
+    # made one ``sem_timedwait`` through the CDLL -- a GIL release that must be
+    # won back behind the rank's BAR1 collector thread (~0.9 ms per call with one
+    # busy thread, the FLIP-LEGS 02.10. measurement in ``memcpy_async_held``),
+    # and the BAR1 collector paid the same contention back (T per batch 1.75 ms
+    # with the c-lane collect overlapping vs 0.75 ms without, 27b-lanes3x80-1023).
+    # ``sem_trywait`` never blocks (one atomic decrement in user space), so it
+    # can be called through ``PyDLL``: the token is taken exactly as before, the
+    # GIL stays. The caller falls back to the blocking ``timedwait`` (GIL
+    # released) only when no token is there yet.
+    def _held_libc(self):
+        lib = self.__dict__.get("_libc_held")
+        if lib is None:
+            lib = ctypes.PyDLL("libc.so.6", use_errno=True)
+            lib.sem_trywait.argtypes = [ctypes.c_void_p]
+            lib.sem_trywait.restype = ctypes.c_int
+            self.__dict__["_libc_held"] = lib
+        return lib
+
+    def _trywait_held_once(self, handle) -> int:
+        ctypes.set_errno(0)
+        if self._held_libc().sem_trywait(handle) == 0:
+            return 0
+        return ctypes.get_errno()
+
+    def _trywait_held_loop(self, handle, what: str) -> bool:
+        while True:
+            err = self._trywait_held_once(handle)
+            if err == 0:
+                return True
+            if err == errno.EINTR:
+                continue
+            if err in (errno.EAGAIN, 0):
+                return False
+            raise OSError(err, f"sem_trywait({what}) failed: {os.strerror(err)}")
+
+    def trywait_held(self, pair: int, slot: int, kind: str) -> bool:
+        """:meth:`trywait` with the GIL kept across the call (PD-LEGS-1024).
+        True = one token taken; False = none there (nothing taken)."""
+        return self._trywait_held_loop(ctypes.c_void_p(self.handle(pair, slot, kind)),
+                                       f"pair={pair} slot={slot} kind={kind}")
+
+    def diagonal_trywait_held(self, card: int, slot: int, kind: str) -> bool:
+        """The diagonal's :meth:`trywait_held` (keyed by card)."""
+        return self._trywait_held_loop(
+            ctypes.c_void_p(self.diagonal_handle(card, slot, kind)),
+            f"card={card} slot={slot} kind={kind}")
+
     def timedwait(self, pair: int, slot: int, kind: str, budget_s: float) -> bool:
         """Wait for one semaphore, or report a REAL timeout.
 

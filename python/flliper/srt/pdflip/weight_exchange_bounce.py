@@ -3387,13 +3387,35 @@ def ptr_attrs(addr: int) -> Tuple[int, int, int]:
 _PTR_ATTRS_BINDING = None
 
 
+#: PD-LEGS-1024: ``cuPointerGetAttribute`` is a pure driver query that never
+#: blocks and never calls back, so the probe is bound through ``PyDLL`` -- the
+#: GIL stays across the call, the way torch itself issues its CUDA queries.
+#: ONE producer, three users: the SEQ collect's destination probe (two calls
+#: per unit, 224 units per weight tag), the BAR1 collector's preplan (two per
+#: destination, prep_ms p50 29-37 ms per tag, 27b-lanes3x80-1023) and the
+#: wake's PTRATTR census on the main thread. Through the CDLL every call was a
+#: GIL release won back behind the rank's other lane thread (see
+#: ``FLLIPER_PDFLIP_SEQ_TRYWAIT_HELD`` for the measurement). The answer is the
+#: same call with the same arguments: (rc, type, device) unchanged, an unknown
+#: address still rc!=0 -> type 0 / device -1, the refusal of an unmapped
+#: destination still fires. Unset = on; 0/false/no/off = the CDLL binding.
+#: Read once, at the first probe of the process.
+ENV_PTRATTR_HELD = "FLLIPER_PDFLIP_PTRATTR_HELD"
+
+
+def ptrattr_held_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_PTRATTR_HELD, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
 def _ptr_attrs_binding():
-    """``cuPointerGetAttribute`` from libcuda.so.1, bound ONCE per process."""
+    """``cuPointerGetAttribute`` from libcuda.so.1, bound ONCE per process --
+    through ``PyDLL`` (GIL kept) unless ``FLLIPER_PDFLIP_PTRATTR_HELD=0``."""
     global _PTR_ATTRS_BINDING
     if _PTR_ATTRS_BINDING is None:
         import ctypes as _ct
 
-        lib = _ct.CDLL("libcuda.so.1")
+        lib = (_ct.PyDLL if ptrattr_held_on() else _ct.CDLL)("libcuda.so.1")
         fn = lib.cuPointerGetAttribute
         fn.restype = _ct.c_int
         # (void* data, CUpointer_attribute attribute, CUdeviceptr ptr)
@@ -3560,6 +3582,39 @@ ENV_SEQ_IPC_HOLD_GIL = "FLLIPER_PDFLIP_SEQ_IPC_HOLD_GIL"
 def seq_ipc_hold_gil_on(env=None) -> bool:
     env = os.environ if env is None else env
     return str(env.get(ENV_SEQ_IPC_HOLD_GIL, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+#: PD-LEGS-1024: the SEQ collect takes each unit's ``full`` token first with a
+#: GIL-holding ``sem_trywait`` (``SemSet.trywait_held``) and blocks in the
+#: GIL-releasing ``timedwait`` slices only when the token is not there yet.
+#: MEASURED (boot dkr27bint4arbar1int4ar10240037, D TP0 c0, 102 P->D tags):
+#: wait_ms p50 4 -- the depositor is ahead and the tokens are posted -- but
+#: total - wait p50 66 / p90 158 ms per 224-unit tag for 4 ms of copies: one
+#: GIL round trip per unit for the wait (plus two for the destination probe,
+#: see ``FLLIPER_PDFLIP_PTRATTR_HELD``), each won back behind the rank's BAR1
+#: collector thread, which pays the same contention (27b-lanes3x80-1023: T per
+#: batch 1.75 ms with the c-lane collect overlapping, 0.75 ms without). The
+#: token accounting is unchanged: exactly one token per unit, taken before the
+#: unit's record is read and its bytes are copied. Unset = on; 0/false/no/off =
+#: the blocking wait for every unit (the old form). Lane-time ``held_takes=``.
+ENV_SEQ_TRYWAIT_HELD = "FLLIPER_PDFLIP_SEQ_TRYWAIT_HELD"
+
+
+def seq_trywait_held_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_SEQ_TRYWAIT_HELD, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def seq_take_held(sems, *, is_diagonal: bool, card, pair, slot: int) -> bool:
+    """One ``full`` token of a SEQ lane taken WITHOUT releasing the GIL, or
+    False (nothing taken: the caller blocks as before). False also when the
+    switch is off or the semaphore set has no held entry point (desk fakes)."""
+    if not seq_trywait_held_on():
+        return False
+    fn = getattr(sems, "diagonal_trywait_held" if is_diagonal else "trywait_held", None)
+    if not callable(fn):
+        return False
+    return bool(fn(int(card) if is_diagonal else int(pair), int(slot), "full"))
 
 
 #: FLIP-LEGS 02.10.: a SEQ deposit writes ONE record file per sync group
@@ -4033,6 +4088,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         _col_recs: dict = {}
         _n_grp_reads = 0
         _n_sync = 0
+        _n_held = 0     # PD-LEGS-1024: units whose token was taken GIL-held
         _first_done = False
         for _grp in _groups:
             if phase == PHASE_DEPOSIT:
@@ -4132,8 +4188,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 # W68 (NF 14.10. 12:17Z, "c2/weights_15: budget expired at
                 # unit 0" after a 117-s host freeze): pause time is given back
                 _dl = PauseAwareDeadline(budget_s, 0.2, what="seq-collect")
-                got = False
-                while _dl.left() > 0:
+                # PD-LEGS-1024: the posted token first, GIL held (one token,
+                # exactly as the blocking wait below would take it)
+                got = seq_take_held(sems, is_diagonal=_is_diagonal, card=card,
+                                    pair=pair, slot=_SEQ_SLOT)
+                if got:
+                    _n_held += 1
+                while not got and _dl.left() > 0:
                     # weg2xsn91: BLOCK on the semaphore in 0.2 s slices
                     if _is_diagonal:
                         _got = sems.diagonal_timedwait(int(card), _SEQ_SLOT,
@@ -4321,7 +4382,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             f"issue_gil={'held' if (_ipc_base and getattr(ops, 'held_gil', False) and seq_ipc_hold_gil_on()) else 'released'} "
             f"records={('group' if seq_group_record_on() else 'unit') if phase == PHASE_DEPOSIT else ('group:%d' % _n_grp_reads)} "
             f"syncs={_n_sync} batch={_bat_units}u/{_bat_bytes >> 20}MiB "
-            f"t={_time.time():.3f} t0={_time.time() - (time.perf_counter() - _t_lane0):.3f}"
+            + (f"held_takes={_n_held}/{len(_batch.pieces)} " if phase == PHASE_COLLECT else "")
+            + f"t={_time.time():.3f} t0={_time.time() - (time.perf_counter() - _t_lane0):.3f}"
             + (f" host={_host_mode or 'none'}" if _lazy else ""))
         if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
             # #1385's lesson, at this form's own site: the file is freed by the
