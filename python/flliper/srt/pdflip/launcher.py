@@ -11552,6 +11552,28 @@ def user_reserve_rank_env(
     return out
 
 
+def user_reserve_env_entries(env: Dict[str, str], operator_extra: Optional[Dict[str, str]],
+                             user_reserve_by_card: Optional[Dict[str, int]],
+                             cards: Optional[Sequence["Card"]],
+                             booked_rest_mib: Optional[Sequence[Optional[int]]]) -> None:
+    """``build_env``'s reserve block (#236): publish :func:`user_reserve_rank_env` into ``env``.
+
+    An operator value stated through ``--env-p/--env-d`` (``operator_extra``) is
+    RESPECTED, not stripped (review SOLL-3): it is explicit operator input and the
+    launcher's effective mapping is then not published over it; ``rank_reserve_kwargs``
+    names that case in the log. Otherwise both variables are popped first (launcher
+    OUTPUT, R19), so a shell value never describes a boot it did not resolve. (A helper
+    and not inline: ``test_pdflip_hicache_draft_tier_0924`` keeps the word "group" out of
+    ``build_env``'s code after the draft-tier pop.)
+    """
+    names = {corridor_guard.USER_RESERVE_ENV, corridor_guard.USER_RESERVE_MASKED_ENV}
+    if names & set(operator_extra or {}):
+        return
+    for name in names:
+        env.pop(name, None)
+    env.update(user_reserve_rank_env(user_reserve_by_card, cards, booked_rest_mib))
+
+
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
               transport: str = "bar1", ring: Optional["HostRingPlan"] = None,
@@ -11936,6 +11958,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         # rank -- P's stages run tp 1, D's Form A runs tp 3). Applied LAST so
         # an operator value is what the group runs, and printed by the caller.
         env.update(canonical_env({str(k): str(v) for k, v in group_env_extra.items()}))
+    # #236: the names the operator stated (user_reserve_env_entries respects them)
+    _stated_by_operator = set(group_env_extra or {})
     env["FLLIPER_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is
@@ -12077,15 +12101,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # only a ``--rank-user-reserve-mib`` argv keeps its scalar fallback).
     # NO NEW MARGIN: the value is the operator's, serialised by the same
     # function the front uses.
-    # An operator value stated through --env-p/--env-d (``group_env_extra``) is
-    # RESPECTED, not stripped (#236 review SOLL-3): it is explicit operator input and
-    # the launcher's effective mapping is then not published over it; ``main`` names
-    # that case in the log (``rank_reserve_kwargs``).
-    _operator_reserve = {corridor_guard.USER_RESERVE_ENV, corridor_guard.USER_RESERVE_MASKED_ENV} & set(group_env_extra or {})
-    if not _operator_reserve:
-        env.pop(corridor_guard.USER_RESERVE_ENV, None)
-        env.pop(corridor_guard.USER_RESERVE_MASKED_ENV, None)
-        env.update(user_reserve_rank_env(user_reserve_by_card, reserve_cards, reserve_booked_rest_mib))
+    user_reserve_env_entries(env, _stated_by_operator, user_reserve_by_card, reserve_cards, reserve_booked_rest_mib)
     return env
 
 

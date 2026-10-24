@@ -1188,6 +1188,8 @@ def corridor_floor_for_current_device(
     # operator's ``--rank-user-reserve-mib`` -- the one knob the user
     # explicitly kept ("das feature muss aber erhalten bleiben"). The fallback
     # is still rank-uniform: it is one CLI value shared by every rank.
+    # ``reserve_for_card`` is the one choice: ``user_reserve_by_card()`` first, the
+    # named ``fallback_reserve_mib`` scalar only where the mapping has no entry.
     reserve, reserve_source = reserve_for_card(uuid, fallback_reserve_mib)
     # #236: the card this rank resolved and the reserve it will add, once per
     # (card, value, source) -- the rank-side half of the launcher's
