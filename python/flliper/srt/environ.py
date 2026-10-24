@@ -1797,7 +1797,8 @@ class Envs:
     # the fixed part itself (vote post - extend end incl. draft - start rate x rows over trimmed, non-first
     # passes), raises the single line with it (never lowers), shares the group max on the packed reduce and
     # persists its readings per form; the launcher seeds the next boot from the form's store once MIN_BOOTS
-    # boots measured it. Default ON; 0 = the seed alone (VOTE-LINE-SINGLE), no store.
+    # boots measured it. Default ON; 0 = the seed alone, value-equal to VOTE-LINE-SINGLE (line, env, budgets;
+    # +1 neutral reduce slot and one log line remain), no store.
     FLLIPER_PDFLIP_VOTE_FIXED_LIVE = EnvBool(True)
     # launcher -> D ranks: the form digest, the D inventory (positional by rank), the boot tag, the store root
     FLLIPER_PDFLIP_VOTE_FIXED_FORM = EnvStr(None)

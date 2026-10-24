@@ -14795,16 +14795,43 @@ def vote_fixed_live_root() -> str:
     return CACHE_DIR
 
 
+#: VOTE-FIXED-LIVE (review S3): group D's effective --kv-cache-dtype as main resolved it from --extra-d ("" = the
+#: profile row's); set once in main, read by the form
+_VFL_ARGV: Dict[str, str] = {}
+
+
+def _vfl_effective_draft(row) -> str:
+    """Review S3: D's EFFECTIVE draft (the spec form main resolved, with an --extra-d draft-token override), not the
+    profile row's; the row's draft kind:steps only where the spec form cannot be read."""
+    try:
+        extra = _SPEC_FORM.get("d_extra_draft_tokens")
+        if spec_form_is_dflash():
+            return (f"DFLASH:block={int(_SPEC_FORM['block'])}:window={int(_SPEC_FORM['window'])}"
+                    + (f":tokens={extra}" if extra else ""))
+        return f"{SPEC_ALGORITHM}:steps={SPEC_NUM_STEPS}:tokens={extra or SPEC_NUM_DRAFT_TOKENS}"
+    except Exception:  # noqa: BLE001
+        dr = getattr(row, "draft", None) if row is not None else None
+        return "" if dr is None else f"{getattr(dr, 'kind', '')}:{getattr(dr, 'steps', '')}"
+
+
 def d_extend_vote_fixed_live_form(profile: Optional[str], cards: Optional[Sequence[Card]],
                                   model: Optional[str]) -> Tuple[Optional[str], str]:
-    """VOTE-FIXED-LIVE rule 5: ``(digest, why)`` of the D form -- profile, the H87 footprint key of the checkpoint
-    (config + quant sidecars + (name, dtype, shape) of every tensor: the quant format is IN it), the D inventory, the
-    profile's KV dtype and draft. ``(None, why)`` with the switch off, without cards or without a readable
-    checkpoint (fail closed: no store, the static record alone)."""
+    """``(digest, why)`` -- :func:`d_extend_vote_fixed_live_material` without the material."""
+    dig, _mat, why = d_extend_vote_fixed_live_material(profile, cards, model)
+    return dig, why
+
+
+def d_extend_vote_fixed_live_material(profile: Optional[str], cards: Optional[Sequence[Card]],
+                                      model: Optional[str]) -> Tuple[Optional[str], Optional[dict], str]:
+    """VOTE-FIXED-LIVE rule 5: ``(digest, material, why)`` of the D form -- profile, the H87 footprint key of the
+    checkpoint (config + quant sidecars + (name, dtype, shape) of every tensor: the quant format is IN it), the D
+    inventory, D's effective KV dtype and draft (review S3). NOT in the form (named): the code revision, the chunk
+    width, the seats, the torch cache cap, the HiCache configuration. ``(None, None, why)`` with the switch off,
+    without cards or without a readable checkpoint (fail closed: no store, the static record alone)."""
     if not _vfl.switch_on():
-        return None, f"{_vfl.ENV_ON}=0"
+        return None, None, f"{_vfl.ENV_ON}=0"
     if not cards:
-        return None, "no D cards"
+        return None, None, "no D cards"
     prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
     if model is None:
         form = pdflip_form.current_form()
@@ -14814,18 +14841,17 @@ def d_extend_vote_fixed_live_form(profile: Optional[str], cards: Optional[Sequen
     except Exception as exc:  # noqa: BLE001 -- unreadable checkpoint: not a form
         fp, fp_why = None, f"footprint unreadable ({type(exc).__name__})"
     if not fp:
-        return None, f"no footprint ({fp_why})"
+        return None, None, f"no footprint ({fp_why})"
     row = pdflip_form.profile_row(prof)
     try:
         inventory = card_identity.inventory_signature(list(cards))
     except Exception as exc:  # noqa: BLE001
-        return None, f"inventory unreadable ({type(exc).__name__})"
-    kv = str(getattr(row, "kv_dtype", "") or "") if row is not None else ""
-    dr = getattr(row, "draft", None) if row is not None else None
-    draft = "" if dr is None else f"{getattr(dr, 'kind', '')}:{getattr(dr, 'steps', '')}"
+        return None, None, f"inventory unreadable ({type(exc).__name__})"
+    kv = str(_VFL_ARGV.get("kv") or "") or (str(getattr(row, "kv_dtype", "") or "") if row is not None else "")
+    draft = _vfl_effective_draft(row)
     mat = _vfl.form_material(prof, fp, pdflip_form.model_key(model or ""), inventory, kv, draft)
     dig = _vfl.form_digest(mat)
-    return (dig, f"form {dig} = {mat}") if dig else (None, "no form material")
+    return (dig, mat, f"form {dig} = {mat}") if dig else (None, None, "no form material")
 
 
 def d_extend_vote_fixed_live_verdict(profile: Optional[str], cards: Optional[Sequence[Card]],
@@ -14885,13 +14911,31 @@ def _d_extend_vote_fixed_live_env(ns, log, label: str, cards: Optional[Sequence[
         _pconst(_budget_rest.VOTE_FIXED_RECORD, getattr(ns, "profile", None))
     except (KeyError, TypeError):
         return   # a profile without the single line (Next Flash: VOTE-MEASURED-LINE on its own branch)
-    dig, why = d_extend_vote_fixed_live_form(getattr(ns, "profile", None), cards, getattr(ns, "model", None))
+    dig, mat, why = d_extend_vote_fixed_live_material(getattr(ns, "profile", None), cards, getattr(ns, "model", None))
     if dig is None:
         log(f"{D_RANK_SOLVE_MARKER} {label} {_vfl.MARKER} store off: {why} -- the ranks' meter raises the line "
             f"within the boot only, nothing persists")
         return
+    # review M1: the FULL boot name (main: ns.boot_name = boot_weg2_<tag>_<rev>_<date>_<time>), the tag only where
+    # main did not run (desk)
+    boot = str(getattr(ns, "boot_name", "") or getattr(ns, "tag", "") or "")
+    root = vote_fixed_live_root()
     env = {_vfl.ENV_FORM: dig, _vfl.ENV_CARDS: ",".join(card_identity.inventory_signature(list(cards or ()))),
-           _vfl.ENV_BOOT: str(getattr(ns, "tag", "") or ""), _vfl.ENV_DIR: vote_fixed_live_root()}
+           _vfl.ENV_BOOT: boot, _vfl.ENV_DIR: root}
+    if not getattr(ns, "dry_run", False):
+        try:   # review M3: the yardstick --import checks old logs against
+            # the totals a D rank's torch sees (NVML total - driver reserved), what PDFLIP-VRAM-PEAK logs as
+            # card_total_mib (5090 32607 - 499 = 32108, 3080 20480 - 425 = 20055)
+            _vfl.write_form(root, dig, mat or {}, [int(getattr(c, "total_mib", 0) or 0)
+                                                   - int(getattr(c, "reserved_mib", 0) or 0) for c in (cards or ())])
+        except Exception as exc:  # noqa: BLE001 -- no sidecar: --import of old logs stays unverified
+            log(f"{D_RANK_SOLVE_MARKER} {label} {_vfl.MARKER} {_vfl.FORM_FILE} not written ({type(exc).__name__})")
+    _d, _v, _w = d_extend_vote_fixed_live_verdict(getattr(ns, "profile", None), cards, getattr(ns, "model", None))
+    if _v is not None:
+        for q in _v.quarantined:   # review M2: loud, never a seed
+            log(f"{D_RANK_SOLVE_MARKER} {label} WARN {_vfl.MARKER} QUARANTINED reading (no seed): {q}")
+        for k in _v.skipped:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {_vfl.MARKER} store doc left out: {k}")
     _have = parse_group_env(getattr(ns, "env_d", "") or "")
     for k, v in env.items():
         if k not in _have and v:
@@ -26389,6 +26433,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dirty = subprocess.run(["git", "-C", tree, "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
     stamp = time.strftime("%m%d_%H%M%S", time.gmtime())
     base = f"{EVIDENCE_DIR}/boot_weg2_{ns.tag}_{tip}_{stamp}"
+    # VOTE-FIXED-LIVE (review M1/S3): the FULL boot name (the store's boot identity, also what --import reads off a
+    # log name) and D's effective KV dtype for the form
+    ns.boot_name = os.path.basename(base)
+    _VFL_ARGV["kv"] = _argv_scalar(str(getattr(ns, "extra_d", "") or ""), "--kv-cache-dtype") or ""
     dry = ns.dry_run
     global _ANCHOR_INDEX_MODE
     _ANCHOR_INDEX_MODE = "ro" if dry else "rw"  # S68 review: a dry run reads the W65 index, never writes it

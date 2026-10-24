@@ -55,12 +55,7 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           "line": _UNSET,
           # VOTE-LINE-SINGLE (24.10.): the measured non-row part per rank (env, read once), and whether
           # this rank's line is the single line (near-OOM + that part) -- set with "line"
-          "vote_fixed": _UNSET, "single": False,
-          # VOTE-FIXED-LIVE (24.10.): the line's base (floor MiB, source, seed F or None), read once; the switch; this
-          # rank's meter (vote_fixed_live.Meter); the group max of F from the packed reduce (ratchet up); the last F
-          # named; the store target (root, form, boot, card) or None; whether a store write failed already
-          "line_base": _UNSET, "live_on": _UNSET, "live": None, "live_group": 0.0, "live_logged": None,
-          "live_store": _UNSET, "live_store_err": False}
+          "vote_fixed": _UNSET, "single": False}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -101,6 +96,7 @@ def rates() -> Optional[List[float]]:
 
 
 def reset_for_tests() -> None:
+    _live_reset()   # VOTE-FIXED-LIVE state (its own block below)
     _CACHE["thresholds"] = _UNSET
     _CACHE["rates"] = _UNSET
     _CACHE["armed"] = False
@@ -115,13 +111,6 @@ def reset_for_tests() -> None:
     _CACHE["line"] = _UNSET
     _CACHE["vote_fixed"] = _UNSET
     _CACHE["single"] = False
-    _CACHE["line_base"] = _UNSET
-    _CACHE["live_on"] = _UNSET
-    _CACHE["live"] = None
-    _CACHE["live_group"] = 0.0
-    _CACHE["live_logged"] = None
-    _CACHE["live_store"] = _UNSET
-    _CACHE["live_store_err"] = False
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -503,6 +492,20 @@ def single_line_active(rank: Optional[int] = None) -> bool:
 
 LIVE_MARKER = "VOTE-FIXED-LIVE"
 
+#: VOTE-FIXED-LIVE state, kept in ``_CACHE`` but declared here (one block, merge-friendly): the line's base (floor
+#: MiB, source, seed F or None), read once; the switch; this rank's meter (vote_fixed_live.Meter); the group max of F
+#: from the packed reduce (ratchet up); the last F named; the store target (root, form, boot, cards, proc) or None;
+#: whether a store write failed already; whether the exit flush is registered
+_LIVE_DEFAULTS = {"line_base": _UNSET, "live_on": _UNSET, "live": None, "live_group": 0.0, "live_logged": None,
+                  "live_store": _UNSET, "live_store_err": False, "live_atexit": False}
+
+
+def _live_reset() -> None:
+    _CACHE.update(_LIVE_DEFAULTS)
+
+
+_live_reset()
+
 
 def live_on() -> bool:
     """``FLLIPER_PDFLIP_VOTE_FIXED_LIVE`` (default ON), read once per process."""
@@ -524,7 +527,24 @@ def _live_meter(rank: Optional[int] = None):
         from flliper.srt.pdflip import vote_fixed_live as _vfl
 
         m = _CACHE["live"] = _vfl.Meter(rank=int(rank or 0))
+        if not _CACHE["live_atexit"]:
+            # review NIT: a boot that ends between two persist marks keeps its last counts (best effort; a SIGKILL
+            # skips it -- the marks and every rise of F were written already)
+            import atexit
+
+            atexit.register(_live_flush)
+            _CACHE["live_atexit"] = True
     return m
+
+
+def _live_flush() -> None:
+    """Exit flush: write the meter's doc if it counted passes since the last write. Never raises."""
+    try:
+        m = _CACHE["live"]
+        if m is not None and m.counted > m.persisted_counted:
+            _live_write(m)
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _live_start_rate(rank: Optional[int]) -> Optional[float]:
@@ -593,16 +613,38 @@ def _live_store():
             form = os.environ.get(_vfl.ENV_FORM, "").strip()
             root = os.environ.get(_vfl.ENV_DIR, "").strip()
             if form and root:
-                st = (root, form, os.environ.get(_vfl.ENV_BOOT, "").strip() or f"pid{os.getpid()}",
-                      [x.strip() for x in os.environ.get(_vfl.ENV_CARDS, "").split(",") if x.strip()])
+                # review M1: the boot name the launcher hands over (full boot stem) -- else this process's core cwd
+                # (<EVIDENCE_DIR>/core/<boot stem>, launcher.core_cwd_for); the file also carries pid-start, so a
+                # relaunch under one tag or a rank restart never writes over another process's readings
+                boot = os.environ.get(_vfl.ENV_BOOT, "").strip() or os.path.basename(os.getcwd())
+                st = (root, form, boot,
+                      [x.strip() for x in os.environ.get(_vfl.ENV_CARDS, "").split(",") if x.strip()],
+                      f"{os.getpid()}-{int(time.time() * 1000)}")
         except Exception:  # noqa: BLE001 -- no store: the meter still measures
             st = None
         _CACHE["live_store"] = st
     return st
 
 
+def _live_write(m) -> bool:
+    """Write this rank's doc (merged, its own file). False without a store target or a rate."""
+    from flliper.srt.pdflip import vote_fixed_live as _vfl
+
+    st = _live_store()
+    rate = _live_start_rate(m.rank)
+    if st is None or rate is None:
+        return False
+    root, form, boot, cards, proc = st
+    card = cards[m.rank] if 0 <= m.rank < len(cards) else "?"
+    _vfl.write_doc(_vfl.doc_path(root, form, boot, m.rank, proc),
+                   m.snapshot(rate, form=form, boot=boot, card=card, source="rank", proc=proc))
+    m.persisted_counted = m.counted
+    return True
+
+
 def _live_after(rank: Optional[int], msg: Optional[str]) -> None:
-    """A counted reading: persist when this rank's F rose or a milestone count is reached. Never raises."""
+    """A counted reading: persist when this rank's F rose, a reading went to the quarantine, or a milestone count is
+    reached. Never raises."""
     if msg is None:
         return
     m = _CACHE["live"]
@@ -611,21 +653,20 @@ def _live_after(rank: Optional[int], msg: Optional[str]) -> None:
 
         rate = _live_start_rate(m.rank)
         f = None if rate is None else m.fixed_mib(rate)
+        quarantined = msg.startswith("QUARANTINED")
         prev = m.persisted_f
         rose = f is not None and (prev is None or f > prev + 0.5)
-        if not (rose or m.counted in (1, _vfl.MIN_PASSES_PER_BOOT) or m.counted % _vfl.PERSIST_EVERY == 0):
+        if quarantined:
+            # review M2: loud -- it raises THIS boot's line (OOM-safe) but never seeds a later boot
+            logger.warning(f"{LIVE_MARKER} rank={m.rank} reading {msg}: raises this boot's line only, persisted as "
+                           f"quarantined (no seed; drop with python -m flliper.srt.pdflip.vote_fixed_live --drop)")
+        if not (rose or quarantined or m.counted in (1, _vfl.MIN_PASSES_PER_BOOT)
+                or m.counted % _vfl.PERSIST_EVERY == 0):
             return
-        if rose:
+        if rose and not quarantined:
             logger.info(f"{LIVE_MARKER} rank={m.rank} reading {msg} own_fixed_mib={f:.0f} counted={m.counted} "
                         f"untrimmed={m.untrimmed} (post - end - start rate x rows over trimmed, non-first passes)")
-        st = _live_store()
-        if st is None or rate is None:
-            m.persisted_f = f
-            return
-        root, form, boot, cards = st
-        card = cards[m.rank] if 0 <= m.rank < len(cards) else "?"
-        _vfl.write_doc(_vfl.doc_path(root, form, boot, m.rank),
-                       m.snapshot(rate, form=form, boot=boot, card=card, source="rank"))
+        _live_write(m)
         m.persisted_f = f
     except Exception as exc:  # noqa: BLE001 -- a store write never kills a pass; named once
         if not _CACHE["live_store_err"]:
@@ -777,6 +818,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 _CACHE["cap_trimmed"] = True
                 post_mib = cuda.mem_get_info()[0] / MIB
                 cap_post = torch_cap - int(cuda.memory_reserved()) / MIB
+            _live_driver_post = post_mib   # VOTE-FIXED-LIVE (review S2): the meter reads the DRIVER post
             post_mib = min(post_mib, cap_post)
         # 27B INT8 night 22.10. (rounds 1+2, D TP1 3080, driver-free minimum 359.8 / 371.8 MiB under a 1024 MiB line): the
         # chunk is funded by the DRIVER's free bytes alone. The rate is the measured RESERVED growth per row
@@ -797,7 +839,9 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
             cache_free_mib = 0.0
         # VOTE-FIXED-LIVE: this read opens the pass the meter pairs with the next chunk (the previous reading commits
         # first, so a raised F is in the line below)
-        live_note_vote(rank, post_mib, rate)
+        # review S2: under the torch cache cap the vote prices the capped post, the meter the driver post (its end is
+        # the driver free; a capped post would make the reading smaller by the gap)
+        live_note_vote(rank, post_mib if cap_post is None else _live_driver_post, rate)
         line_mib = corridor_line_mib(rank)
         cap = rows_cap(post_mib, rate, page_size, line_mib)
         if cap >= int(configured):

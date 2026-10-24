@@ -98,8 +98,18 @@ def _counted_passes(stamp):
 
 
 def _import(root, form, stamps):
+    """Import fixture boots as VERIFIED boots of ``form`` (review M3: the CLI verifies the logs first)."""
     for s in stamps:
-        V.import_passes(root, form, s, ALL[s], rate=START)
+        V.import_passes(root, form, s, ALL[s], rate=START, verified=True)
+
+
+def _slice(stamp, k, n=3):
+    """Every rank's passes, the k-th of n contiguous slices (one boot split into n test boots of the same form)."""
+    out = {}
+    for r, ps in ALL[stamp].items():
+        size = -(-len(ps) // n)
+        out[r] = ps[k * size:(k + 1) * size]
+    return out
 
 
 def _verdict(root, form):
@@ -185,7 +195,7 @@ class TheGateCountsBoots(CustomTestCase):
             _import(root, "int4ar", ["int4ar091424", "int4ar223241", "int4ar003732"])
             v = _verdict(root, "int4ar")
             self.assertEqual((v.gate_open, v.fixed_mib, v.qualifying), (False, 252, ("int4ar003732", "int4ar223241")))
-            V.import_passes(root, "int4ar", "int4ar003732-again", ALL["int4ar003732"], rate=START)
+            V.import_passes(root, "int4ar", "int4ar003732-again", ALL["int4ar003732"], rate=START, verified=True)
             v = _verdict(root, "int4ar")
         self.assertEqual((v.gate_open, v.fixed_mib), (True, 252))
         self.assertIn("int4ar091424", v.worst)
@@ -313,8 +323,17 @@ class TheLauncherSeedsFromTheStore(CustomTestCase):
             self.assertIsNone(vals)
             self.assertTrue(why.startswith("F unmeasured for form"), why)
             self.assertIn("gate closed", why)
-            V.import_passes(root, d, "duo-b2", ALL["duo100906"], rate=START)
-            V.import_passes(root, d, "duo-b3", ALL["int4ar223241"], rate=START)
+            # review M3: three VERIFIED boots of the duo form (the one duo boot split in three -- the old version of
+            # this test opened the duo gate with int4ar passes)
+            for k in range(3):
+                V.import_passes(root, d, f"duo-b{k}", _slice("duo100906", k), rate=START, verified=True)
+            # an UNVERIFIED import (foreign logs) counts for nothing, however high
+            _doc(root, d, "foreign", 0, {10: 400.0}, counted=500)
+            with open(V.doc_path(root, d, "foreign", 0)) as fh:
+                doc = json.load(fh)
+            doc["verified"] = False
+            with open(V.doc_path(root, d, "foreign", 0), "w") as fh:
+                json.dump(doc, fh)
             vals, src = L.d_extend_vote_fixed_record(F.PROFILE_QWEN27B, 2, cards, "/m/" + NVFP4_MODEL)
         self.assertEqual(vals, [232.0, 232.0])
         self.assertIn("gate OPEN", src)
@@ -527,6 +546,160 @@ class TheHooksAreWired(CustomTestCase):
         self.assertLess(a, src.index("_limit_at = len(vals)"))
         self.assertIn("_pdflip_extend_trim.live_fixed_payload()", src)
         self.assertIn("_pdflip_extend_trim.live_fixed_group(int(t[_vfix_at]))", src)
+
+
+EXCERPT = os.path.join(OLD, "excerpt_080355_D.txt")
+DREI_FRONT = "PDFLIP-LAUNCH ... --model-path /spinning/llm_stuff/club-3090/models-cache/" + DREI_MODEL + " --tp 3\n"
+
+
+class TheReviewRound(CustomTestCase):
+    """Review VOTE-FIXED-LIVE 24.10. (M1-M3, S3): the store never loses a reading, a foreign reading never seeds,
+    a foreign log never opens a gate."""
+
+    def setUp(self):
+        ET.reset_for_tests()
+
+    def tearDown(self):
+        ET.reset_for_tests()
+
+    # -- M1 -------------------------------------------------------------------------------------------------------
+    def test_m1_the_boot_is_the_logs_full_stem(self):
+        self.assertEqual(V.boot_of_log("/e/boot_weg2_dkr27bbar1drei10241106_1ecda02a58_1024_110644.D.log"),
+                         "boot_weg2_dkr27bbar1drei10241106_1ecda02a58_1024_110644")
+        with _store():
+            ns = _ns(boot_name="boot_weg2_t_abc_1024_110644")
+            L._d_extend_flip_rate_env(ns, [].append, "D", PRE._cards())
+            self.assertEqual(L.parse_group_env(ns.env_d)[V.ENV_BOOT], "boot_weg2_t_abc_1024_110644")
+
+    def test_m1_a_write_merges_never_replaces(self):
+        with tempfile.TemporaryDirectory() as root:
+            p = V.doc_path(root, "f", "b", 1, "77-1")
+            self.assertTrue(p.endswith("b.tp1.77-1.json"))
+            a, b = V.Meter(rank=1), V.Meter(rank=1)
+            a.readings, a.counted = {61: 300.0}, 30
+            b.readings, b.counted = {10: 50.0}, 1
+            V.write_doc(p, a.snapshot(START, boot="b"))
+            V.write_doc(p, b.snapshot(START, boot="b"))
+            doc = V.load_docs(root, "f")[0]
+        self.assertEqual(doc["readings"], [[10, 50.0], [61, 300.0]])
+        self.assertEqual(doc["counted"], 30)
+
+    def test_m1_the_rank_writes_its_own_process_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            extra = {V.ENV_FORM: "f1", V.ENV_DIR: root, V.ENV_BOOT: "boot_weg2_t", V.ENV_CARDS: "A,B,C"}
+            with _rank(extra=extra):
+                _pass(1, 1000, 10, 700)
+                _pass(1, 1000, 61, 700)
+                names = os.listdir(V.store_dir(root, "f1"))
+        self.assertEqual(len(names), 1)
+        self.assertRegex(names[0], r"^boot_weg2_t\.tp1\.%d-\d+\.json$" % os.getpid())
+
+    # -- M2 -------------------------------------------------------------------------------------------------------
+    def test_m2_a_reading_above_the_ceiling_raises_this_boot_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            extra = {V.ENV_FORM: "f1", V.ENV_DIR: root, V.ENV_BOOT: "b", V.ENV_CARDS: "A,B,C"}
+            with _rank(extra=extra), self.assertLogs(ET.logger, level="WARNING") as cm:
+                _pass(1, 1000, 10, 700)
+                _pass(1, 1500, 10, 900)                      # cost 600, excess 597 > 476: quarantined
+                self.assertEqual(ET.corridor_line_mib(1), 400.0 + math.ceil(600 - START * 10))   # OOM-safe in boot
+                self.assertEqual(ET.live_fixed_payload(), -math.ceil(600 - START * 10))
+            self.assertTrue(any("QUARANTINED" in m for m in cm.output))
+            docs = V.load_docs(root, "f1")
+            self.assertEqual((docs[0]["readings"], len(docs[0]["quarantined"])), ([], 1))
+            v = V.aggregate(docs, START)
+        self.assertEqual((v.fixed_mib, len(v.quarantined), v.passes), (None, 1, 1))   # never a seed
+
+    def test_m2_the_launcher_never_seeds_from_the_quarantine(self):
+        with _store() as root:
+            d = _digest(DREI_MODEL, PRE._cards())
+            _doc(root, d, "bad", 1, {10: 900.0})                # excess 897 > 476 at the start rate
+            vals, src = L.d_extend_vote_fixed_record(F.PROFILE_QWEN27B, 3, PRE._cards(), "/m/" + DREI_MODEL)
+            lines = []
+            L._d_extend_flip_rate_env(_ns(), lines.append, "D", PRE._cards())
+        self.assertEqual(vals, [float(RECORD)] * 3)
+        self.assertTrue(any("WARN" in ln and "QUARANTINED" in ln and "bad" in ln for ln in lines), lines)
+
+    def test_m2_the_way_back(self):
+        with tempfile.TemporaryDirectory() as root:
+            _import(root, "f", ["003738"])
+            _doc(root, "f", "bad", 1, {10: 400.0})          # excess 397: under the ceiling, raises the store
+            self.assertEqual(_verdict(root, "f").fixed_mib, 397)
+            self.assertEqual(V.main(["--drop", root, "f", "bad"]), 0)
+            self.assertEqual(_verdict(root, "f").fixed_mib, RECORD)
+
+    def test_m2_a_foreign_tail_is_not_the_draft(self):
+        m = V.Meter(rank=1)
+        for end, draft in ((900, None), (900, 500), (900, 860)):
+            m.on_vote(1000, START), m.on_trim(), m.on_chunk(10, end)
+            if draft is not None:
+                m.on_draft(draft)
+            m.on_target_decode()
+        # pass 2: forward drop 100, "draft" drop 400 > 100 -> chunk end stands; pass 3: draft drop 40 counts
+        self.assertEqual((m.tails_skipped, m.readings), (1, {10: 140.0}))
+
+    # -- M3 -------------------------------------------------------------------------------------------------------
+    def _form(self, root):
+        mat = V.form_material("qwen27b", "fpINT8", DREI_MODEL, ("RTX5090", "RTX3080", "RTX3080"))
+        V.write_form(root, "f", mat, [32108, 20055, 20055])
+
+    def test_m3_the_import_checks_model_and_cards(self):
+        with open(EXCERPT) as fh:
+            d_text = fh.read()
+        with tempfile.TemporaryDirectory() as root:
+            self.assertFalse(V.verify_logs(root, "f", DREI_FRONT, d_text)[0])              # no sidecar yet
+            self.assertTrue(V.verify_logs(root, "f", f"... {V.ENV_FORM}=f ...", "")[0])     # the front names it
+            self._form(root)
+            self.assertTrue(V.verify_logs(root, "f", DREI_FRONT, d_text)[0])
+            self.assertFalse(V.verify_logs(root, "f", DREI_FRONT.replace(DREI_MODEL, NVFP4_MODEL), d_text)[0])
+            two = "\n".join(ln for ln in d_text.splitlines() if "rank=2 " not in ln)
+            self.assertFalse(V.verify_logs(root, "f", DREI_FRONT, two)[0])                 # duo-like rank count
+            other = d_text.replace("card_total_mib=32108", "card_total_mib=20055")
+            self.assertFalse(V.verify_logs(root, "f", DREI_FRONT, other)[0])               # another card
+
+    def test_m3_an_unverified_import_counts_for_nothing(self):
+        with tempfile.TemporaryDirectory() as root, open(EXCERPT) as fh:
+            d_text = fh.read()
+            log = os.path.join(root, "boot_weg2_t_rev_1024_080355.D.log")
+            with open(log, "w") as out:
+                out.write(d_text)
+            self.assertEqual(V.main(["--import", root, "f", log]), 0)          # no sidecar, no front: unverified
+            v = _verdict(root, "f")
+            self.assertEqual((v.fixed_mib, v.boots, len(v.skipped)), (None, (), 3))
+            self._form(root)
+            with open(log[: -len(".D.log")] + ".front.log", "w") as out:
+                out.write(DREI_FRONT)
+            V.main(["--import", root, "f", log])
+            v = _verdict(root, "f")
+        self.assertEqual((v.boots, v.skipped), (("boot_weg2_t_rev_1024_080355",), ()))
+
+    def test_m3_the_launcher_writes_the_forms_yardstick(self):
+        with _store() as root:
+            L._d_extend_flip_rate_env(_ns(), [].append, "D", PRE._cards())
+            fd = V.read_form(root, _digest(DREI_MODEL, PRE._cards()))
+            ns = _ns(dry_run=True)
+            with mock.patch.object(V, "write_form") as wf:
+                L._d_extend_flip_rate_env(ns, [].append, "D", PRE._cards())
+            self.assertEqual(wf.call_count, 0)                  # a dry run writes nothing
+        self.assertEqual(fd["material"]["model_key"], DREI_MODEL)
+        self.assertEqual(fd["totals"], [32108, 20055, 20055])
+
+    # -- S1 / S3 --------------------------------------------------------------------------------------------------
+    def test_s1_a_malformed_doc_is_named_and_left_out(self):
+        with tempfile.TemporaryDirectory() as root:
+            _import(root, "f", ["003738"])
+            with open(os.path.join(V.store_dir(root, "f"), "x.tp0.json"), "w") as fh:
+                fh.write('{"schema": "%s", "boot": "x", "counted": 3, "readings": [[0, 5]]}' % V.SCHEMA)
+            v = _verdict(root, "f")
+        self.assertEqual(v.fixed_mib, RECORD)
+        self.assertEqual(len(v.skipped), 1)
+        self.assertIn("malformed", v.skipped[0])
+
+    def test_s3_the_effective_kv_dtype_is_in_the_form(self):
+        with _store():
+            a = _digest(DREI_MODEL, PRE._cards())
+            with mock.patch.dict(L._VFL_ARGV, {"kv": "auto"}):
+                b = _digest(DREI_MODEL, PRE._cards())
+        self.assertNotEqual(a, b)
 
 
 if __name__ == "__main__":
