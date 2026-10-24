@@ -258,6 +258,7 @@ from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
 from flliper.srt.pdflip import d_admit_refusal as _d_admit_refusal  # D-ADMIT-REFUSED
 from flliper.srt.pdflip import head_vote_hold as _pdflip_head_vote_hold  # S42
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
+from flliper.srt.pdflip import wake_cpu_defer as _pdflip_wake_cpu_defer  # WAKE-OUTLIERS-1024 launch-aware bound
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from flliper.srt.pdflip import d_extend_beacon as _pdflip_d_ext  # S49 D-EXTEND-BEACON (SOLL R6)
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
@@ -21083,7 +21084,12 @@ class Scheduler(
         # that can enter a collective (a skip batch runs none)
         if _prefix_lens_check.has_deferred() and not getattr(batch, "pdflip_skip_extend", False):
             _prefix_lens_check.resolve_deferred()
-        result = self._run_batch_forward(batch, pp_proxy_tensors)
+        # WAKE-OUTLIERS-1024: a wake deferral's bound never releases the deferred CPU work INTO a running launch
+        _pdflip_wake_cpu_defer.launch_begin()
+        try:
+            result = self._run_batch_forward(batch, pp_proxy_tensors)
+        finally:
+            _pdflip_wake_cpu_defer.launch_end()
         # S78 D-DECODE-GAP: the run wall of a decode-advancing batch (a MIXED-D forward blocks to its end)
         _pdflip_d_decode_gap.on_run_end(self, batch)
         return result

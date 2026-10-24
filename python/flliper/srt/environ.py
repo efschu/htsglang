@@ -3992,6 +3992,13 @@ class Envs:
     # Off: byte-identical old journal (R/C/A/E only).
     FLLIPER_HICACHE_L3_JOURNAL_TOUCH = EnvBool(True)
     FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S = EnvFloat(30.0)
+    # WAKE-OUTLIERS-1024 (27B int8 boot ..._1024_080355): the T lines of a KV page come from EVERY TP rank of a group,
+    # and those ranks read the identical page set (D TP0/TP1/TP2 PDFLIP-READ-STAGES: 8776008 pages each) -- three
+    # identical lines per page. P PP0 parsed and applied 0.1-3.4 M journal lines per wake (95 % T), 0.4-6.8 s of
+    # GIL-bound Python beside PP0's first P forwards. On (default False = deduplicated): a non-owner rank at the
+    # owner's pp/cp position (a pure TP peer) leaves the T line of a canonical KV page to the owner; component pages
+    # (.mamba/.draft/.qsa_indexer) and every PP stage keep theirs. True = every rank journals its read hits again.
+    FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS = EnvBool(False)
     FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     FLLIPER_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)

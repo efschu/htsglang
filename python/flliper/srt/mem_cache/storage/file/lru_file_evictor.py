@@ -138,6 +138,16 @@ def _kv_sidecar_twins(stem: str) -> Tuple[str, ...]:
     return tuple(stem[:u] + tag + stem[u:] for tag in _PAIR_SIDECAR_TAGS)
 
 
+
+#: WAKE-OUTLIERS-1024: the component tags of a store page (the same tags ``_note_evicted_file`` names); a stem without
+#: one is a canonical KV page, shared by every TP rank of a group.
+_COMPONENT_STEM_TAGS = (".qsa_indexer", ".mamba", ".draft")
+
+
+def _is_component_stem(stem: str) -> bool:
+    return any(tag in stem for tag in _COMPONENT_STEM_TAGS)
+
+
 class PdFlipL3EvictorPauseRefused(RuntimeError):
     """NF review 3 (B): the background L3 evictor could not be parked at the sleep entry (named stop)."""
 
@@ -378,6 +388,13 @@ class LRUFileEvictor:
         self._writes_shared_keys = bool(writes_shared_keys)
         self._is_storage_owner = (not self._writes_shared_keys) or (
             tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
+        )
+        # WAKE-OUTLIERS-1024: a pure TP peer of the owner (same pp stage and cp position, tp_rank > 0) reads the
+        # SAME canonical KV pages as the owner (identical PDFLIP-READ-STAGES page counts on every D TP rank), so its
+        # T lines duplicate the owner's -- see _journal_touch. PP stages read different page sets and keep theirs.
+        self._journal_touch_tp_peer = bool(
+            self._writes_shared_keys and not self._is_storage_owner
+            and tp_rank > 0 and pp_rank == 0 and attn_cp_rank == 0
         )
         # 28.09. THE INDEX IS PERSISTED IN THE STORE (store_journal.py): every
         # writing rank of a shared-key store appends write-ahead lines to its own
@@ -1276,6 +1293,12 @@ class LRUFileEvictor:
             return
         try:
             if not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH.get():
+                return
+            if (getattr(self, "_journal_touch_tp_peer", False) and not _is_component_stem(suffixed_key)
+                    and not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS.get()):
+                # WAKE-OUTLIERS-1024: the owner journals this canonical KV page's read hit itself (TP peers read the
+                # identical page set); a peer's line is a duplicate the other group's owner parses at its wake
+                # (P PP0, boot ..._1024_080355: 3.2 M of 3.4 M lines were T, 6.8 s beside the first P forwards)
                 return
             now = time.time()
             seen = self.__dict__.get("_journal_touched")
