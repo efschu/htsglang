@@ -26337,6 +26337,19 @@ def run_scheduler_process(
         # exits quietly and leaves the others inspectable. The operator ends
         # the boot; the dying rank does not. Off-path is untouched -- with the
         # flag unset `hold_enabled()` is False and the SIGQUIT goes as before.
+        # S7 D-SURVIVES-P (24.10., boot dkr27bnvfp4dualbar1drei10240856): under --dual-mps P and D are
+        # clients of ONE MPS server per card, and an MPS client that exits with work still on the card is
+        # undefined behaviour for every client of that card (NVIDIA MPS "Client Early Termination"). P PP1
+        # died here at 09:09:47 with its last chunk on card 1; the same second Xid 31 hit D TP1 there and D
+        # died of it. So the dying rank ends its own GPU work FIRST -- barlink abort trip, bounded device
+        # sync, MPS terminate_client on itself if it does not drain -- and only then signals and exits.
+        # Off without MPS (CUDA_MPS_PIPE_DIRECTORY unset) or FLLIPER_PDFLIP_MPS_EXIT_QUIESCE=0; never raises.
+        try:
+            from flliper.srt.pdflip import mps_exit_quiesce as _s7q
+
+            _s7q.quiesce_self(f"scheduler exception {type(scheduler_exc).__name__} (tp{tp_rank} pp{pp_rank})")
+        except Exception:  # noqa: BLE001 - the quiesce may not mask the death
+            pass
         _1223_hold_on = False
         try:
             from flliper.srt.managers import debug_hold as _1223

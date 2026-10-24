@@ -2823,6 +2823,11 @@ def kill_process_tree(
         return
 
     children = itself.children(recursive=True)
+    # S7 D-SURVIVES-P (24.10.): a SIGKILL to an MPS client with work on its card is the "signals" case
+    # NVIDIA MPS calls undefined for every client of that card -- under --dual-mps that is the other
+    # group (D). Every child that is a client of this boot's MPS daemon is terminated through the daemon
+    # (terminate_client: safe for the other clients) BEFORE the SIGKILL. No-op without MPS.
+    _s7_terminate_mps_children(children, skip_pid)
     killed = []
     for child in children:
         if child.pid == skip_pid:
@@ -2850,6 +2855,21 @@ def kill_process_tree(
 
     if wait_timeout is not None and killed:
         _wait_for_reap_or_raise(killed, wait_timeout)
+
+
+def _s7_terminate_mps_children(children, skip_pid=None) -> None:
+    """S7: MPS terminate_client for every child of this tree that is an MPS client (see
+    ``pdflip/mps_exit_quiesce.py``). Never raises; a no-op unless the process is an MPS client."""
+    try:
+        from flliper.srt.pdflip import mps_exit_quiesce as _s7q
+
+        if not _s7q.armed():
+            return
+        pids = [c.pid for c in children if c.pid != skip_pid]
+        if pids:
+            _s7q.terminate_clients(pids, why="kill_process_tree")
+    except Exception:  # noqa: BLE001 - the teardown goes on
+        logger.warning("S7 MPS-EXIT-QUIESCE: terminate before kill raised", exc_info=True)
 
 
 def process_group_is_confined_to_tree(
