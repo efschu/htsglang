@@ -14642,7 +14642,7 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
     if any(deltas):
         rests = [None if v is None else int(v) + int(d) for v, d in zip(rests, deltas)]
         prov = (f"{prov} + vote-line delta {','.join(str(d) for d in deltas)} "
-                f"({_budget_rest.VOTE_LINE_MARKER})")
+                f"{_budget_rest.VOTE_LINE_BASIS} ({_budget_rest.VOTE_LINE_MARKER})")
     return {"booked_rest_mib": rests, "booked_rest_provenance": prov}
 
 
@@ -14651,11 +14651,12 @@ def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int
                                  log: Optional[Log] = None) -> List[int]:
     """PDFLIP-VOTE-LINE-BOOK (desk/27b-int8-tp1corridor-1024, pdflip/budget_rest.py):
     per card the MiB the extend width vote now keeps free beyond the line the booked
-    rest ``name`` was measured under -- ``max(0, max(300, floor) - record_line)`` where the
-    card's corridor floor is MEASURED (reserve 0, as the booked path charges none; an
-    unmeasured or hand-set law books nothing), 0 elsewhere. The caller books it beside the rest, so
-    the budget and the vote are ONE fixpoint again: the vote's line comes out of the KV
-    pool, not out of the chunk."""
+    rest ``name`` was measured under -- ``ceil8(max(0, line_for_floor_mib(floor) -
+    record_line))`` where the card's corridor floor is MEASURED and its footprint is of
+    this form (reserve 0, as the booked path charges none; an unmeasured, hand-set or
+    foreign-form floor books nothing), 0 elsewhere. DERIVED, not measured: the record
+    under-books the current line, the caller books the delta beside it, so the vote's
+    line comes out of the KV pool, not out of the chunk."""
     n = len(cards)
     if not _budget_rest.vote_line_switch_on():
         if log is not None:
@@ -14673,21 +14674,46 @@ def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int
                 f"under is unknown (boots {','.join(boots) or '-'}) -- no delta booked (named, not "
                 f"guessed); re-measured under the current line the rest already contains it")
         return [0] * n
-    from flliper.srt.pdflip.extend_trim import CHUNKING_FLOOR_MIB
+    from flliper.srt.pdflip.extend_trim import line_for_floor_mib
 
+    # reserve 0 BY DESIGN: the booked path charges no user reserve, and a reserve here
+    # would book a forbidden corridor reserve as "line" (keine-korridor-reserve-nie)
     floors = corridor_budget.floors_for_cards(cards, group, 0)
-    lines = [max(float(CHUNKING_FLOOR_MIB), float(floors[c.uuid].mib)) for c in cards]
+    lines = [line_for_floor_mib(floors[c.uuid].mib) for c in cards]
     act = [bool(floors[c.uuid].measured) for c in cards]
+    form_why: List[Optional[str]] = [None] * n
+    uuids = [c.uuid for c in cards]
+    _stores: Dict[str, object] = {}
+    for i, c in enumerate(cards):
+        if not act[i]:
+            continue
+        path = str(floors[c.uuid].provenance or "").split("#", 1)[0].strip()
+        if path not in _stores:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    _stores[path] = json.load(fh) or {}
+            except Exception as exc:  # noqa: BLE001 -- an unreadable store books nothing
+                _stores[path] = f"footprint store {path or '-'} unreadable ({type(exc).__name__})"
+        st = _stores[path]
+        why = st if isinstance(st, str) else _budget_rest.footprint_form_mismatch(st, uuids)
+        if why is not None:
+            act[i] = False
+            form_why[i] = why
     deltas = _budget_rest.vote_line_deltas(rests, lines, act, rec_line)
     if log is not None:
         for i, c in enumerate(cards):
             cf = floors[c.uuid]
+            reason = ""
+            if rests[i] is None:
+                reason = " -> 0: no booked rest on this card"
+            elif form_why[i] is not None:
+                reason = f" -> 0: the floor is not of this form ({form_why[i]})"
+            elif not act[i]:
+                reason = " -> 0: the floor is not measured (an unmeasured or hand-set law cuts no KV for the vote line)"
             log(f"{_budget_rest.VOTE_LINE_MARKER} group={group} ordinal={i} nvml{c.nvml_index}: "
-                f"delta {deltas[i]} MiB = vote line {lines[i]:.0f} (max(300, floor {cf.mib} "
-                f"source={cf.source})) - record line {rec_line} ({name}, rc12g halt line of its "
-                f"boots)" + ("" if act[i] else " -> 0: the floor is not measured (an unmeasured or hand-set "
-                             "law cuts no KV for the vote line)")
-                + ("" if rests[i] is not None else " -> 0: no booked rest on this card"))
+                f"delta {deltas[i]} MiB {_budget_rest.VOTE_LINE_BASIS} = ceil8(vote line {lines[i]:.0f} "
+                f"(max(300, floor {cf.mib} source={cf.source})) - record line {rec_line} ({name}, "
+                f"rc12g halt line of its boots))" + reason)
     return deltas
 
 

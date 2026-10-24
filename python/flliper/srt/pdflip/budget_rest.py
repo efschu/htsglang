@@ -224,8 +224,11 @@ def resolve(values: Optional[Sequence[Optional[int]]], boots: str, n_cards: int,
 # 21.10. (786fe038dc) the vote's line became the corridor law and on 22.10.
 # (NACHT2 port) the card's MEASURED floor (767 / 701 / 700 on the 27B D): the
 # vote now keeps ``line - 300`` MiB more free at exactly that instant. The
-# record does not contain that room (it was measured without it), and the
-# budget gave it to the KV pool -- so the vote takes it out of the chunk.
+# record does not contain that room (it was measured without it): the booked
+# rest UNDER-books the current regime, the budget gave the room to the KV pool,
+# and the vote takes it out of the chunk. (Review 24.10.: no double booking in
+# the budget is resolved here -- the overlap of the line with rate x rows inside
+# the vote is the root, ticket S4.) The delta is DERIVED, not measured.
 #
 # METAL (boot boot_weg2_dkr27bbar1drei10240803_b9cddabda1_1024_080355, rc39a,
 # D.log 08:16:36): TP1 (3080, budget 17384 = 20480 - 425 - 592 - 2079) post
@@ -236,19 +239,28 @@ def resolve(values: Optional[Sequence[Optional[int]]], boots: str, n_cards: int,
 #
 # THE FIX books the moved line beside the rest, per card,
 #
-#     delta = max(0, line_now - record_line)      line_now = max(300, floor)
+#     delta = ceil8(max(0, line_now - record_line))   line_now = extend_trim.line_for_floor_mib(floor)
 #
-# only where the floor is MEASURED (corridor_guard.CorridorFloor.measured): an
-# unmeasured card's vote line is the stated law 1024, and UNMEASURED-FALLBACK
-# is verdict-only -- it never spends KV pool (corridor_guard #1257c). A hand-set law (ENV-OVERRIDE) is a moved TARGET with its
-# +-20 % band, not a measured requirement -- it books no delta either (the
-# planner mirror, which prices the stated law, stays the launcher's twin). No reserve: the delta is the
-# vote's own line, which the vote enforces anyway; it moves those bytes from
-# the KV pool to the chunk instead of from the chunk to nothing. The end
-# state at the tightest instant is unchanged by construction -- the vote
-# still ends at its line -- so this is NOT the OOM direction; what changes is
-# the width: rows_cap(post + delta, rate, page, line_now) ==
-# rows_cap(post, rate, page, record_line).
+# (ceil8: up to the budget's 8-MiB grain, so budget + rest -- the torch cap -- stays
+# byte-identical, review A2). Only where the floor is MEASURED
+# (corridor_guard.CorridorFloor.measured) AND its footprint is of THIS form (the
+# store's card set and TP equal this pass's cards, review S3): an unmeasured
+# card's vote line is the stated law 1024 and UNMEASURED-FALLBACK is verdict-only
+# -- it never spends KV pool (corridor_guard #1257c); a hand-set law
+# (ENV-OVERRIDE) is a moved TARGET with its +-20 % band, not a measured
+# requirement; a footprint of another form (the launcher reads the LAST
+# published D digest) is not the line this boot's ranks keep. The floor is read
+# with reserve 0 (the booked path charges no user reserve; a reserve passed here
+# would be a forbidden corridor reserve, keine-korridor-reserve-nie).
+#
+# No reserve: the delta is the vote's own line, which the vote enforces anyway;
+# it moves those bytes from the chunk to the KV pool's account. The PREDICTED
+# end state at the tightest instant is unchanged -- the vote still ends at its
+# line: rows_cap(post + delta, rate, page, line_now) == rows_cap(post, rate,
+# page, record_line) -- the metal check is A1. The delta is DERIVED (code state
+# of the record's boots vs today's measured floor), never a measurement; a
+# record re-measured with budget_rest under the current line switches it off
+# (its boots differ).
 #
 # A record re-measured under another line (its boots differ from the ones
 # named here) books no delta and says so: the regime of an unknown boot set
@@ -256,6 +268,11 @@ def resolve(values: Optional[Sequence[Optional[int]]], boots: str, n_cards: int,
 # --------------------------------------------------------------------------
 
 VOTE_LINE_MARKER = "PDFLIP-VOTE-LINE-BOOK"
+#: the D budget's rounding grain (launcher.budgets_from_dc: ``// 8 * 8``)
+BUDGET_GRAIN_MIB = 8
+#: review A3 (HOCHRECHNUNG != MESSUNG): the delta is DERIVED -- the code state of the record's
+#: boots (line 300) against today's measured floor -- never a measurement of VRAM.
+VOTE_LINE_BASIS = "DERIVED (record boots' code line vs measured floor; not a measurement)"
 #: the KV-vs-width choice (user law 30.08.: a KV<->performance trade is selectable). Default ON
 #: (user order 14.10.: new features on); =0 = the pre-fix budgets: the KV pool keeps the vote's
 #: room and the vote narrows the chunk (rc39a: 4096 -> 256..691 rows on the 27B D).
@@ -297,10 +314,32 @@ def record_vote_line(name: str, boots: Sequence[str]) -> Optional[int]:
     return int(ent[1])
 
 
+def footprint_form_mismatch(store: Mapping, uuids: Sequence[str]) -> Optional[str]:
+    """Review S3: ``None`` when the phase-footprint store behind a measured floor is of THIS
+    form -- its card set equals ``uuids`` and its profile's TP x PP (fields 2, 3 of
+    ``profile``) equals the card count -- else the reason. The launcher reads the LAST
+    published D digest; a footprint of another form (a duo boot after a drei boot) is not
+    the line this boot's ranks will keep. Pure."""
+    cards = sorted(str(k) for k in (store.get("cards") or {}))
+    want = sorted(str(u) for u in uuids)
+    if cards != want:
+        return f"footprint cards {cards} != this pass's cards {want}"
+    prof = list(store.get("profile") or [])
+    if len(prof) >= 4:
+        try:
+            tp_pp = int(prof[2]) * int(prof[3])
+        except (TypeError, ValueError):
+            return f"footprint profile {prof!r} unreadable"
+        if tp_pp != len(want):
+            return f"footprint profile tp x pp {tp_pp} != {len(want)} cards"
+    return None
+
+
 def vote_line_deltas(rests: Sequence[Optional[int]], lines_now: Sequence[float],
                      measured: Sequence[bool], record_line: Optional[int]) -> List[int]:
-    """Per card ``max(0, ceil(line_now) - record_line)`` -- 0 where the card has no
-    booked rest, where its floor is not measured, or where the record's line is unknown. Pure."""
+    """Per card ``max(0, ceil(line_now) - record_line)`` rounded UP to :data:`BUDGET_GRAIN_MIB`
+    -- 0 where the card has no booked rest, where its floor is not measured (or not of
+    this form), or where the record's line is unknown. Pure. DERIVED, not measured."""
     if not (len(rests) == len(lines_now) == len(measured)):
         raise ValueError(f"{VOTE_LINE_MARKER}: {len(rests)} rests, {len(lines_now)} lines, "
                          f"{len(measured)} floors -- a partial vector never prices a card it never saw")
@@ -309,7 +348,12 @@ def vote_line_deltas(rests: Sequence[Optional[int]], lines_now: Sequence[float],
         if r is None or record_line is None or not bool(act):
             out.append(0)
             continue
-        out.append(max(0, int(-(-float(ln) // 1)) - int(record_line)))
+        raw = max(0, int(-(-float(ln) // 1)) - int(record_line))
+        # review A2: UP to the budget's 8-MiB grain -- the budget is ``(... - rest) // 8 * 8``, so
+        # with a multiple of 8 the budget falls by exactly the delta and budget + rest (the torch
+        # cap, budget + rest - OTHER) stays byte-identical; an unrounded delta could raise it by
+        # up to 7 MiB (the OOM direction).
+        out.append(-(-raw // BUDGET_GRAIN_MIB) * BUDGET_GRAIN_MIB)
     return out
 
 

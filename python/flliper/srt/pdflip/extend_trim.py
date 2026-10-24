@@ -306,6 +306,14 @@ def _read_corridor_line() -> "tuple[float, str]":
         return float(CHUNKING_FLOOR_MIB), "halt-line"
 
 
+def line_for_floor_mib(floor_mib: float) -> float:
+    """THE vote line for a card whose corridor floor is ``floor_mib``: ``max(300, floor)``. One
+    formula for the rank (:func:`corridor_line_mib`) and the launcher's budget
+    (PDFLIP-VOTE-LINE-BOOK, ``launcher.booked_rest_vote_line_deltas``), so the line the budget
+    books and the line the vote keeps cannot drift apart."""
+    return max(float(CHUNKING_FLOOR_MIB), float(floor_mib))
+
+
 def corridor_line_mib(rank: Optional[int] = None) -> float:
     """The card line the chunk's growth must leave free: THIS card's corridor law (``max(300, floor target)``), read
     once per process and named once (``EXTEND-CORRIDOR-LINE``) -- never the old 300 MiB halt line under it, and no
@@ -328,7 +336,7 @@ def corridor_line_mib(rank: Optional[int] = None) -> float:
             mib, src = _read_corridor_line()
         except Exception:  # noqa: BLE001
             mib, src = float(CHUNKING_FLOOR_MIB), "halt-line"
-        line = _CACHE["line"] = max(float(CHUNKING_FLOOR_MIB), float(mib))
+        line = _CACHE["line"] = line_for_floor_mib(mib)
         logger.info(f"{LINE_MARKER} rank={'?' if rank is None else int(rank)} line_mib={line:.0f} source={src} "
                     f"(the width vote keeps this card's corridor law; funds = driver free; no reserve)")
     return float(line)  # type: ignore[arg-type]
