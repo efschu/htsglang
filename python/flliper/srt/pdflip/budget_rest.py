@@ -440,6 +440,58 @@ def vote_line_single_on(environ: Optional[Mapping[str, str]] = None) -> bool:
     return str(env.get(VOTE_LINE_SINGLE_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
 
 
+# --------------------------------------------------------------------------
+# ADMIT-BASIS (#201 TRIM-LAW, review MUSS 1, 24.10.): the static trim threshold the admission measurements ran under.
+#
+# The flip arm's static threshold (``FLLIPER_PDFLIP_EXTEND_TRIM_MIB``) is not only the width vote's trim: the forward
+# trim and the ADMISSION trim (``extend_trim.before_admission``, PDFLIP-ADMIT-BOOK) read the same parsed list. The
+# admission record (``D_ADMIT_NEED_MIB`` = near-OOM 400 + A_peak 522 - post_floor 508) and the duo decision not to book
+# one (measured minimum 690, "the admission trim works at 1104") were MEASURED with that list at 1104 on every rank:
+# all six int4ar record boots (dkr27bint4arbar1int4ar10231552 / 10231723 / 10232111 / 10232232 / 10240037,
+# dkr27bint4arrc4bar1int4ar10240914) and the duo record boot (dkr27bnvfp4duorebarbar1duo10241008) log
+# ``EXTEND-TRIM-FLIP FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1104,1104`` (stated law 1024 + floor chunk 256 x 0.3091). Their
+# ``post_floor`` is a driver free AFTER a trim under 1104: an untrimmed pass enters the admission at ``post >= T``, and
+# the near-OOM law at the admission instant ``post - A >= 400`` holds from the threshold side only while
+# ``T >= 400 + A_peak``. #201 makes T follow the card law (780 / 847 for a measured 3080 / 5090 floor, 718 under
+# VOTE-LINE-SINGLE): a pass with 900 MiB free and returnable cache trims at 1104 before the admission, at 780 it does
+# not -- 900 - 522 = 378 < 400 despite the booked post, because the booking leans on the 1104 regime.
+#
+# So the launcher never WRITES a computed threshold under this basis (``max(card-law threshold, basis)`` per rank,
+# named ``ADMIT-BASIS``), until an admission census measured under the lower threshold replaces the record and this
+# basis with it. No reserve: 1104 is the measured regime of the records, not a margin on top of anything. A card law
+# OVER the basis (a measured line > 1024) still raises the threshold; a hand value in ``--env-d`` (the INT8 profile's
+# ``1200,1100,800``, the regime the INT8 census ran under) is the profile's own measured regime and stays byte for byte;
+# a rank without a rate (``0`` = never trims) is never armed by the basis.
+# --------------------------------------------------------------------------
+
+#: the threshold the admission records were measured under (env the ranks read, value per rank in MiB)
+ADMIT_TRIM_BASIS: Tuple[str, int] = ("FLLIPER_PDFLIP_EXTEND_TRIM_MIB", 1104)
+ADMIT_TRIM_BASIS_MARKER = "ADMIT-BASIS"
+
+
+def admit_trim_bound(values: Sequence[float]) -> List[Tuple[float, bool]]:
+    """Per rank ``(max(value, basis), held)`` -- ``held`` when the basis lifted the value. A value ``<= 0`` (never
+    trims) stays as it is: the basis arms nothing that was not armed. Pure."""
+    basis = float(ADMIT_TRIM_BASIS[1])
+    out: List[Tuple[float, bool]] = []
+    for v in values:
+        fv = float(v)
+        out.append((fv, False) if fv <= 0 or fv >= basis else (basis, True))
+    return out
+
+
+#: review R1 (#201): a hand value in ``--env-d`` under the basis is named, not overruled
+ADMIT_TRIM_HAND_MARKER = "HANDWERT-UNTER-BASIS"
+
+
+def admit_trim_hand_under_basis(values: Sequence[float]) -> List[Tuple[int, float]]:
+    """Review R1: ``(rank, value)`` for every rank of a USER-given threshold list whose value is armed (``> 0``) and
+    under :data:`ADMIT_TRIM_BASIS`. The value stays in force (a hand value is the user's regime, not overruled); the
+    caller names it. Pure."""
+    basis = float(ADMIT_TRIM_BASIS[1])
+    return [(r, float(v)) for r, v in enumerate(values) if 0 < float(v) < basis]
+
+
 @dataclass(frozen=True)
 class ExtendPass:
     """One width vote paired with the chunk it funded (one D rank).
