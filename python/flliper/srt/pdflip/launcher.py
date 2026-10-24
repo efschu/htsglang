@@ -11700,6 +11700,106 @@ def parse_group_env(spec: str) -> Dict[str, str]:
     return canonical_env(out)
 
 
+def user_reserve_env_value(user_reserve_by_card: Dict[str, int]) -> str:
+    """``{card_uuid: MiB}`` -> the value of ``corridor_guard.USER_RESERVE_ENV``.
+
+    #236: ONE serialiser for the front's ``fenv`` and every group's env, so the
+    three consumers (front, P ranks, D ranks) cannot be handed different text
+    for the same mapping.
+    """
+    return json.dumps({u: int(v) for u, v in user_reserve_by_card.items()})
+
+
+def effective_reserve_by_card(
+    cards: Sequence["Card"],
+    user_reserve_by_card: Optional[Dict[str, int]],
+    booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """The reserve the launcher ACTUALLY BOOKS per card for ONE group, and what it masked.
+
+    ``(effective, masked)``, both ``{card_uuid: MiB}``. On a card whose awake rest is a
+    BOOKED record (``booked_rest_mib[i] is not None``) the launcher charges no user
+    reserve: the measured rest is what consumed it ("reserve 0 BY DESIGN ... would book a
+    forbidden corridor reserve", ``booked_rest_kwargs``; keine-korridor-reserve-nie), so the
+    effective value is 0 and the stated value goes to ``masked``. On every other card the
+    effective value is the operator's. ONE function for ``budgets_from_dc`` (its
+    ``_reserve_eff``) and for the rank env (#236 review MUSS-1), so the launcher's budget
+    and a rank's floor cannot price different reserves for the same card and group.
+    """
+    booked = [None] * len(cards) if booked_rest_mib is None else list(booked_rest_mib)
+    if len(booked) != len(cards):
+        raise PdFlipLaunchRefused(
+            f"#236: {len(booked)} booked rests for {len(cards)} cards -- a partial "
+            "vector never prices a card it never saw")
+    effective: Dict[str, int] = {}
+    masked: Dict[str, int] = {}
+    for i, c in enumerate(cards):
+        stated = int((user_reserve_by_card or {}).get(c.uuid, 0))
+        if booked[i] is not None:
+            effective[c.uuid] = 0
+            if stated > 0:
+                masked[c.uuid] = stated
+        else:
+            effective[c.uuid] = stated
+    return effective, masked
+
+
+def user_reserve_rank_env(
+    user_reserve_by_card: Optional[Dict[str, int]],
+    cards: Optional[Sequence["Card"]] = None,
+    booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
+) -> Dict[str, str]:
+    """The env entries that carry the operator's reserve to the ranks of ONE group.
+
+    Empty unless the operator stated a reserve on at least one card:
+    ``parse_user_reserve`` returns ``{uuid: 0}`` for every card when the flag is
+    absent, and publishing that would turn "no reserve stated" into "reserve 0
+    stated" on a rank, which silently beats the rank's own
+    ``--rank-user-reserve-mib`` scalar fallback (``reserve_for_card``).
+
+    With ``cards`` the value is the group's EFFECTIVE reserve
+    (:func:`effective_reserve_by_card`, the same function ``budgets_from_dc`` prices
+    with): a booked-rest card gets 0 and is named in
+    ``corridor_guard.USER_RESERVE_MASKED_ENV`` (log only). Without ``cards`` (a group
+    with no booked rest, e.g. P, and desk callers) the operator's value is published as
+    stated.
+    """
+    if not user_reserve_by_card or not any(int(v) > 0 for v in user_reserve_by_card.values()):
+        return {}
+    if cards is None:
+        if booked_rest_mib is not None:
+            raise ValueError("a booked-rest vector needs the cards it belongs to")
+        effective, masked = {u: int(v) for u, v in user_reserve_by_card.items()}, {}
+    else:
+        effective, masked = effective_reserve_by_card(cards, user_reserve_by_card, booked_rest_mib)
+    out = {corridor_guard.USER_RESERVE_ENV: user_reserve_env_value(effective)}
+    if masked:
+        out[corridor_guard.USER_RESERVE_MASKED_ENV] = user_reserve_env_value(masked)
+    return out
+
+
+def user_reserve_env_entries(env: Dict[str, str], operator_extra: Optional[Dict[str, str]],
+                             user_reserve_by_card: Optional[Dict[str, int]],
+                             cards: Optional[Sequence["Card"]],
+                             booked_rest_mib: Optional[Sequence[Optional[int]]]) -> None:
+    """``build_env``'s reserve block (#236): publish :func:`user_reserve_rank_env` into ``env``.
+
+    An operator value stated through ``--env-p/--env-d`` (``operator_extra``) is
+    RESPECTED, not stripped (review SOLL-3): it is explicit operator input and the
+    launcher's effective mapping is then not published over it; ``rank_reserve_kwargs``
+    names that case in the log. Otherwise both variables are popped first (launcher
+    OUTPUT, R19), so a shell value never describes a boot it did not resolve. (A helper
+    and not inline: ``test_pdflip_hicache_draft_tier_0924`` keeps the word "group" out of
+    ``build_env``'s code after the draft-tier pop.)
+    """
+    names = {corridor_guard.USER_RESERVE_ENV, corridor_guard.USER_RESERVE_MASKED_ENV}
+    if names & set(operator_extra or {}):
+        return
+    for name in names:
+        env.pop(name, None)
+    env.update(user_reserve_rank_env(user_reserve_by_card, cards, booked_rest_mib))
+
+
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
               transport: str = "bar1", ring: Optional["HostRingPlan"] = None,
@@ -11748,7 +11848,16 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # pre-form behaviour and FLLIPER_PDFLIP_FORM is popped.
               boot_form: Optional["pdflip_form.PdFlipForm"] = None,
               # 27B FP8 (--fp8-uniform-marlin): one byte layout on every rank.
-              fp8_uniform_marlin: bool = False) -> Dict[str, str]:
+              fp8_uniform_marlin: bool = False,
+              # #236: the operator's per-card external headroom
+              # (``--user-reserve-mib``, ``{card_uuid: MiB}``), handed to EVERY
+              # rank of the group through the group env -- see the block at the
+              # end of this function. None = a desk caller / no reserve stated.
+              user_reserve_by_card: Optional[Dict[str, int]] = None,
+              # #236 review MUSS-1: the group's cards and booked awake-rest vector
+              # (None for P and desk callers) -- see ``effective_reserve_by_card``.
+              reserve_cards: Optional[Sequence["Card"]] = None,
+              reserve_booked_rest_mib: Optional[Sequence[Optional[int]]] = None) -> Dict[str, str]:
     # Rename 1b: ONE spelling per variable from here on -- the one this tree
     # reads (name_compat.canonical_env). Every pop, the PHASE_FLIP prefix strip
     # and the per-group overrides below act on that name; an operator's
@@ -12075,6 +12184,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         # rank -- P's stages run tp 1, D's Form A runs tp 3). Applied LAST so
         # an operator value is what the group runs, and printed by the caller.
         env.update(canonical_env({str(k): str(v) for k, v in group_env_extra.items()}))
+    # #236: the names the operator stated (user_reserve_env_entries respects them)
+    _stated_by_operator = set(group_env_extra or {})
     env["FLLIPER_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is
@@ -12205,6 +12316,26 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     for _k in (corridor_guard.POINTER_FROZEN_ENV, corridor_guard.RECIPE_ENV,
                corridor_guard.RECIPE_SELF_ENV):
         env.pop(_k, None)
+    # #236 (Auftrag, fund of the #233 second review): THE USER RESERVE REACHES
+    # THE RANKS. ``corridor_guard.USER_RESERVE_ENV`` had exactly one setter, the
+    # front's ``fenv`` (main(), below); every rank-side reader of the floor
+    # (``vram_dial``, ``weight_updater._pdflip_corridor_floor_bytes``,
+    # ``corridor_floor_for_current_device`` -> kv_vmm_backing / seam reserve /
+    # extend_trim / phase_flip_runtime) reads the reserve ONLY from this env, so
+    # with ``--user-reserve-mib`` the launcher priced floor = transient + reserve
+    # while every rank priced floor = transient + 0 (the OOM direction).
+    # Group env, so P and D, host and worker of every form inherit it through
+    # ``Popen(env=spec.env)`` -> ``mp.Process`` exactly as FLLIPER_PDFLIP_GROUP
+    # does; the mapping is keyed by card UUID and each rank picks its own card
+    # by ``registry.nvml.current_device_uuid()`` -- never by index.
+    # Launcher OUTPUT (R19 discipline): published only when the operator stated
+    # a reserve (any card > 0), POPPED otherwise, so a value inherited from a
+    # shell never describes a boot it did not resolve and a boot without
+    # ``--user-reserve-mib`` keeps today's env byte for byte (a rank booted with
+    # only a ``--rank-user-reserve-mib`` argv keeps its scalar fallback).
+    # NO NEW MARGIN: the value is the operator's, serialised by the same
+    # function the front uses.
+    user_reserve_env_entries(env, _stated_by_operator, user_reserve_by_card, reserve_cards, reserve_booked_rest_mib)
     return env
 
 
@@ -16603,10 +16734,9 @@ def budgets_from_dc(
     _reserve_eff = user_reserve_by_card
     if any(v is not None for v in booked):
         # the reserve is not charged on a card whose measured rest is booked
-        # (the rest is what consumed it); the floor lines still print it
-        _reserve_eff = {c.uuid: (0 if booked[i] is not None
-                                 else int((user_reserve_by_card or {}).get(c.uuid, 0)))
-                        for i, c in enumerate(cards)}
+        # (the rest is what consumed it); the floor lines still print it.
+        # #236 review MUSS-1: THE function the rank env uses too.
+        _reserve_eff, _ = effective_reserve_by_card(cards, user_reserve_by_card, booked)
     floors = corridor_budget.floors_for_cards(cards, label, _reserve_eff)
     _terms_seen: List[Dict[str, object]] = []  # VRAM-VERTRAG M1: the pass's view
     for i, c in enumerate(cards):
@@ -26718,6 +26848,43 @@ def l15_mib_by_card_identity(ns, cards: List[Card], log,
             log(line)
 
 
+def rank_reserve_kwargs(group: str, ns, cards: Sequence["Card"],
+                        user_reserve_by_card: Optional[Dict[str, int]], log: Optional[Log] = None) -> Dict[str, object]:
+    """The ``build_env`` kwargs that hand ``group``'s ranks the reserve the launcher books for it.
+
+    #236 review MUSS-1: D's awake rest is a booked record on every card of the standard
+    form (``budget_rest_from_records``), where ``budgets_from_dc`` charges NO user reserve;
+    the ranks of D therefore get 0 there (named, with the stated value, in the rank's
+    ``PDFLIP-USER-RESERVE-READ`` line). P is unbooked: the operator's value. The booked
+    vector is the one ``budgets_from_dc`` is called with (``booked_rest_kwargs``), so the
+    two read one record and one function (:func:`effective_reserve_by_card`).
+    Logs the masking once per call when ``log`` is given, and names an operator
+    ``--env-<g>`` value of the variable that stands instead (#236 review SOLL-3).
+    """
+    booked = None
+    # --d-only: ``d_only_solve`` calls ``budgets_from_dc`` WITHOUT ``booked_rest_mib`` (the
+    # D-solo pass keeps floor + reserve), so the launcher charges the reserve on every card
+    # there and the ranks must carry it too -- one truth (#236 nachpruefung BUG 1).
+    if group == "D" and not bool(getattr(ns, "d_only", False)):
+        booked = booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)).get("booked_rest_mib")
+    if log is not None:
+        eff, masked = effective_reserve_by_card(cards, user_reserve_by_card, booked)
+        if any(int(v) > 0 for v in (user_reserve_by_card or {}).values()):
+            log(f"PDFLIP-USER-RESERVE-RANK-ENV group={group}: "
+                + ", ".join(f"nvml{c.nvml_index} stated={int((user_reserve_by_card or {}).get(c.uuid, 0))} "
+                            f"effective={eff[c.uuid]}"
+                            + (" (masked: booked awake rest, the launcher charges no reserve there)"
+                               if c.uuid in masked else "")
+                            for c in cards))
+        _op = parse_group_env(str(getattr(ns, "env_d" if group == "D" else "env_p", "") or ""))
+        _named = [k for k in (corridor_guard.USER_RESERVE_ENV, corridor_guard.USER_RESERVE_MASKED_ENV) if k in _op]
+        if _named:
+            log(f"PDFLIP-USER-RESERVE-RANK-ENV group={group}: --env-{group.lower()} states {', '.join(_named)}; "
+                "the operator value STANDS and the launcher's effective mapping is NOT published over it "
+                "(rank floor may then differ from the launcher budget -- operator's choice)")
+    return dict(user_reserve_by_card=user_reserve_by_card, reserve_cards=cards, reserve_booked_rest_mib=booked)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -28690,7 +28857,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        "store_dir": expert_store_dir_of(ns),
                        "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
     _estore_id = publish_store_identity(ns.model, _emap, log)
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), **rank_reserve_kwargs("P", ns, cards, user_reserve_by_card, log), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--pdflip-vision-source ram`, named where the
     # P env is built (the line is empty, and nothing is logged, for `disk`).
     # VISION-GGUF: only a transient boot resolves the tower's directory (a GGUF reads it from --tokenizer-path)
@@ -29116,7 +29283,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
-        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), **rank_reserve_kwargs("D", ns, cards, user_reserve_by_card, log), expert_map_path=_emap, expert_store_identity=_estore_id)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("FLLIPER_"))
         log(f"PDFLIP-GROUP-ENV D: {_sg or '(leer)'}")
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_only_bind_argv(ns.front_host), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.pdflip_vision, window_mib=ns.d_barlink_bar1_window_mib), ns.transport), state.logs["D"], env_d)
@@ -29173,7 +29340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_tokvec.line)
         refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "pdflip_boot_form", None), log)
         refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
-        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), **rank_reserve_kwargs("D", ns, cards, user_reserve_by_card, log), expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
@@ -29279,7 +29446,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_tokvec.line)
         refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "pdflip_boot_form", None), log)
         refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), **rank_reserve_kwargs("D", ns, cards, user_reserve_by_card, log), expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
@@ -29875,9 +30042,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # LINE -- which is the shared surface, in one direction only, so the two
     # cannot disagree.
     if user_reserve_by_card:
-        fenv[corridor_guard.USER_RESERVE_ENV] = json.dumps(
-            {u: int(v) for u, v in user_reserve_by_card.items()}
-        )
+        fenv[corridor_guard.USER_RESERVE_ENV] = user_reserve_env_value(user_reserve_by_card)
     log("front argv: " + " ".join(shlex.quote(a) for a in front_argv))
     ffh = open(front_log, "ab")
     _front_cwd = core_cwd_for(front_log, tree, log)
