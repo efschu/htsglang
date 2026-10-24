@@ -250,4 +250,4 @@ def test_the_fix_needs_220s_span_start_on_the_landed_record(monkeypatch):
     _land(s, r)
     _tick(s, r)
     recs = rvp.take_requests(rvp.needs_p_dir())
-    assert r._pdflip_store_delivered == FIRST and len(recs) == 1 and recs[0]["d_extent"] == 26844
+    assert s.waiting_queue == [] and len(recs) == 1 and recs[0]["d_extent"] == 26844   # (keep_on_d clears the witness)
