@@ -6016,7 +6016,26 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.forget(gone)
             except Exception:  # noqa: BLE001 -- bookkeeping, never a gate on the read
                 pass
+            # PPHASE-GAPS-1024 (review SOLL 1): the struck files are no copy -- void their record (and this process's
+            # census memo) like the LRU's on_evict does; before, the record kept saying "copied" (A5 class)
+            self._l3sec_void_stems(gone)
         return out
+
+    def _l3sec_void_stems(self, stems: List[str]) -> int:
+        """PPHASE-GAPS-1024: ``l3_secured.invalidate_stems`` on every arena this backend opened (memory only, never a
+        gate on the caller). Returns the slots voided."""
+        if not stems:
+            return 0
+        n = 0
+        try:
+            from flliper.srt.mem_cache import l3_secured as _l3s
+
+            for arena in list((getattr(self, "_arenas", None) or {}).values()):
+                if arena is not None:
+                    n += int(_l3s.invalidate_stems(arena, list(stems)) or 0)
+        except Exception as exc:  # noqa: BLE001 -- named; the record then stays as it was (the free decision re-asks)
+            logger.warning("PPHASE-GAPS-1024 L3SEC-VOID of %d stem(s) failed: %r", len(stems), exc)
+        return n
 
     def _arena_kv_present_prefix(self, keys: List[str]) -> Optional[int]:
         """#1439: how many LEADING KV pages are COMPLETE in the L2 arena, from
@@ -7118,6 +7137,17 @@ class HiCacheFile(HiCacheStorage):
             self._evictor.clear()
             if self.metadata_cache is not None:
                 self.metadata_cache.clear()
+            # PPHASE-GAPS-1024 (review SOLL 1): every file is gone -- the shared record of every arena this backend
+            # opened says so too (before, it kept saying "copied": A5 class, and a warm census memo then read the
+            # whole arena as secured)
+            try:
+                from flliper.srt.mem_cache import l3_secured as _l3s
+
+                for _arena in list((getattr(self, "_arenas", None) or {}).values()):
+                    if _arena is not None:
+                        _l3s.void_all(_arena)
+            except Exception as exc:  # noqa: BLE001 -- named; the free decision re-asks the (empty) index anyway
+                logger.warning("PPHASE-GAPS-1024 L3SEC-VOID-ALL at clear failed: %r", exc)
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
         except Exception as e:

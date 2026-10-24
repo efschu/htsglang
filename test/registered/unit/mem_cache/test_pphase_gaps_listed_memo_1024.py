@@ -15,13 +15,18 @@ The arena-size term is ``l3_secured.unsecured_keys_lo`` (S109d), which ``ArenaMH
 for EVERY claim that must make room: it asks the index again for every COMPLETE slot the record calls copied --
 ~0.5 M lookups on the 27B KV arena (720896 slots of one token each).
 
-THE FIX (l3_secured ``LISTED_MEMO``): per arena, the generation at which a slot's stem was last FOUND listed; the
-record is still read for every slot on every census, only the index question is skipped for a slot confirmed at its
-current generation. The danger direction is a page reported COPIED that is not (the keep list would let the clock
-take it): these tests hold census(memo) == census(no memo) through every orderly transition (new copies, the L3 LRU
-taking a file, a record re-published under index lag, a slot re-completed under a new generation), and they hold the
-one documented window -- index entry gone, record not yet voided -- at the claim's free decision
-(``verify_candidates`` asks the index without the memo and refuses the page).
+THE FIX (l3_secured ``LISTED_MEMO``): per arena and PROCESS, the generation at which a slot's stem was last FOUND
+listed; the SHARED record is still read for every slot on every census, only the index question is skipped for a
+record-positive slot confirmed at its current generation. The danger direction is a page reported COPIED that is not
+(the keep list would let the clock take it). Safety rests on two cross-process things, both held here:
+(a) the record gate -- the memo answers only for record-positive slots, so a record voided by ANY process (another
+rank's L3 LRU) reads uncopied through a warm memo (R1, second ShmArena object on the same path = another process);
+(b) the claim's free decision (``verify_candidates`` -> ``secured``) asks the index WITHOUT the memo.
+census(memo) == census(no memo) is held in-process through the orderly transitions; where record and index disagree
+across processes (S109-A1 window; a sister's void + same-generation re-publish under index lag between two censuses
+of this process) the residue is named and the free decision refuses (R2b). ``HiCacheFile.clear`` and the
+``_stat_stems`` strike now void the record (R3, R3s; review SOLL 1). Review tests R1-R4 (review-pphase-gaps-1024.md,
+desk/27b-pphase-gaps-review-1024 @ 74f392b61f) are taken over below.
 """
 from __future__ import annotations
 
@@ -232,3 +237,156 @@ def test_census_cost_characterisation(tmp_path, monkeypatch):
     warm = best(3)
     print("PPHASE-GAPS-1024 census ms no-memo=%.1f memo-warm=%.1f slots=262144" % (cold, warm))
     assert warm < cold / 3.0
+
+
+# --- review R1-R4 (review-pphase-gaps-1024.md), adapted -----------------------------------------------------------
+
+
+def _sister(path, sb, n):
+    """Another process's view of the same arena: its own ShmArena object (own memo), the same record file."""
+    from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
+
+    b = ShmArena(path, sb, n)
+    assert l3s.arrays(b, create=True) is not None
+    return b
+
+
+def _memo_of(a):
+    cur = getattr(a, l3s._MEMO_ATTR, None)
+    return None if cur is None else cur[1]
+
+
+def _path_of(tmp_path, name="a", sb=256):
+    return str(tmp_path / f"arena-{name}-{sb}.bin")
+
+
+def test_r1_sister_void_is_seen_through_a_warm_memo(tmp_path, monkeypatch):
+    """MUSS 1 (record gate): the evicting process voided the SHARED record; this process's memo still holds the old
+    generation (``_forget_listed`` ran on the sister's object only). The record gate, not the memo, decides."""
+    n = 64
+    a, be, idx = _arena(tmp_path, n)
+    _REAL_UNSEC(a, be)
+    b = _sister(_path_of(tmp_path), 256, n)
+    st = a.slot_stem(11)
+    idx.remove([st])
+    assert l3s.invalidate_stems(b, [st]) == 1
+    m = _memo_of(a)
+    assert m is not None and int(m[11]) == _gen(a, 11), "precondition: this process's memo is untouched"
+    on, off = _both(a, be, monkeypatch)
+    assert np.array_equal(on, off)
+    assert _key_lo(a, 11) in set(on.tolist()), "a record voided by the sister process must read uncopied here"
+
+
+def test_r2n_census_that_saw_the_void_forgets_the_memo(tmp_path, monkeypatch):
+    """SOLL 2 (narrowed R2): this process ran a census while the sister's void stood -- the memo entry is forgotten,
+    so the sister's later same-generation re-publish under index lag is asked again (census(memo)==census(no memo))."""
+    n = 64
+    a, be, idx = _arena(tmp_path, n)
+    _REAL_UNSEC(a, be)
+    b = _sister(_path_of(tmp_path), 256, n)
+    st = a.slot_stem(20)
+    idx.remove([st])
+    l3s.invalidate_stems(b, [st])
+    _REAL_UNSEC(a, be)                                       # this process sees the record negative once
+    assert int(_memo_of(a)[20]) == -1
+    l3s.publish(b, np.array([20]), np.array([_gen(b, 20)]))  # sister's write-behind: record back, index not yet
+    on, off = _both(a, be, monkeypatch)
+    assert _key_lo(a, 20) in set(off.tolist())
+    assert np.array_equal(on, off)
+
+
+def test_r2_residue_void_and_republish_between_two_censuses_is_refused_at_the_free_decision(tmp_path, monkeypatch):
+    """The named residue: void AND same-generation re-publish by the sister between two censuses of this process --
+    the memo still answers "copied" (documented), and the memo-free free decision refuses the page (R2b)."""
+    n = 32
+    a, be, idx = _arena(tmp_path, n)
+    _REAL_UNSEC(a, be)
+    b = _sister(_path_of(tmp_path), 256, n)
+    st = a.slot_stem(5)
+    idx.remove([st])
+    l3s.invalidate_stems(b, [st])
+    l3s.publish(b, np.array([5]), np.array([_gen(b, 5)]))
+    on, off = _both(a, be, monkeypatch)
+    assert _key_lo(a, 5) in set(off.tolist())
+    assert _key_lo(a, 5) not in set(on.tolist()), "the residue as documented (if this flips, update the module note)"
+    sec = l3s.verify_candidates(a, [(5, _key_lo(a, 5), 0, 256)], be)
+    assert sec["mask"] == [False] and sec["on_disk"] == 0
+
+
+def _clear_backend(tmp_path, a, idx):
+    """A minimal HiCacheFile for the real ``clear`` / ``_stat_stems`` (its own store dir, this arena opened)."""
+    store = tmp_path / "store"
+    store.mkdir(exist_ok=True)
+    (store / "somefile").write_bytes(b"x")
+    ev = types.SimpleNamespace(cleared=0, forgot=[])
+    ev.clear = lambda: setattr(ev, "cleared", ev.cleared + 1)
+    ev.forget = lambda stems: ev.forgot.extend(stems)
+    hb = types.SimpleNamespace(file_path=str(store), _evictor=ev, metadata_cache=None, _arenas={"kv": a},
+                               _l3idx=idx)
+    hb._l3_index = lambda: idx
+    hb._sharded_path = lambda st: str(store / "nope" / st)
+    hb._flat_layout_present = lambda: False
+    hb._stat_stem = lambda st: None
+    return hb
+
+
+def test_r3_store_clear_voids_the_record_and_the_memo(tmp_path, monkeypatch):
+    """SOLL 1: ``HiCacheFile.clear`` empties the index and unlinks every file -- with a warm memo the census read the
+    whole arena as copied before. Now the record is voided: census(memo) == census(no memo) == every page."""
+    from flliper.srt.mem_cache import hicache_storage as hs
+
+    n = 64
+    a, be, idx = _arena(tmp_path, n)
+    _REAL_UNSEC(a, be)
+    hb = _clear_backend(tmp_path, a, idx)
+    assert hs.HiCacheFile.clear(hb, force=True) is True
+    on, off = _both(a, be, monkeypatch)
+    assert off.shape[0] == n and np.array_equal(on, off)
+    assert int((np.asarray(l3s.arrays(a)[0]) >= 0).sum()) == 0, "the shared record is void"
+
+
+def test_r3s_stat_strike_voids_the_record(tmp_path, monkeypatch):
+    """SOLL 1: the ``_stat_stems`` strike (index names a stem, the disk does not have it) voids the record too."""
+    from flliper.srt.mem_cache import hicache_storage as hs
+
+    n = 64
+    a, be, idx = _arena(tmp_path, n)
+    _REAL_UNSEC(a, be)
+    hb = _clear_backend(tmp_path, a, idx)
+    hb._l3sec_void_stems = types.MethodType(hs.HiCacheFile._l3sec_void_stems, hb)
+    gone = [a.slot_stem(3), a.slot_stem(44)]
+    assert hs.HiCacheFile._stat_stems(hb, gone) == {}
+    on, off = _both(a, be, monkeypatch)
+    assert np.array_equal(on, off)
+    assert {_key_lo(a, 3), _key_lo(a, 44)} <= set(on.tolist())
+
+
+def test_r3b_free_decision_refuses_after_index_clear(tmp_path, monkeypatch):
+    """Even a raw index clear (no record void at all) is refused at the free decision."""
+    n = 32
+    a, be, idx = _arena(tmp_path, n)
+    _REAL_UNSEC(a, be)
+    idx.clear()
+    cands = [(s, _key_lo(a, s), 0, 256) for s in range(n)]
+    sec = l3s.verify_candidates(a, cands, be)
+    assert sec["on_disk"] == 0 and not any(sec["mask"])
+
+
+def test_r4_per_slot_form_with_memo_on_equals_memo_off(tmp_path, monkeypatch):
+    """SOLL 4: the per-slot fallback (backend without the pointer twin) with the memo ON."""
+    n = 128
+    a, _be, idx = _arena(tmp_path, n, name="p")
+    be = types.SimpleNamespace(_l3idx=idx)
+    be.l3_listed = lambda stems: [bool(x) for x in idx.has(list(stems))] if stems else []
+    for s_ in (3, 50, 90):
+        idx.remove([a.slot_stem(s_)])
+    f0 = l3s.FAST_STATS["fallback"]
+    on, off = _both(a, be, monkeypatch)
+    assert l3s.FAST_STATS["fallback"] > f0, "precondition: the per-slot form ran"
+    assert np.array_equal(on, off) and on.shape[0] == 3
+    m = _memo_of(a)
+    assert m is not None and int((m >= 0).sum()) == n - 3, "only the listed slots are remembered"
+    idx.remove([a.slot_stem(7)])
+    l3s.invalidate_stems(a, [a.slot_stem(7)])
+    on, off = _both(a, be, monkeypatch)
+    assert np.array_equal(on, off) and on.shape[0] == 4
