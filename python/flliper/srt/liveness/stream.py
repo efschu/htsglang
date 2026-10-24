@@ -88,8 +88,21 @@ async def guarded_stream(
     it was declared dead, so continuing would stream from a torn-down job.
     """
     watchdog.start()
+    iterator = source.__aiter__()
     try:
-        async for chunk in source:
+        while True:
+            # NF-STALL-1024: the wait on the SOURCE is not the consumer's. The
+            # clock is pinned while the producer has nothing to offer (D inside
+            # a buffered tool-call parameter, a held-back reasoning trace) and
+            # starts at the offer -- otherwise a 90 s producer silence reaps a
+            # consumer that reads all the time (rc36p 1024_195853, 9 streams).
+            watchdog.note_source_wait(True)
+            try:
+                chunk = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            finally:
+                watchdog.note_source_wait(False)
             if watchdog.released:
                 raise ConsumerGone(
                     watchdog.job_id,

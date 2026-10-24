@@ -157,6 +157,10 @@ class LivenessState:
     #: LIVEPARK: the server holds the request on purpose (a D park); the
     #: silence clock is paused and restarts at the resumption (hold.py)
     held: bool = False
+    #: NF-STALL-1024: the stream waits on its SOURCE (no chunk to offer, e.g.
+    #: a tool-call parameter the parser buffers); the clock is pinned -- a
+    #: consumer cannot refuse bytes nobody offered it
+    awaiting_source: bool = False
 
     def silent_for(self, now: float | None = None) -> float:
         return (now if now is not None else time.monotonic()) - self.last_progress_at
@@ -171,6 +175,7 @@ class LivenessState:
             "declared_dead": self.declared_dead,
             "in_grace": self.in_grace,
             "held": self.held,
+            "awaiting_source": self.awaiting_source,
         }
 
 
@@ -206,6 +211,11 @@ class ConsumerWatchdog:
         #: resumption. None = every silence counts (the pre-LIVEPARK watchdog).
         self._held = held
         self._held_since: float | None = None
+        #: NF-STALL-1024: when the current source wait began (None = a chunk
+        #: is offered, or the producer is not reported at all) and whether the
+        #: over-limit producer silence was already named once
+        self._source_wait_since: float | None = None
+        self._source_wait_named = False
         self.policy = policy
         self._release = release
         self._clock = clock or time.monotonic
@@ -241,6 +251,29 @@ class ConsumerWatchdog:
             # reclaimer acts on a claim that is live again.
             self.state.in_grace = False
             self._set_phase(AttachmentPhase.ACTIVE, 0.0)
+
+    def note_source_wait(self, waiting: bool) -> None:
+        """NF-STALL-1024: the stream starts / stops waiting on its source.
+
+        ``True`` while the wrapper awaits the next chunk from the producer,
+        ``False`` the moment a chunk is in hand and about to be offered. The
+        silence clock is pinned while waiting and starts at the offer, so it
+        measures exactly what the class is named for: how long the consumer
+        has not taken bytes it was given. A producer that is silent -- D
+        decoding a tool-call parameter the parser releases only at its end,
+        a long reasoning trace under ``stream_reasoning=False`` -- is not a
+        dead consumer (rc36p ``..._1024_195853``: 9 streams reaped at 90 s
+        while D decoded and the front read). Never called = the watchdog
+        behaves as before (every silence counts).
+        """
+        now = self._clock()
+        self.state.last_progress_at = now
+        self.state.awaiting_source = waiting
+        if waiting:
+            self._source_wait_since = now
+            self._source_wait_named = False
+        else:
+            self._source_wait_since = None
 
     @property
     def released(self) -> bool:
@@ -331,6 +364,8 @@ class ConsumerWatchdog:
                     pass
                 if self._held is not None and self._hold_tick():
                     continue
+                if self._source_tick(timeout):
+                    continue
                 silent = self.state.silent_for(self._clock())
                 if silent >= timeout:
                     await self._declare_dead(silent, timeout)
@@ -346,6 +381,37 @@ class ConsumerWatchdog:
                     self._set_phase(AttachmentPhase.GRACE, silent)
         except asyncio.CancelledError:
             raise
+
+    def _source_tick(self, timeout: float) -> bool:
+        """NF-STALL-1024: True while the stream waits on its source.
+
+        The clock is pinned to now (it restarts at the offer) and a grace
+        entered during an undelivered offer is left: the consumer took that
+        chunk, or the wrapper would not be waiting on the source. A producer
+        silence over the class limit is named once per wait, so the log shows
+        the case that used to be reaped.
+        """
+        since = self._source_wait_since
+        if since is None:
+            return False
+        now = self._clock()
+        self.state.last_progress_at = now
+        if self.state.in_grace:
+            self.state.in_grace = False
+            self._set_phase(AttachmentPhase.ACTIVE, 0.0)
+        if not self._source_wait_named and now - since >= timeout:
+            self._source_wait_named = True
+            logger.info(
+                "job %s: PRODUCER-SILENT %.1fs (over the %.1fs limit for %s) -- "
+                "no chunk to offer (e.g. a tool-call parameter the parser "
+                "buffers); not the consumer's silence, clock pinned until the "
+                "next offer",
+                self.job_id,
+                now - since,
+                timeout,
+                self.state.endpoint_class,
+            )
+        return True
 
     def _hold_tick(self) -> bool:
         """LIVEPARK: True while the server holds the request on purpose.
