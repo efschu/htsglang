@@ -343,7 +343,12 @@ _REAP_SLOT_ANCHOR = 4 + _POOL_SLOT_COUNT
 #: no E-tail part -- `_pdflip_read_no_writer_local`). The MIN makes it the
 #: group's answer: one rank that still sees a writer keeps the old deliverable.
 _REAP_SLOT_NO_WRITER = 5 + _POOL_SLOT_COUNT
-_REAP_PACKED_LEN = 6 + _POOL_SLOT_COUNT
+#: HLEAF-STALE-1024: 1 = the read's anchor (``last_host_node``) is still in this
+#: rank's tree. The MIN makes it the group's answer (SOLL R11): one rank whose
+#: anchor left the tree while the read was in flight refuses the insert on
+#: every rank, instead of hanging the read's span under a removed node there.
+_REAP_SLOT_ANCHOR_ATTACHED = 6 + _POOL_SLOT_COUNT
+_REAP_PACKED_LEN = 7 + _POOL_SLOT_COUNT
 _ANCHOR_ABSTAIN = 2**31 - 1
 
 
@@ -4948,6 +4953,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         node is no D-leaf (``evicted``) and no H-leaf (no host value) for any caller."""
         for cd in getattr(node, "component_data", None) or ():
             cd.value = None
+
+    def _pdflip_prefetch_anchor_attached(self, node: Any) -> bool:
+        """HLEAF-STALE-1024: True when ``node`` (a read's ``last_host_node``) still hangs in THIS tree -- every edge
+        up to ``self.root_node`` present. A chain that ends at another root (a node of a tree ``_reset_full``
+        replaced) or at a parent that no longer lists the node is detached. A structure this check cannot read (no
+        dict ``children``) counts as attached: the insert runs as before."""
+        root = getattr(self, "root_node", None)
+        if node is None or root is None or node is root:
+            return True
+        n = node
+        for _ in range(1 << 20):
+            if n is root:
+                return True
+            p = getattr(n, "parent", None)
+            if p is None:
+                return False
+            children = getattr(p, "children", None)
+            if not isinstance(children, dict):
+                return True
+            if not any(c is n for c in children.values()):
+                return False
+            n = p
+        return True
 
     def _leaf_set_detached(self, node: UnifiedTreeNode) -> bool:
         """S92 invariant: True when ``node`` is not in its parent's children (removed from the tree). Such a node is
@@ -12143,6 +12171,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        # HLEAF-STALE-1024 A1: a Form A worker publishes its read's anchor at once (TP0's S39 veto set)
+        _r12.worker_read_registered(self)
 
     def _prefetch_line_terms(self, need: int) -> dict:
         """The named terms of the #915 L1/L2 lines (#1068 slice 4), read in
@@ -12643,6 +12673,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         packed_list += [_probed_local, _h_vote, tail_adopt.local_vote(req_id)]
         packed_list += [_a_vote]
         packed_list += [_pdflip_read_no_writer_local(req_id, operation)]
+        packed_list += [1 if UnifiedRadixCache._pdflip_prefetch_anchor_attached(self, last_host_node) else 0]
         assert len(packed_list) == _REAP_PACKED_LEN
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
@@ -12668,6 +12699,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             packed = torch.tensor(packed_list, dtype=torch.int)
         _probed, _hit_tokens = self._reap_annotation_from_packed(packed)
+        # HLEAF-STALE-1024: the group's answer (MIN) -- 0 when the anchor left the tree on ANY rank
+        _anchor_in_tree = int(packed[_REAP_SLOT_ANCHOR_ATTACHED].item()) > 0
         _hit_end = int(_hit_tokens)
         _hit_tokens = _hp1_end_unpack(_eb, int(_hit_tokens))
         # TAIL-CONSUME-ON-FULL (h48 pdflip-182-1661): the H63b receipt only at a
@@ -12836,6 +12869,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # cutover that made the stamp stale re-issues the whole affected
             # population itself, after the rebind, through the ordinary
             # intake prefetch (`phase_flip_runtime._post_cutover_readmit`).
+        elif not _anchor_in_tree:
+            # HLEAF-STALE-1024 (NF rc39 boot 1024_074822, D TP1/TP2 08:02:03Z,
+            # "H-leaf extra: [314]" + "1 stale nodes in host_leaves: [314]" +
+            # "mamba host LRU: +S3=set(), +lru={314}"): the anchor of this read
+            # left the tree while it was in flight (S39 dropped node 310, a
+            # store-backed device leaf the registration's host lock could not
+            # hold). `_insert_helper_host` walks DOWN from the anchor and never
+            # looks up: it hung the span under the removed node, the new node
+            # was a host leaf of no tree. Refused in the #937 shape -- the span
+            # goes back to its pool, the next match re-reads from where the tree
+            # really ends (here the second read of pdflip-4-108, 6592 tokens).
+            self._prefetch_insert_refused_detached = (
+                getattr(self, "_prefetch_insert_refused_detached", 0) + 1
+            )
+            _hd = self._prefetch_insert_refused_detached
+            if _hd <= 32 or (_hd & (_hd - 1)) == 0:
+                logger.warning(
+                    "HLEAF-STALE PREFETCH ANCHOR DETACHED req=%s anchor=%s local_in_tree=%d "
+                    "tokens=%d (n=%d): the read's anchor left the tree while the read was in "
+                    "flight (on this or a peer rank -- the group's MIN); the span is released "
+                    "to its pool, NOT inserted below a removed node",
+                    req_id, getattr(last_host_node, "id", "?"),
+                    int(UnifiedRadixCache._pdflip_prefetch_anchor_attached(self, last_host_node)),
+                    int(min_completed_tokens), _hd,
+                )
+            insert_result = InsertResult(prefix_len=0, host_span_unclaimed=True)
         else:
             # The stamp is current: the slots adopted here belong to the
             # binding that is live right now.
@@ -13036,7 +13095,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # references since they resolved, and this termination is the group's
         # vote that all of them have; the order protection ends here. A SHORT
         # read keeps it: the refetch (#1471) still needs the rest.
-        if int(min_completed_tokens) >= len(prefetch_key):
+        # HLEAF-STALE-1024 S3 (review): a read the group refused for its detached anchor took NOTHING over -- the
+        # hand-off keeps its protection for the re-read that follows (the group's MIN, every rank alike).
+        if int(min_completed_tokens) >= len(prefetch_key) and _anchor_in_tree:
             _pdflip_handoff_consumed(req_id, "fetch", loaded=int(min_completed_tokens))
 
         # #841: a declined insert loaded NOTHING into the tree. Reporting the
