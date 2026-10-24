@@ -314,7 +314,8 @@ def test_solve_with_p_line_uses_its_fixed_and_marginal_cost():
                                   prefix_tokens=92000, line_p=line_p)
     per_req = 1000.0 * 6.94 / 1.53
     denom = (0.611 + 0.00093 * 92) - (0.039 + 0.00088 * 92)
-    assert why == "ok" and x == pytest.approx((per_req + 93.0 - 227.0) / denom)
+    # a hand line without n_hi: no D width known -> one forward, named (LIVE-X-FWDCOST 1024)
+    assert why == "ok(one-forward:no-D-width)" and x == pytest.approx((per_req + 93.0 - 227.0) / denom)
     # the drain rate alone (the old answer): the crossing lies far beyond the ceiling
     x_drain, why_drain = pp.solve_x_cost_line(price_s=6.94, k=1.53, line=line, r_p=1437.0,
                                               prefix_tokens=92000)

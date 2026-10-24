@@ -60,7 +60,14 @@ def _x(price_s, k):
 
 
 def test_the_old_price_over_k_reproduces_n4p_and_n4q():
-    assert abs(_x(5.27, 1.33) - 6224) < 15          # N4p 10:06:26 X*=6224
+    # N4p 10:06:26 X*=6224 was solved with D's a=155 ms ONCE per request; that boot's
+    # formula is the one-forward fallback (a line without any D width, named)
+    line = {k: v for k, v in D_LINE.items() if k != "n_hi"}
+    x_logged, why = pp.solve_x_cost_line(price_s=5.27, k=1.33, line=line, r_p=None,
+                                         prefix_tokens=PREFIX, line_p=P_LINE)
+    assert why == "ok(one-forward:no-D-width)" and abs(x_logged - 6224) < 15
+    # LIVE-X-FWDCOST 1024: 6.2k is two D forwards of <= 3367 -> one more a, X ~5.94k
+    assert 5900 < _x(5.27, 1.33) < x_logged
     assert _x(5.27, 1.33) < UNCACHED_14_69          # -> LONG
 
 
@@ -73,7 +80,8 @@ def test_red_excursion_price_is_the_warm_mean_of_both_waits():
 def test_red_a_text_request_like_pdflip_14_69_is_short_without_the_store_credit():
     price, _ = pp.excursion_price_s(DP, PD, (), FIRST)
     x_star = _x(price, 1.0)                           # undivided
-    assert x_star > UNCACHED_14_69 and 9500 < x_star < 10600
+    # LIVE-X-FWDCOST 1024: 3 D forwards of <= 3367 (a=155 ms each) -> 9495, was 10071 with a once
+    assert x_star > UNCACHED_14_69 and 9300 < x_star < 10600
     x, _limited = pp.x_step_limited(min(x_star, 12288), X_PREV, envs.FLLIPER_PDFLIP_X_COST_MAX_STEP.get())
     assert x > UNCACHED_14_69                         # even the first hysteresis step admits it
 
@@ -200,7 +208,8 @@ def test_n4p_text_only_samples_still_make_7691_short():
     price, src = pp.excursion_price_s(text_dp, text_pd, (), FIRST)
     assert price is None and "dp n=0" in src
     x_star = _x(5.27, 1.0)
-    assert 8200 < x_star < 8450 and x_star > UNCACHED_14_69
+    # LIVE-X-FWDCOST 1024: 3 D forwards of <= 3367 -> 7771 (8.3k with a once), still > 7691
+    assert 7700 < x_star < 8450 and x_star > UNCACHED_14_69
 
 
 def test_red_the_cost_line_resolve_never_waits_for_the_launcher_import(monkeypatch):
