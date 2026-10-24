@@ -54,7 +54,10 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           "line": _UNSET,
           # VOTE-LINE-SINGLE (24.10.): the measured non-row part per rank (env, read once), and whether
           # this rank's line is the single line (near-OOM + that part) -- set with "line"
-          "vote_fixed": _UNSET, "single": False}
+          "vote_fixed": _UNSET, "single": False,
+          # ADMIT-TRIM (desk/27b-admit-trim-1024): the width-vote pass counter, the pass whose vote trimmed, the pass
+          # whose admission trimmed
+          "vote_seq": 0, "vote_trim_seq": -1, "admit_seq": -1}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -109,6 +112,9 @@ def reset_for_tests() -> None:
     _CACHE["line"] = _UNSET
     _CACHE["vote_fixed"] = _UNSET
     _CACHE["single"] = False
+    _CACHE["vote_seq"] = 0
+    _CACHE["vote_trim_seq"] = -1
+    _CACHE["admit_seq"] = -1
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -121,7 +127,7 @@ def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[floa
 
 
 def maybe_trim(cuda, rank: int, threshold_mib: Optional[float],
-               clock=time.perf_counter) -> Optional[str]:
+               clock=time.perf_counter, site: str = "") -> Optional[str]:
     """Trim when the card's free bytes are under ``threshold_mib``. Returns the
     line it logged, ``None`` when it did nothing."""
     if threshold_mib is None:
@@ -154,6 +160,7 @@ def maybe_trim(cuda, rank: int, threshold_mib: Optional[float],
         f"card_free_before={free0 / MIB:.0f} "
         f"card_free_after={'na' if free1 < 0 else f'{free1 / MIB:.0f}'} "
         f"threshold={threshold_mib:.0f}"
+        + (f" site={site}" if site else "")
     )
     logger.info(line)
     return line
@@ -521,6 +528,8 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
     raise. With prefill work pending and a rate for this rank: trim once (if
     the card is under the trim threshold and no trim is armed yet), read the
     card, return ``rows_cap`` when it is narrower than ``configured``."""
+    # ADMIT-TRIM: one vote = one pass (before_admission keys on it); counted before any abstention
+    _CACHE["vote_seq"] = int(_CACHE["vote_seq"]) + 1
     try:
         vals = rates()
         rate = threshold_for(rank, vals)
@@ -535,6 +544,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         if not _CACHE["armed"]:
             if maybe_trim(cuda, rank, threshold_for(rank, thresholds()), clock) is not None:
                 _CACHE["armed"] = True
+                _CACHE["vote_trim_seq"] = _CACHE["vote_seq"]
         post, _total = cuda.mem_get_info()
         post_mib = post / MIB
         # PDFLIP-EXTEND-CAP: under the P0 torch cache cap the allocator's own line
@@ -592,6 +602,46 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         return cap
     except Exception as exc:  # noqa: BLE001 -- a vote that cannot price abstains
         logger.debug("%s skipped: %s", CHUNKING_MARKER, exc)
+        return None
+
+
+# --------------------------------------------------------------------------
+# ADMIT-TRIM (desk/27b-admit-trim-1024, review M3 24.10.): the trim right before the admission when the vote of this
+# pass did not trim.
+#
+# The vote trims once and then stays ``armed`` until an extend runs (``_before_extend_trim``). When the admission is
+# REFUSED (D-ADMIT-REFUSED), no extend runs, ``armed`` stays set, the following votes do not trim, decode rounds
+# refill the allocator cache -- and the handback that is finally admitted lands on an untrimmed card. int4ar
+# ``_1023_223241`` 23:19:34: after 568 refusals in 174 s TP1 admitted at card_free_before=32 MiB, the forward trim then
+# returned 630 MiB (TP0 222, released 578); 127 int4ar passes ran their admission without a vote trim, 10 of them
+# under the near-OOM edge.
+#
+# The scheduler calls :func:`before_admission` where a request has passed the X gate and is about to be added (its
+# Mamba restore and KV load-back allocate in ``add_one_req``). Once per pass and only when this pass's vote did not
+# trim, the rank trims under its static threshold -- the same ``maybe_trim`` as the vote, logged with ``site=admit``.
+# Rank-local memory care (SOLL R11): no verdict, no width, no collective moves. No static threshold = nothing, byte
+# for byte. Cost: one ``cudaMemGetInfo`` per admitting pass, a sync + ``empty_cache`` only when the card is short.
+# --------------------------------------------------------------------------
+
+ADMIT_SITE = "admit"
+
+
+def before_admission(cuda, rank: Optional[int]) -> Optional[str]:
+    """Trim before this pass's admission when this pass's vote did not trim (``armed`` left over from a pass whose
+    admission was refused). Once per pass; ``None`` when nothing was trimmed. Never raises."""
+    try:
+        if rank is None:
+            return None
+        seq = int(_CACHE["vote_seq"])
+        if _CACHE["admit_seq"] == seq or _CACHE["vote_trim_seq"] == seq:
+            return None
+        _CACHE["admit_seq"] = seq
+        thr = threshold_for(int(rank), thresholds())
+        if thr is None:
+            return None
+        return maybe_trim(cuda, int(rank), thr, site=ADMIT_SITE)
+    except Exception as exc:  # noqa: BLE001 -- a guard never kills an admission
+        logger.debug("%s admit skipped: %s", MARKER, exc)
         return None
 
 

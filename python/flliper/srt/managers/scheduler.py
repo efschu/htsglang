@@ -19186,6 +19186,10 @@ class Scheduler(
                 _x_refused.append(req)
                 continue
             _pdflip_hbd.note_admit(req)
+            # ADMIT-TRIM (desk/27b-admit-trim-1024, SOLL v2 R11: rank-local memory care, no verdict or width moves):
+            # the vote of this pass did not trim (armed left over from refused admissions) -> trim before the
+            # admission's Mamba restore / KV load-back allocate in add_one_req; once per pass (pdflip/extend_trim.py)
+            _pdflip_extend_trim.before_admission(torch.cuda, getattr(getattr(self, "ps", None), "tp_rank", None))
             # PARK-WINDOW-GATE (29.09.): while the front's collect window is
             # open, no extend whose forward ends after its deadline -- the park
             # must not wait for it. Inert without a window (every term replicated).

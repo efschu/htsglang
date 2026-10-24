@@ -14639,11 +14639,105 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
     rests = list(res.values)
     prov = res.provenance
     deltas = booked_rest_vote_line_deltas(cards, rests, name, profile, group, log)
+    vote_deltas = list(deltas)
+    # PDFLIP-ADMIT-BOOK (desk/27b-admit-trim-1024): the admission peak priced beside the vote line -- per card the
+    # larger of the two posts (they never coexist), only where the record's form runs
+    deltas = booked_rest_admit_deltas(cards, rests, vote_deltas, profile, group, log, rest_name=name)
     if any(deltas):
         rests = [None if v is None else int(v) + int(d) for v, d in zip(rests, deltas)]
-        prov = (f"{prov} + vote-line delta {','.join(str(d) for d in deltas)} "
-                f"{_budget_rest.VOTE_LINE_BASIS} ({_budget_rest.VOTE_LINE_MARKER})")
+        if deltas == vote_deltas:
+            prov = (f"{prov} + vote-line delta {','.join(str(d) for d in deltas)} "
+                    f"{_budget_rest.VOTE_LINE_BASIS} ({_budget_rest.VOTE_LINE_MARKER})")
+        else:
+            prov = (f"{prov} + delta {','.join(str(d) for d in deltas)} = max(vote-line delta "
+                    f"{','.join(str(d) for d in vote_deltas)} {_budget_rest.VOTE_LINE_BASIS} "
+                    f"({_budget_rest.VOTE_LINE_MARKER}), admission need {_budget_rest.ADMIT_RECORD} "
+                    f"{_budget_rest.ADMIT_BASIS} ({_budget_rest.ADMIT_MARKER}))")
     return {"booked_rest_mib": rests, "booked_rest_provenance": prov}
+
+
+def d_admit_need_record(profile: Optional[str] = None, n: Optional[int] = None,
+                        cards: Optional[Sequence[Card]] = None,
+                        model: Optional[str] = None) -> Tuple[Optional[List[float]], str]:
+    """PDFLIP-ADMIT-BOOK: the profile's ``D_ADMIT_NEED_MIB`` per card (one value covers every card) and its boots,
+    or ``(None, why)`` -- no record, the switch off (``FLLIPER_PDFLIP_ADMIT_BOOK=0``), a vector that does not fit
+    ``n`` cards, or a FORM the record was not measured on (checkpoint ``model``, else the published form's, and the D
+    cards' inventory against ``budget_rest.ADMIT_NEED_FORMS``; unknown checkpoint or no cards = not this form, fail
+    closed: nothing booked)."""
+    if not _budget_rest.admit_book_on():
+        return None, f"{_budget_rest.ADMIT_ENV}=0"
+    try:
+        vals = list(_pconst(_budget_rest.ADMIT_RECORD, profile))
+    except (KeyError, TypeError):
+        return None, f"no {_budget_rest.ADMIT_RECORD} record"
+    if not vals or any(v is None for v in vals):
+        return None, f"{_budget_rest.ADMIT_RECORD} {vals!r} has an unmeasured card"
+    prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
+    row = pdflip_form.profile_row(prof)
+    rec = row.constants.get(_budget_rest.ADMIT_RECORD) if row is not None else None
+    boots = tuple(getattr(rec, "boots", ()) or ()) if rec is not None else ()
+    if model is None:
+        form = pdflip_form.current_form()
+        model = form.model if form is not None else ""
+    try:
+        inventory = card_identity.inventory_signature(list(cards)) if cards else ()
+    except Exception:  # noqa: BLE001 -- an unreadable inventory is not this form (fail closed)
+        inventory = ()
+    why = _budget_rest.admit_form_mismatch(boots, pdflip_form.model_key(model or ""), inventory)
+    if why is not None:
+        return None, why
+    if n is not None and len(vals) not in (1, int(n)):
+        out = [float(vals[0])] * int(n) if len(set(vals)) == 1 else None
+        if out is None:
+            return None, f"{_budget_rest.ADMIT_RECORD} {vals!r} does not fit {n} cards"
+        return out, _pconst_boots(_budget_rest.ADMIT_RECORD, profile)
+    out = [float(v) for v in vals]
+    if n is not None and len(out) == 1:
+        out = out * int(n)
+    return out, _pconst_boots(_budget_rest.ADMIT_RECORD, profile)
+
+
+def booked_rest_admit_deltas(cards: List[Card], rests: Sequence[Optional[int]], vote_deltas: Sequence[int],
+                             profile: Optional[str] = None, group: str = "D",
+                             log: Optional[Log] = None, rest_name: Optional[str] = None) -> List[int]:
+    """PDFLIP-ADMIT-BOOK (desk/27b-admit-trim-1024, budget_rest): per card ``max(vote-line delta,
+    ceil8(D_ADMIT_NEED_MIB))`` where the card has a booked rest and the record's form runs; the vote-line deltas
+    unchanged everywhere else (no record, foreign form, switch off, group P). The admission peak (post-wake handbacks,
+    up to 522 MiB) lands before the forward trim and no trim can return it (the vote trim already ran, the remaining
+    cache is not returnable); the budget therefore keeps it free -- a priced post, never a reserve. Rank-uniform: a
+    launcher term, no width moves rank-locally (SOLL R11)."""
+    n = len(cards)
+    if str(group).upper() != "D":
+        return list(vote_deltas)
+    needs, src = d_admit_need_record(profile, n, cards)
+    if needs is None:
+        if log is not None and (src.startswith("admission need unmeasured") or "name no form" in src
+                                or src.endswith("=0")):
+            log(f"{_budget_rest.ADMIT_MARKER} group={group}: off -- {src}; the vote-line delta alone")
+        return list(vote_deltas)
+    out = _budget_rest.admit_deltas(rests, vote_deltas, needs)
+    # review S1: the need is relative to the rest it was derived beside -- another rest is named loudly (and still
+    # booked: dropping the post would be the OOM direction), never carried on silently
+    basis_name, basis_mib = _budget_rest.ADMIT_REST_BASIS
+    off = [(i, r) for i, r in enumerate(rests) if r is not None and int(r) != int(basis_mib)]
+    if log is not None and (off or (rest_name is not None and str(rest_name) != basis_name)):
+        log(f"{_budget_rest.ADMIT_MARKER} REST-MISMATCH group={group}: {_budget_rest.ADMIT_RECORD} was derived beside "
+            f"{basis_name} {basis_mib} MiB per card; this pass books {rest_name or '?'} "
+            f"{','.join('-' if r is None else str(r) for r in rests)} -- the need still books (dropping it is the OOM "
+            f"direction) but is NOT re-derived for this rest: re-measure with python -m flliper.srt.pdflip.budget_rest "
+            f"--admit-need")
+    if log is not None:
+        for i, c in enumerate(cards):
+            if rests[i] is None:
+                why = "no booked rest on this card -> nothing"
+            elif out[i] == int(vote_deltas[i]):
+                why = f"the vote-line delta {vote_deltas[i]} already carries it"
+            else:
+                why = f"books {out[i]} (vote-line delta {vote_deltas[i]})"
+            log(f"{_budget_rest.ADMIT_MARKER} group={group} ordinal={i} nvml{c.nvml_index}: admission need "
+                f"{needs[i]:.0f} MiB ({_budget_rest.ADMIT_RECORD}, {src}; {_budget_rest.ADMIT_BASIS}) -> "
+                f"max(vote-line delta, ceil8(need)) = {out[i]} MiB: {why}")
+    return out
 
 
 def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int]], name: str,

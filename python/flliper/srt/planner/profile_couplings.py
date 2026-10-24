@@ -1163,6 +1163,11 @@ def launcher_d_budgets(totals: Sequence[float], dc: Sequence[float], *, profile:
                         "(VOTE-LINE-SINGLE, only for the record's forms: Qwen3.8-27B-INT8-gdncov-vocabembed on RTX5090,RTX3080,RTX3080 -> "
                         "line 638, delta 344 per card), else max(300, floor) - 300; here the stated law, which is not measured: 0 "
                         "(on the rig with a measured floor the launcher's D budget is lower by that delta)")
+            gaps.append("Admission post beside the booked rest (PDFLIP-ADMIT-BOOK, launcher.booked_rest_admit_deltas): per card "
+                        "max(vote-line delta, ceil8(D_ADMIT_NEED_MIB)) -- only for the record's form (int4ar: "
+                        "Huihui-Qwen3.8-27B-Abliterated-INT4-W4A16-AutoRound-ct on RTX3080,RTX3080 -> 416 MiB per card; the "
+                        "INT8 drei vote-line delta already carries its 300); the checkpoint is not visible here: 0 (on the rig "
+                        "the int4ar D budget is lower by 416 MiB per card)")
     carve_on = row is not None and bool(getattr(row, "budget_charges_driver_carve", False))
     if carve_on or booked is not None:
         min_total = int(getattr(row, "driver_carve_min_total_mib", 0) or 0) if row is not None else 0
