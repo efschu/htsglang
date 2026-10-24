@@ -515,7 +515,11 @@ def held_without_seat(req: Any, can_run_list: Iterable[Any]) -> bool:
     "prefill finished" test of ``process_batch_result_prefill``): no first token, ever.
 
     Only a LANE hold qualifies (``pdflip_lane_parked`` is True): the pressure park (#679) and every other continuation keep the old
-    accounting (R1).  A held continuation that the forwarded schedule names runs a chunk, is in ``can_run_list`` and is counted as ever."""
+    accounting (R1).  A held continuation that the forwarded schedule names runs a chunk, is in ``can_run_list`` and is counted as ever.
+
+    27B-PP-SKIPOUT-1024: the batch builder no longer asks this predicate -- it asks the general one,
+    ``managers/pp_continuation_seat.counts_middle_chunk`` (counted iff the continuation is IN the batch), of which this is
+    the lane case.  The #679 in-place park and a follower's #992 not-named continuation leaked the same count."""
     if getattr(req, LANE_PARKED_ATTR, False) is not True:
         return False
     return not any(r is req for r in (can_run_list or ()))

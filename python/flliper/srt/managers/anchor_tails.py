@@ -176,15 +176,28 @@ def bodies_in_batch(tails: Sequence[Any], can_run_list: Sequence[Any]) -> Tuple[
 def contains_last_prefill_chunk(
     can_run_list: Sequence[Any], chunked_req: Any, tails: Sequence[Any]
 ) -> bool:
-    """``ScheduleBatch.contains_last_prefill_chunk``. With no tail it is the
-    stock expression unchanged; with tails, a one-request batch whose only
-    member continues (the chunked request OR a tail) carries no last chunk."""
-    if not tails:
-        return chunked_req is None or len(can_run_list) != 1
+    """``ScheduleBatch.contains_last_prefill_chunk``: a one-request batch whose
+    only member continues (the chunked request OR a tail) carries no last chunk.
+
+    27B-PP-SKIPOUT-1024 (SOLL R11): the question is the SEAT, not the slot. The
+    stock expression ``chunked_req is None or len(can_run_list) != 1`` asked
+    whether a chunked request EXISTS, which only equals "the only member is the
+    chunked request" while the chunked request always takes a seat (upstream).
+    Here it may not (the #679 in-place park, the lane hold, a follower's #992
+    not-named continuation): its one-member batch of a FRESH request's final
+    chunk then read as "no last chunk" -> ``_pp_can_skip_output_comm`` skips the
+    output exchange on that stage while a stage whose slot is empty (PP0 after
+    PDFLIP-PARK) receives -> hang; on a stage that also skips, placeholder
+    zeros reach the final chunk (``_validate_pp_skip_output_comm``). The seat is
+    the batch membership, which is uniform across the stages by construction
+    (#992/#791), so the verdict is too. Byte-identical whenever the chunked
+    request is in the batch -- every upstream pass."""
     if len(can_run_list) != 1:
         return True
     only = can_run_list[0]
-    return not (only is chunked_req or any(only is t for t in tails))
+    if only is chunked_req:
+        return False
+    return not any(only is t for t in (tails or ()))
 
 
 class VoidRestore(NamedTuple):

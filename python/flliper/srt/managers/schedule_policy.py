@@ -1524,6 +1524,12 @@ class PrefillAdder:
         #: "nothing resident", which is precisely the pass that then mints a
         #: second one.
         self.chunked_req_outstanding = False
+        #: 27B-PP-SKIPOUT-1024: `_add_scheduled_req` minted a forwarded NOT-LAST
+        #: chunk while `chunked_req_outstanding` was True (a follower only, on
+        #: PP0's word that its slot is empty). The scheduler then displaces its
+        #: resident continuation before adopting `new_chunked_req`
+        #: (managers/pp_continuation_seat.py `displace_resident`).
+        self.displaced_resident_continuation = False
         #: H105: on a Form A group the scheduler installs the host-verdict
         #: exchange here (`Scheduler._form_a_admission_follow_fn`); None keeps
         #: every gate in `add_one_req` rank-local exactly as before.
@@ -2659,10 +2665,29 @@ class PrefillAdder:
             # the same geometry rule PP0 applied (the carried verdict said
             # "not last" and the extent ends at the anchor cut of the carried
             # fill), so this rank carries the rid exactly as PP0 does.
+            #
+            # 27B-PP-SKIPOUT-1024 (SOLL R11): "WHY NOT ANNOUNCING LOSES NOTHING"
+            # ABOVE IS WITHDRAWN -- measured false. An unannounced NOT-LAST chunk
+            # takes no `inflight_middle_chunks` increment (the batch builder
+            # counts `scheduler.chunked_req` only), so its skipped output trips
+            # `_validate_pp_skip_output_comm` (27B rc35i4ar3 fe572f3224, boot
+            # ..._1024_063046, PP1 06:36:08, rid pdflip-3-8); its KV is never
+            # stashed, and the merge would hand a half-prefilled request to the
+            # running batch. The state itself is PP0's word that ITS slot is
+            # empty: PP0 mints a continuation only with `chunked_req is None`
+            # (#959 refuses every other mint), so the resident continuation
+            # here is a stale one PP0 already let go (PDFLIP-PARK runs on PP0
+            # only, after a pass that named nothing). The follower therefore
+            # mints the named request as PP0 did and DISPLACES the resident:
+            # the scheduler empties the slot and gives the resident's rows
+            # back (managers/pp_continuation_seat.py). No refusal (the boot-15
+            # livelock stays impossible), no second continuation (one field,
+            # one occupant), nothing unannounced.
             if self._is_anchor_body(req, prefix_len, prefix_len + extend_len):
                 self._mint_anchor_tail(req, "_add_scheduled_req")
             elif self.chunked_req_outstanding:
-                note_second_continuation_refused(req, "_add_scheduled_req")
+                self.displaced_resident_continuation = True
+                self._mint_chunked(req, "_add_scheduled_req/displace")
             else:
                 self._mint_chunked(req, "_add_scheduled_req")
         if not carried_chunk:

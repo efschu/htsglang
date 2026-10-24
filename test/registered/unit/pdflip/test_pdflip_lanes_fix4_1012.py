@@ -116,18 +116,23 @@ class AccountingStatementTest(unittest.TestCase):
         _account(SimpleNamespace(chunked_req=req), [_req("S", 1), req])
         self.assertEqual(req.inflight_middle_chunks, 1)
 
-    def test_r1_a_pressure_park_is_counted_exactly_as_before(self):
-        """The #679 pressure park is not a lane park: its accounting is not touched (R1, default path)."""
+    def test_a_pressure_park_outside_the_batch_is_not_counted_either(self):
+        """27B-PP-SKIPOUT-1024 REVISES the former R1 pin ("a #679 pressure park is counted exactly as before"): that count was the
+        same leak as the lane hold's -- the decrement walks ``batch.reqs`` only, so the in-place-parked continuation kept +1 for ever,
+        ``process_pending_pdflip_park`` waited on it and its final chunk read as a middle chunk. The batch builder now counts a
+        continuation iff it is in the batch (``pp_continuation_seat.counts_middle_chunk``)."""
         req = _held_continuation(inflight=0, lane_parked=False, pool_parked=True)
         _account(SimpleNamespace(chunked_req=req), [_req("S", 0)])
-        self.assertEqual(req.inflight_middle_chunks, 1)
+        self.assertEqual(req.inflight_middle_chunks, 0)
 
-    def test_r1_a_request_without_any_lane_attribute_is_counted_as_before(self):
+    def test_a_request_without_any_lane_attribute_is_counted_iff_it_is_in_the_batch(self):
         class _Plain:
             inflight_middle_chunks = 0
         plain = _Plain()
         _account(SimpleNamespace(chunked_req=plain), [_req("S", 0)])
-        self.assertEqual(plain.inflight_middle_chunks, 1)
+        self.assertEqual(plain.inflight_middle_chunks, 0, "not in the batch: no chunk of it runs")
+        _account(SimpleNamespace(chunked_req=plain), [plain])
+        self.assertEqual(plain.inflight_middle_chunks, 1, "in the batch: counted as ever")
 
     def test_no_continuation_nothing_to_count(self):
         _account(SimpleNamespace(chunked_req=None), [_req("S", 0)])  # must not raise
@@ -300,12 +305,14 @@ class MetalFiveTest(_SchedPatch):
     def test_canfail_the_leaked_count_would_keep_every_stage_from_parking(self):
         """CAN-FAIL twin: the accounting as it was (every non-empty batch counts the chunked request) -> no park."""
         with _LanesOn():
-            orig = lanes_p.held_without_seat
-            lanes_p.held_without_seat = lambda req, can_run_list: False
+            from flliper.srt.managers import pp_continuation_seat as seat
+
+            orig = seat.counts_middle_chunk
+            seat.counts_middle_chunk = lambda req, can_run_list: req is not None
             try:
                 stages = _run(passes=14, rpcs={3: (1, 1)}, arrivals={5: [_spur1]})
             finally:
-                lanes_p.held_without_seat = orig
+                seat.counts_middle_chunk = orig
             self.assertEqual([st.park_pass for st in stages], [None, None, None])
             self.assertEqual(self.released, [])
 
@@ -383,7 +390,8 @@ class SourcePinTest(unittest.TestCase):
         src = inspect.getsource(sch.Scheduler._get_new_batch_prefill_raw)
         i = src.index("inflight_middle_chunks += 1")
         blk = src[max(0, i - 400): i + 60]
-        self.assertIn("_lanes_p.held_without_seat(self.chunked_req, can_run_list)", blk)
+        # 27B-PP-SKIPOUT-1024: the general seat predicate, of which the lane hold is one case
+        self.assertIn("_pp_seat.counts_middle_chunk(self.chunked_req, can_run_list)", blk)
 
     def test_the_predicate_is_the_lane_flag_and_the_batch_membership(self):
         held = _held_continuation()
