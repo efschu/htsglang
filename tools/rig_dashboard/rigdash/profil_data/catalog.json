@@ -37166,6 +37166,38 @@
    ],
    "type": "EnvInt"
   },
+  "FLLIPER_DISCARD_NAMED": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "#221 Fix A \"benannt verwerfen\" (rule R7, kein stiller Verlust), DEFAULT ON: every discarded #1068 deferral mark and every read unit a reset drops is named on one \"#221 DISCARD-NAMED site=... rid=...\" line with one census exit (defer_cleared_refetch / defer_lost_at_reset; read units discard_reset_join). 0/false/no/off = the pre-#221 behaviour: no line, no census, site 3 clears nothing, sites 2/4 clear silently.",
+   "id": "FLLIPER_DISCARD_NAMED",
+   "kind": "env",
+   "lesestellen": [
+    "managers/discard_named.py:102"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_DISCARD_NAMED",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/discard_named.py",
+    "kind": "os.environ",
+    "line": 102,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_DISTRIBUTED_INIT_METHOD_OVERRIDE": {
    "bare": false,
    "choices": null,
@@ -37207,7 +37239,7 @@
    "id": "FLLIPER_DP_RANK",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:26004"
+    "managers/scheduler.py:26075"
    ],
    "level": "expert",
    "name": "FLLIPER_DP_RANK",
@@ -37216,7 +37248,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 26004,
+    "line": 26075,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -42775,7 +42807,7 @@
    "id": "FLLIPER_GIL_SWITCH_INTERVAL_MS",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:26211"
+    "managers/scheduler.py:26282"
    ],
    "level": "expert",
    "name": "FLLIPER_GIL_SWITCH_INTERVAL_MS",
@@ -42784,7 +42816,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 26211,
+    "line": 26282,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43725,7 +43757,7 @@
      "source": {
       "file": "mem_cache/unified_radix_cache.py",
       "kind": "os.environ",
-      "line": 749
+      "line": 750
      }
     }
    },
@@ -44004,8 +44036,8 @@
    "id": "FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:22713",
-    "managers/scheduler.py:23763"
+    "managers/scheduler.py:22783",
+    "managers/scheduler.py:23834"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP",
@@ -44014,7 +44046,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 22713,
+    "line": 22783,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44771,7 +44803,7 @@
    "id": "FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:1107"
+    "mem_cache/unified_radix_cache.py:1108"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PREFETCH_BUDGET_FROM_READ",
@@ -44780,7 +44812,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 1107,
+    "line": 1108,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44803,7 +44835,7 @@
    "id": "FLLIPER_HICACHE_PREFETCH_HIT0_DONE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:1089"
+    "mem_cache/unified_radix_cache.py:1090"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PREFETCH_HIT0_DONE",
@@ -44812,7 +44844,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 1089,
+    "line": 1090,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44835,8 +44867,8 @@
    "id": "FLLIPER_HICACHE_PREFETCH_IO_WORKERS",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:980",
-    "managers/cache_controller.py:5036"
+    "managers/cache_controller.py:981",
+    "managers/cache_controller.py:5046"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PREFETCH_IO_WORKERS",
@@ -44845,7 +44877,7 @@
    "source": {
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 980,
+    "line": 981,
     "tree": "27b"
    },
    "status": "harvested",
@@ -44990,7 +45022,7 @@
    "id": "FLLIPER_HICACHE_ROUND_TIMING",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:803"
+    "mem_cache/unified_radix_cache.py:804"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ROUND_TIMING",
@@ -44999,7 +45031,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 803,
+    "line": 804,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -45087,7 +45119,7 @@
    "id": "FLLIPER_HICACHE_WRITE_STREAM_PRIORITY",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:439"
+    "managers/cache_controller.py:440"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_WRITE_STREAM_PRIORITY",
@@ -45096,7 +45128,7 @@
    "source": {
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 439,
+    "line": 440,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -55099,7 +55131,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_REF_RECHECK",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:188"
+    "managers/cache_controller.py:189"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_REF_RECHECK",
@@ -55108,7 +55140,7 @@
    "source": {
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 188,
+    "line": 189,
     "tree": "27b"
    },
    "status": "harvested",
@@ -56906,7 +56938,7 @@
    "id": "FLLIPER_PDFLIP_DC_SNAPSHOT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:26169",
+    "managers/scheduler.py:26240",
     "managers/scheduler_components/weight_updater.py:2022"
    ],
    "level": "expert",
@@ -56916,7 +56948,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 26169,
+    "line": 26240,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -57524,7 +57556,7 @@
    "id": "FLLIPER_PDFLIP_DORMANT_ADMIT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1521",
+    "managers/scheduler.py:1522",
     "pdflip/front.py:5206"
    ],
    "level": "expert",
@@ -57534,7 +57566,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1521,
+    "line": 1522,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -59620,8 +59652,8 @@
     "managers/pdflip_store_told.py:1837",
     "managers/pdflip_told_fallback.py:1550",
     "managers/pdflip_told_fallback.py:1508",
-    "managers/scheduler.py:1086",
-    "managers/scheduler.py:1860"
+    "managers/scheduler.py:1087",
+    "managers/scheduler.py:1861"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_LAYOUT",
@@ -60899,7 +60931,7 @@
    "id": "FLLIPER_PDFLIP_DUAL_STORE_SHORT_MAX_CYCLES",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1087"
+    "managers/scheduler.py:1088"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_STORE_SHORT_MAX_CYCLES",
@@ -60908,7 +60940,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1087,
+    "line": 1088,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -65384,7 +65416,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/schedule_policy.py:184",
-    "mem_cache/unified_radix_cache.py:829"
+    "mem_cache/unified_radix_cache.py:830"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_END_ANCHOR",
@@ -65445,7 +65477,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7607"
+    "mem_cache/unified_radix_cache.py:7614"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -65454,7 +65486,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7607,
+    "line": 7614,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -66583,8 +66615,8 @@
     "managers/pdflip_d_hostgap.py:92",
     "managers/pdflip_d_hostgap.py:101",
     "managers/pdflip_d_hostgap.py:113",
-    "mem_cache/unified_radix_cache.py:737",
-    "mem_cache/unified_radix_cache.py:777",
+    "mem_cache/unified_radix_cache.py:738",
+    "mem_cache/unified_radix_cache.py:778",
     "pdflip/form.py:1464"
    ],
    "level": "expert",
@@ -67376,7 +67408,7 @@
     "entrypoints/openai/serving_chat.py:308",
     "layers/moe/expert_offload.py:8983",
     "layers/moe/store_adopt.py:68",
-    "managers/cache_controller.py:1418",
+    "managers/cache_controller.py:1419",
     "managers/corridor_guard.py:991",
     "managers/pdflip_flush_nonblock.py:74"
    ],
@@ -68471,7 +68503,7 @@
    "id": "FLLIPER_PDFLIP_L15_ALIGN_PROBE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:23367"
+    "managers/scheduler.py:23437"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L15_ALIGN_PROBE",
@@ -68480,7 +68512,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 23367,
+    "line": 23437,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -68533,7 +68565,7 @@
    "id": "FLLIPER_PDFLIP_L15_DEPOSIT",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:9156",
+    "managers/scheduler.py:9214",
     "managers/scheduler_components/weight_updater.py:12684",
     "pdflip/front.py:19375",
     "pdflip/l15_deposit_hook.py:42",
@@ -68546,7 +68578,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 9156,
+    "line": 9214,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -68630,8 +68662,8 @@
    "id": "FLLIPER_PDFLIP_L15_HOT_SHARE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:9141",
-    "managers/scheduler.py:23572",
+    "managers/scheduler.py:9199",
+    "managers/scheduler.py:23642",
     "managers/scheduler_components/weight_updater.py:12803",
     "pdflip/front.py:19336",
     "pdflip/front.py:9286",
@@ -68645,7 +68677,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 9141,
+    "line": 9199,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -68698,7 +68730,7 @@
    "id": "FLLIPER_PDFLIP_L15_L2_SHADOW",
    "kind": "env",
    "lesestellen": [
-    "pdflip/park_l3.py:843"
+    "pdflip/park_l3.py:852"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L15_L2_SHADOW",
@@ -68707,7 +68739,7 @@
    "source": {
     "file": "pdflip/park_l3.py",
     "kind": "os.environ",
-    "line": 843,
+    "line": 852,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -71069,8 +71101,8 @@
    "id": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:734",
-    "mem_cache/unified_radix_cache.py:746"
+    "mem_cache/unified_radix_cache.py:735",
+    "mem_cache/unified_radix_cache.py:747"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
@@ -71079,7 +71111,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 734,
+    "line": 735,
     "tree": "27b"
    },
    "status": "harvested",
@@ -71896,7 +71928,7 @@
    "id": "FLLIPER_PDFLIP_ORPHAN_OWN_SLOTS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:868"
+    "mem_cache/unified_radix_cache.py:869"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ORPHAN_OWN_SLOTS",
@@ -71905,7 +71937,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 868,
+    "line": 869,
     "tree": "27b"
    },
    "status": "harvested",
@@ -73482,7 +73514,7 @@
    "id": "FLLIPER_PDFLIP_PREFETCH_FROM_ANCHOR",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1823"
+    "managers/scheduler.py:1824"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFETCH_FROM_ANCHOR",
@@ -73491,7 +73523,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1823,
+    "line": 1824,
     "tree": "27b"
    },
    "status": "harvested",
@@ -73543,7 +73575,7 @@
    "id": "FLLIPER_PDFLIP_PREFETCH_STALL_PASSES",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:10071"
+    "managers/scheduler.py:10141"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFETCH_STALL_PASSES",
@@ -73552,7 +73584,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 10071,
+    "line": 10141,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -73575,7 +73607,7 @@
    "id": "FLLIPER_PDFLIP_PREFETCH_STALL_S",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:862"
+    "managers/scheduler.py:863"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFETCH_STALL_S",
@@ -73584,7 +73616,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 862,
+    "line": 863,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -75270,8 +75302,8 @@
    "id": "FLLIPER_PDFLIP_QUIESCE_EMPTY_CACHE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1999",
-    "managers/scheduler.py:2003"
+    "managers/scheduler.py:2000",
+    "managers/scheduler.py:2004"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_QUIESCE_EMPTY_CACHE",
@@ -75280,7 +75312,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1999,
+    "line": 2000,
     "tree": "27b"
    },
    "status": "harvested",
@@ -75805,7 +75837,7 @@
    "id": "FLLIPER_PDFLIP_RELEASE_DRAIN_CAP",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:756"
+    "mem_cache/unified_radix_cache.py:757"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RELEASE_DRAIN_CAP",
@@ -75814,7 +75846,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 756,
+    "line": 757,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -75837,8 +75869,8 @@
    "id": "FLLIPER_PDFLIP_RELEASE_FLUSH_DEDUP",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:2056",
-    "managers/scheduler.py:2097"
+    "managers/scheduler.py:2112",
+    "managers/scheduler.py:2153"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RELEASE_FLUSH_DEDUP",
@@ -75847,7 +75879,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 2056,
+    "line": 2112,
     "tree": "27b"
    },
    "status": "harvested",
@@ -75899,7 +75931,7 @@
    "id": "FLLIPER_PDFLIP_RESET_CENSUS_DEFER_S",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:849"
+    "mem_cache/unified_radix_cache.py:850"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_RESET_CENSUS_DEFER_S",
@@ -75908,7 +75940,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 849,
+    "line": 850,
     "tree": "27b"
    },
    "status": "harvested",
@@ -76459,7 +76491,7 @@
    "id": "FLLIPER_PDFLIP_S64_DENSE_PRESENCE_FULL_SPAN",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:124"
+    "managers/cache_controller.py:125"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_S64_DENSE_PRESENCE_FULL_SPAN",
@@ -76468,7 +76500,7 @@
    "source": {
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 124,
+    "line": 125,
     "tree": "27b"
    },
    "status": "harvested",
@@ -76553,7 +76585,7 @@
    "id": "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:759"
+    "managers/scheduler.py:760"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH",
@@ -76562,7 +76594,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 759,
+    "line": 760,
     "tree": "27b"
    },
    "status": "harvested",
@@ -78037,7 +78069,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7996"
+    "mem_cache/unified_radix_cache.py:8003"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -78046,7 +78078,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7996,
+    "line": 8003,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -78161,7 +78193,7 @@
    "id": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1736"
+    "managers/scheduler.py:1737"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_ARM_FROM_ANCHOR",
@@ -78170,7 +78202,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1736,
+    "line": 1737,
     "tree": "nf"
    },
    "status": "harvested",
@@ -78347,7 +78379,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1062"
+    "managers/scheduler.py:1063"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
@@ -78356,7 +78388,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1062,
+    "line": 1063,
     "tree": "27b"
    },
    "status": "harvested",
@@ -78375,7 +78407,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1085
+      "line": 1086
      }
     },
     "nf": {
@@ -78384,7 +78416,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1013
+      "line": 1014
      }
     }
    },
@@ -78399,7 +78431,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_MAX_CYCLES",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1085"
+    "managers/scheduler.py:1086"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_MAX_CYCLES",
@@ -78408,7 +78440,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1085,
+    "line": 1086,
     "tree": "27b"
    },
    "status": "harvested",
@@ -78460,7 +78492,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_TAIL_X",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1025",
+    "managers/scheduler.py:1026",
     "pdflip/launcher.py:4344"
    ],
    "level": "expert",
@@ -78470,7 +78502,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1025,
+    "line": 1026,
     "tree": "27b"
    },
    "status": "harvested",
@@ -78559,7 +78591,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:10439"
+    "mem_cache/unified_radix_cache.py:10446"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -78568,7 +78600,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 10439,
+    "line": 10446,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -80689,7 +80721,7 @@
    "id": "FLLIPER_PDFLIP_VISION",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:5367",
+    "managers/scheduler.py:5423",
     "managers/tokenizer_manager.py:515",
     "pdflip/vision_stage_service.py:832"
    ],
@@ -80700,7 +80732,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 5367,
+    "line": 5423,
     "tree": "27b"
    },
    "status": "harvested",
@@ -82349,7 +82381,7 @@
    "id": "FLLIPER_PDFLIP_WAKE_SHORT_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:1136"
+    "managers/scheduler.py:1137"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_WAKE_SHORT_DECIDE",
@@ -82358,7 +82390,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 1136,
+    "line": 1137,
     "tree": "27b"
    },
    "status": "harvested",
@@ -91826,7 +91858,7 @@
    "id": "FLLIPER_TP_HEAD_CONGRUENCE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:12606"
+    "managers/scheduler.py:12676"
    ],
    "level": "expert",
    "name": "FLLIPER_TP_HEAD_CONGRUENCE",
@@ -91835,7 +91867,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 12606,
+    "line": 12676,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -94687,28 +94719,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2999,
-  "envs": 2120,
+  "entries": 3000,
+  "envs": 2121,
   "explained": 310,
   "flags": 864,
-  "harvested": 1856,
+  "harvested": 1857,
   "trees": {
    "abweichung": 31,
-   "beide": 2722,
+   "beide": 2723,
    "nur_27b": 235,
    "nur_nf": 24
   },
   "unexplained": 708
  },
- "tree_rev": "27b=f89b51d054+nf=3955ba9b03",
+ "tree_rev": "27b=ec7368e073+nf=c1d86ea06b",
  "trees": {
   "27b": {
-   "entries": 2957,
-   "rev": "f89b51d054"
+   "entries": 2958,
+   "rev": "ec7368e073"
   },
   "nf": {
-   "entries": 2746,
-   "rev": "3955ba9b03"
+   "entries": 2747,
+   "rev": "c1d86ea06b"
   }
  },
  "warnungen": []
