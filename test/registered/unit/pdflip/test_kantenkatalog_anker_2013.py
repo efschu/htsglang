@@ -101,10 +101,10 @@ class ResolveAnchor(unittest.TestCase):
 
 
 class ResolveEdges(unittest.TestCase):
-    def test_real_tree_resolves_all_139(self):
-        """All 139 edges, resolved against this tree as its own line: every one resolves, except the edges that name only the OTHER line."""
+    def test_real_tree_resolves_all_140(self):
+        """All 140 edges (K140 PARK-REARM-1024), resolved against this tree as its own line: every one resolves, except the edges that name only the OTHER line."""
         res = PC.resolve_edge_evidence_items(KANTEN_ALLE, REPO_ROOT, TREE)
-        self.assertEqual(len(res), 139)
+        self.assertEqual(len(res), 140)
         self.assertEqual(problems(res), {})
         for i, r in res.items():
             self.assertIn(r["status"], PC.ANCHOR_OK + PC.ANKER_FREMD + ("extern_fehlt",), i)

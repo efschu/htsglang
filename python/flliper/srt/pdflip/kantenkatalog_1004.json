@@ -419,6 +419,9 @@
      "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 1100, "anchor": "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS = EnvInt(0)"}, "trees": ["nf"]},
     {"id": "K139", "von": "FLLIPER_PDFLIP_PRIO_AS_AGE", "nach": "FLLIPER_PDFLIP_LANES", "rel": "requires", "calc": "text", "value": null,
      "satz": "Priority as age (default on) acts only with FLLIPER_PDFLIP_LANES=1: without the lane switch the front does not read 'priority', so there is nothing to order by and the value does nothing (prio_age.enabled = lanes AND prio_as_age).",
-     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 1201, "anchor": "FLLIPER_PDFLIP_PRIO_AS_AGE = EnvBool(True)"}, "trees": ["nf"]}
+     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 1201, "anchor": "FLLIPER_PDFLIP_PRIO_AS_AGE = EnvBool(True)"}, "trees": ["nf"]},
+    {"id": "K140", "von": "FLLIPER_PDFLIP_PARK_ANCHOR_REARM", "nach": "FLLIPER_PDFLIP_PARK_END_ANCHOR_FIRST", "rel": "requires", "calc": "text", "value": null,
+     "satz": "The re-arm of refused park anchors (default on) acts only on the chains PARK-END-ANCHOR-FIRST marks: without it no park END node is marked and no chain intermediate is dropped KV-only, so there is nothing to re-arm -- what it brings is the resume anchor backed late on every rank instead of lost at the reset; what it costs is one small group collective per group-verdict flush, a few more when a park anchor waits.",
+     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 3226, "anchor": "FLLIPER_PDFLIP_PARK_ANCHOR_REARM = EnvBool(True)"}}
   ]
 }
