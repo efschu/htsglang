@@ -83,7 +83,18 @@ _STATE: Dict[str, Any] = {
     # VRAM-Vertrag M2: the largest batch (seats n) a window saw -- an int
     # compare per forward, the window end hands it to pdflip/vram_actual
     "seats": 0,
+    # DUAL-GRANT-1024: the largest transient (peak_allocated - start_allocated) of a
+    # chunk or round window of THIS process -- the boot's own measurement of its form,
+    # read by the dual card ledger's law (dual_p_kv_stage.card_law)
+    "transient_max": 0,
+    "transient_max_phase": "",
 }
+
+
+def measured_transient():
+    """(bytes, phase) of the largest chunk/round transient this process measured so far; (0, '') before
+    the first window."""
+    return int(_STATE.get("transient_max") or 0), str(_STATE.get("transient_max_phase") or "")
 
 #: H59: the two cumulative allocator counters the line reports as a delta per
 #: window. ``num_alloc_retries`` counts ``release_cached_blocks`` + retry in
@@ -227,6 +238,9 @@ def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time, *,
         f"alloc_retries_total={'na' if retries is None else retries}"
     )
     logger.info(line)
+    if phase in ("chunk", "round") and start_alloc is not None and pa - int(start_alloc) > int(_STATE["transient_max"]):
+        _STATE["transient_max"] = int(pa - int(start_alloc))
+        _STATE["transient_max_phase"] = phase
     seats = int(_STATE.get("seats") or 0)
     _STATE["seats"] = 0
     from flliper.srt.pdflip import vram_actual

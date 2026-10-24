@@ -418,70 +418,176 @@ PHYS_CHECK_S = 10.0
 PHYS_BOOK_AFTER = 3
 
 
-def law_floor_bytes(group: str) -> int:
-    """DUAL-GRANT-1024: this card's MEASURED corridor transient in bytes (the
-    law the CORRIDOR LAW BREACHED line grades against), or a hand-set law
-    (``FLLIPER_CORRIDOR_LAW_FLOOR_MIB``). An unmeasured fallback 1024, no card,
-    or no guard answers 0: it grades and refuses elsewhere, it never spends KV
-    pool here (``CorridorFloor.actuates``, the guard's own rule).
+#: DUAL-GRANT-1024: per-card sidecar of the ledger -- each group's own measured transient
+LAW_SUFFIX = ".law"
+#: the loud line of a card whose law is 0 (nothing measured on it yet), once per process and card
+LAW_ZERO_MARK = "LEDGER-PHYS law=0"
+#: the loud line of a law that makes P's top grant infeasible even with D at zero
+LAW_INFEASIBLE_MARK = "LEDGER-PHYS LAW MAKES FULL CONTEXT INFEASIBLE"
 
-    The USER RESERVE is NOT part of it: house rule 19.09. ("Reserven NIE"),
-    and where an arm still passes ``--user-reserve-mib`` the launcher prices it
-    in the plan already. This prices a measured transient, it reserves
-    nothing: the ledger is the ONE place that hands the card's bytes to KV,
-    and a full commit of it must leave the card at its law, never at 0.
 
-    Metal 27B NVFP4 dual boot_..._1ecda02a58_1024_115913 (5090, PP0 law 1055 =
-    MEASURED-P transient, TP0 law 767 = MEASURED-D): LEDGER-PHYS gap
-    phys_free - ledger_free 9938 -> 3440 -> 618 -> 102 -> 14 -> 0 MiB while
-    P's and D's torch caches grew (P reserved 16190 -> 17726, D 28286 -> 29404
-    MiB), then held at 0 by OVER-PROMISE bookings (12:10:35 123600896 B, ...).
-    The 12:08:43 grant of pdflip-0-20 (2231369728 B on ledger free 2281701376)
-    left the card at 64/62 MiB; nothing booked it, because the ledger never
-    promised MORE than the card had -- it promised all of it."""
+def _own_transient():
+    """(bytes, phase) of the largest chunk/round transient THIS process measured
+    (vram_peak_window, the PDFLIP-VRAM-PEAK windows); (0, '') when unmeasured."""
     try:
-        from flliper.srt.managers import corridor_guard as _cg
+        from flliper.srt.model_executor import vram_peak_window as _vpw
 
-        fl = _cg.corridor_floor_for_current_device(group=group)
-    except Exception:  # noqa: BLE001 -- no guard, no floor term (the old check stands)
-        return 0
-    if not str(getattr(fl, "card_uuid", "") or ""):
-        return 0
-    if not (bool(getattr(fl, "measured", False))
-            or str(getattr(fl, "source", "")) == str(getattr(_cg, "FLOOR_SOURCE_ENV", "ENV-OVERRIDE"))):
-        return 0
-    return max(0, int(getattr(fl, "transient_mib", 0) or 0)) << 20
+        return _vpw.measured_transient()
+    except Exception:  # noqa: BLE001 -- no instrument, no law term (the old check stands)
+        return 0, ""
+
+
+def card_law(led, group: str):
+    """DUAL-GRANT-1024: ONE law per card -- the max over both groups of the
+    transient each MEASURED in THIS boot, in THIS form (the PDFLIP-VRAM-PEAK
+    chunk/round windows of the group's rank on this card). Returns
+    (bytes, law_src). 0 while neither group has a window.
+
+    Why not the corridor guard's floor: its 'measured' seeds are the flip form's
+    (weg2sb5h 09.09., a 4096-row probe prefill, keyed by group, not by profile):
+    1055/767 MiB on the 5090, where this dual form chunks at most 1024 and D
+    prefills nothing at X=1 -- the boot measured P 273, D 380 MiB (review
+    dual-grant-1024 MUSS-1). The law here prices the boot's own transient; it
+    reserves nothing: the ledger is the ONE place that hands the card's bytes
+    to KV, and a full commit must leave the card at the transient its own
+    windows need, never at 0. No user reserve enters (house rule 19.09.); the
+    launcher's reserve only shapes the boot sizing, and at run time the caches
+    ate it in boot ..._1ecda02a58_1024_115913 (gap 9938 -> 0 MiB).
+
+    Each process max-merges its own group's value into ``<ledger>.law`` (flock),
+    and both groups' ticks read the same max -- the price does not depend on
+    which group ticked last (review pin 2)."""
+    import fcntl
+    import json
+
+    path = str(getattr(led, "path", "") or "")
+    own_b, own_phase = _own_transient()
+    if not path:
+        return int(own_b), ("boot-peak %s=%dMiB(%s)" % (group, own_b >> 20, own_phase or "-")) if own_b else "none"
+    law_path = path + LAW_SUFFIX
+    vals = {}
+    try:
+        fd = os.open(law_path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                with open(law_path) as f:
+                    vals = json.load(f) or {}
+            except (OSError, ValueError):
+                vals = {}
+            old = vals.get(group) or [0, ""]
+            if int(own_b) > int(old[0]):
+                vals[group] = [int(own_b), str(own_phase)]
+                tmp = "%s.%d.tmp" % (law_path, os.getpid())
+                with open(tmp, "w") as f:
+                    json.dump(vals, f)
+                os.replace(tmp, law_path)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    except OSError:
+        vals = {group: [int(own_b), str(own_phase)]}
+    best = 0
+    parts = []
+    for g in sorted(vals):
+        b, ph = int(vals[g][0]), str(vals[g][1])
+        best = max(best, b)
+        parts.append("%s=%dMiB(%s)" % (g, b >> 20, ph or "-"))
+    return best, ("boot-peak " + ",".join(parts)) if best else "none"
+
+
+def _p_top_need(actor, led) -> Optional[int]:
+    """Bytes P's TOP grant asks of this card (the stage table's last level), or None when unknown.
+    The P actor has its own table; D reads P's published stage file for this ledger (cached)."""
+    if hasattr(actor, "bytes_for") and hasattr(actor, "top") and getattr(led, "group", "") == "P":
+        try:
+            return int(actor.bytes_for(int(actor.top)) - actor.bytes_for(0))
+        except Exception:  # noqa: BLE001
+            return None
+    cached = getattr(actor, "_p_top_need", None)
+    if cached is not None:
+        return int(cached)
+    import glob
+    import json
+
+    for fn in glob.glob("/dev/shm/wkvs-*-pp*.json"):
+        try:
+            with open(fn) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if str(d.get("ledger", "")) == str(getattr(led, "path", "")) and d.get("bytes"):
+            actor._p_top_need = int(d["bytes"][-1])
+            return int(actor._p_top_need)
+    return None
+
+
+def _law_feasibility(actor, led, law: int, law_src: str) -> None:
+    """MUSS-2: a law that makes P's top grant infeasible EVEN WITH D AT ZERO is
+    said once, loudly, with the numbers -- never a silent backoff wedge. Which
+    wins (full context, user order 06.10., or the near-OOM rule) is the user's
+    call; nothing here decides it."""
+    if getattr(actor, "_law_infeasible_said", False) or law <= 0:
+        return
+    need = _p_top_need(actor, led)
+    if need is None:
+        return
+    from flliper.srt.pdflip.card_kv_ledger import peek
+
+    st = peek(getattr(led, "path", ""))
+    if st is None:
+        return
+    pool = int(st.budget)
+    if need > pool:
+        actor._law_infeasible_said = True
+        booked = int(getattr(actor, "_law_booked", 0) or 0)
+        logger.error("%s %s card=%s law=%d law_src=%s pool=%d need_top=%d pool_without_law_booking=%d: P's top "
+                     "grant cannot be met even with D at zero -- the full-context vs near-OOM trade is the "
+                     "user's decision", MARK, LAW_INFEASIBLE_MARK, os.path.basename(str(getattr(led, "path", ""))),
+                     int(law), law_src, pool, int(need), pool + booked)
 
 
 def phys_check(actor, group: str) -> None:
     """Throttled instrument (operator order after dual14): the ledger's free
     bytes against the card's physical free bytes. OVER-PROMISE = the ledger
     would grant bytes the card does not have (dual14: budget counted twice),
-    or bytes the card only has UNDER its actuating corridor law (DUAL-GRANT-1024:
-    ``phys`` is the free bytes ABOVE the law, ``law_floor_bytes``)."""
+    or bytes the card only has UNDER the card's law (DUAL-GRANT-1024,
+    ``card_law``: the boot's own measured transient, max over both groups).
+    The two parts are booked in ONE reconcile and logged apart: the card-use
+    part as ``BOOKED ... of unbooked card use`` (budget_rest's ALLOC-CACHE
+    record reads only that), the law part as ``LAW-BOOKED``."""
     t = _now()
     if t < getattr(actor, "_phys_next", 0.0):
         return
     actor._phys_next = t + PHYS_CHECK_S
     led = getattr(actor, "ledger", None)
     path = getattr(led, "path", None)
-    phys_raw = phys_free_bytes()
-    if not path or phys_raw is None:
+    phys1 = phys_free_bytes()
+    if not path or phys1 is None:
         return
     from flliper.srt.pdflip.card_kv_ledger import peek
 
     st = peek(path)
     if st is None:
         return
-    law = law_floor_bytes(group)
+    # SOLL-2: a release that lands between the two readings (decommit, then ledger.release) would read as a
+    # phantom over-promise of its size; the larger reading after the peek closes that (a grant in between
+    # only under-reads the over -- the safe side)
+    phys2 = phys_free_bytes()
+    phys_raw = max(int(phys1), int(phys2)) if phys2 is not None else int(phys1)
+    law, law_src = card_law(led, group)
+    if law <= 0 and not getattr(actor, "_law_zero_said", False):
+        actor._law_zero_said = True
+        logger.warning("%s %s (unmeasured: no chunk/round window of either group on card %s yet): this card can "
+                       "be committed to 0 until one is", MARK, LAW_ZERO_MARK, os.path.basename(str(path)))
     phys = max(0, int(phys_raw) - int(law))
     over = int(st.free) - int(phys)
     win = actor.__dict__.setdefault("_phys_over", [])
     if over > 0:
         win.append(over)
         logger.warning("%s LEDGER-PHYS OVER-PROMISE by %d B group=%s ledger_free=%d phys_free=%d budget=%d "
-                       "committed=%s law=%d", MARK, over, group, int(st.free), int(phys_raw), int(st.budget),
-                       dict(st.committed), int(law))
+                       "committed=%s law=%d law_src=%s", MARK, over, group, int(st.free), int(phys_raw),
+                       int(st.budget), dict(st.committed), int(law), law_src)
         if len(win) >= PHYS_BOOK_AFTER:
             # metal dual15: 628359168 B of card use outside the KV pools stood
             # for minutes. Persistent = real.
@@ -493,13 +599,24 @@ def phys_check(actor, group: str) -> None:
             n = led.reconcile(phys, cap=over)
             win.clear()
             if n > 0:
-                logger.warning("%s LEDGER-PHYS BOOKED %d B of unbooked card use into the budget (group=%s, "
-                               "%d checks over %.0f s)", MARK, n, group, PHYS_BOOK_AFTER,
-                               PHYS_BOOK_AFTER * PHYS_CHECK_S)
+                use = min(int(n), max(0, int(st.free) - int(phys_raw)))       # the card-use part
+                lawn = int(n) - use                                           # the law part
+                if use > 0:
+                    logger.warning("%s LEDGER-PHYS BOOKED %d B of unbooked card use into the budget (group=%s, "
+                                   "%d checks over %.0f s)", MARK, use, group, PHYS_BOOK_AFTER,
+                                   PHYS_BOOK_AFTER * PHYS_CHECK_S)
+                if lawn > 0:
+                    actor._law_booked = int(getattr(actor, "_law_booked", 0) or 0) + lawn
+                    logger.warning("%s LEDGER-PHYS LAW-BOOKED %d B (group=%s law=%d law_src=%s): the card's free "
+                                   "bytes above its measured transient, not card use", MARK, lawn, group,
+                                   int(law), law_src)
+                _law_feasibility(actor, led, law, law_src)
     else:
         win.clear()
-        logger.info("%s LEDGER-PHYS ok group=%s ledger_free=%d phys_free=%d budget=%d committed=%s law=%d", MARK,
-                    group, int(st.free), int(phys_raw), int(st.budget), dict(st.committed), int(law))
+        logger.info("%s LEDGER-PHYS ok group=%s ledger_free=%d phys_free=%d budget=%d committed=%s law=%d "
+                    "law_src=%s", MARK, group, int(st.free), int(phys_raw), int(st.budget), dict(st.committed),
+                    int(law), law_src)
+        _law_feasibility(actor, led, law, law_src)
 
 
 # -- wiring (P process, dual only) -------------------------------------------
@@ -1092,6 +1209,13 @@ def pp0_grant(sched, req) -> Optional[int]:
         waited = _wait_granted(rid)
         logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
                     (" after %d waits over %.1f s" % waited) if waited else "")
+        if waited:
+            _BOOT_WAIT["n"] += 1
+            _BOOT_WAIT["sum"] += float(waited[1])
+            _BOOT_WAIT["max"] = max(_BOOT_WAIT["max"], float(waited[1]))
+            logger.info("%s %s grants_waited=%d wait_s_sum=%.1f wait_s_max=%.1f infeasible_rids=%d (cumulative "
+                        "this boot; the price of the card law is read here)", MARK, BOOT_WAIT_MARK,
+                        _BOOT_WAIT["n"], _BOOT_WAIT["sum"], _BOOT_WAIT["max"], len(_BOOT_INFEASIBLE))
     else:
         _lv = min(tokens, int(stages[0]["top"])) if stages else tokens
         if _dpar.head_bypass_floor_armed():
@@ -1118,6 +1242,10 @@ def pp0_grant(sched, req) -> Optional[int]:
 #: rid -> [first_t, next_t, interval_s, waits, suppressed]
 _WAITS: dict = {}
 _CENSUS = {"next": 0.0, "iv": 1.0, "waits": 0}
+#: DUAL-GRANT-1024 SOLL-4: the boot's P card-wait census (cumulative, one line per waited grant)
+_BOOT_WAIT = {"n": 0, "sum": 0.0, "max": 0.0}
+_BOOT_INFEASIBLE: set = set()
+BOOT_WAIT_MARK = "P-KV-WAIT BOOT-CENSUS"
 
 
 def _now() -> float:
@@ -1160,6 +1288,8 @@ def _log_wait(rid: str, tokens: int, detail=None, infeasible=None) -> None:
             try:
                 _line = infeasible()
                 if _line:
+                    if len(_BOOT_INFEASIBLE) < 65536:
+                        _BOOT_INFEASIBLE.add(str(rid))
                     logger.info("#1640 GRANT-INFEASIBLE %s", _line)
             except Exception:  # noqa: BLE001 -- a log line never reaches the round
                 pass

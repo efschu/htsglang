@@ -34,8 +34,9 @@ L_JOIN = ("[2026-10-24 12:01:43 PP0] DUAL-TP3PP3 P-KV JOIN card=e773fd938f6d boo
           "contributed=1379926016 B top=266240 tokens step=4096 -- P keeps 0 mapped; its KV is the card pool's")
 L_SHORT = ("[2026-10-24 12:08:38 PP0] #1530 GRANT-SHORT rid=pdflip-0-20 tokens=154149 level=154149 sum=154149 "
            "older=0 hold=none cards=[0:need=2231369728,have=2214592512,P=0,D=2684354560,demD=0,presP=0")
-#: the CORRIDOR-FLOOR laws of card 0 (front lines of the same boot): P 1055 MEASURED-P, D 767 MEASURED-D
-LAW_P, LAW_D = 1055, 767
+#: card 0's law after review MUSS-1: the boot's OWN measured transients (PDFLIP-VRAM-PEAK, P.log 12:19:50 PP0
+#: chunk transient_mib=273, D.log 12:06:49 TP0 round transient_mib=380), no longer the flip-form seeds 1055/767
+LAW_P, LAW_D = 273, 380
 
 
 def _i(pat, line):
@@ -76,6 +77,8 @@ def _checks(monkeypatch, led, phys, floor, n=S.PHYS_BOOK_AFTER):
     monkeypatch.setattr(S, "_now", lambda: clock[0])
     monkeypatch.setattr(S, "phys_free_bytes", lambda: int(phys))
     monkeypatch.setattr(CG, "corridor_floor_for_current_device", lambda group=None, **_k: floor)
+    # the law's source is this process's own measurement now (dual_p_kv_stage.card_law)
+    monkeypatch.setattr(S, "_own_transient", lambda: (int(floor.transient_mib) << 20, "chunk"))
     for _ in range(n):
         S.phys_check(actor, led.group)
         clock[0] += S.PHYS_CHECK_S
