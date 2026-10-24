@@ -7183,14 +7183,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # stage, dual D would log peer_replicas defect=1. Off on dual: the AUX-HOST-LAW branch answers 0 as before
             # the merge. Launch env, set on every rank of both dual groups (rank-uniform).
             return 0
-        if not UnifiedRadixCache._s109r_rank_alone(self):
-            # a TP group whose peers hold mamba replicas: a rank-local device slot (and the eviction behind it) would
-            # leave the tombstone sets unequal (#639b) -- named, not taken
-            return self._s109r_note(req, depth, "peer_replicas", 0)
         last_hash = node.get_last_hash_value() if callable(getattr(node, "get_last_hash_value", None)) else None
         held = UnifiedRadixCache._s109r_anchor_held(self, last_hash)
         written = last_hash is not None and last_hash in (self.__dict__.get("_s109r_written") or ())
         extra = "held=%s written_here=%d" % ("-" if held is None else int(bool(held)), int(written))
+        if not UnifiedRadixCache._s109r_rank_alone(self):
+            # a TP group whose peers hold mamba replicas: a rank-local device slot (and the eviction behind it) would
+            # leave the tombstone sets unequal (#639b) -- named, not taken. S109R-PEER (27B rc35i4ar3 boot
+            # 1024_003732): the refusal is a defect only where an anchor existed to be refused (memory-only probe,
+            # no read, no collective -- every rank answers for its own index).
+            return self._s109r_note(req, depth, UnifiedRadixCache._s109r_peer_class(node, held, written), 0, extra)
         # the read is attempted whatever ``held`` says (an index gap must never cost tokens); ``held`` only names a miss
 
         def _note(req_, depth_, how, got=0):
@@ -7249,6 +7251,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return "branch_point_never_anchored"
         return "store_miss_unsecured"
 
+    @staticmethod
+    def _s109r_peer_class(node, held=None, written: bool = False) -> str:
+        """S109R-PEER (27B rc35i4ar3 fe572f3224, boot 1024_003732, D TP2 without Form A): what a peer-replica refusal
+        cost. METAL: 41 cases ``how=peer_replicas attached=0 defect=1`` on TP0 and TP1 (pdflip-1-11 depth=18139, ...)
+        -- none of the 41 depths is one at which the boot wrote, saved, secured or lost a state (D and P), no S109c
+        spill in the whole boot, every e1 host probe of the boot ``held=0``: the depths are KV-walk ends (prompt
+        divergence points, sequence tails), no tier ever held an anchor there, and the line still said defect=1.
+
+        ``peer_replicas`` (defect) = an anchor existed and the group form refused it: the index holds the key
+        (``held`` True), the node was released with its copy proven (``pdflip_anchor_secured``), or this rank wrote
+        it in this boot -- or the index cannot tell (``held`` None: an unanswerable index never hides a loss).
+        ``peer_replicas_unanchored`` = the index answers no and nothing says the anchor ever existed: the refusal
+        cost nothing, the tokens past the last state are the walk's own."""
+        if held is True or held is None or bool(getattr(node, "pdflip_anchor_secured", False)) or written:
+            return "peer_replicas"
+        return "peer_replicas_unanchored"
+
     def _s109r_rank_alone(self) -> bool:
         """S109R: True where no peer holds a mamba replica of this tree -- TP0 of a Form A group (the workers hold no
         recurrent state, K23 host role) or the local-PP floor (a TP group of one). The forms S109c runs on."""
@@ -7263,7 +7282,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return bool(_hos.form_a_host(self))
 
     #: S109R-MISS: the refusals the monitor counts as tokens recomputed although a secured anchor existed
-    #: (the same set as the monitor's S109R_VERMEIDBAR, deskq/wacht/nf_scharf.py)
+    #: (the same set as the monitor's S109R_VERMEIDBAR, deskq/wacht/nf_scharf.py); ``peer_replicas_unanchored``
+    #: (S109R-PEER, :meth:`_s109r_peer_class`) is deliberately NOT in it
     S109R_DEFECT_HOWS = ("store_miss", "held_unread", "copy_failed", "no_device_slot", "node_changed",
                          "peer_replicas")
 
@@ -7277,8 +7297,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.info("S109R ANCHOR-DEVICE-READ n=%d rid=%s depth=%d how=%s attached=%d defect=%d%s (a device-KV node "
                         "without a host copy and without a state at the hit: its mamba anchor is read from the store "
                         "into a device mamba slot instead of recomputing from the last state; defect=1 only where a "
-                        "secured anchor was not served -- branch_point_never_anchored / store_miss_unsecured had no "
-                        "anchor on any tier)",
+                        "secured anchor was not served -- branch_point_never_anchored / store_miss_unsecured / "
+                        "peer_replicas_unanchored had no anchor on any tier)",
                         n, getattr(req, "rid", "?"), int(depth), how, int(bool(got)), int(defect),
                         (" " + extra) if extra else "")
         return int(got)
