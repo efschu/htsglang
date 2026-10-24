@@ -14279,51 +14279,66 @@ class Front:
             "R6 commit pending: D fixed the next chunk of %s, its exact rest follows with that chunk's start record (was %s: "
             "%s)" % (",".join(sorted(pend)[:4]), sv.verdict, sv.why), sv.left_s, sv.s_tokens, sv.half_x)
 
-    def _r6_hold_d_free(self, sv: "phase_policy.SetVerdict", x_tok: int, site: str) -> bool:
-        """#200 (SOLL R3 + R8 against R6/R6k, R11): True = a D verdict (``D_AFTER_TIMER``) is final AT ONCE although an R6 piece is
-        pending (a COMMITTED chunk, ``_r6_commit_hold``; an R6 stop D has not applied, ``_r6_halt_hold``), because even the MOST
-        those pieces can still add cannot lift S to X.
+    def _r6_hold_d_free(self, sv: "phase_policy.SetVerdict", x_tok: int, site: str, *, gu: int = 0, decoding: bool = True,
+                        r2_only: bool = False) -> bool:
+        """#200 (SOLL R3 + R8 against R6/R6k, R7, R11): True = a D verdict (``D_AFTER_TIMER``) is final AT ONCE although an R6 piece
+        is pending (a COMMITTED chunk, ``_r6_commit_hold``; on NF also an R6 stop D has not applied, ``_r6_halt_hold``), because no
+        record of D can change it.
 
         R3 "Läuft T_halb ab mit S < X: das Set wird auf D prefillt. Kein Flip." / R8 "D bei S < X" -- the hold exists only for R6
         "wächst S (inkl. des laufenden Rests) über X": a pending piece's exact rest is unknown, so a D verdict could hide an R6
         case. Its upper bound IS known (no estimate, user 19.10. "NICHTS SCHÄTZEN"): a COMMITTED chunk adds at most D's rest
-        (free <= rest), a stopped prefill at most the free it was counted with at the stop (D can only launch more, never take a
-        launch back; R1u's shared piece only lowers it). S + sum(bounds) < X -> no outcome of D's record makes S >= X: R6 cannot
-        apply, holding the set is waiting R3 forbids (live risk: up to ``R6_HALT_STALE_S`` = 30 s when D writes no halt record).
-        S + sum(bounds) >= X (or no X / a bound not known) -> R6 may still apply: the holds stand as before. A pending stop is
-        not released by this (it goes back to D on D's own record: ``_r6_halt_tick`` / ``_r6_halt_settle``, R7). Only D verdicts:
-        a flip verdict is never changed here (R1a/R6 carry rules unchanged)."""
+        (free <= rest); a stopped prefill at most D's REST AT THE STOP (``bound`` = counted free + the chunk in flight, review
+        A1: a discarding halt loses the in-flight chunk, the halted free then exceeds the counted one; ``_r6_halt_refresh``
+        names a halted free above the bound). Released only when
+          S + sum(bounds) < X                       (R6 cannot apply; S = X would flip by R3, so ">=" holds), and
+          not decoding or gu == 0 or S + sum(bounds) + gu <= X   (review A2: the S49 X-SUM hold of phase_policy -- granted D
+                                                    prefills D has not begun, ``gu`` -- would hold the verdict made again on
+                                                    D's record; D never prefills over X; R8 without decode is never held).
+        ``r2_only`` (review S1, SOLL R2): "R2 kurz only: no set member" -- no member, S stays 0 whatever D records: R6 can never
+        apply, the kurz requests go to D at once. A missing bound / X keeps the hold (named). Only D verdicts: a flip verdict is
+        never changed here (R1a/R6 carry rules unchanged). A pending stop goes back to D on D's own record (R7)."""
         if sv.verdict != phase_policy.V_D_AFTER_TIMER:
             return False
         commit = self.__dict__.get("_r6_commit_now") or {}
         pend = self.__dict__.get("_r6_halt_pending") or set()
         if not commit and not pend:
             return False                      # nothing would hold
+        if r2_only and int(sv.s_tokens) == 0:
+            self.counters["set_r6_hold_d_free"] += 1
+            self.counters["set_r6_hold_d_free_r2"] += 1
+            return True
         try:
             x = int(x_tok)
             if not isinstance(commit, dict):
-                return False                  # no per-piece rest known: the hold stands
+                raise TypeError("no per-piece rest")
             halts = self.__dict__.get("_r6_halt") or {}
             b_commit = sum(max(0, int(v)) for v in commit.values())
             b_halt = 0
             for rid in pend:
-                c = (halts.get(rid) or {}).get("counted")
-                if c is None:
-                    return False              # a stop without its counted free: the hold stands
-                b_halt += max(0, int(c))
+                b = (halts.get(rid) or {}).get("bound")
+                if b is None:
+                    raise TypeError("stop without bound")
+                b_halt += max(0, int(b))
             s = int(sv.s_tokens)
+            g = max(0, int(gu or 0))
         except (TypeError, ValueError):
+            self.counters["r6_hold_d_free_nobound"] += 1   # review N1: the hold stands, named by its counter
             return False
         if x <= 0 or s + b_commit + b_halt >= x:
-            return False                      # R6 may still apply: the holds decide as before
+            return False                      # R6 (or R3 at S = X) may still apply: the holds decide as before
+        if decoding and g > 0 and s + b_commit + b_halt + g > x:
+            self.counters["r6_hold_d_free_xsum"] += 1      # review A2: S49 could hold the verdict on D's record
+            return False
         self.counters["set_r6_hold_d_free"] += 1
-        key = (self.epoch, s, x, tuple(sorted(commit)), tuple(sorted(pend)))
+        key = (self.epoch, s, x, g, tuple(sorted(commit)), tuple(sorted(pend)))
         if self.__dict__.get("_r6_hold_d_free_last") != key:
             self.__dict__["_r6_hold_d_free_last"] = key
-            logger.info("PDFLIP R6-HOLD-D-FREE site=%s S=%d commit_bound=%d halt_bound=%d X=%d commit=%s halt=%s epoch=%d -- the most "
-                        "the pending R6 piece(s) can still add cannot lift S to X: R6 cannot apply, the D verdict is final now "
-                        "(SOLL R3/R8 \"S < X: das Set wird auf D prefillt\"; R6 bound = D's rest / the counted free)", site, s,
-                        b_commit, b_halt, x, ",".join(sorted(commit)[:4]) or "-", ",".join(sorted(pend)[:4]) or "-", self.epoch)
+            logger.info("PDFLIP R6-HOLD-D-FREE site=%s S=%d commit_bound=%d halt_bound=%d X=%d gu=%d decoding=%d commit=%s halt=%s "
+                        "epoch=%d -- the most the pending R6 piece(s) can still add cannot lift S to X (nor S49's sum over X): R6 "
+                        "cannot apply, the D verdict is final now (SOLL R3/R8 \"S < X: das Set wird auf D prefillt\"; R6 bound = "
+                        "D's rest / D's rest at the stop)", site, s, b_commit, b_halt, x, g, int(bool(decoding)),
+                        ",".join(sorted(commit)[:4]) or "-", ",".join(sorted(pend)[:4]) or "-", self.epoch)
         return True
 
     def _r6k_clear_class(self, rid: str) -> None:
@@ -14803,6 +14818,7 @@ class Front:
         self.__dict__["_r6_counted"] = {}  # S56: only this reading's counted rows may be redirected
         self.__dict__["_r6_in_flight"] = {}
         self.__dict__["_r6_commit_now"] = {}  # #200: rid -> D's rest (the most a pending commit can add to S)
+        self.__dict__["_r6_halt_pending"] = set()  # #200 review N2: the NF halt state, reset alike (unify merge)
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
         # S56: a started row counts D's REAL rest, and only when the front redirects it to P (``_r6_tokens_of``)
@@ -15809,6 +15825,7 @@ class Front:
         running = Front._r1u_running(self, self._dc_carried_running(), members)
         members = Front._r1u_members(self, members)  # review A3: a member's share of a launched D chunk is not new
         unstarted = 0
+        _r2only = False   # #200 review S1
         if _fd.enabled():
             # EZ-S2a: ONE decision. S49's granted-not-started term is an INPUT of the verdict (NS:S49), not a second pass
             unstarted = _fd.granted_unstarted(
@@ -15827,6 +15844,7 @@ class Front:
             sv = _dec.verdict
             if members and not _dec.in_set:
                 # R2: nothing in it is halb/big (a SHORT whose exact u reads kurz): no set, D at once -- never a hold on nothing
+                _r2only = True
                 sv = phase_policy.SetVerdict(phase_policy.V_D_AFTER_TIMER, "R2 kurz only: no set member, D now (S=0)", 0.0, 0,
                                              sv.half_x)
             if unstarted > 0 and sv.verdict == phase_policy.V_COLLECT and sv.why.startswith("NS:S49"):
@@ -15839,15 +15857,25 @@ class Front:
                 d_prefill_running_uncached=running,  # R6: what D REALLY prefills right now counts into S (S49)
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
             sv = Front._set_xsum_hold(self, sv, x_tok, running, decoding=decoding)
+        # #200 review A2: the S49 term the verdict made again on D's record would weigh (decider: its input; else the X-SUM hold's)
+        _gu = unstarted if _fd.enabled() else (Front._xsum_unstarted(self, running)
+                                               if envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get() else 0)
         # R4OVER-1024 review A3: the R2 hold sees the POLICY verdict; the one-tick R6 commit hold (it can only ADD to S, never
         # turn a flip into a non-flip) sits behind it and never voids a held flip
         sv = Front._r2_kurz_grant_hold(self, sv, now, members=members)  # FLIPTIME-1023 SOLL R2 (+R4OVER-1024 frozen wait)
-        if not Front._r6_hold_d_free(self, sv, x_tok, "set"):  # #200 (SOLL R3/R8): a D verdict R6 cannot reach is not held
+        if not Front._r6_hold_d_free(self, sv, x_tok, "set", gu=_gu, decoding=decoding,
+                                     r2_only=_r2only):  # #200 (SOLL R3/R8, R2): a D verdict R6 cannot reach is not held
             sv = Front._r6_commit_hold(self, sv)  # review A1: no final verdict while a counted prefill's next chunk is COMMITTED
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
         return members, sv, kw
+
+    def _xsum_unstarted(self, running: int) -> int:
+        """S56/S49: the rows D has not begun, at their granted price (``running`` is D's rest of the started ones now); a kurz
+        grant is never part of it (SOLL R2 + R6k). The term of ``_set_xsum_hold`` and of #200's gate (review A2)."""
+        return max(0, Front._d_pf_pending_tokens(self, unstarted_only=True, skip_kurz=True)) if _dxb.enabled() \
+            else max(0, Front._d_pf_pending_tokens(self, skip_kurz=True) - int(running))
 
     def _set_xsum_hold(self, sv: "phase_policy.SetVerdict", x_tok: int, running: int,
                        decoding: bool = True) -> "phase_policy.SetVerdict":
@@ -15864,9 +15892,7 @@ class Front:
             return sv
         if not decoding:
             return sv
-        # S56: the rows D has not begun, at their granted price (``running`` is D's rest of the started ones now)
-        unstarted = max(0, Front._d_pf_pending_tokens(self, unstarted_only=True, skip_kurz=True)) if _dxb.enabled() \
-            else max(0, Front._d_pf_pending_tokens(self, skip_kurz=True) - int(running))
+        unstarted = Front._xsum_unstarted(self, running)
         if unstarted <= 0 or sv.s_tokens + unstarted <= int(x_tok):
             return sv
         self.counters["set_xsum_hold_unstarted"] += 1
@@ -16350,7 +16376,7 @@ class Front:
                                       d_prefill_running_uncached=_run, new_since_last=0,
                                       class_x_tokens=x_cls)
         sv = Front._r2_kurz_grant_hold(self, sv, now, members=members)  # FLIPTIME-1023 SOLL R2 (+R4OVER-1024)
-        if not Front._r6_hold_d_free(self, sv, x_tok, "queue-sum"):  # #200 (SOLL R3/R8)
+        if not Front._r6_hold_d_free(self, sv, x_tok, "queue-sum", decoding=decoding):  # #200 (SOLL R3/R8; no S49 here)
             sv = Front._r6_commit_hold(self, sv)  # review A1 (behind the R2 hold, R4OVER-1024 review A3)
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)

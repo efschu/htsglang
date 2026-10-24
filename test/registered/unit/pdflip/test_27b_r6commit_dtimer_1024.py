@@ -89,8 +89,51 @@ def test_gate_changes_d_verdicts_only_and_needs_every_bound():
     assert not F.Front._r6_hold_d_free(_bare(_r6_commit_now={"a": 1}), sv_d, 0, "t")
     assert not F.Front._r6_hold_d_free(_bare(_r6_commit_now={"a"}), sv_d, 6000, "t")
     assert not F.Front._r6_hold_d_free(_bare(), sv_d, 6000, "t")
-    assert not F.Front._r6_hold_d_free(_bare(_r6_halt_pending={"h"}, _r6_halt={"h": {}}), sv_d, 6000, "t")
-    o = _bare(_r6_commit_now={"a": 2000}, _r6_halt_pending={"h"}, _r6_halt={"h": {"counted": 3000}})
-    assert not F.Front._r6_hold_d_free(o, sv_d, 6000, "t")                 # 1000 + 2000 + 3000 = X: S may reach X (R6)
-    o = _bare(_r6_commit_now={"a": 2000}, _r6_halt_pending={"h"}, _r6_halt={"h": {"counted": 2999}})
+    o = _bare(_r6_halt_pending={"h"}, _r6_halt={"h": {"counted": 10}})       # review A1: no bound (only counted) -> hold, named
+    assert not F.Front._r6_hold_d_free(o, sv_d, 6000, "t") and o.counters["r6_hold_d_free_nobound"] == 1
+    o = _bare(_r6_commit_now={"a": 2000}, _r6_halt_pending={"h"}, _r6_halt={"h": {"bound": 3000, "counted": 10}})
+    assert not F.Front._r6_hold_d_free(o, sv_d, 6000, "t")                 # 1000 + 2000 + 3000 = X: S may reach X (R6/R3)
+    o = _bare(_r6_commit_now={"a": 2000}, _r6_halt_pending={"h"}, _r6_halt={"h": {"bound": 2999, "counted": 10}})
     assert F.Front._r6_hold_d_free(o, sv_d, 6000, "t") and o.counters["set_r6_hold_d_free"] == 1
+
+
+def test_review_a2_s49_term_in_the_gate():
+    """Review A2 (S49 X-SUM, phase_policy ``_d_verdict``): released only when S + bounds + gu <= X while D decodes; R8 (no decode)
+    and gu = 0 ignore the term. 48-687: 4584 + 784 = 5368, gu 1000 -> 6368 > 6114 held; gu 746 -> 6114 <= X released."""
+    sv_d = PP.SetVerdict(PP.V_D_AFTER_TIMER, "R3 T_halb over", 0.0, U48, 3057)
+    assert not F.Front._r6_hold_d_free(_bare(_r6_commit_now={"c": 784}), sv_d, X48, "t", gu=1000, decoding=True)
+    o = _bare(_r6_commit_now={"c": 784})
+    assert not F.Front._r6_hold_d_free(o, sv_d, X48, "t", gu=1000) and o.counters["r6_hold_d_free_xsum"] == 1
+    assert F.Front._r6_hold_d_free(_bare(_r6_commit_now={"c": 784}), sv_d, X48, "t", gu=746, decoding=True)
+    assert F.Front._r6_hold_d_free(_bare(_r6_commit_now={"c": 784}), sv_d, X48, "t", gu=1000, decoding=False)   # R8
+    assert F.Front._r6_hold_d_free(_bare(_r6_commit_now={"c": 784}), sv_d, X48, "t", gu=0, decoding=True)
+
+
+def test_review_s1_r2_kurz_only_d_verdict_is_released_unconditionally():
+    """Review S1 (SOLL R2): "R2 kurz only: no set member" -- S stays 0 whatever D records, R6 can never apply: released even
+    when the bounds alone reach X."""
+    sv_r2 = PP.SetVerdict(PP.V_D_AFTER_TIMER, "R2 kurz only: no set member, D now (S=0)", 0.0, 0, 3057)
+    o = _bare(_r6_commit_now={"c": 9000})
+    assert not F.Front._r6_hold_d_free(o, sv_r2, X48, "t")
+    o = _bare(_r6_commit_now={"c": 9000})
+    assert F.Front._r6_hold_d_free(o, sv_r2, X48, "t", r2_only=True) and o.counters["set_r6_hold_d_free_r2"] == 1
+
+
+def test_review_a2_live_48_687_plus_1000_granted_unstarted_holds_then_s49(monkeypatch, caplog, tmp_path):
+    """Review A2 REPRO (red on the first #200 head: "D", D would get 4584 + 784 + 1000 = 6368 > X 6114). A halb D prefill of 1000
+    granted and NOT begun (S49 term); 48-687's next chunk COMMITTED (rest 784). The gate must hold; once the chunk's start record
+    gives free 784 the verdict made again is S49's COLLECT (5368 + 1000 > X), never D over X, no flip (R7)."""
+    now, f, ws = _commit_front(monkeypatch, tmp_path, rest=784)
+    f._d_pf_book().grant(rid="pdflip-48-690", tokens=1000, now=now - 0.5)
+    f.groups["D"].outstanding["pdflip-48-690"] = now - 0.5
+    F.Front._r6k_note_class(f, "pdflip-48-690", "halb", "arrival", HX48)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(now) == "hold"
+        assert f.counters["r6_hold_d_free_xsum"] >= 1 and f.counters["set_r6_hold_d_free"] == 0
+        assert f.counters["set_d_after_timer"] == 0
+        for w in ws:                                                    # D's built batch did not take it: free 784 known
+            w.resolve_commit(launched=[])
+        assert f._decode_collect(now + 0.05) == "hold"
+    # the second COLLECT has the same (set, members) key: its SET-VERDICT line is deduplicated -- S49's own counter names it
+    assert f.counters["set_xsum_hold_unstarted"] >= 1, dict(f.counters)
+    assert f.counters["set_d_after_timer"] == 0 and f.counters["set_flip_p"] == 0 and f.counters["set_reroute_p"] == 0
