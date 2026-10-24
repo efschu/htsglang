@@ -647,3 +647,33 @@ def test_s5_form_a_host_publishes_its_own_ratio(monkeypatch):
     assert rd["decode_reserve_scope"] == "host" and rd["decode_reserve"] == int(math.ceil(CLIP * 0.10))
     monkeypatch.setattr(dlr, "_form_a_token_cut", lambda: True)   # under the token cut every rank's gate counts
     assert dlr.lifetime_reading(s)["decode_reserve_scope"] == "group"
+
+
+# ======================================================================== Qwen-RISK: unnormalised requests before the MIN
+def test_q1_none_max_new_and_none_output_price_the_full_clip_and_never_raise():
+    r = SimpleNamespace(rid="n", origin_input_ids=[0] * 1000, output_ids=None, mamba_pool_idx=0,
+                        sampling_params=SimpleNamespace(max_new_tokens=None), finished=lambda: False)
+    assert sp.decode_clip_of(r) == CLIP                          # None = the context rest, clipped
+    assert sp.running_request_reserve(r, 0.5) == CLIP * 0.5
+    assert dlr.resume_price(r, _S) == 1000 + CLIP + 1
+    r2 = _req("x", 10, out=3, max_new=100)
+    assert sp.decode_clip_of(r2) == 97                           # a normalised request: unchanged
+
+
+def test_q2_a_parked_request_that_cannot_be_priced_still_lets_every_rank_enter_the_min(monkeypatch):
+    calls = []
+
+    def avail():
+        calls.append(1)
+        return 10 ** 9
+
+    def _boom(req, sched):
+        raise TypeError("unpriceable")
+
+    monkeypatch.setattr(dlr, "resume_price", _boom)
+    old = _parked("old", 1, 1000)
+    young = _parked("y", 2, 500, site=ds.SITE_PRESSURE)
+    book = ds.ResumeBook.from_env(_ON)
+    ds.admission_gate([young], running=[old], avail_tokens=avail, resume_book=book,
+                      need_of=dpr._resume_need_of(SimpleNamespace()))
+    assert calls == [1], "the need is priced, then the reading (the collective) is entered exactly once"
