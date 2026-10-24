@@ -29,6 +29,27 @@ import pytest
 from flliper.srt.pdflip import launcher as L
 from flliper.srt.pdflip import l15_plan
 
+
+# Review S1 (desk/27b-int8-tp1corridor-1024): HERMETIC against the rig's published corridor-floor
+# digest. booked_rest_kwargs books the PDFLIP-VOTE-LINE-BOOK delta where a MEASURED floor is
+# published for these UUIDs (the real rig); with the pointer pinned to a missing file every floor
+# reads UNMEASURED-FALLBACK and the budgets below are the record path alone, on any host.
+import os  # noqa: E402
+import unittest.mock as mock  # noqa: E402
+
+from flliper.srt.managers import corridor_guard as _CG_HERMETIC  # noqa: E402
+
+_FLOOR_DIGEST_HERMETIC = mock.patch.dict(
+    os.environ, {_CG_HERMETIC.FLOOR_DIGEST_FILE_ENV: "/nonexistent/flliper-test-corridor-floor-digest.json"})
+
+
+def setUpModule():
+    _FLOOR_DIGEST_HERMETIC.start()
+
+
+def tearDownModule():
+    _FLOOR_DIGEST_HERMETIC.stop()
+
 # Three-card fixture copied from test_pdflip_budget_rest_no_reserve_0929.py
 # (U5090 / U0 / U2, L.Card, L.order_cards). order_cards puts the 5090 first,
 # so the card order after ordering is [5090(nvml1), 3080(nvml0), 3080(nvml2)].

@@ -35,6 +35,24 @@ from flliper.srt.pdflip import form as F  # noqa: E402
 from flliper.srt.pdflip import launcher as L  # noqa: E402
 from flliper.srt.pdflip import torch_cache_cap as TCC  # noqa: E402
 
+
+# Review S1 (desk/27b-int8-tp1corridor-1024): HERMETIC against the rig's published corridor-floor
+# digest. booked_rest_kwargs books the PDFLIP-VOTE-LINE-BOOK delta where a MEASURED floor is
+# published for these UUIDs (the real rig); with the pointer pinned to a missing file every floor
+# reads UNMEASURED-FALLBACK and the budgets below are the record path alone, on any host.
+from flliper.srt.managers import corridor_guard as _CG_HERMETIC  # noqa: E402
+
+_FLOOR_DIGEST_HERMETIC = mock.patch.dict(
+    os.environ, {_CG_HERMETIC.FLOOR_DIGEST_FILE_ENV: "/nonexistent/flliper-test-corridor-floor-digest.json"})
+
+
+def setUpModule():
+    _FLOOR_DIGEST_HERMETIC.start()
+
+
+def tearDownModule():
+    _FLOOR_DIGEST_HERMETIC.stop()
+
 U5090 = "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
 U0 = "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"
 U2 = "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
