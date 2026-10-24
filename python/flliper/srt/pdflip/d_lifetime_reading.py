@@ -29,6 +29,9 @@ THE READING (``lifetime_reading``, merged into ``pdflip_kv`` by ``Scheduler.get_
 ``decode_reserve`` / ``decode_reserve_by_rid``
     the reserve term and its split over the running decodes (a displaced decode gives its share back --
     ``PrefillAdder.released_by_leaving``; the front's AGE PLAN credits it to the victim).
+``leaving_rows_by_rid``
+    KVD-1024 (front KV class D): the rows each running decode is GUARANTEED to give back when it is displaced -- its
+    seat minus the path rows other holders keep locked (pdflip/d_leaving_rows.py). The AGE PLAN's victim price.
 ``admitted_rids``
     requests D has admitted whose rows are already in the reading but which are not in ``running_rids`` yet (the
     extend batch the merge has not taken, the chunked continuation): the front's burst debit must not charge them
@@ -136,6 +139,35 @@ def _live(reqs):
     return out
 
 
+def _leaving_by_rid(tree, running) -> Dict[str, int]:
+    """KVD-1024: :func:`d_leaving_rows.leaving_rows_by_rid` of the running decodes (the set D displaces from)."""
+    from flliper.srt.pdflip.d_leaving_rows import leaving_rows_by_rid
+
+    return dict(list(leaving_rows_by_rid(tree, running).items())[:64])
+
+
+def _leaving_joint(sched, tree, running):
+    """KVD review MUSS 2: ``[[rid, cumulative joint rows], ...]`` over the decodes D can displace now, youngest first
+    (``d_park_runtime.displaceable`` / ``youngest_first`` -- the set and order its SEAT-AGE walks)."""
+    import os
+
+    from flliper.srt.pdflip import d_park_runtime as _dpr
+    from flliper.srt.pdflip.d_leaving_rows import joint_leaving_rows
+
+    pool = running
+    if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() != "1":
+        pool = _dpr.displaceable(getattr(sched, "running_batch", None))
+    live = {id(r) for r in running}
+    order = _dpr.youngest_first([r for r in pool if id(r) in live])[:64]
+    return [[str(r.rid), int(c)] for r, c in zip(order, joint_leaving_rows(tree, order))]
+
+
+def _leaving_fallbacks() -> Dict[str, int]:
+    from flliper.srt.pdflip.d_leaving_rows import FALLBACKS
+
+    return dict(FALLBACKS)
+
+
 def lifetime_reading(sched) -> Dict[str, Any]:
     """The fields above, from THIS scheduler (TP0 when served on ``/server_info``). Raises on a missing pool -- the
     caller (``get_internal_state``) catches, an instrument never breaks the info route."""
@@ -183,6 +215,15 @@ def lifetime_reading(sched) -> Dict[str, Any]:
         "decode_reserve_ratio": round(float(ratio), 6),
         "decode_reserve_scope": scope,
         "decode_reserve_by_rid": dict(list(by_rid.items())[:64]),
+        # KVD-1024 (front KV class D): the rows each running decode is GUARANTEED to give back when it is displaced
+        # (pdflip/d_leaving_rows.py) -- the front's AGE PLAN prices a victim by this, not by its seat length
+        "leaving_rows_by_rid": _leaving_by_rid(tree, running),
+        # review MUSS 2: the JOINT release of the k youngest displaceable decodes, in D's displacement order
+        # ([[rid, cumulative rows], ...]: rows only they hold between them come free with the k-th)
+        "leaving_rows_joint": _leaving_joint(sched, tree, running),
+        # review MUSS 3 / SOLL 2: the bound's fallbacks by kind and the KV verdicts that said "nobody leaves"
+        "leaving_fallbacks": _leaving_fallbacks(),
+        "displace_nobody_leaves": int(getattr(sched, "_pdflip_sa_nobody_leaves", 0) or 0),
         "admitted_rids": admitted[:64],
         "ledger_outstanding": ledger_out,
         "ledger_rids": [str(r) for r in ledger_rids][:64],
