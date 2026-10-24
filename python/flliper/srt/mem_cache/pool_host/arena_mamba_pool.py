@@ -34,6 +34,8 @@ from flliper.srt.mem_cache.pool_host.arena_pool import (
     PLACEHOLDERS,
     ArenaMHAHostPool,
     _arena_page_load_mode,
+    _arena_page_load_timing,
+    admit_peak_stages_on,
     _select_rows_async,
     index_to_device_async,
     load_index_async,
@@ -59,11 +61,54 @@ def anchor_bypass_on(env=None) -> bool:
     return str(env.get(ENV_ANCHOR_BYPASS, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+ENV_STATE_LOAD_BLOCK_BYTES = "FLLIPER_PDFLIP_ARENA_STATE_LOAD_BLOCK_BYTES"
+
+
 def _arena_state_load_block_bytes() -> int:
     try:
-        return max(1 << 20, int(os.environ.get("FLLIPER_PDFLIP_ARENA_STATE_LOAD_BLOCK_BYTES", str(256 << 20))))
+        return max(1 << 20, int(os.environ.get(ENV_STATE_LOAD_BLOCK_BYTES, str(256 << 20))))
     except ValueError:
         return 256 << 20
+
+
+def _state_load_block_rows(row_bytes: int, dma: bool, env=None) -> int:
+    """#217 ADMIT-PEAK (24.10.): slots per block of the device state stage.
+
+    MEASURED (PDFLIP-SLEEP-STAGING ``mamba_state_stage``, unsampled, at every
+    sleep): the stage reached 224.4 MiB on int4ar (6 x 37.4, rc42 _1024_125438
+    8 of 17 sleeps), 187 MiB on INT8 drei TP1/TP2 (10 x 18.7), 205.7 / 233.8 MiB
+    on NVFP4 duo TP0 / TP1 -- ``256 MiB // row`` slots. The sleep drops it
+    (sleep_staging, +254 MiB fix (a)), so the FIRST load after every wake -- the
+    handback admission -- allocates it again: A - released of that pass is 154
+    (4 slots) and 226-232 MiB (>= 6 slots), the part of the admission peak
+    (504..522) the forward trim cannot return because the stage stays live.
+
+    In "dma" mode the stage is only the landing zone of the per-slot H2D copies
+    out of the registered arena; consecutive blocks reuse it in stream order on
+    the same (load) stream, no host sync between them, and the split is two
+    ``index_copy_`` per block (:meth:`ArenaMambaPoolHost._state_split_vec`), so
+    one slot per block costs no extra CPU: ONE row. The "cpu" mode keeps its
+    256-MiB pinned stage (a host sync per block). An explicit
+    FLLIPER_PDFLIP_ARENA_STATE_LOAD_BLOCK_BYTES keeps its old meaning for both;
+    FLLIPER_PDFLIP_ADMIT_PEAK_STAGES=0 restores 256 MiB."""
+    env = os.environ if env is None else env
+    if str(env.get(ENV_STATE_LOAD_BLOCK_BYTES, "") or "").strip():
+        return max(1, _arena_state_load_block_bytes() // max(1, int(row_bytes)))
+    if dma and admit_peak_stages_on(env):
+        return 1
+    return max(1, (256 << 20) // max(1, int(row_bytes)))
+
+
+#: #217: unset = on -- the device stage splits into the pool with two strided
+#: ``index_copy_`` per block (all layers at once); 0/false/no/off = the
+#: per-layer loop (48 layers x ~9 torch ops, a ``.contiguous()`` copy of every
+#: layer's temporal block and a conv row temporary each).
+ENV_STATE_SPLIT_VEC = "FLLIPER_PDFLIP_MAMBA_STATE_SPLIT_VEC"
+
+
+def state_split_vec_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_STATE_SPLIT_VEC, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 #: DP-NACHLAUF 02.10.: the staging rows' per-layer load with device rows on
@@ -858,9 +903,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     comp.append((cur, off_j, ln_j)); cur += ln_j
             self._compact = (comp, cur)
         comp, row_bytes = self._compact
-        B = max(1, _arena_state_load_block_bytes() // max(1, row_bytes))
-        bb = min(B, n)
         dma = _arena_page_load_mode(self._page_bytes) == "dma"
+        B = _state_load_block_rows(row_bytes, dma)  # #217: one slot per block in "dma" mode
+        bb = min(B, n)
         if dma:
             runs = merge_state_extents(comp)
         elif self._state_stage is None or self._state_stage.shape[0] < bb or self._state_stage.shape[1] != row_bytes:
@@ -878,6 +923,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
         e_c = int(self.conv_dtype.itemsize)
         t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
         L = int(lay["L"])
+        vec = self._state_split_vec(device_pool, comp, row_bytes) if state_split_vec_on() else None
+        # review #217 S6: the split's DEVICE time under FLLIPER_PDFLIP_ARENA_PAGE_LOAD_TIMING=1 (events around each
+        # block's split, one sync at the end) -> START-LOADING components ``mamba.split_dev``; host time stays ``split``
+        _sev = [] if (dev.type == "cuda" and _arena_page_load_timing()) else None
         for start in range(0, n, B):
             b = min(B, n - start)
             sl = slots_cpu[start:start + b]
@@ -893,31 +942,107 @@ class ArenaMambaPoolHost(MambaPoolHost):
             _tc = time.perf_counter()
             _sub["issue"] = _sub.get("issue", 0.0) + (_tc - _tb) * 1000.0
             d_b = didx[start:start + b]
-            k = 0
-            for l in range(L):
-                cur, _off, ln = comp[k]; k += 1
-                src = dev_stage[:, cur:cur + ln].contiguous().view(self.temporal_dtype).view((b,) + t_shape)
-                device_pool.mamba_cache.temporal[l].index_copy_(0, d_b, src)
-                dst_c = device_pool.mamba_cache.conv[0][l]
-                row = torch.empty((b,) + conv_shape, dtype=dst_c.dtype, device=dev)
-                ch0 = 0
-                for _j in range(3):
-                    cur_j, _off_j, ln_j = comp[k]; k += 1
-                    n_j = ln_j // (width * e_c)
-                    row[:, ch0:ch0 + n_j] = dev_stage[:, cur_j:cur_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
-                    ch0 += n_j
-                dst_c.index_copy_(0, d_b, row)
+            if _sev is not None:
+                _se0 = torch.cuda.Event(enable_timing=True); _se0.record()
+            if vec is not None:
+                # #217: all layers in two strided index_copy_ (no per-layer
+                # temporaries); the stage row is (L, per_layer) = [temporal |
+                # conv extents in channel order], the pool rows (L, S, bytes)
+                t_u8, c_u8, per_layer, ln_t, ln_c = vec
+                s3 = dev_stage.view(b, L, per_layer)
+                t_u8.index_copy_(1, d_b, s3[:, :, :ln_t].transpose(0, 1))
+                c_u8.index_copy_(1, d_b, s3[:, :, ln_t:ln_t + ln_c].transpose(0, 1))
+            else:
+                k = 0
+                for l in range(L):
+                    cur, _off, ln = comp[k]; k += 1
+                    src = dev_stage[:, cur:cur + ln].contiguous().view(self.temporal_dtype).view((b,) + t_shape)
+                    device_pool.mamba_cache.temporal[l].index_copy_(0, d_b, src)
+                    dst_c = device_pool.mamba_cache.conv[0][l]
+                    row = torch.empty((b,) + conv_shape, dtype=dst_c.dtype, device=dev)
+                    ch0 = 0
+                    for _j in range(3):
+                        cur_j, _off_j, ln_j = comp[k]; k += 1
+                        n_j = ln_j // (width * e_c)
+                        row[:, ch0:ch0 + n_j] = dev_stage[:, cur_j:cur_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
+                        ch0 += n_j
+                    dst_c.index_copy_(0, d_b, row)
             _sub["split"] = _sub.get("split", 0.0) + (time.perf_counter() - _tc) * 1000.0
+            if _sev is not None:
+                _se1 = torch.cuda.Event(enable_timing=True); _se1.record()
+                _sev.append((_se0, _se1))
             if _pin and not dma and start + b < n:
                 _td = time.perf_counter()
                 torch.cuda.current_stream(dev).synchronize()  # the stage is reused by the next block
                 _sub["sync"] = _sub.get("sync", 0.0) + (time.perf_counter() - _td) * 1000.0
+        if _sev:
+            torch.cuda.current_stream(dev).synchronize()
+            _sub["split_dev"] = _sub.get("split_dev", 0.0) + sum(e0.elapsed_time(e1) for e0, e1 in _sev)
         global _STATE_LOAD_N
         _STATE_LOAD_N += 1
         if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
-            logger.info("PDFLIP-ARENA-STATE-LOAD n=%d slots=%d own_bytes=%d block=%d mode=%s (this rank's extents, %s, split on device)",
+            logger.info("PDFLIP-ARENA-STATE-LOAD n=%d slots=%d own_bytes=%d block=%d mode=%s stage_bytes=%d split=%s "
+                        "(this rank's extents, %s, split on device)",
                         _STATE_LOAD_N, n, n * row_bytes, B, "dma" if dma else "cpu",
+                        int(self._state_dev_stage.numel()), "vec" if vec is not None else "layers",
                         f"{len(runs)} copies per slot from the arena" if dma else "pinned gather + one H2D per block")
+
+    def _state_split_vec(self, device_pool, comp, row_bytes: int):
+        """#217: ``(temporal_u8, conv_u8, per_layer, ln_t, ln_c)`` when the device
+        pool's state tensors take the stage's per-layer block as it is, so ONE
+        strided ``index_copy_`` per tensor lands every layer of a block; ``None``
+        keeps the per-layer loop. Holds when the pool's ``temporal`` / ``conv[0]``
+        are single contiguous ``(L, S, ...)`` tensors of the host pool's dtypes
+        and shapes, every layer has the same extent lengths in the compact order
+        (temporal, conv q, k, v), the temporal extent is one whole device row and
+        the three conv extents are the device conv row in channel order (what
+        the loop writes into ``row[:, ch0:ch0 + n_j]``). Same bytes, same rows."""
+        try:
+            mc = device_pool.mamba_cache
+            if len(mc.conv) != 1:
+                return None
+            temporal, conv = mc.temporal, mc.conv[0]
+            if not (isinstance(temporal, torch.Tensor) and isinstance(conv, torch.Tensor)):
+                return None
+            lay = self._layout
+            L = int(lay["L"])
+            if temporal.dim() < 3 or conv.dim() < 3 or int(temporal.shape[0]) != L or int(conv.shape[0]) != L:
+                return None
+            if not (temporal.is_contiguous() and conv.is_contiguous()):
+                return None
+            if temporal.dtype != self.temporal_dtype or conv.dtype != self.conv_dtype:
+                return None
+            if tuple(temporal.shape[2:]) != tuple(lay["t_shape"]) or tuple(conv.shape[2:]) != tuple(lay["conv_shape"]):
+                return None
+            if len(comp) != 4 * L:
+                return None
+            ln_t = int(comp[0][2])
+            lc = [int(comp[j][2]) for j in (1, 2, 3)]
+            per_layer = ln_t + sum(lc)
+            for l in range(L):
+                if int(comp[4 * l][2]) != ln_t or [int(comp[4 * l + j][2]) for j in (1, 2, 3)] != lc:
+                    return None
+                if any(int(comp[4 * l + j][0]) != l * per_layer + (0, ln_t, ln_t + lc[0], ln_t + lc[0] + lc[1])[j]
+                       for j in range(4)):
+                    return None
+            if per_layer * L != int(row_bytes):
+                return None
+            e_t, e_c, width = int(temporal.element_size()), int(conv.element_size()), int(lay["width"])
+            t_row = 1
+            for d in temporal.shape[2:]:
+                t_row *= int(d)
+            c_row = 1
+            for d in conv.shape[2:]:
+                c_row *= int(d)
+            if ln_t != t_row * e_t or sum(lc) != c_row * e_c or int(conv.shape[-1]) != width:
+                return None
+            if any(x % (width * e_c) for x in lc):
+                return None
+            t_u8 = temporal.view(torch.uint8).view(L, int(temporal.shape[1]), ln_t)
+            c_u8 = conv.view(torch.uint8).view(L, int(conv.shape[1]), sum(lc))
+            return t_u8, c_u8, per_layer, ln_t, sum(lc)
+        except Exception:  # noqa: BLE001 -- any shape this does not know keeps the per-layer loop
+            return None
 
     def _load_rest_rows(self, device_pool, host_rows, dev_rows, layer_id, io_backend) -> str:
         """The staging (non-arena) rows of one layer. DP-NACHLAUF 02.10.: with
