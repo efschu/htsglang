@@ -13754,7 +13754,8 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
             "form": group_form_block(spec.env)}})
 
 
-def write_p_respawn_spec(spec: GroupSpec, ns, log: Log, dry: bool) -> str:
+def write_p_respawn_spec(spec: GroupSpec, ns, log: Log, dry: bool,
+                         card_need_mib: Optional[Dict[int, int]] = None) -> str:
     """S7b P-RESTART (Auftrag #214): the exec record of group P -- the argv/env/cwd launch_group actually
     exec'd, never re-planned -- for the front's P restart (pdflip/dual_p_restart.py, stage 2): same cards, same
     planner cut. Dual layout only; '' = not written (the front's restart is then unarmed and says so). The file
@@ -13763,15 +13764,22 @@ def write_p_respawn_spec(spec: GroupSpec, ns, log: Log, dry: bool) -> str:
         return ""
     from flliper.srt.pdflip import dual_p_restart as _s7b
 
+    if not _s7b._on(os.environ, _s7b.RESTART_ENV):
+        log(f"{_s7b.MARK} P-RESPAWN-SPEC not written: {_s7b.RESTART_ENV}=0 (stage 1 only, P is not restarted)")
+        return ""
+
     path = _s7b.respawn_path(GPU_ARB, getattr(ns, "tag", "") or "untagged")
     try:
         _s7b.write_spec(path, argv=list(spec.argv), env=dict(spec.env), cwd=spec.cwd, log=spec.log,
-                        port=int(spec.port), tag=str(getattr(ns, "tag", "") or ""), pid=int(spec.pid))
+                        port=int(spec.port), tag=str(getattr(ns, "tag", "") or ""), pid=int(spec.pid),
+                        card_need_mib=card_need_mib)
     except OSError as e:
         log(f"{_s7b.MARK} P-RESPAWN-SPEC not written ({type(e).__name__}: {e}) -- the front's P restart is unarmed")
         return ""
-    log(f"{_s7b.MARK} P-RESPAWN-SPEC {path}: argv {len(spec.argv)} items, env {len(spec.env)} keys, cwd "
-        f"{spec.cwd or '-'}, mode 0600 -- the front's P restart (stage 2) re-execs exactly this")
+    log(f"{_s7b.MARK} P-RESPAWN-SPEC {path}: argv {len(spec.argv)} items, env {len(spec.env)} keys (secrets "
+        f"masked), cwd {spec.cwd or '-'}, mode 0600, P's planned peak per card (budget + overhead, MiB) "
+        f"{card_need_mib or 'NONE -- the restart will refuse to spawn'} -- the front's P restart (stage 2) "
+        f"re-execs exactly this")
     return path
 
 
@@ -28349,7 +28357,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec_p.env.update(dual_share_env(ns, "P"))
     spec_p.env.update(dual_priority_env(ns, "P", log))  # DUAL-SHARE: {} unless a switch is on
     launch_group(spec_p, tree, log, dry)
-    ns._s7b_spec_path = write_p_respawn_spec(spec_p, ns, log, dry)  # S7b P-RESTART: dual layout only, else ''
+    try:  # S7b review MUSS 1: P's PLANNED peak per card (budget + overhead) -- the number D is sized against
+        _s7b_plan = dual_share_planned_dc(cards, state.budgets["P"], getattr(ns, "extra_p", ""),
+                                          int(getattr(ns, "dual_p_overhead_mib", 1500)))
+        _s7b_need = {int(c.nvml_index): int(_s7b_plan[c.uuid]) for c in cards}
+    except Exception as _e7:  # noqa: BLE001 -- no plan = the restart refuses to spawn, named in its line
+        log(f"S7B P-RESPAWN-SPEC: P's planned peak not derivable ({type(_e7).__name__}: {_e7})")
+        _s7b_need = None
+    ns._s7b_spec_path = write_p_respawn_spec(spec_p, ns, log, dry, _s7b_need)  # S7b P-RESTART: dual only, else ''
     ns._dual_spec_d = None
     if getattr(ns, "dual_share", False):
         # DUAL-TP3PP3 1b: D boots NOW as the union owner; P holds before its
@@ -29430,6 +29445,10 @@ def teardown(path: str, report: dict | None = None) -> int:
     # module global is empty here and the recorded path is the only source.
     set_admin_key(None, st.get("admin_key_file", ""))
     print(f"PDFLIP-TEARDOWN admin key file: {drop_admin_key_file()}")
+    if st.get("tag"):  # S7b review SOLL 7: P's exec record dies with the boot
+        from flliper.srt.pdflip import dual_p_restart as _s7b
+
+        print(f"PDFLIP-TEARDOWN S7B respawn record: {_s7b.remove_spec(GPU_ARB, st['tag'])}")
     pids = set()
     for name, pid in st.get("pids", {}).items():
         if pid:

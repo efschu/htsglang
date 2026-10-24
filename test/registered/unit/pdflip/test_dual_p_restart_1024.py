@@ -11,7 +11,10 @@ Danger directions: (1) a P death still stops the boot in the dual layout (the sp
 D death is taken over (must keep the STOP); (3) D prefills over X while P is away (Phasen-Gesetz) or takes a
 p_only request; (4) a P leg that died is failed to the client, or handed to D half-prefilled; (5) P counts as back
 on /health alone while its ranks have not signed in (R11 barrier), or is respawned while the old session still
-holds the card; (6) the restart loops without bound.
+holds the card; (6) the restart loops without bound. Review round (review-p-restart-1024.md): (7) the card gate
+passes on the argv budget while P's plan (budget + overhead) does not fit (OOM); (8) orphaned P ranks of a dead
+leader survive the kill; (9) a respawned P is left standing after a failure; (10) a held rank (#1223) is killed;
+(11) the front reports 200 while P is gone for good; (12) the dead P's arena refs go unnamed.
 
 Fake front: ``object.__new__(Front)`` with the attributes the touched methods read (the house pattern of
 test_pdflip_front_health_facts_b1_0927). Fake launcher: an IO double with the driver's methods.
@@ -26,8 +29,12 @@ import inspect
 import json
 import os
 import re
+import shutil
+import signal
 import stat
+import subprocess
 import tempfile
+import textwrap
 import time
 import types
 import unittest
@@ -115,7 +122,8 @@ class OnPDead(unittest.TestCase):
             f._dual_inflight = {leg.rid: leg}
             with self.assertLogs(S.logger, "ERROR") as cm:
                 self.assertTrue(S.on_p_dead(f, "W17 PdFlipGroupDead group P"))
-            self.assertEqual(S.state_of(f).state, S.DEAD)
+            self.assertEqual(S.state_of(f).state, S.FAILED)                  # no restart armed: gone for good
+            self.assertTrue(S.state_of(f).no_restart)
             self.assertTrue(leg.dual_pause)                                   # the dual pass requeues it
             self.assertTrue(any("S7B P-LEG-ABORTED rid=pdflip-0-6" in m for m in cm.output))
             self.assertEqual(S.state_of(f).old_sid, P_SID)
@@ -189,7 +197,7 @@ class LegAbort(unittest.TestCase):
             f = self._f()
             leg = _p("pdflip-0-7", 120000)
             self.assertTrue(S.mark_failed_leg(f, leg, RuntimeError("500"), p_looks_dead=lambda fr: True))
-            self.assertEqual(S.state_of(f).state, S.DEAD)
+            self.assertEqual(S.state_of(f).state, S.FAILED)
             self.assertTrue(leg.dual_pause)
 
     def test_a_live_p_the_flip_form_or_no_ledger_keep_the_old_failure(self):
@@ -242,7 +250,7 @@ class FrontWiring(unittest.TestCase):
                 _poll(f, {"P": False, "D": True}, {P_SID: False, D_SID: True}, d)
             self.assertEqual(f.state, "serving")
             self.assertIsNone(f.stop)
-            self.assertEqual(S.state_of(f).state, S.DEAD)
+            self.assertEqual(S.state_of(f).state, S.FAILED)
             for _ in range(3):                                                # absent: no W17 later either
                 _poll(f, {"P": False, "D": True}, {P_SID: False, D_SID: True}, d)
             self.assertEqual(f.state, "serving")
@@ -270,12 +278,13 @@ class FrontWiring(unittest.TestCase):
         with _Env():
             f = _front()
             f.groups["D"].health_facts = FH.GroupFacts(True, True, 0, None, time.time())
-            S.on_p_dead(f, "x")
+            with mock.patch.object(S, "restart_armed", lambda env=None: True):
+                S.on_p_dead(f, "x", spawn_driver=lambda fr: None)
             with mock.patch.object(front_mod.Front, "_probe_group_health", _http({"P": False, "D": True})):
                 r = asyncio.run(f._handle_health_facts())
             body = json.loads(r.body)
-            self.assertEqual(r.status, 200)
-            self.assertEqual(body["P"], "absent: S7B dead")
+            self.assertEqual(r.status, 200)                                   # P may still come back
+            self.assertEqual(body["P"], "absent: S7B restarting")
             self.assertEqual(body["unhealthy"], {})
 
     def test_a_refused_p_wake_does_not_stop(self):
@@ -318,7 +327,7 @@ class FrontWiring(unittest.TestCase):
             f = _front()
             S.on_p_dead(f, "x")
             b = S.state_block(f)["p_restart"]
-            self.assertEqual((b["state"], b["armed"], b["restart_armed"]), (S.DEAD, True, False))
+            self.assertEqual((b["state"], b["armed"], b["restart_armed"]), (S.FAILED, True, False))
 
 
 # ------------------------------------------------------------------------------------------------ stage 2
@@ -326,9 +335,9 @@ class FakeIO:
     """The Fake-Launcher: the driver's effects as a script."""
 
     def __init__(self, *, alive_for=0, survives_kill=False, health_after=0, signed_after=0, exits_rc=None,
-                 spec=True, stage_files=True, room_at=0):
+                 spec=True, stage_files=True, room_at=0, spec_env=None):
         self.t = 0.0
-        self.spec = {"argv": ["python3", "-m", "x"], "env": {}} if spec else {}
+        self.spec = {"argv": ["python3", "-m", "x"], "env": dict(spec_env or {})} if spec else {}
         self.alive_for, self.survives_kill = alive_for, survives_kill
         self.health_after, self.signed_after, self.exits_rc = health_after, signed_after, exits_rc
         self.stage_files = stage_files
@@ -383,7 +392,7 @@ def _dead_front():
         f = _front()
         S.on_p_dead(f, "x", spawn_driver=lambda fr: None)
     st = S.state_of(f)
-    st.state = S.RESTARTING
+    st.state, st.no_restart = S.RESTARTING, False
     f._dual_stages_obj = object()
     f.groups["P"].health_fail_streak = 9
     f.groups["P"].outstanding["pdflip-0-6"] = 1.0
@@ -464,25 +473,36 @@ class RestartDriver(unittest.TestCase):
 
 
 class CardNeed(unittest.TestCase):
-    # specimen 10240650, P's argv: two --rank-gpu-memory-mib, argparse keeps the last
-    ARGV = ["python", "-m", "flliper.launch_server", "--rank-gpu-id", "0,1,2", "--rank-gpu-memory-mib",
-            "26256,16128,15384", "--port", "30031", "--rank-gpu-memory-mib", "6610,5050,5200"]
+    # specimen 10240650: launcher.log "D sized from P's PLAN (budget + overhead, MiB): nvml0 9110, nvml1 7550,
+    # nvml2 7700" -- P's argv budget alone is 6610/5050/5200 (review MUSS 1: 2500 MiB/card short)
+    PLAN = {0: 9110, 1: 7550, 2: 7700}
 
-    def test_the_last_budget_per_card(self):
-        self.assertEqual(S.card_need_from_argv(self.ARGV), {0: 6610, 1: 5050, 2: 5200})
-        self.assertEqual(S.card_need_from_argv(["--rank-gpu-id=0,0,1", "--rank-gpu-memory-mib=100,200,300"]),
-                         {0: 300, 1: 300})                                    # co-located ranks add up
-        self.assertEqual(S.card_need_from_argv(["--rank-gpu-id", "0,1"]), {})
-        self.assertEqual(S.card_need_from_argv(["--rank-gpu-id", "0,1", "--rank-gpu-memory-mib", "1,2,3"]), {})
+    def test_the_gate_checks_the_plan_not_the_argv_budget(self):
+        spec = {"argv": ["--rank-gpu-id", "0,1,2", "--rank-gpu-memory-mib", "6610,5050,5200"],
+                "card_need_mib": {str(k): v for k, v in self.PLAN.items()}, "env": {}}
+        io = S.RealIO(_front(), spec, {})
+        free = [front_mod.CardFree(nvml_index=i, uuid="GPU-%d" % i, free_mib=m, reserved_mib=0, carve_out_known=True)
+                for i, m in ((0, 7000), (1, 9000), (2, 9000))]
+        with mock.patch.object(front_mod, "_nvml_free", lambda: free):
+            ok, why = io.card_room()
+        self.assertFalse(ok)                                                  # 7000 >= 6610 but < 9110
+        self.assertIn("nvml0 free=7000<need=9110", why)
+        free[0] = front_mod.CardFree(nvml_index=0, uuid="GPU-0", free_mib=9110, reserved_mib=0, carve_out_known=True)
+        with mock.patch.object(front_mod, "_nvml_free", lambda: free):
+            self.assertTrue(io.card_room()[0])                                # exactly the plan, no reserve on top
 
-    def test_verdict_no_reserve_on_top(self):
-        need = {0: 6610, 1: 5050}
-        self.assertTrue(S.card_room_verdict(need, {0: 6610, 1: 5050})[0])     # exactly the budget is enough
-        ok, why = S.card_room_verdict(need, {0: 6609, 1: 9000})
+    def test_no_plan_in_the_record_no_spawn(self):
+        io = S.RealIO(_front(), {"argv": ["--rank-gpu-memory-mib", "1"], "env": {}}, {})
+        ok, why = io.card_room()
         self.assertFalse(ok)
-        self.assertIn("nvml0 free=6609<need=6610", why)
-        self.assertFalse(S.card_room_verdict(need, {})[0])                   # NVML blind: no spawn on a guess
-        self.assertTrue(S.card_room_verdict({}, {})[0])
+        self.assertIn("no planned P peak", why)
+
+    def test_verdict(self):
+        self.assertFalse(S.card_room_verdict(self.PLAN, {})[0])               # NVML blind: no spawn on a guess
+        self.assertFalse(S.card_room_verdict({}, {0: 99999})[0])
+        ok, why = S.card_room_verdict(self.PLAN, {0: 9110, 1: 7549, 2: 9000})
+        self.assertFalse(ok)
+        self.assertIn("nvml1 free=7549<need=7550", why)
 
 
 class RespawnRecord(unittest.TestCase):
@@ -491,11 +511,12 @@ class RespawnRecord(unittest.TestCase):
             path = S.respawn_path(d, "dkr27bnvfp4dualbar1drei10241200")
             S.write_spec(path, argv=["python3", "-m", "flliper.launch_server", "--port", "30001"],
                          env={"CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps/pipe"}, cwd="/x", log="/x/P.log", port=30001,
-                         tag="t", pid=42)
+                         tag="t", pid=42, card_need_mib={0: 9110})
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             rec = S.read_spec(path)
             self.assertEqual(rec["argv"][-1], "30001")
             self.assertEqual(rec["env"]["CUDA_MPS_PIPE_DIRECTORY"], "/tmp/mps/pipe")
+            self.assertEqual(S.spec_card_need(rec), {0: 9110})
             with mock.patch.dict(os.environ, {S.SPEC_ENV: path, S.RESTART_ENV: "1"}):
                 self.assertTrue(S.restart_armed())
             with mock.patch.dict(os.environ, {S.SPEC_ENV: path, S.RESTART_ENV: "0"}):
@@ -513,15 +534,328 @@ class RespawnRecord(unittest.TestCase):
                                {"A": "1"}, pid=77, cwd="/core")
             lines = []
             ns = types.SimpleNamespace(dual_layout=True, tag="t1")
-            path = L.write_p_respawn_spec(spec, ns, lines.append, False)
+            with mock.patch.dict(os.environ, {S.RESTART_ENV: "1"}):
+                path = L.write_p_respawn_spec(spec, ns, lines.append, False, {0: 9110, 1: 7550})
             rec = S.read_spec(path)
             self.assertEqual((rec["argv"], rec["env"], rec["cwd"], rec["pid"]), (spec.argv, {"A": "1"}, "/core", 77))
+            self.assertEqual(S.spec_card_need(rec), {0: 9110, 1: 7550})
             self.assertTrue(any("S7B P-RESPAWN-SPEC" in ln for ln in lines))
             self.assertEqual(L.write_p_respawn_spec(spec, types.SimpleNamespace(dual_layout=False, tag="t2"),
                                                     lines.append, False), "")
+            with mock.patch.dict(os.environ, {S.RESTART_ENV: "0"}):           # stage 1 only: no record at all
+                self.assertEqual(L.write_p_respawn_spec(spec, types.SimpleNamespace(dual_layout=True, tag="t3"),
+                                                        lines.append, False, {0: 1}), "")
+            self.assertFalse(os.path.exists(S.respawn_path(d, "t3")))
             self.assertEqual(L.write_p_respawn_spec(spec, ns, lines.append, True), "")
             self.assertFalse(os.path.exists(S.respawn_path(d, "t2")))
 
+
+# ------------------------------------------------------------------------------------------------ review round
+class EndSession(unittest.TestCase):
+    """MUSS 2: every pid of P's old session, a dead leader's orphans included."""
+
+    def test_orphans_of_a_dead_leader_are_killed_one_by_one(self):
+        killed, asked = [], []
+        out = S.end_session_pids(
+            4711, session_pids=lambda sid: {11, 12}, terminate=lambda pids: asked.append(list(pids)) or [11, 12],
+            kill_tree=lambda leader: "ok", kill_pid=killed.append, alive=lambda p: True, own_sid=1234)
+        self.assertEqual(asked, [[11, 12]])                                    # MPS terminate first (#210)
+        self.assertEqual(sorted(killed), [11, 12])                            # then SIGKILL each pid of the session
+        self.assertIn("sigkill=[11, 12]", out)
+
+    def test_never_the_fronts_own_session(self):
+        out = S.end_session_pids(77, session_pids=lambda sid: {1, 2}, terminate=lambda p: [], kill_tree=lambda l: "",
+                                 kill_pid=lambda p: self.fail("killed"), alive=lambda p: True, own_sid=77)
+        self.assertIn("refused", out)
+
+    @unittest.skipIf(shutil.which("ps") is None, "ps not in this image")
+    def test_real_orphans_in_a_session_die(self):
+        leader = subprocess.Popen(["bash", "-c", "sleep 300 & sleep 300 & wait"], start_new_session=True)
+        sid = leader.pid
+        try:
+            for _ in range(100):
+                if len(front_mod._session_pids(sid)) >= 3:
+                    break
+                time.sleep(0.05)
+            os.kill(sid, signal.SIGKILL)
+            leader.wait(10)                                                   # the leader is gone, its sleeps orphaned
+            orphans = sorted(front_mod._session_pids(sid))
+            self.assertGreaterEqual(len([p for p in orphans if S._pid_live(p)]), 2)
+            io = S.RealIO(_front(), {"env": {}, "argv": ["x"]}, {})
+            line = asyncio.run(io.end_session(sid))
+            for _ in range(100):
+                if not io.session_alive(sid):
+                    break
+                time.sleep(0.05)
+            self.assertFalse(io.session_alive(sid), line)
+        finally:
+            for p in front_mod._session_pids(sid):
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+class AfterSpawnCleanup(unittest.TestCase):
+    """MUSS 3: a respawned P never stays behind a failure."""
+
+    def _ends(self, io):
+        return [c for c in io.calls if c[0] == "end_session"]
+
+    def test_ready_bound_exit_and_stop_end_the_new_session(self):
+        f = _dead_front()
+        io = FakeIO(health_after=10 ** 6)
+        self.assertEqual(_drive(f, io, **{S.READY_ENV: "20"}), S.FAILED)
+        self.assertEqual([c[1] for c in self._ends(io)], [9999])
+        self.assertIn("respawned session 9999 ended", S.state_of(f).note)
+        f = _dead_front()
+        io = FakeIO(health_after=10 ** 6, exits_rc=1)
+        self.assertEqual(_drive(f, io), S.FAILED)
+        self.assertEqual([c[1] for c in self._ends(io)], [9999])              # a half-dead tree: orphans too
+
+        class StopIO(FakeIO):
+            def spawn(self_):
+                n = super().spawn()
+                f.state = "STOP"                                               # D died while P was joining
+                return n
+        f = _dead_front()
+        io = StopIO(health_after=10 ** 6)
+        self.assertEqual(_drive(f, io), S.FAILED)
+        self.assertEqual([c[1] for c in self._ends(io)], [9999])
+
+
+class HoldBoot(unittest.TestCase):
+    """MUSS 4: #1223 -- a held P rank is never killed (user order 06.09.)."""
+    HOLD = {"FLLIPER_DEBUG_HOLD": "1", "FLLIPER_DEBUG_HOLD_S": "100"}
+
+    def test_the_old_session_is_never_killed(self):
+        f = _dead_front()
+        io = FakeIO(alive_for=10 ** 6, spec_env=self.HOLD)
+        self.assertEqual(_drive(f, io), S.FAILED)
+        self.assertEqual(io.calls, [])                                        # no end_session, no spawn
+        self.assertIn("not killed (#1223)", S.state_of(f).note)
+
+    def test_the_hold_ends_by_itself_then_the_restart(self):
+        f = _dead_front()
+        io = FakeIO(alive_for=150, spec_env=self.HOLD)
+        self.assertEqual(_drive(f, io), S.SERVING)
+        self.assertEqual([c[0] for c in io.calls], ["spawn"])
+        self.assertGreaterEqual(io.calls[0][1], 150)
+
+    def test_a_failed_new_p_in_a_hold_boot_stays(self):
+        f = _dead_front()
+        io = FakeIO(health_after=10 ** 6, spec_env=self.HOLD)
+        self.assertEqual(_drive(f, io, **{S.READY_ENV: "10"}), S.FAILED)
+        self.assertNotIn("end_session", [c[0] for c in io.calls])
+
+    def test_hold_boot_reads_both_names(self):
+        self.assertEqual(S.hold_boot({"env": {"SGLANG_DEBUG_HOLD": "1"}}), (True, S.DEFAULT_HOLD_S))
+        self.assertEqual(S.hold_boot({"env": {"FLLIPER_DEBUG_HOLD": "0"}})[0], False)
+
+
+class FailedHealth(unittest.TestCase):
+    """MUSS 5: gone for good is not healthy."""
+
+    def _health(self, f):
+        f.groups["D"].health_facts = FH.GroupFacts(True, True, 0, None, time.time())
+        with mock.patch.object(front_mod.Front, "_probe_group_health", _http({"P": False, "D": True})):
+            r = asyncio.run(f._handle_health_facts())
+        return r.status, json.loads(r.body)
+
+    def test_no_restart_armed_is_503_named(self):
+        with _Env():
+            f = _front()
+            S.on_p_dead(f, "x")
+            status, body = self._health(f)
+        self.assertEqual(status, 503)
+        self.assertIn("S7B P-ABSENT-NO-RESTART", body["unhealthy"]["P"])
+
+    def test_a_failed_restart_is_503_named(self):
+        f = _dead_front()
+        _drive(f, FakeIO(spec=False))
+        with _Env(restart="1"):
+            status, body = self._health(f)
+        self.assertEqual(status, 503)
+        self.assertIn("S7B P-RESTART FAILED: no respawn record", body["unhealthy"]["P"])
+
+
+class ReapRanksSecrets(unittest.TestCase):
+    """SOLL 3/4/5/6/7."""
+
+    def test_the_wait_is_per_request(self):
+        with _Env():
+            f = _front()
+            with mock.patch.object(S, "restart_armed", lambda env=None: True):
+                S.on_p_dead(f, "x", now=1000.0, spawn_driver=lambda fr: None)
+            old, late = _p("old", 90000), _p("late", 90000)
+            old.t_arrive, late.t_arrive = 900.0, 1000.0 + S.DEFAULT_WAIT_S - 5
+            f.queue.extend([old, late])
+            S.tick(f, 1000.0 + S.DEFAULT_WAIT_S + 1)
+            self.assertIn("P-WAIT-EXPIRED", str(old.fut.exception(timeout=0)))
+            self.assertFalse(late.fut.done())                                 # arrived late: its own clock
+        self.assertGreaterEqual(S.DEFAULT_WAIT_S, S.DEFAULT_GRACE_S + 30 + S.DEFAULT_CARD_WAIT_S + S.DEFAULT_READY_S)
+
+    def test_a_respawned_leader_is_reaped_before_the_verdict(self):
+        polled = []
+        f = _front()
+        f._s7b_proc = types.SimpleNamespace(poll=lambda: polled.append(1) or 0)
+        f.groups["P"].health_facts = FH.GroupFacts(True, True, 0, None, time.time())
+        with mock.patch.object(front_mod, "_sid_alive", lambda sid: False):
+            self.assertTrue(S._p_looks_dead(f))
+        self.assertEqual(polled, [1])
+        polled.clear()
+        with mock.patch.object(front_mod, "_session_pids", lambda sid: set()):
+            self.assertFalse(S.RealIO(f, {"env": {}}, {}).session_alive(99))
+        self.assertEqual(polled, [1])
+
+    def test_ranks_from_pp_size(self):
+        self.assertEqual(S.p_ranks(["--pp-size", "4"], 3), 4)
+        self.assertEqual(S.p_ranks(["--pp-size=3", "--tp-size", "2"], 3), 6)
+        self.assertEqual(S.p_ranks(["--x"], 3), 3)
+        from flliper.srt.pdflip import dual_p_kv_stage as PK
+
+        with tempfile.TemporaryDirectory() as d:
+            f = _front()
+            f.dual_kv_ledgers = ["x"]
+            f.tag = "t"
+            io = S.RealIO(f, {"env": {}, "argv": ["--pp-size", "4"], "tag": "t"}, {})
+            t0 = time.time() - 10
+            with mock.patch.object(PK, "stage_file", lambda tag, r, root="/dev/shm": os.path.join(d, "%s-%d" % (tag, r))):
+                for r in range(3):
+                    open(os.path.join(d, "t-%d" % r), "w").close()
+                self.assertFalse(io.ranks_signed_in(t0))                       # PP=4: three files are not all
+                open(os.path.join(d, "t-3"), "w").close()
+                self.assertTrue(io.ranks_signed_in(t0))
+
+    def test_secrets_masked_and_put_back(self):
+        argv = ["python", "-m", "x", "--admin-api-key=s3cr3t", "--port", "30031", "--admin-api-key", "s3cr3t"]
+        env = {"HF_TOKEN": "hf_abc", "FLLIPER_HICACHE_BIGRAM_KEYS": "1", "A": "b"}
+        m_argv, m_env = S.mask_argv(argv), S.mask_env(env)
+        self.assertNotIn("s3cr3t", json.dumps([m_argv, m_env]))
+        self.assertNotIn("hf_abc", json.dumps([m_argv, m_env]))
+        self.assertEqual(m_env["FLLIPER_HICACHE_BIGRAM_KEYS"], "1")            # a switch named *KEYS is no secret
+        argv2, env2, missing = S.unmask({"argv": m_argv, "env": m_env}, {"HF_TOKEN": "hf_abc"}, "s3cr3t")
+        self.assertEqual(argv2, argv)
+        self.assertEqual(env2["HF_TOKEN"], "hf_abc")
+        self.assertEqual(missing, [])
+        _, env3, missing = S.unmask({"argv": ["x"], "env": m_env}, {}, "")
+        self.assertNotIn("HF_TOKEN", env3)
+        self.assertEqual(missing, ["HF_TOKEN"])
+
+    def test_the_record_dies_with_the_boot(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = S.respawn_path(d, "t")
+            open(path, "w").close()
+            self.assertTrue(S.remove_spec(d, "t").startswith("removed"))
+            self.assertEqual(S.remove_spec(d, "t"), "none")
+        from flliper.srt.pdflip import launcher as L
+
+        self.assertIn("_s7b.remove_spec(GPU_ARB", inspect.getsource(L.teardown))
+
+    def test_boot_json_names_the_new_p(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "boot_t.json")
+            with open(path, "w") as fh:
+                json.dump({"pids": {"P": 11, "D": 12, "front": 13}, "tag": "t"}, fh)
+            self.assertIn("11 -> 99", S.rewrite_boot_pids(path, "P", 99))
+            self.assertEqual(json.load(open(path))["pids"], {"P": 99, "D": 12, "front": 13})
+
+
+class ArenaCensus(unittest.TestCase):
+    """MUSS 6: the dead P's arena state is measured at P-DEAD and named at P-BACK."""
+
+    def test_p_back_names_the_difference(self):
+        snaps = iter([{"arena-32768.bin": {"slots": 112, "complete": 90, "pinned": 50, "refs": 179, "claimed": 3}},
+                      {"arena-32768.bin": {"slots": 112, "complete": 92, "pinned": 48, "refs": 120, "claimed": 1}}])
+        with mock.patch.object(S, "ARENA_CENSUS", lambda fr: next(snaps)):
+            f = _dead_front()
+            with self.assertLogs(S.logger, "WARNING") as cm:
+                self.assertEqual(_drive(f, FakeIO()), S.SERVING)
+        line = [m for m in cm.output if "S7B P-BACK" in m][0]
+        self.assertIn("arena-32768.bin:pinned 50->48 refs 179->120 claimed 3->1", line)
+
+    def test_delta_text(self):
+        self.assertEqual(S.arena_delta_text({}, {}), "none")
+        self.assertIn("unreadable", S.arena_delta_text({"a": None}, {"a": None}))
+
+
+class RealDualPass(unittest.TestCase):
+    """SOLL 8: the REAL _p_drain_pass_dual (its source, byte for byte, out of Front.controller) with a dead P."""
+
+    def _pass(self, front):
+        src = inspect.getsource(front_mod.Front.controller)
+        a = src.index("        async def _p_drain_pass_dual() -> int:")
+        b = src.index("        async def _p_drain_pass() -> int:")
+        ns = dict(front_mod.__dict__)
+        ns.update(self=front, sem=asyncio.Semaphore(4), _ahead=0, _ro_state=None, _ro_max=0)  # one leg at a time
+        exec(compile(textwrap.dedent(src[a:b]), "dual_pass", "exec"), ns)
+        return ns["_p_drain_pass_dual"]
+
+    def _front(self):
+        f = _front()
+        f.tp_prefill_max_tokens = 1                                           # the dual's X (specimen 10240650)
+        f.dual_kv_ledgers = ["/dev/shm/wkv-none-s7b"]
+        f.p_phase_max_requests, f.p_pool_tokens, f.p_concurrency = 0, 0, 1
+        f._p_phase_k, f._p_cost_tasks, f._p_intake_stalled = [], set(), False
+        return f
+
+    def _patches(self, leg1):
+        F = front_mod.Front
+        return [mock.patch.object(F, "leg1", leg1), mock.patch.object(F, "_log_p_prefix_reuse", lambda self, r: None),
+                mock.patch.object(front_mod, "_dual_p_pressure", lambda paths: 0),
+                mock.patch.object(F, "_dual_p_held_by_stage", lambda self: False),
+                mock.patch.object(F, "_q696_stall_held", lambda self: False),
+                mock.patch.object(F, "_dual_resume_held", lambda self: False),
+                mock.patch.object(F, "_dual_short_reorder", lambda self, head_blocked: False),
+                mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_ENABLE_X_COST_LINE": "0"})]
+
+    def _run(self, f, leg1):
+        async def go():
+            loop = asyncio.get_running_loop()
+            mk = lambda rid, u: front_mod.Pending(rid, "/generate", {}, "t", time.time(), loop.create_future(),
+                                                  est_prompt=u, est_uncached=u)
+            f.queue.extend([mk("pdflip-0-6", 120000), mk("pdflip-0-7", 50000)])
+            await self._pass(f)()
+            return list(f.queue)
+        ps = self._patches(leg1)
+        for p_ in ps:
+            p_.start()
+        try:
+            return asyncio.run(go())
+        finally:
+            for p_ in ps:
+                p_.stop()
+
+    def test_a_leg_that_dies_with_p_goes_back_to_the_head(self):
+        async def leg1(self, p):
+            async def post():
+                raise ConnectionResetError("Cannot connect to host 127.0.0.1:30031")
+            await S.leg1_rpc(self, p, post())
+
+        with _Env():
+            f = self._front()
+            f.groups["P"].health_facts = FH.GroupFacts(False, False, 2, None, time.time())   # the poller's dead fact
+            q = self._run(f, leg1)
+            self.assertEqual([p.rid for p in q], ["pdflip-0-6"])               # requeued at the head, not failed
+            self.assertFalse(q[0].fut.done())
+            self.assertEqual(list(f._ready_for_d), [])                         # never handed to D
+            self.assertEqual(f.counters["leg1_failures"], 0)
+            self.assertEqual(f.counters["s7b_legs_aborted"], 1)
+            self.assertEqual(S.state_of(f).state, S.FAILED)                    # no restart armed in this test
+            S.tick(f)                                                          # the controller: gone for good -> named 503
+            self.assertIn("P-ABSENT-NO-RESTART", str(q[0].fut.exception(timeout=0)))
+
+    def test_a_marked_leg_that_still_returns_200_goes_to_d(self):
+        async def leg1(self, p):
+            p.dual_pause = True                                                # marked at the death, P had finished it
+            p.leg1_prompt_tokens = 120000
+
+        with _Env():
+            f = self._front()
+            q = self._run(f, leg1)
+            self.assertEqual([p.rid for p in f._ready_for_d][:1], ["pdflip-0-6"])
+            self.assertFalse(getattr(f._ready_for_d[0], "dual_pause", False))
+            self.assertFalse(f._ready_for_d[0].fut.done())
 
 if __name__ == "__main__":
     unittest.main()

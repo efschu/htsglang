@@ -32,8 +32,8 @@ STAGE 2 (``restart_driver``): the launcher writes P's exec record (argv, env, cw
      own crash-diagnose window ends in ``kill_process_tree`` on the specimens); past the grace it ends the session
      itself: MPS ``terminate_client`` for every old P pid first (#210: a SIGKILL on a computing MPS client is the
      undefined case), then ``kill_process_tree``;
-  1b. CARD ROOM: every P card must have P's planned budget free again (the LAST --rank-gpu-memory-mib of P's own
-     argv, summed per --rank-gpu-id card; NVML allocatable free) before the spawn -- a P that slept had lent its
+  1b. CARD ROOM: every P card must have P's PLANNED peak free again (budget + overhead, the number the launcher
+     sized D against, written into the record as ``card_need_mib``; NVML allocatable free) before the spawn -- a P that slept had lent its
      weights' bytes to the card pool (#1956 WAKE-SEES-LOAN), D may still hold them; P comes back only once the card
      has them free (bound ``FLLIPER_PDFLIP_DUAL_P_RESTART_CARD_WAIT_S``, default 600 s; no reserve on top);
   2. spawns P again with the SAME argv/env (same cards, same planner cut -- the record is the launcher's exec'd
@@ -82,11 +82,20 @@ READY_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_READY_S"
 MAX_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_MAX"
 CARD_WAIT_ENV = "FLLIPER_PDFLIP_DUAL_P_RESTART_CARD_WAIT_S"
 DEFAULT_CARD_WAIT_S = 600.0
-DEFAULT_WAIT_S = 900.0
+#: review SOLL 3: the per-request wait covers the driver's own bounds (grace 90 + kill 30 + card 600 + ready 900)
+DEFAULT_WAIT_S = 1800.0
 DEFAULT_GRACE_S = 90.0
 DEFAULT_READY_S = 900.0
 DEFAULT_MAX = 2
 SPEC_SCHEMA = "pdflip.p_respawn/1"
+#: review SOLL 7: what the respawn record never holds in clear (env NAMES, case-insensitive; argv flags)
+SECRET_NAME_RX = r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|ADMIN_KEY|ACCESS_KEY|PRIVATE_KEY"
+SECRET_ARGV_FLAGS = ("--admin-api-key",)   # restored from the front's own admin key
+MASK = "S7B-MASKED"
+#: review MUSS 4: #1223 DEBUG-HOLD (debug_hold.HOLD_ENV / HOLD_S_ENV / DEFAULT_HOLD_S, and the pre-rename names)
+HOLD_ENVS = ("FLLIPER_DEBUG_HOLD", "SGLANG_DEBUG_HOLD")
+HOLD_S_ENVS = ("FLLIPER_DEBUG_HOLD_S", "SGLANG_DEBUG_HOLD_S")
+DEFAULT_HOLD_S = 1800.0
 STATUS_EVERY_S = 30.0
 
 SERVING = "serving"
@@ -147,6 +156,9 @@ class PRestartState:
     answered: int = 0
     last_status_t: float = 0.0
     note: str = ""
+    no_restart: bool = False
+    arena_dead: Any = None
+    arena_back: Any = None
     task: Any = None
 
     def snapshot(self) -> dict:
@@ -181,6 +193,21 @@ def state_block(front, env=None) -> dict:
     snap["armed"] = armed(front, env)
     snap["restart_armed"] = restart_armed(env)
     return {"p_restart": snap}
+
+
+def health_reason(front, env=None) -> Optional[str]:
+    """Review MUSS 5: the front's /health is non-200 while P is gone for good (FAILED, or no restart armed) --
+    with X = 1 every new prompt is answered 503 then. None while P serves or may still come back."""
+    if not p_absent(front, env):
+        return None
+    st = state_of(front)
+    if st.state != FAILED:
+        return None
+    return "%s %s: %s" % (MARK, "P-ABSENT-NO-RESTART" if st.no_restart else "P-RESTART FAILED", st.note[:200])
+
+
+def _fail_name(st) -> str:
+    return "P-ABSENT-NO-RESTART" if st.no_restart else "P-RESTART-FAILED"
 
 
 def _x(front) -> int:
@@ -223,6 +250,7 @@ def on_p_dead(front, why: str, *, now: Optional[float] = None, env=None,
     st.state, st.why, st.t_dead = DEAD, str(why), now
     st.old_sid = int(getattr(P, "sid", 0) or 0)
     st.deaths += 1
+    st.arena_dead = ARENA_CENSUS(front)   # review MUSS 6: the shared arena as the dead P left it
     inflight = dict(getattr(front, "_dual_inflight", None) or {})
     outstanding = len(getattr(P, "outstanding", {}) or {})
     queue = list(getattr(front, "queue", ()) or ())
@@ -255,8 +283,10 @@ def on_p_dead(front, why: str, *, now: Optional[float] = None, env=None,
             if loop is not None:
                 st.task = loop.create_task(restart_driver(front, RealIO.from_env(front, env)))
     else:
-        answer_p_bound(front, "P-ABSENT-NO-RESTART",
-                       "P is dead and no restart is armed (%s=0 or no respawn record in %s)" % (RESTART_ENV, SPEC_ENV))
+        # review MUSS 5: P never comes back -- the same end state as a failed restart (front /health non-200)
+        st.state, st.no_restart = FAILED, True
+        st.note = "no restart armed (%s=0 or no respawn record in %s)" % (RESTART_ENV, SPEC_ENV)
+        answer_p_bound(front, "P-ABSENT-NO-RESTART", "P is dead and " + st.note)
     _kick(front)
     return True
 
@@ -305,8 +335,9 @@ def hand_to_d(front) -> int:
     return len(moved)
 
 
-def answer_p_bound(front, name: str, detail: str) -> int:
-    """Answer (503, by name) every queued request only P can serve. D-capable ones are left to ``hand_to_d``."""
+def answer_p_bound(front, name: str, detail: str, pred=None) -> int:
+    """Answer (503, by name) every queued request only P can serve (and ``pred`` accepts). D-capable ones are left
+    to ``hand_to_d``."""
     q = getattr(front, "queue", None)
     if not q:
         return 0
@@ -314,6 +345,8 @@ def answer_p_bound(front, name: str, detail: str) -> int:
     for p in list(q):
         fut = getattr(p, "fut", None)
         if fut is None or fut.done() or d_capable(front, p):
+            continue
+        if pred is not None and not pred(p):
             continue
         try:
             q.remove(p)
@@ -388,12 +421,23 @@ def _p_looks_dead(front) -> bool:
     P = (getattr(front, "groups", {}) or {}).get("P")
     if P is None:
         return False
+    _reap_respawned(front)   # review SOLL 5: an unreaped respawned leader reads 'alive' in ps
     f = getattr(P, "health_facts", None)
     if f is not None and (getattr(f, "hold", None) is not None or not getattr(f, "alive", True)):
         return True
     from flliper.srt.pdflip import front as _front_mod
 
     return not _front_mod._sid_alive(int(getattr(P, "sid", 0) or 0))
+
+
+def _reap_respawned(front) -> Optional[int]:
+    proc = front.__dict__.get("_s7b_proc")
+    if proc is None:
+        return None
+    try:
+        return proc.poll()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def tick(front, now: Optional[float] = None, env=None) -> None:
@@ -403,10 +447,12 @@ def tick(front, now: Optional[float] = None, env=None) -> None:
     st = state_of(front)
     hand_to_d(front)
     if st.state == FAILED:
-        answer_p_bound(front, "P-RESTART-FAILED", "P did not come back: %s" % (st.note or st.why)[:200])
-    elif now - st.t_dead > _num(env, WAIT_ENV, DEFAULT_WAIT_S):
-        answer_p_bound(front, "P-WAIT-EXPIRED", "P absent %.0f s > %s=%.0f s (state=%s)" % (
-            now - st.t_dead, WAIT_ENV, _num(env, WAIT_ENV, DEFAULT_WAIT_S), st.state))
+        answer_p_bound(front, _fail_name(st), "P does not come back: %s" % (st.note or st.why)[:200])
+    else:
+        # review SOLL 3: the wait is per request, from its arrival (or the death, whichever is later)
+        wait = _num(env, WAIT_ENV, DEFAULT_WAIT_S)
+        answer_p_bound(front, "P-WAIT-EXPIRED", "waited > %s=%.0f s for P (state=%s)" % (WAIT_ENV, wait, st.state),
+                       pred=lambda p: now - max(float(getattr(p, "t_arrive", st.t_dead) or st.t_dead), st.t_dead) > wait)
     if now - st.last_status_t >= STATUS_EVERY_S:
         st.last_status_t = now
         q = [p for p in list(getattr(front, "queue", ()) or ()) if not p.fut.done()]
@@ -434,12 +480,87 @@ def p_back(front, *, now: Optional[float] = None) -> None:
     front.__dict__["_dual_backoff_until"] = 0.0
     absent_s = now - st.t_dead
     st.state, st.restarts = SERVING, st.restarts + 1
+    st.arena_back = ARENA_CENSUS(front)
     front.counters["s7b_p_back"] += 1
-    logger.warning("%s P-BACK pid=%s absent_s=%.1f restarts=%d to_d=%d legs_aborted=%d answered=%d -- P serves "
-                   "again (health 200 + every rank's stage file rewritten after the spawn; R11: the front "
-                   "decides, the ranks only signed in)", MARK, st.new_pid, absent_s, st.restarts, st.to_d,
-                   st.legs_aborted, st.answered)
+    logger.warning("%s P-BACK pid=%s absent_s=%.1f restarts=%d to_d=%d legs_aborted=%d answered=%d arena=%s -- P "
+                   "serves again (health 200 + every rank's stage file rewritten after the spawn; R11: the front "
+                   "decides, the ranks only signed in; arena = ARENA-REF-CENSUS at P-DEAD -> P-BACK: reader refs "
+                   "and open writers of the dead P carry no pid and are not reaped, review MUSS 6)", MARK,
+                   st.new_pid, absent_s, st.restarts, st.to_d, st.legs_aborted, st.answered,
+                   arena_delta_text(st.arena_dead, st.arena_back))
     _kick(front)
+
+
+# ---------------------------------------------------------------- review MUSS 6: the shared arena's census
+def arena_paths(front, tags=None) -> List[str]:
+    import glob
+
+    tags = list(tags or [])
+    for t in (str(getattr(front, "tag", "") or ""),):
+        if t and t not in tags:
+            tags.append(t)
+    out: List[str] = []
+    for t in tags:
+        for p in sorted(glob.glob("/dev/shm/pdflip-arena-%s/*.bin" % t)):
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def arena_census_of(path: str) -> Optional[Dict[str, int]]:
+    """slots / complete / pinned (COMPLETE with a reader ref) / refs / claimed of ONE arena file, read-only through
+    the front's lookup view (the same header read as ShmArena.ref_census). None = unreadable."""
+    try:
+        import ctypes
+
+        import numpy as np
+
+        from flliper.srt.mem_cache.storage.file.hicache_arena import ArenaView
+
+        v = ArenaView(path)
+        try:
+            out = (ctypes.c_int64 * 6)()
+            v._lib.arena_layout(v.slots, v.slot_bytes, out)
+            hb, hope = int(out[0]), int(out[3])
+            u32 = np.frombuffer(v._mm, dtype=np.uint32, count=v.slots * hb // 4, offset=hope)
+            hdr = u32.reshape(v.slots, hb // 4)
+            state, ref = hdr[:, 0], hdr[:, 1]
+            res = {"slots": int(v.slots), "complete": int((state == 2).sum()),
+                   "pinned": int(((state == 2) & (ref > 0)).sum()), "refs": int(ref.sum(dtype=np.int64)),
+                   "claimed": int((state == 1).sum())}
+            del u32, hdr, state, ref
+            return res
+        finally:
+            v.close()
+    except Exception:  # noqa: BLE001 -- an instrument never stops the front
+        return None
+
+
+def arena_census(front) -> Dict[str, Any]:
+    tags = []
+    spec = read_spec(str(os.environ.get(SPEC_ENV, "") or "")) or {}
+    if spec.get("tag"):
+        tags.append(str(spec["tag"]))
+    return {os.path.basename(p): arena_census_of(p) for p in arena_paths(front, tags)}
+
+
+#: replaceable in tests (the census reads /dev/shm)
+ARENA_CENSUS = arena_census
+
+
+def arena_delta_text(before, after) -> str:
+    if not before and not after:
+        return "none"
+    parts = []
+    for name in sorted(set(before or {}) | set(after or {})):
+        a, b = (before or {}).get(name), (after or {}).get(name)
+        if not a or not b:
+            parts.append("%s:unreadable" % name)
+            continue
+        parts.append("%s:pinned %d->%d refs %d->%d claimed %d->%d complete %d->%d" % (
+            name, a["pinned"], b["pinned"], a["refs"], b["refs"], a["claimed"], b["claimed"],
+            a["complete"], b["complete"]))
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------- stage 2: the respawn record and the driver
@@ -447,11 +568,126 @@ def respawn_path(gpu_arb: str, tag: str) -> str:
     return os.path.join(gpu_arb, "p_respawn_%s.json" % str(tag))
 
 
+def remove_spec(gpu_arb: str, tag: str) -> str:
+    """Review SOLL 7: the record dies with the boot (launcher --teardown)."""
+    path = respawn_path(gpu_arb, tag)
+    try:
+        os.unlink(path)
+        return "removed %s" % path
+    except FileNotFoundError:
+        return "none"
+    except OSError as e:
+        return "not removed (%s)" % e
+
+
+def _secret_name(name: str) -> bool:
+    import re
+
+    return re.search(SECRET_NAME_RX, str(name), re.IGNORECASE) is not None
+
+
+def mask_argv(argv: List[str]) -> List[str]:
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            out.append(MASK)
+            skip = False
+            continue
+        hit = next((f for f in SECRET_ARGV_FLAGS if a == f or a.startswith(f + "=")), None)
+        if hit is None:
+            out.append(a)
+        elif a == hit:
+            out.append(a)
+            skip = True
+        else:
+            out.append(hit + "=" + MASK)
+    return out
+
+
+def mask_env(env: Dict[str, str]) -> Dict[str, str]:
+    return {k: (MASK if _secret_name(k) and str(v) != "" else str(v)) for k, v in env.items()}
+
+
+def unmask(spec: dict, front_env: Dict[str, str], admin_key: str) -> "tuple[List[str], Dict[str, str], List[str]]":
+    """The exec record with its secrets put back: env values from the front's own environment (the launcher built
+    both from one os.environ), the admin key from the front's. Returns (argv, env, names not restorable)."""
+    missing: List[str] = []
+    env = {}
+    for k, v in (spec.get("env") or {}).items():
+        if v == MASK:
+            if k in front_env:
+                env[k] = front_env[k]
+            else:
+                missing.append(k)
+        else:
+            env[k] = v
+    argv = []
+    for a in spec.get("argv") or []:
+        if a == MASK or a.endswith("=" + MASK):
+            if not admin_key:
+                missing.append("argv:" + a)
+                argv.append(a)
+                continue
+            argv.append(admin_key if a == MASK else a[: -len(MASK)] + admin_key)
+        else:
+            argv.append(a)
+    return argv, env, missing
+
+
+def rewrite_boot_pids(path: str, group: str, pid: int) -> str:
+    """Review SOLL 4: the launcher's boot json (what --teardown reads) names the respawned P."""
+    try:
+        with open(path) as f:
+            st = json.load(f)
+        old = (st.get("pids") or {}).get(group)
+        st.setdefault("pids", {})[group] = int(pid)
+        tmp = "%s.tmp.s7b.%d" % (path, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=1, default=str)
+        os.replace(tmp, path)
+        return "pids.%s %s -> %d in %s" % (group, old, int(pid), path)
+    except (OSError, ValueError) as e:
+        return "pids.%s not rewritten (%s: %s)" % (group, type(e).__name__, e)
+
+
+def hold_boot(spec: dict) -> "tuple[bool, float]":
+    """Review MUSS 4: is P's boot a #1223 DEBUG-HOLD boot, and how long does a held rank hold."""
+    env = spec.get("env") or {}
+    on = any(str(env.get(k, "")) == "1" for k in HOLD_ENVS)
+    hold_s = DEFAULT_HOLD_S
+    for k in HOLD_S_ENVS:
+        try:
+            if env.get(k):
+                hold_s = float(env[k])
+                break
+        except (TypeError, ValueError):
+            pass
+    return on, hold_s
+
+
+def end_session_pids(sid: int, *, session_pids, terminate, kill_tree, kill_pid, alive, own_sid: int) -> str:
+    """Review MUSS 2: end EVERY process of P's old session -- MPS terminate_client first (#210), then the leader's
+    tree, then SIGKILL for each pid of the session still alive (a dead leader leaves orphaned schedulers that
+    kill_process_tree never sees: it returns at the leader's NoSuchProcess). Never the front's own session."""
+    if int(sid) <= 1 or int(sid) == int(own_sid):
+        return "refused: sid=%s (own sid %s)" % (sid, own_sid)
+    pids = sorted(int(p) for p in session_pids(int(sid)))
+    done = terminate(pids) if pids else []
+    tree = kill_tree(int(sid))
+    left = [p for p in pids if alive(p)]
+    for p in left:
+        kill_pid(p)
+    return "pids=%s mps_terminated=%s kill_process_tree=%s sigkill=%s" % (pids, sorted(done or []), tree, left)
+
+
 def write_spec(path: str, *, argv: List[str], env: Dict[str, str], cwd: str, log: str, port: int, tag: str,
-               pid: int) -> str:
-    """The launcher's exec record of P (the argv/env it actually exec'd, not a redacted copy), mode 0600."""
-    rec = {"schema": SPEC_SCHEMA, "group": "P", "argv": list(argv), "env": dict(env), "cwd": str(cwd),
-           "log": str(log), "port": int(port), "tag": str(tag), "pid": int(pid),
+               pid: int, card_need_mib: Optional[Dict[int, int]] = None) -> str:
+    """The launcher's exec record of P (the argv/env it actually exec'd), mode 0600. Secrets are masked (SOLL 7) and
+    put back from the front's environment at the spawn. ``card_need_mib``: P's PLANNED peak per NVML card (budget +
+    overhead, the number D was sized against -- review MUSS 1); the card gate checks exactly this."""
+    rec = {"schema": SPEC_SCHEMA, "group": "P", "argv": mask_argv(list(argv)), "env": mask_env(dict(env)),
+           "cwd": str(cwd), "log": str(log), "port": int(port), "tag": str(tag), "pid": int(pid),
+           "card_need_mib": {str(int(k)): int(v) for k, v in (card_need_mib or {}).items()},
            "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -471,31 +707,29 @@ def _flag_last(argv: List[str], flag: str) -> Optional[str]:
     return val
 
 
-def card_need_from_argv(argv: List[str]) -> Dict[int, int]:
-    """P's planned budget per physical card from its OWN argv: the last ``--rank-gpu-memory-mib`` (argparse: the last
-    occurrence wins) summed per ``--rank-gpu-id`` card. {} = not derivable (the gate then leaves it to P's boot)."""
-    ids, mib = _flag_last(list(argv), "--rank-gpu-id"), _flag_last(list(argv), "--rank-gpu-memory-mib")
-    if not ids or not mib:
-        return {}
+def spec_card_need(spec: dict) -> Dict[int, int]:
+    """P's planned peak per NVML card from the record (review MUSS 1). {} = not recorded."""
     try:
-        cards = [int(x) for x in ids.split(",") if x.strip() != ""]
-        need = [int(x) for x in mib.split(",") if x.strip() != ""]
+        return {int(k): int(v) for k, v in (spec.get("card_need_mib") or {}).items()}
+    except (TypeError, ValueError):
+        return {}
+
+
+def p_ranks(argv: List[str], default: int) -> int:
+    """Review SOLL 6: P's rank count from its own argv (--pp-size x --tp-size)."""
+    try:
+        pp = int(_flag_last(list(argv), "--pp-size") or 0)
+        tp = int(_flag_last(list(argv), "--tp-size") or 1)
     except ValueError:
-        return {}
-    if len(need) == 1 and len(cards) > 1:
-        need = need * len(cards)
-    if len(cards) != len(need):
-        return {}
-    out: Dict[int, int] = {}
-    for c, m in zip(cards, need):
-        out[c] = out.get(c, 0) + m
-    return out
+        return default
+    return pp * max(1, tp) if pp > 0 else default
 
 
 def card_room_verdict(need: Dict[int, int], free: Dict[int, int]) -> "tuple[bool, str]":
-    """Pure: every card's allocatable free >= P's planned budget there (no reserve on top)."""
+    """Pure: every card's allocatable free >= P's planned peak there (no reserve on top). No recorded need = no
+    spawn (review MUSS 1: the argv budget alone is 2500 MiB/card short of P's plan)."""
     if not need:
-        return True, "need not derivable from P's argv -- P's own boot checks"
+        return False, "no planned P peak in the respawn record (card_need_mib) -- no spawn on a guess"
     if not free:
         return False, "NVML unreadable"
     short = ["nvml%d free=%s<need=%d" % (c, free.get(c, "?"), m) for c, m in sorted(need.items())
@@ -520,6 +754,15 @@ def read_spec(path: str) -> Optional[dict]:
     return rec
 
 
+def _pid_live(pid: int) -> bool:
+    """A process exists and is not a zombie."""
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
 class RealIO:
     """The driver's effects on the real rig. Tests hand the driver a fake with the same methods."""
 
@@ -538,63 +781,89 @@ class RealIO:
         await asyncio.sleep(s)
 
     def session_alive(self, sid: int) -> bool:
+        """Any non-zombie process of the session (SOLL 5: the respawned leader is reaped first)."""
+        _reap_respawned(self.front)
+        if not sid:
+            return False
         from flliper.srt.pdflip import front as _front_mod
 
-        return bool(sid) and _front_mod._sid_alive(int(sid))
+        return any(_pid_live(p) for p in _front_mod._session_pids(int(sid)))
 
     async def end_session(self, sid: int) -> str:
-        """MPS terminate_client for every pid of the old session (#210), then kill_process_tree."""
         def _run() -> str:
+            import signal
+
             from flliper.srt.pdflip import front as _front_mod
             from flliper.srt.pdflip import mps_exit_quiesce as _s7q
 
-            pids = sorted(_front_mod._session_pids(int(sid)))
-            done: List[int] = []
-            if str(self.spec.get("env", {}).get("CUDA_MPS_PIPE_DIRECTORY", "") or "").strip():
-                spec_env = dict(os.environ)
-                spec_env["CUDA_MPS_PIPE_DIRECTORY"] = self.spec["env"]["CUDA_MPS_PIPE_DIRECTORY"]
-                done = _s7q.terminate_clients(pids, why="s7b_restart",
-                                              ctl=lambda c: _s7q.control(c, env=spec_env, timeout_s=5.0))
-            try:
-                from flliper.srt.utils.common import kill_process_tree
+            pipe = str((self.spec.get("env") or {}).get("CUDA_MPS_PIPE_DIRECTORY", "") or "").strip()
 
-                kill_process_tree(int(sid), include_parent=True, wait_timeout=30)
-                killed = "ok"
-            except Exception as e:  # noqa: BLE001 -- named in the driver's line
-                killed = "%s: %s" % (type(e).__name__, str(e)[:120])
-            return "pids=%s mps_terminated=%s kill_process_tree=%s" % (pids, done, killed)
+            def terminate(pids):
+                if not pipe:
+                    return []
+                spec_env = dict(os.environ)
+                spec_env["CUDA_MPS_PIPE_DIRECTORY"] = pipe
+                return _s7q.terminate_clients(pids, why="s7b_restart",
+                                              ctl=lambda c: _s7q.control(c, env=spec_env, timeout_s=5.0))
+
+            def kill_tree(leader):
+                try:
+                    from flliper.srt.utils.common import kill_process_tree
+
+                    kill_process_tree(int(leader), include_parent=True, wait_timeout=30)
+                    return "ok"
+                except Exception as e:  # noqa: BLE001 -- named in the line, the per-pid kill follows
+                    return "%s: %s" % (type(e).__name__, str(e)[:120])
+
+            def kill_pid(p):
+                try:
+                    os.kill(int(p), signal.SIGKILL)
+                except OSError:
+                    pass
+
+            return end_session_pids(int(sid), session_pids=_front_mod._session_pids, terminate=terminate,
+                                    kill_tree=kill_tree, kill_pid=kill_pid, alive=_pid_live, own_sid=os.getsid(0))
 
         return await asyncio.to_thread(_run)
 
     def card_room(self) -> "tuple[bool, str]":
         from flliper.srt.pdflip import front as _front_mod
 
-        need = card_need_from_argv(list(self.spec.get("argv") or []))
+        need = spec_card_need(self.spec)
         free = {int(c.nvml_index): int(c.free_mib) for c in _front_mod._nvml_free()} if need else {}
         return card_room_verdict(need, free)
 
+    def exec_record(self) -> "tuple[List[str], Dict[str, str], List[str]]":
+        return unmask(self.spec, dict(os.environ), str(getattr(self.front, "admin_key", "") or ""))
+
     def spawn(self) -> int:
         spec = self.spec
+        argv, env, missing = self.exec_record()
+        if any(m.startswith("argv:") for m in missing):
+            raise RuntimeError("the masked admin key cannot be put back (the front has none): %s" % missing)
+        if missing:
+            logger.warning("%s P-RESTART env secrets not in the front's environment, left out: %s", MARK, missing)
         fh = open(spec["log"], "ab")
         fh.write(("=== PDFLIP group P RE-launched by the front (%s) %s ===\n" % (
             MARK, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))).encode())
         fh.flush()
-        p = subprocess.Popen(spec["argv"], env=spec["env"], stdout=fh, stderr=subprocess.STDOUT,
+        p = subprocess.Popen(argv, env=env, stdout=fh, stderr=subprocess.STDOUT,
                              cwd=spec.get("cwd") or None, start_new_session=True)
         self.front.__dict__["_s7b_proc"] = p
         try:
-            # the arm's group stop finds the new P like the launcher's (H135b registry); the launcher's state
-            # json still names the old pid (named boundary: --teardown misses a respawned P, a container stop not)
+            # the arm's group stop (H135b registry) and --teardown's boot json (SOLL 4) name the new P
             from flliper.srt.pdflip import launcher as _launcher
 
-            logger.warning("%s %s", MARK, _launcher.register_boot_group(str(spec.get("tag", "") or ""), "P", int(p.pid)))
-        except Exception as e:  # noqa: BLE001 -- a lost registry entry costs the arm its group stop, not the restart
-            logger.warning("%s P-RESTART boot-group registry not written: %s: %s", MARK, type(e).__name__, e)
+            tag = str(spec.get("tag", "") or "")
+            logger.warning("%s %s", MARK, _launcher.register_boot_group(tag, "P", int(p.pid)))
+            logger.warning("%s %s", MARK, rewrite_boot_pids(
+                _launcher._operator_dir(_launcher.GPU_ARB, "boot_%s.json" % tag), "P", int(p.pid)))
+        except Exception as e:  # noqa: BLE001 -- a lost entry costs the teardown its pid, not the restart
+            logger.warning("%s P-RESTART registry / boot json not written: %s: %s", MARK, type(e).__name__, e)
         return int(p.pid)
 
     def spawned_exited(self) -> Optional[int]:
-        p = self.front.__dict__.get("_s7b_proc")
-        return None if p is None else p.poll()
+        return _reap_respawned(self.front)
 
     async def health_ok(self) -> bool:
         P = self.front.groups["P"]
@@ -613,7 +882,7 @@ class RealIO:
                   self.env.get("FLLIPER_PDFLIP_DUAL_KV_TAG", "") or self.env.get("FLLIPER_PDFLIP_TAG", "pdflip")):
             if t and t not in tags:
                 tags.append(t)
-        for r in range(_pk.LEND_GATE_RANKS):
+        for r in range(p_ranks(list(self.spec.get("argv") or []), _pk.LEND_GATE_RANKS)):
             fresh = False
             for t in tags:
                 try:
@@ -639,9 +908,21 @@ async def restart_driver(front, io, env=None) -> str:
             return _fail(front, "restart budget spent (%d of %s=%d)" % (
                 st.restarts, MAX_ENV, int(_num(env, MAX_ENV, DEFAULT_MAX))))
         grace = _num(env, GRACE_ENV, DEFAULT_GRACE_S)
+        hold, hold_s = hold_boot(io.spec)
+        if hold:
+            # review MUSS 4 (#1223, user order 06.09.): a held P rank is never killed -- the live attach at the wall is
+            # what a hold boot is for. The old session ends by itself when the hold ends; D serves meanwhile.
+            grace = grace + hold_s
+            logger.warning("%s P-RESTART hold boot (#1223): the old P session %s is not killed; waiting up to %.0f s "
+                           "(hold %.0f s + grace) for it to end by itself", MARK, st.old_sid, grace, hold_s)
         t0 = io.now()
         while io.session_alive(st.old_sid) and io.now() - t0 < grace:
+            if getattr(front, "state", None) == "STOP":
+                return _fail(front, "front stopped while the old P session ended")
             await io.sleep(1.0)
+        if io.session_alive(st.old_sid) and hold:
+            return _fail(front, "hold boot: old P session %s still alive after %.0f s -- not killed (#1223)" % (
+                st.old_sid, grace))
         if io.session_alive(st.old_sid):
             how = await io.end_session(st.old_sid)
             logger.warning("%s P-RESTART old session %s outlived the grace %.0f s: %s", MARK, st.old_sid, grace, how)
@@ -649,7 +930,7 @@ async def restart_driver(front, io, env=None) -> str:
             while io.session_alive(st.old_sid) and io.now() - t1 < 30.0:
                 await io.sleep(1.0)
             if io.session_alive(st.old_sid):
-                return _fail(front, "old P session %s still alive after kill_process_tree" % st.old_sid)
+                return _fail(front, "old P session %s still alive after terminate + kill of every pid" % st.old_sid)
         cwait = _num(env, CARD_WAIT_ENV, DEFAULT_CARD_WAIT_S)
         t2 = io.now()
         while True:
@@ -675,20 +956,40 @@ async def restart_driver(front, io, env=None) -> str:
         while io.now() - st.t_spawn < ready:
             rc = io.spawned_exited()
             if rc is not None:
-                return _fail(front, "respawned P exited rc=%s during its boot" % rc)
+                return await _fail_spawned(front, io, "respawned P exited rc=%s during its boot" % rc)
             if getattr(front, "state", None) == "STOP":
-                return _fail(front, "front stopped while P was joining")
+                return await _fail_spawned(front, io, "front stopped while P was joining")
             if await io.health_ok():
                 signed = io.ranks_signed_in(st.t_spawn)
                 if signed is None or signed:
                     p_back(front)
                     return SERVING
             await io.sleep(2.0)
-        return _fail(front, "P not back within %s=%.0f s (health or a rank's stage file missing)" % (READY_ENV, ready))
+        return await _fail_spawned(front, io, "P not back within %s=%.0f s (health or a rank's stage file missing)"
+                                   % (READY_ENV, ready))
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 -- the driver never takes the front down
-        return _fail(front, "driver raised %s: %s" % (type(e).__name__, str(e)[:200]))
+        why = "driver raised %s: %s" % (type(e).__name__, str(e)[:200])
+        if st.state == JOINING and st.new_pid:
+            try:
+                return await _fail_spawned(front, io, why)
+            except Exception:  # noqa: BLE001
+                pass
+        return _fail(front, why)
+
+
+async def _fail_spawned(front, io, why: str) -> str:
+    """Review MUSS 3: a failure after the spawn ends the respawned session (the poller skips an absent P and
+    --teardown may not know it) -- except in a hold boot, where a held new rank stays for the attach (MUSS 4)."""
+    st = state_of(front)
+    if hold_boot(io.spec)[0]:
+        return _fail(front, "%s -- respawned session %s left standing (hold boot, #1223)" % (why, st.new_pid))
+    try:
+        how = await io.end_session(st.new_pid)
+    except Exception as e:  # noqa: BLE001 -- named in the line
+        how = "end_session raised %s: %s" % (type(e).__name__, e)
+    return _fail(front, "%s -- respawned session %s ended: %s" % (why, st.new_pid, how))
 
 
 def _fail(front, why: str) -> str:
@@ -697,5 +998,5 @@ def _fail(front, why: str) -> str:
     front.counters["s7b_restart_failed"] += 1
     logger.error("%s P-RESTART FAILED: %s -- P stays absent, D serves on; P-bound requests are answered by name",
                  MARK, why)
-    answer_p_bound(front, "P-RESTART-FAILED", why[:200])
+    answer_p_bound(front, _fail_name(st), why[:200])
     return FAILED

@@ -11736,10 +11736,14 @@ class Front:
         _p_absent = _s7b.p_absent(self)
         for g in self.groups.values():
             if g.name == "P" and _p_absent:
-                # S7b: D serves while P is away -- the front is healthy; the P column names the state
+                # S7b: D serves while P is away -- the front is healthy while P may come back; once P is gone for
+                # good (restart failed / none armed) it is not: every new prompt is answered 503 (review MUSS 5)
                 _st7 = _s7b.state_of(self)
                 results[g.name] = "absent: %s %s" % (_s7b.MARK, _st7.state)
                 facts_out[g.name] = {"source": "s7b", "state": _st7.state, "why": _st7.why[:200]}
+                _r7 = _s7b.health_reason(self)
+                if _r7 is not None:
+                    unhealthy[g.name] = _r7
                 continue
             f = g.health_facts
             if f is None or now - f.t > _fh.STALE_S:
