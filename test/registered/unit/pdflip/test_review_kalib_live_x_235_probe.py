@@ -11,6 +11,8 @@ import os
 import time
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+import sys  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_pdflip_set_scheduler_1017 import _fx, _on, _verdicts  # noqa: E402
 from test_pdflip_kalib_live_x_235 import CEILING, COMMIT, FORM_ENV_VALUE, TAG, _curves, _write  # noqa: E402
