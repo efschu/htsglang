@@ -38729,7 +38729,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 5270
+      "line": 5278
      }
     }
    },
@@ -47392,7 +47392,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 5271
+      "line": 5279
      }
     }
    },
@@ -61252,7 +61252,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4395,
+    "line": 4403,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61737,6 +61737,34 @@
    "text": "",
    "trees": [
     "27b",
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_D_LEND_KEEP_NOSPLIT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "KEEP-NOSPLIT (24.10., nf-mixed-forward-kosten-1024): D's KEEP-SHORT never keeps lent expert rows that would leave the #794 width vote short of the pending short prefill. (a) A barrier leg (front_priced=0 by construction) is priced at the front's carried upper bound (x-pdflip-front-upper), not at 0; (b) the keep price is raised to the vote's own inverse (line + vote_rate x rows) when the A4 price is below it. Metal _234711: 80 of 96 narrowed head chunks followed a keep priced at 0-5 rows, the full return came one pass later anyway (\"extend pending chunked\", 120x) -- each head a whole mixed pass (~0.48 s intercept). Off = the old price byte for byte.",
+   "id": "FLLIPER_PDFLIP_D_LEND_KEEP_NOSPLIT",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_LEND_KEEP_NOSPLIT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4280,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
     "nf"
    ],
    "type": "EnvBool"
@@ -93446,28 +93474,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2959,
-  "envs": 2080,
+  "entries": 2960,
+  "envs": 2081,
   "explained": 310,
   "flags": 864,
-  "harvested": 1830,
+  "harvested": 1831,
   "trees": {
    "abweichung": 30,
    "beide": 2716,
    "nur_27b": 210,
-   "nur_nf": 15
+   "nur_nf": 16
   },
   "unexplained": 694
  },
- "tree_rev": "27b=9fbca210a1+nf=49cfdde0d0",
+ "tree_rev": "27b=9fbca210a1+nf=807de14309",
  "trees": {
   "27b": {
    "entries": 2926,
    "rev": "9fbca210a1"
   },
   "nf": {
-   "entries": 2731,
-   "rev": "49cfdde0d0"
+   "entries": 2732,
+   "rev": "807de14309"
   }
  },
  "warnungen": []
