@@ -527,6 +527,79 @@ def d_residue_record_for(path: str, accept: Optional[Callable[[dict], bool]], ca
     return rec, f" [#227 card-set pick, {how}]"
 
 
+def dc_residue_max_from_records(rows: Sequence[Dict[str, object]], cards: Sequence[Card], weight_source: str,
+                                n: Optional[int] = None) -> Tuple[Optional[Dict[str, int]], str]:
+    """#227 MUSS-1: group D's dormant residue per card = the MAXIMUM over ALL D sleeps of the newest ``n``
+    (default :data:`P_DORMANT_EXPECT_N`) boots whose samples name EXACTLY this boot's cards under the same
+    weight form -- bare, no margin ("a maximum of measurements, not a reserve"; the caller adds the slack).
+
+    A boot measured on the #227 rule stamps ``vram_residue_kind`` (``first_sleep`` + one
+    ``max_over_sleeps`` sample per new maximum, front ``_note_d_residue_reading``); its value is the maximum
+    over its samples. A LEGACY boot (first sleep only, no kind) contributes first sleep +
+    :data:`DC_RECORD_MARGIN_MIB` (the #1444 form: its later sleeps were never recorded -- measured growth
+    +244..+484 MiB, so the bare first sleep would book too little). ``(None, why)`` when no exact-card-set
+    boot exists, or when none of the selected boots carries the kind (all legacy: the caller keeps the
+    pre-#227 newest-sample form, byte for byte)."""
+    n = P_DORMANT_EXPECT_N if n is None else int(n)
+    want = {c.uuid for c in cards}
+    by_boot: Dict[str, List[Dict[str, object]]] = {}
+    for r in rows or ():
+        if not isinstance(r, dict):
+            continue
+        vals = r.get("vram_residue_mib")
+        if not isinstance(vals, dict) or set(vals) != want:
+            continue
+        if str(r.get("vram_residue_form", "") or "") != str(weight_source):
+            continue
+        if any(not isinstance(vals[u], (int, float)) or isinstance(vals[u], bool) or vals[u] <= 0 for u in want):
+            continue
+        by_boot.setdefault(str(r.get("boot_tag", "?")), []).append(r)
+    if not by_boot:
+        return None, f"no group-D sample of exactly this card set under form {str(weight_source)!r}"
+    boots = sorted(by_boot.items(), key=lambda kv: max(str(x.get("at", "")) for x in kv[1]), reverse=True)[:n]
+    if not any(x.get("vram_residue_kind") for _t, rs in boots for x in rs):
+        return None, "only legacy first-sleep samples (no vram_residue_kind) -> pre-#227 newest-sample form"
+    out: Dict[str, int] = {}
+    parts = []
+    for tag, rs in boots:
+        measured = any(x.get("vram_residue_kind") for x in rs)
+        add = 0 if measured else DC_RECORD_MARGIN_MIB
+        for u in want:
+            v = max(int(x["vram_residue_mib"][u]) for x in rs) + add
+            out[u] = max(out.get(u, 0), v)
+        kind = ("max_over_sleeps" if any(x.get("vram_residue_kind") == "max_over_sleeps" for x in rs)
+                else "first_sleep" if measured else f"LEGACY first sleep +{DC_RECORD_MARGIN_MIB}")
+        parts.append(f"{tag} [{kind}]")
+    return out, (f"MAX over all D sleeps of the newest {len(boots)} of {len(by_boot)} boot(s) of exactly this "
+                 f"card set, form {str(weight_source)!r}, bare: "
+                 + ", ".join(f"nvml{c.nvml_index} {c.name} {out[c.uuid]}" for c in cards)
+                 + " MiB; boots " + ", ".join(parts))
+
+
+def dc_residue_for(path: str, accept: Optional[Callable[[dict], bool]], cards: Sequence[Card],
+                   weight_source: str) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, int]], str, str]:
+    """#227: ``(sample for the RoPE context term, per-uuid residue or None, provenance, pick note)`` of the
+    sidecar at ``path`` for this boot's group-D reserve. Order: (1) the measured maximum of exact-card-set
+    boots (:func:`dc_residue_max_from_records`); (2) otherwise the pre-#227 form -- newest sample of exactly
+    this card set, else of a COVERING card set (another D topology: named, keeps the #1444 margin), through
+    :func:`dc_residue_from_record`."""
+    rows = host_ledger.read_measured_records(path, "D", accept=accept)
+    if os.environ.get(DC_RECORD_ENV, "1").strip() != "0":
+        vals, prov = dc_residue_max_from_records(rows, cards, weight_source)
+        if vals is not None:
+            want = {c.uuid for c in cards}
+            exact = [r for r in rows if isinstance(r.get("vram_residue_mib"), dict) and set(r["vram_residue_mib"]) == want]
+            return max(exact, key=lambda e: str(e.get("at", ""))), vals, prov, ""
+    rec, how = pick_d_residue_record(rows, cards)
+    vals, prov = dc_residue_from_record(rec, cards, weight_source)
+    note = ("" if rec is None or rec is max(rows, key=lambda e: str(e.get("at", "")))
+            else f" [#227 card-set pick, {how}]")
+    if vals is not None and how.startswith("covering"):
+        prov = (f"COVERING card set (a sample of another D topology, pre-#227 form with the "
+                f"{DC_RECORD_MARGIN_MIB} MiB margin; this card set has no sample of its own yet): " + prov)
+    return rec, vals, prov, note
+
+
 P_DORMANT_EXPECT_ENV = "FLLIPER_PDFLIP_D_EXPECT_P_RECORD"
 #: How many of the newest group-P boots (same calibration identity, same weight
 #: form, every card measured) the expectation takes the per-card MAXIMUM over.
@@ -26700,9 +26773,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # newest sample alone would hand dual a 2-card duo sample, which dc_residue_from_record refuses card by card
     # (-> the constant, ~1 GiB per card off P). Prefer the newest sample of EXACTLY this boot's card set, then the
     # newest that covers it (the pre-#227 answer), then the newest at all (for the refusal's wording).
-    _dc_rec_d, _dc_pick_note = d_residue_record_for(measured_record_path(), _dc_accept, cards)
-    _dc_from_record, _dc_record_prov = dc_residue_from_record(
-        _dc_rec_d, cards, ns.pdflip_weight_source)
+    _dc_rec_d, _dc_from_record, _dc_record_prov, _dc_pick_note = dc_residue_for(
+        measured_record_path(), _dc_accept, cards, ns.pdflip_weight_source)
     # D-EXPECT: group P's measured dormant residue, same calibration identity,
     # read only where the expectation uses it (27B: not read at all).
     _p_dormant_recs = p_dormant_records(ns.profile, calib_sample_accept)

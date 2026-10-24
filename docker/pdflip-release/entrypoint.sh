@@ -475,15 +475,15 @@ gpu_identity_gate() {
     0) say "GPU-Gate: Arch sm_86/sm_89/sm_120, ${PROFILE_CARD_COUNT} Karten${PROFILE_INVENTORY:+, Kalibrier-Inventar [$PROFILE_INVENTORY]} -- passt" ;;
     3) [ -n "$msg" ] || msg="card_identity rc=3 ohne benannte Meldung: ${out##*$'\n'}"
        case $msg in
-         HW-COUNT:*) if [ "$esc" = 1 ]; then say "WARN: $msg -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}, Operator-Ausnahme)"; return 0; fi
+         HW-COUNT:*) if [ "$esc" = 1 ]; then say "WARN: $msg -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}, Operator-Ausnahme)"; forced_past_ep HW-COUNT "$msg (Operator-Ausnahme HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS})"; return 0; fi
                      if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST HW-COUNT $msg"; forced_past_ep HW-COUNT "$msg"; return 0; fi ;;
        esac
        refuse GPU "$msg" ;;
     4) [ -n "$msg" ] || msg="HW-UNCALIBRATED: card_identity rc=4 ohne benannte Meldung: ${out##*$'\n'}"
        if [ "${HTSGLANG_FORCE:-0}" = 1 ]; then say "FORCED-PAST HW-UNCALIBRATED $msg"; forced_past_ep HW-UNCALIBRATED "$msg"; return 0; fi
-       if [ "$esc" = 1 ]; then say "WARN: $msg -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}, Operator-Ausnahme)"; return 0; fi
+       if [ "$esc" = 1 ]; then say "WARN: $msg -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}, Operator-Ausnahme)"; forced_past_ep HW-UNCALIBRATED "$msg (Operator-Ausnahme HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS})"; return 0; fi
        refuse UNCALIBRATED "$msg (Operator-Ausnahme auf eigenes Risiko: HTSGLANG_EXPECT_GPUS=0)" ;;
-    *) if [ "$esc" = 1 ]; then say "WARN: card_identity scheitert (rc=$rc) -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS})"; return 0; fi
+    *) if [ "$esc" = 1 ]; then say "WARN: card_identity scheitert (rc=$rc) -- uebergangen (HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS})"; forced_past_ep HW-COUNT "card_identity scheitert (rc=$rc), Operator-Ausnahme HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}"; return 0; fi
        refuse GPU "card_identity scheitert (rc=$rc): ${out##*$'\n'}" ;;
   esac
 }

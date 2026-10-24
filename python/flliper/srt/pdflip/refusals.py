@@ -357,7 +357,11 @@ def take_held() -> List[Tuple[str, Dict[str, object]]]:
 # table".  With "forced = no records" no boot could ever write that measurement: the 27B sidecar has no sample
 # since 22.10. 02:04Z and int4ar's D residue stayed the 2652 MiB constant against 1258 MiB measured at its sleep.
 
-_RX_BLOCKERS = re.compile(r"not yet runnable, (\d+) blocker\(s\): (.*?)(?: \|\| visible: .*)?$", re.S)
+#: #227 review MUSS-2: the WHOLE topology text (topology.plan_topology + launcher.topology_check_line's one
+#: "|| visible:" tail) as a full match -- a foreign prefix or any further "||" judgement is not neutral
+_RX_BLOCKERS = re.compile(
+    r"HW-COUNT: \d+ cards would be P = TP\d+ x PP\d+, D = TP\d+ x PP\d+ \(host ordinal \d+\); "
+    r"not yet runnable, (\d+) blocker\(s\): (.*?)(?: \|\| visible: (?:(?!\|\|).)*)?", re.S)
 _RX_BLOCKER_TAG = re.compile(r"(?:^|; )\[([A-Z][A-Z0-9-]*)\] ")
 _RX_CROSSING = re.compile(
     r"HW-UNCALIBRATED: PP-CUT crossing prices are measured at PCIe widths x\d+(?:, x\d+)* only; "
@@ -370,8 +374,8 @@ def _hw_count_metal_only(text: str) -> bool:
     """HW-COUNT whose blocker list is exactly N x ``[METAL-UNPROVEN]`` (topology.plan_topology's text): the card
     count is runnable, only no release boot on N cards exists yet.  A profile/visible count mismatch
     (card_identity ``--expect-count``, order_cards) or any further blocker is a foreign configuration."""
-    m = _RX_BLOCKERS.search(str(text))
-    if m is None:
+    m = _RX_BLOCKERS.fullmatch(str(text))
+    if m is None or "||" in m.group(2):
         return False
     tags = _RX_BLOCKER_TAG.findall(m.group(2))
     return bool(tags) and len(tags) == int(m.group(1)) and all(t == "METAL-UNPROVEN" for t in tags)
@@ -487,6 +491,39 @@ def forced_record_stamp() -> Optional[List[str]]:
         return list(_SEAL["classes"])
     v = _env_seal()
     return list(v) if v is not None else []
+
+
+#: what the launcher prints in a forced boot's front log (both lines are the contract for the hand tools)
+FORCED_BOOT_LOG_MARK = "FORCED BOOT (--force)"
+RECORDS_WRITES_LOG_MARK = "FORCED-RECORDS WRITES"
+
+
+def front_log_records_verdict(front_log: str, max_bytes: int = 64 << 20) -> Tuple[bool, str]:
+    """#227 review S5: may a HAND tool (tools/pd_free0_record, tools/owned_miss_record) turn boot
+    ``front_log``'s numbers into a record?  Yes for an unforced boot; for a forced one only when its launcher
+    sealed ``FORCED-RECORDS WRITES``. A forced boot before #227 or with verdict NONE measured outside the
+    promise -- the same rule the boot itself obeys. An unreadable log refuses."""
+    forced = writes = False
+    try:
+        with open(front_log, "rb") as fh:
+            seen = 0
+            for raw in fh:
+                seen += len(raw)
+                if FORCED_BOOT_LOG_MARK.encode() in raw:
+                    forced = True
+                if RECORDS_WRITES_LOG_MARK.encode() in raw:
+                    writes = True
+                    break
+                if seen > max_bytes:
+                    break
+    except OSError as exc:
+        return False, "front log unreadable (%s): %s" % (front_log, exc)
+    if not forced:
+        return True, "not a forced boot"
+    if writes:
+        return True, "forced boot sealed FORCED-RECORDS WRITES"
+    return False, ("forced boot without a FORCED-RECORDS WRITES verdict (verdict NONE, or a forced boot before "
+                   "#227): what it measured lies outside the promise and is not a record")
 
 
 def _env_seal(environ: Optional[Dict[str, str]] = None) -> Optional[Tuple[str, ...]]:

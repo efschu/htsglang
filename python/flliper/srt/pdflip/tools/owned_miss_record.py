@@ -159,6 +159,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(json.dumps(rec, indent=1))
     if a.append:
         from flliper.srt.pdflip import host_ledger
+        from flliper.srt.pdflip import refusals as _refusals
+
+        _stem = a.d_log[: -len(".D.log")] if a.d_log.endswith(".D.log") else a.d_log
+        ok, why = _refusals.front_log_records_verdict(_stem + ".front.log")   # #227 review S5
+        if not ok:
+            print("OWNED-MISS-RECORD REFUSED: %s" % why, file=sys.stderr)
+            return 2
 
         path = a.record or os.path.join(os.path.dirname(os.path.abspath(a.d_log)),
                                         host_ledger.MEASURED_RECORD_NAME)

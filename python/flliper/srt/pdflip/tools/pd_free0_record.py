@@ -71,6 +71,12 @@ def main(argv=None) -> int:
         print(json.dumps(r, sort_keys=True))
     if ns.append:
         from flliper.srt.pdflip import host_ledger
+        from flliper.srt.pdflip import refusals as _refusals
+
+        ok, why = _refusals.front_log_records_verdict(ns.front_log)   # #227 review S5
+        if not ok:
+            print("PD-FREE0-RECORD REFUSED: %s" % why, file=sys.stderr)
+            return 2
 
         path = ns.record or os.path.join(os.path.dirname(os.path.abspath(ns.front_log)),
                                          host_ledger.MEASURED_RECORD_NAME)

@@ -385,7 +385,8 @@ class CardSetPick(unittest.TestCase):
 
     def test_the_launcher_reads_all_d_samples_through_the_pick(self):
         src = open(LAUNCHER_SRC, encoding="utf-8").read()
-        self.assertIn("_dc_rec_d, _dc_pick_note = d_residue_record_for(measured_record_path(), _dc_accept, cards)", src)
+        self.assertIn("_dc_rec_d, _dc_from_record, _dc_record_prov, _dc_pick_note = dc_residue_for(\n"
+                      "        measured_record_path(), _dc_accept, cards, ns.pdflip_weight_source)", src)
 
     def test_the_sidecar_reader_applies_the_pick_and_names_it_only_when_it_differs(self):
         d = tempfile.mkdtemp()
@@ -401,6 +402,156 @@ class CardSetPick(unittest.TestCase):
         self.assertEqual(L.d_residue_record_for(os.path.join(d, "absent.json"), None, dual), (None, ""))
 
 
+class _FrontStub:
+    """The attributes Front._note_d_residue_reading reads -- no Front construction (GPU-free)."""
+
+    def __init__(self, path, first, reserve):
+        import collections
+        self.counters = collections.Counter()
+        self.dormant_image = {"D": first}
+        self.dc_reserve = dict(reserve)
+        self.epoch = 3
+        self.measured_record = path
+        self.weights_resident = False
+
+    def _sidecar_submit(self, fn, *args):
+        fn(*args)
+
+
+class MaxOverSleeps(Base):
+    """#227 review MUSS-1: D residue = the MEASURED maximum of all D sleeps (W19 grades only the first)."""
+
+    U = ("GPU-aaaa", "GPU-bbbb")
+
+    def first(self, a=1258, b=1258):
+        rec = d_sample("int4arA", {self.U[0]: a, self.U[1]: b})
+        rec["vram_residue_kind"] = "first_sleep"
+        return rec
+
+    def stub(self, reserve=1578):
+        from flliper.srt.pdflip.front import Front
+        st = _FrontStub(self.path, self.first(), {u: reserve for u in self.U})
+        return st, (lambda dc, held=None: Front._note_d_residue_reading(st, "D", dc, held))
+
+    def test_a_later_sleep_that_raises_a_card_appends_the_boot_maximum(self):
+        st, note = self.stub()
+        self.assertIsNone(note({self.U[0]: 1250, self.U[1]: 1258}))           # nothing new
+        rec = note({self.U[0]: 1400, self.U[1]: 1300})
+        self.assertEqual(rec["vram_residue_mib"], {self.U[0]: 1400, self.U[1]: 1300})
+        self.assertEqual(rec["vram_residue_kind"], "max_over_sleeps")
+        rec = note({self.U[0]: 1350, self.U[1]: 1600})
+        self.assertEqual(rec["vram_residue_mib"], {self.U[0]: 1400, self.U[1]: 1600})
+        self.assertEqual([x["vram_residue_mib"] for x in self.samples()],
+                         [{self.U[0]: 1400, self.U[1]: 1300}, {self.U[0]: 1400, self.U[1]: 1600}])
+        self.assertEqual(st.counters["dc_over_reserve"], 1)                    # 1600 > 1578, named, no stop
+
+    def test_the_l15_hold_is_stripped_like_at_the_first_sleep(self):
+        os.environ["FLLIPER_PDFLIP_L15"] = "1"
+        try:
+            st, note = self.stub()
+            rec = note({self.U[0]: 9400, self.U[1]: 1300}, {self.U[0]: 7616})
+            self.assertEqual(rec["vram_residue_mib"][self.U[0]], 1784)
+        finally:
+            os.environ.pop("FLLIPER_PDFLIP_L15", None)
+
+    def test_group_p_resident_weights_and_no_first_sample_write_nothing(self):
+        from flliper.srt.pdflip.front import Front
+        st, note = self.stub()
+        self.assertIsNone(Front._note_d_residue_reading(st, "P", {self.U[0]: 9999}))
+        st.weights_resident = True
+        self.assertIsNone(note({self.U[0]: 9999, self.U[1]: 9999}))
+        st.weights_resident = False
+        st.dormant_image = {}
+        self.assertIsNone(note({self.U[0]: 9999, self.U[1]: 9999}))
+        self.assertEqual(self.samples(), [])
+
+    def cards(self):
+        return two_3080()
+
+    def test_danger_direction_the_next_boot_books_at_least_the_measured_maximum(self):
+        """int4ar 10231444: first sleep 1258, a later sleep 1600 -- the next boot must book >= 1600."""
+        st, note = self.stub()
+        host_ledger.append_measured_record(self.path, st.dormant_image["D"])     # the first-sleep record
+        note({self.U[0]: 1600, self.U[1]: 1600})
+        _rec, vals, prov, _note = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1600, self.U[1]: 1600}, prov)        # bare: + slack 64 by the caller
+        self.assertIn("MAX over all D sleeps", prov)
+        self.assertGreaterEqual(min(vals.values()), 1600)
+
+    def test_max_over_the_newest_boots_legacy_keeps_its_margin(self):
+        rows = []
+        legacy = dict(d_sample("old", {self.U[0]: 1258, self.U[1]: 1258}), at="2026-10-20T00:00:00Z")
+        rows.append(legacy)
+        b = dict(self.first(), boot_tag="new", at="2026-10-25T00:00:00Z")
+        rows += [b, dict(b, vram_residue_kind="max_over_sleeps", vram_residue_mib={self.U[0]: 1500, self.U[1]: 1400},
+                         at="2026-10-25T01:00:00Z")]
+        vals, prov = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1514, self.U[1]: 1514})              # legacy 1258+256 still dominates
+        self.assertIn("LEGACY first sleep +256", prov)
+        vals, _ = L.dc_residue_max_from_records(rows, self.cards(), "exchange", n=1)
+        self.assertEqual(vals, {self.U[0]: 1500, self.U[1]: 1400})              # only the newest boot
+
+    def test_all_legacy_keeps_the_pre_227_line_byte_for_byte(self):
+        legacy = d_sample("old", {self.U[0]: 1258, self.U[1]: 1258})
+        with open(self.path, "w") as fh:
+            json.dump({"samples": [legacy]}, fh)
+        rec, vals, prov, note = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        old_vals, old_prov = L.dc_residue_from_record(legacy, self.cards(), "exchange")
+        self.assertEqual((vals, prov, note), (old_vals, old_prov, ""))
+        self.assertIsNone(L.dc_residue_max_from_records([legacy], self.cards(), "exchange")[0])
+
+    def test_a_covering_card_set_is_named_and_keeps_the_margin(self):
+        U5 = "GPU-cccc"
+        cover = dict(d_sample("dual", {self.U[0]: 1364, self.U[1]: 1364, U5: 1848}), vram_residue_kind="first_sleep")
+        with open(self.path, "w") as fh:
+            json.dump({"samples": [cover]}, fh)
+        _rec, vals, prov, _n = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1364 + 256, self.U[1]: 1364 + 256})
+        self.assertTrue(prov.startswith("COVERING card set"), prov)
+
+    def test_the_front_wires_both_later_reading_paths(self):
+        src = open(os.path.join(ROOT, "python", "flliper", "srt", "pdflip", "front.py"), encoding="utf-8").read()
+        self.assertIn("self._note_d_residue_reading(src, dc, _l15_held)", src)
+        self.assertIn("self._dc_reading_off_path(src, S.sid, rec, l15_held=_l15_held)", src)
+        self.assertIn("self._note_d_residue_reading(src, dc, l15_held)", src)
+        self.assertIn('rec["vram_residue_kind"] = "first_sleep"', src)
+
+
+class ReviewSoll(Base):
+    def test_s1_park_and_x_cost_key_carries_the_card_set(self):
+        from flliper.srt.pdflip.front import park_form_key_with_cards
+        self.assertEqual(park_form_key_with_cards("ckpt|arch=dense", {"GPU-62dbbae1-e859": 1, "GPU-31d7ef41-f574": 2}),
+                         "ckpt|arch=dense|cards=GPU-31d7ef41,GPU-62dbbae1")
+        self.assertEqual(park_form_key_with_cards("", {"GPU-1": 1}), "")
+        self.assertEqual(park_form_key_with_cards("k", {}), "k")
+
+    def _front_log(self, *lines):
+        p = os.path.join(self.dir, "boot_weg2_t_0123456789_1024_000000.front.log")
+        with open(p, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return p
+
+    def test_s5_hand_tools_obey_the_boot_verdict(self):
+        self.assertEqual(R.front_log_records_verdict(self._front_log("x"))[0], True)
+        self.assertEqual(R.front_log_records_verdict(self._front_log("PDFLIP-LAUNCH FORCED BOOT (--force): ..."))[0], False)
+        self.assertEqual(R.front_log_records_verdict(self._front_log(
+            "PDFLIP-LAUNCH FORCED BOOT (--force): ...", "PDFLIP-LAUNCH FORCED-RECORDS WRITES: ..."))[0], True)
+        self.assertEqual(R.front_log_records_verdict(os.path.join(self.dir, "absent.front.log"))[0], False)
+        from flliper.srt.pdflip.tools import pd_free0_record
+        src = open(pd_free0_record.__file__, encoding="utf-8").read()
+        self.assertIn("_refusals.front_log_records_verdict(ns.front_log)", src)
+        from flliper.srt.pdflip.tools import owned_miss_record
+        self.assertIn('_refusals.front_log_records_verdict(_stem + ".front.log")',
+                      open(owned_miss_record.__file__, encoding="utf-8").read())
+
+    @unittest.skipUnless(os.path.exists(ENTRYPOINT_SRC), "no docker/pdflip-release/entrypoint.sh in this tree (NF line)")
+    def test_s6_the_operator_escape_is_listed_not_silent(self):
+        src = open(ENTRYPOINT_SRC, encoding="utf-8").read()
+        self.assertEqual(src.count("Operator-Ausnahme HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}"), 3)
+        self.assertIsNone(R.records_class("HW-COUNT", "HW-COUNT: 3 cards visible, profile wants 2 "
+                                                      "(Operator-Ausnahme HTSGLANG_EXPECT_GPUS=0)"))
+
+
 class LauncherWiring(unittest.TestCase):
     def test_seal_flush_and_export_precede_the_front_spawn_after_every_refusal_site(self):
         src = open(LAUNCHER_SRC, encoding="utf-8").read()
@@ -412,7 +563,9 @@ class LauncherWiring(unittest.TestCase):
         self.assertLess(main.index("fenv = dict(os.environ)"), seal)
         # every refusal site main reaches directly or through its solvers runs before the seal
         for call in ("refuse_value(", "log_d_rank_vram_solve(", "log_wake_credit_solve(", "p_card_verdict(",
-                     "inventory_check_line(", "topology_check_line(", "forced_lane_borrow(", "dc_measured_d_mib("):
+                     "inventory_check_line(", "topology_check_line(", "forced_lane_borrow(", "dc_measured_d_mib(",
+                     "prepare_weight_exchange(", "xchg_form_dormant_reserve(", "order_cards(", "host_preflight(",
+                     "apply_inventory_derivation("):
             for m in re.finditer(re.escape(call), main):
                 self.assertLess(m.start(), seal, f"{call} at offset {m.start()} after the seal")
 
