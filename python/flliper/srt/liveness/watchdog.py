@@ -51,7 +51,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable
 
-from flliper.srt.liveness.classes import DEFAULT_TIMEOUTS_S, EndpointClass
+from flliper.srt.liveness.classes import (
+    DEFAULT_TIMEOUTS_S,
+    SOURCE_WAIT_PINNED_CLASSES,
+    EndpointClass,
+)
 from flliper.srt.liveness.grace import (
     AttachmentPhase,
     AttachmentRegistry,
@@ -77,6 +81,21 @@ __all__ = [
 #: interesting part; a much smaller fraction would put healthy but bursty
 #: consumers into grace constantly and make the signal useless.
 DEFAULT_GRACE_FRACTION = 0.25
+
+#: NF-STALL-1024: process-wide counters for the monitor (Boten-Regel: no
+#: release without a trace). ``producer_silent`` = source waits that passed
+#: the class limit while the engine still made progress (pinned, named once);
+#: ``producer_stall_released`` = source waits released because the ENGINE made
+#: no progress for the rid for the class limit either.
+_PRODUCER_SILENCE_COUNTERS: dict[str, int] = {
+    "producer_silent": 0,
+    "producer_stall_released": 0,
+}
+
+
+def producer_silence_counters() -> dict[str, int]:
+    """A copy of the NF-STALL-1024 counters (see ``_PRODUCER_SILENCE_COUNTERS``)."""
+    return dict(_PRODUCER_SILENCE_COUNTERS)
 
 
 class ConsumerGone(RuntimeError):
@@ -203,8 +222,18 @@ class ConsumerWatchdog:
         claims: Iterable[ResourceClaim] = (),
         registry: AttachmentRegistry | None = None,
         held: Callable[[], bool] | None = None,
+        engine_progress: Callable[[], int | None] | None = None,
     ) -> None:
         self.job_id = job_id
+        #: NF-STALL-1024: a monotone count of what the ENGINE delivered for
+        #: this stream's rids (None = unknown, e.g. the rid already left the
+        #: table). While the stream waits on its source, the clock stays pinned
+        #: only as long as this count moved within the class limit; an engine
+        #: silent that long is a stalled producer and is released. None as the
+        #: callable = no engine view: the pin is bounded by nothing but the log.
+        self._engine_progress = engine_progress
+        self._engine_value: int | None = None
+        self._engine_at: float | None = None
         #: LIVEPARK: "does the SERVER hold this request on purpose right now"
         #: (hold.py). While it answers True the silence is the producer's, not
         #: the consumer's: the clock is paused and starts again at the
@@ -272,8 +301,24 @@ class ConsumerWatchdog:
         if waiting:
             self._source_wait_since = now
             self._source_wait_named = False
+            self._engine_value = self._read_engine()
+            self._engine_at = now
         else:
             self._source_wait_since = None
+            self._engine_at = None
+
+    @property
+    def pins_source_wait(self) -> bool:
+        """NF-STALL-1024: does this class pin the clock on a source wait?"""
+        return self.policy.endpoint_class in SOURCE_WAIT_PINNED_CLASSES
+
+    def _read_engine(self) -> int | None:
+        if self._engine_progress is None:
+            return None
+        try:
+            return self._engine_progress()
+        except Exception:  # noqa: BLE001 - a broken probe counts as progress unknown
+            return None
 
     @property
     def released(self) -> bool:
@@ -395,21 +440,49 @@ class ConsumerWatchdog:
         if since is None:
             return False
         now = self._clock()
+        if self._engine_progress is not None and self._engine_at is not None:
+            value = self._read_engine()
+            if value is None or value != self._engine_value:
+                # the engine delivered (or the rid left its table: the
+                # request is ending) -- the silence is the parser's
+                self._engine_value = value
+                self._engine_at = now
+            elif now - self._engine_at >= timeout:
+                # Neither bytes nor engine output for the class limit: a
+                # stalled producer, not a parser holding text back. Unpin;
+                # the clock counts from the engine's last delivery, so the
+                # ordinary check releases it on this tick.
+                _PRODUCER_SILENCE_COUNTERS["producer_stall_released"] += 1
+                logger.warning(
+                    "job %s: PRODUCER-STALL no engine output for %.1fs while the "
+                    "stream waited on its source (limit %.1fs for %s) -- "
+                    "releasing (producer_stall_released=%d)",
+                    self.job_id,
+                    now - self._engine_at,
+                    timeout,
+                    self.state.endpoint_class,
+                    _PRODUCER_SILENCE_COUNTERS["producer_stall_released"],
+                )
+                self.state.last_progress_at = self._engine_at
+                self._source_wait_since = None
+                return False
         self.state.last_progress_at = now
         if self.state.in_grace:
             self.state.in_grace = False
             self._set_phase(AttachmentPhase.ACTIVE, 0.0)
         if not self._source_wait_named and now - since >= timeout:
             self._source_wait_named = True
+            _PRODUCER_SILENCE_COUNTERS["producer_silent"] += 1
             logger.info(
                 "job %s: PRODUCER-SILENT %.1fs (over the %.1fs limit for %s) -- "
                 "no chunk to offer (e.g. a tool-call parameter the parser "
                 "buffers); not the consumer's silence, clock pinned until the "
-                "next offer",
+                "next offer (producer_silent=%d)",
                 self.job_id,
                 now - since,
                 timeout,
                 self.state.endpoint_class,
+                _PRODUCER_SILENCE_COUNTERS["producer_silent"],
             )
         return True
 
@@ -440,6 +513,10 @@ class ConsumerWatchdog:
                     self.state.endpoint_class,
                 )
             self.state.last_progress_at = now
+            if self._engine_at is not None:
+                # NF-STALL-1024: a park is no engine stall either; the engine
+                # clock restarts with the silence clock at the resumption
+                self._engine_at = now
             if self.state.in_grace:
                 self.state.in_grace = False
                 self._set_phase(AttachmentPhase.ACTIVE, 0.0)

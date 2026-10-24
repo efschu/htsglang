@@ -199,6 +199,10 @@ class ReqState:
     # For performance metrics
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
+    # NF-STALL-1024: outputs the scheduler delivered for this rid (the
+    # liveness watchdog's engine-progress view while the stream's parser
+    # holds text back; liveness/stream.py guard_generate_stream)
+    engine_outputs: int = 0
     ttft_observed: bool = False
 
     # Upstream #35255: whether the request reached the scheduler (a handler
@@ -2630,6 +2634,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
+                state.engine_outputs += 1  # NF-STALL-1024 engine progress
                 pending_notify[rid] = state
 
                 if len(pending_notify) >= batch_notify_size:

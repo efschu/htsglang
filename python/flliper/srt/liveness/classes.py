@@ -107,7 +107,12 @@ DEFAULT_TIMEOUT_RATIONALE: dict[EndpointClass, str] = {
         "#505-C-01). What it must survive is therefore a slow reader and an "
         "inter-token stall, not TTFT. Short enough that a dead chat client does "
         "not hold KV blocks for minutes. The most contended resource in the "
-        "process, so the least patient of the stream classes."
+        "process, so the least patient of the stream classes. NF-STALL-1024: "
+        "the clock counts only a chunk OFFERED and not taken; while the "
+        "producer has nothing to offer (a tool-call parameter the parser "
+        "releases at its end, a held-back reasoning trace) it is pinned, as "
+        "long as the engine still makes progress for the rid -- an engine "
+        "silent for the same limit is reaped (SOURCE_WAIT_PINNED_CLASSES)."
     ),
     EndpointClass.EMBEDDING: (
         "One write, so the timeout never fires in practice. Present so the "
@@ -140,7 +145,8 @@ DEFAULT_TIMEOUT_RATIONALE: dict[EndpointClass, str] = {
     ),
     EndpointClass.AUDIO_TRANSCRIPTION: (
         "Chunked ASR writes per chunk, so silence longer than a couple of "
-        "chunks is the consumer's, not the model's."
+        "chunks is the consumer's, not the model's. Deliberately NOT in "
+        "SOURCE_WAIT_PINNED_CLASSES: every silence counts, as before."
     ),
     EndpointClass.REALTIME_SESSION: (
         "A realtime socket that has sent no audio for a minute is not "
@@ -156,3 +162,14 @@ DEFAULT_TIMEOUT_RATIONALE: dict[EndpointClass, str] = {
         "enough that a closed browser tab stops driving load."
     ),
 }
+
+
+#: NF-STALL-1024: the classes whose watchdog pins the clock while the stream
+#: waits on its SOURCE (``guarded_stream``). Only the token stream: its
+#: producer can be silent for minutes inside a buffered tool-call parameter
+#: while the consumer reads (rc36p 1024_195853, 9 streams reaped at 90 s).
+#: Every other class keeps "every silence counts" -- the rationale of each
+#: (e.g. AUDIO_TRANSCRIPTION) argues from a producer that writes per chunk.
+SOURCE_WAIT_PINNED_CLASSES: frozenset[EndpointClass] = frozenset(
+    {EndpointClass.LLM_STREAM}
+)

@@ -40,6 +40,8 @@ from flliper.srt.liveness import (
     ResourceClaim,
     global_hold_registry,
     guard_generate_stream,
+    guarded_stream,
+    producer_silence_counters,
 )
 from flliper.test.ci.ci_register import register_cpu_ci
 from flliper.test.test_utils import CustomTestCase
@@ -432,6 +434,332 @@ class TokenizerSideTest(CustomTestCase):
         self.assertTrue(global_hold_registry().any_held(["q", "y"]))
         TokenizerManager._handle_pdflip_liveness_hold(None, PdFlipLivenessHoldOutput(held=[]))
         self.assertFalse(global_hold_registry().is_held("x"))
+
+
+# ---------------------------------------------------------------------------
+# NF-STALL-1024 review (24.10.): SOLL-1 engine bound, SOLL-2 class scope,
+# SOLL-3 leak direction / phases / one log per phase / source exception.
+# ---------------------------------------------------------------------------
+
+WD_LOGGER = "flliper.srt.liveness.watchdog"
+
+
+async def _forever_after_first():
+    yield b"c0"
+    await asyncio.Event().wait()
+
+
+class SourceWaitLeakTest(CustomTestCase):
+    """SOLL-3a: a client that closes while D is silent -- the real FIN-during-
+    silence case. Cancel / aclose must stop the watchdog, end its task, take the
+    attachment off the registry and release nothing."""
+
+    def _wd(self, clock, registry):
+        return ConsumerWatchdog(job_id="stream-leak", policy=llm_policy(), release=Released(),
+                                clock=clock, claims=[ResourceClaim(kind=ClaimKind.KV, key="leak")],
+                                registry=registry)
+
+    def test_cancel_during_source_wait_stops_everything(self):
+        clock = FakeClock()
+        registry = AttachmentRegistry(clock=clock)
+
+        async def run():
+            wd = self._wd(clock, registry)
+            stream = guarded_stream(_forever_after_first(), wd)
+
+            async def consume():
+                async for _ in stream:
+                    pass
+
+            task = asyncio.create_task(consume())
+            await settle()
+            self.assertTrue(wd.state.awaiting_source)
+            self.assertIsNotNone(registry.get("stream-leak"))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await settle()
+            self.assertFalse(wd.state.awaiting_source)
+            self.assertIsNone(wd._task)
+            self.assertIsNone(registry.get("stream-leak"))
+            self.assertEqual(wd._release.calls, 0)
+
+        asyncio.run(run())
+
+    def test_aclose_at_the_offer_stops_everything(self):
+        clock = FakeClock()
+        registry = AttachmentRegistry(clock=clock)
+
+        async def run():
+            wd = self._wd(clock, registry)
+            stream = guarded_stream(_forever_after_first(), wd)
+            self.assertEqual(await stream.__anext__(), b"c0")  # suspended at the offer
+            await stream.aclose()
+            await settle()
+            self.assertIsNone(wd._task)
+            self.assertIsNone(registry.get("stream-leak"))
+            self.assertEqual(wd._release.calls, 0)
+
+        asyncio.run(run())
+
+
+class SourceExceptionTest(CustomTestCase):
+    def test_a_source_that_raises_during_the_wait_propagates_and_stops(self):
+        """SOLL-3c: the error reaches the response, the watchdog is stopped,
+        nothing is released, the pin is gone."""
+        clock = FakeClock()
+
+        async def boom(gate):
+            yield b"c0"
+            await gate.wait()
+            raise RuntimeError("source died")
+
+        async def run():
+            released = Released()
+            wd = ConsumerWatchdog(job_id="j", policy=llm_policy(), release=released, clock=clock)
+            gate = asyncio.Event()
+            stream = guarded_stream(boom(gate), wd)
+            got = []
+
+            async def consume():
+                async for chunk in stream:
+                    got.append(chunk)
+
+            task = asyncio.create_task(consume())
+            await settle()
+            clock.advance(200.0)  # silent beyond the limit first
+            await settle()
+            gate.set()
+            with self.assertRaises(RuntimeError):
+                await task
+            await settle()
+            self.assertEqual(got, [b"c0"])
+            self.assertEqual(released.calls, 0)
+            self.assertFalse(wd.state.awaiting_source)
+            self.assertIsNone(wd._task)
+
+        asyncio.run(run())
+
+
+class SilenceChunkSilenceTest(CustomTestCase):
+    def test_phases_name_producer_silent_once_each_then_a_stall_is_reaped(self):
+        """SOLL-3b: silence, chunk, silence, chunk, then a consumer stall;
+        PRODUCER-SILENT exactly once per wait phase, counter +2, release only
+        for the untaken offer."""
+        clock = FakeClock()
+
+        async def phased(g0, g1):
+            yield b"c0"
+            await g0.wait()
+            yield b"c1"
+            await g1.wait()
+            yield b"c2"
+            yield b"c3"
+
+        async def run():
+            released = Released()
+            wd = ConsumerWatchdog(job_id="stream-phases", policy=llm_policy(), release=released,
+                                  clock=clock)
+            g0, g1 = asyncio.Event(), asyncio.Event()
+            stream = guarded_stream(phased(g0, g1), wd)
+            got = []
+
+            async def consume():
+                async for chunk in stream:
+                    got.append(chunk)
+                    if chunk == b"c2":
+                        await asyncio.sleep(3600)  # takes c2, never reads c3
+
+            task = asyncio.create_task(consume())
+            await settle()
+            for _ in range(3):  # phase 1: 300 s silent
+                clock.advance(100.0)
+                await settle()
+            g0.set()
+            await settle()
+            for _ in range(3):  # phase 2: 300 s silent
+                clock.advance(100.0)
+                await settle()
+            self.assertEqual(released.calls, 0)
+            g1.set()
+            await settle()
+            clock.advance(89.0)
+            await settle()
+            self.assertEqual(released.calls, 0)
+            clock.advance(2.0)
+            await asyncio.wait_for(released.event.wait(), timeout=2.0)
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001
+                pass
+            return got
+
+        before = producer_silence_counters()["producer_silent"]
+        with self.assertLogs(WD_LOGGER, level="INFO") as logs:
+            got = asyncio.run(run())
+        named = [m for m in logs.output if "PRODUCER-SILENT" in m and "stream-phases" in m]
+        self.assertEqual(len(named), 2, named)
+        self.assertEqual(producer_silence_counters()["producer_silent"] - before, 2)
+        self.assertEqual(got[:3], [b"c0", b"c1", b"c2"])
+
+
+class EngineProgressBoundTest(CustomTestCase):
+    """SOLL-1: the pin holds only while the ENGINE delivers for the rid."""
+
+    def test_engine_silent_for_the_limit_is_released_and_counted(self):
+        clock = FakeClock()
+        engine = {"n": 0}
+
+        async def run():
+            released = Released()
+            wd = ConsumerWatchdog(job_id="stream-stall", policy=llm_policy(), release=released,
+                                  clock=clock, engine_progress=lambda: engine["n"])
+            stream = guarded_stream(_forever_after_first(), wd)
+
+            async def consume():
+                async for _ in stream:
+                    pass
+
+            task = asyncio.create_task(consume())
+            await settle()
+            for _ in range(10):  # 600 s: parser buffers, engine decodes
+                clock.advance(60.0)
+                engine["n"] += 25
+                await settle()
+            self.assertEqual(released.calls, 0)
+            clock.advance(89.0)  # engine stops delivering
+            await settle()
+            self.assertEqual(released.calls, 0)
+            clock.advance(2.0)
+            await asyncio.wait_for(released.event.wait(), timeout=2.0)
+            self.assertTrue(wd.state.declared_dead)
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001
+                pass
+
+        before = producer_silence_counters()["producer_stall_released"]
+        with self.assertLogs(WD_LOGGER, level="WARNING") as logs:
+            asyncio.run(run())
+        self.assertTrue(any("PRODUCER-STALL" in m for m in logs.output), logs.output)
+        self.assertEqual(producer_silence_counters()["producer_stall_released"] - before, 1)
+
+    def test_a_park_is_no_engine_stall(self):
+        """Held (D park) with no engine output: after the resumption the
+        engine clock starts fresh, no instant release."""
+        clock = FakeClock()
+        holds = HoldRegistry()
+
+        async def run():
+            released = Released()
+            wd = ConsumerWatchdog(job_id="stream-park", policy=llm_policy(), release=released,
+                                  clock=clock, engine_progress=lambda: 7,
+                                  held=lambda: holds.any_held(["p"]))
+            stream = guarded_stream(_forever_after_first(), wd)
+            task = asyncio.create_task(stream.__anext__())
+            await task  # c0 taken
+            waiter = asyncio.create_task(stream.__anext__())  # source wait
+            await settle()
+            holds.replace(["p"])
+            await settle()
+            clock.advance(300.0)
+            await settle()
+            holds.replace([])
+            await settle()
+            clock.advance(80.0)
+            await settle()
+            self.assertEqual(released.calls, 0)
+            clock.advance(11.0)  # 91 s without engine output after the resumption
+            await asyncio.wait_for(released.event.wait(), timeout=2.0)
+            waiter.cancel()
+            try:
+                await waiter
+            except BaseException:  # noqa: BLE001
+                pass
+
+        asyncio.run(run())
+
+    def test_wiring_through_guard_generate_stream(self):
+        """The real probe: ReqState.engine_outputs in rid_to_state. Moving ->
+        no abort over 4x the limit; frozen -> aborted."""
+
+        class State:
+            engine_outputs = 0
+
+        class Manager(FakeTokenizerManager):
+            def __init__(self) -> None:
+                super().__init__()
+                self.rid_to_state = {"pdflip-wire-1": State()}
+
+        async def run():
+            manager = Manager()
+            response = guard_generate_stream(
+                FakeResponse(_forever_after_first()), tokenizer_manager=manager,
+                obj=FakeObj("pdflip-wire-1"),
+                config=LivenessConfig(timeouts_s={EndpointClass.LLM_STREAM.value: 0.3},
+                                      poll_interval_s=0.02))
+
+            async def consume():
+                async for _ in response.body_iterator:
+                    pass
+
+            task = asyncio.create_task(consume())
+            for _ in range(24):  # 1.2 s, engine delivering
+                manager.rid_to_state["pdflip-wire-1"].engine_outputs += 1
+                await asyncio.sleep(0.05)
+            moving = list(manager.aborted)
+            for _ in range(60):  # engine frozen
+                if manager.aborted:
+                    break
+                await asyncio.sleep(0.02)
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001
+                pass
+            return moving, list(manager.aborted)
+
+        moving, frozen = asyncio.run(run())
+        self.assertEqual(moving, [])
+        self.assertEqual(frozen, ["pdflip-wire-1"])
+
+
+class ClassScopeTest(CustomTestCase):
+    def test_audio_transcription_keeps_every_silence_counting(self):
+        """SOLL-2: only LLM_STREAM pins; a silent ASR producer is reaped as before."""
+        clock = FakeClock()
+
+        async def run():
+            released = Released()
+            wd = ConsumerWatchdog(job_id="asr", release=released, clock=clock,
+                                  policy=LivenessPolicy(endpoint_class=EndpointClass.AUDIO_TRANSCRIPTION,
+                                                        poll_interval_s=0.01))
+            self.assertFalse(wd.pins_source_wait)
+            stream = guarded_stream(_forever_after_first(), wd)
+
+            async def consume():
+                async for _ in stream:
+                    pass
+
+            task = asyncio.create_task(consume())
+            await settle()
+            self.assertFalse(wd.state.awaiting_source)
+            clock.advance(121.0)
+            await asyncio.wait_for(released.event.wait(), timeout=2.0)
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001
+                pass
+
+        asyncio.run(run())
+
+    def test_only_llm_stream_is_pinned(self):
+        from flliper.srt.liveness import SOURCE_WAIT_PINNED_CLASSES
+
+        self.assertEqual(SOURCE_WAIT_PINNED_CLASSES, frozenset({EndpointClass.LLM_STREAM}))
 
 
 if __name__ == "__main__":

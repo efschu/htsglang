@@ -89,6 +89,9 @@ async def guarded_stream(
     """
     watchdog.start()
     iterator = source.__aiter__()
+    # SOLL-2: only the classes in SOURCE_WAIT_PINNED_CLASSES (LLM_STREAM);
+    # every other class keeps "every silence counts".
+    pin = watchdog.pins_source_wait
     try:
         while True:
             # NF-STALL-1024: the wait on the SOURCE is not the consumer's. The
@@ -96,13 +99,15 @@ async def guarded_stream(
             # a buffered tool-call parameter, a held-back reasoning trace) and
             # starts at the offer -- otherwise a 90 s producer silence reaps a
             # consumer that reads all the time (rc36p 1024_195853, 9 streams).
-            watchdog.note_source_wait(True)
+            if pin:
+                watchdog.note_source_wait(True)
             try:
                 chunk = await iterator.__anext__()
             except StopAsyncIteration:
                 break
             finally:
-                watchdog.note_source_wait(False)
+                if pin:
+                    watchdog.note_source_wait(False)
             if watchdog.released:
                 raise ConsumerGone(
                     watchdog.job_id,
@@ -195,12 +200,30 @@ def guard_generate_stream(
         # consumer -- the clock runs from its resumption (hold.py)
         return holds.any_held(ids)
 
+    def engine_progress() -> int | None:
+        # NF-STALL-1024 SOLL-1: what the engine delivered for these rids
+        # (ReqState.engine_outputs, one per output the scheduler sent). None
+        # when a rid is not (or no longer) in the table -- the request is
+        # ending or unknown here, which is no stall verdict.
+        states = getattr(tokenizer_manager, "rid_to_state", None)
+        if not isinstance(states, dict):
+            return None
+        total = 0
+        for rid in ids:
+            state = states.get(rid)
+            count = getattr(state, "engine_outputs", None) if state is not None else None
+            if not isinstance(count, int):
+                return None
+            total += count
+        return total
+
     watchdog = ConsumerWatchdog(
         job_id=f"stream-{ids[0]}",
         policy=policy,
         release=release,
         claims=claims_for_rids(ids),
         held=held,
+        engine_progress=engine_progress,
     )
     return guard_streaming_response(response, watchdog)
 

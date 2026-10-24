@@ -21,6 +21,7 @@ This watches *clients* on a socket. The two never interact and share no code.
 from flliper.srt.liveness.classes import (
     DEFAULT_TIMEOUT_RATIONALE,
     DEFAULT_TIMEOUTS_S,
+    SOURCE_WAIT_PINNED_CLASSES,
     EndpointClass,
 )
 from flliper.srt.liveness.grace import (
@@ -51,6 +52,7 @@ from flliper.srt.liveness.watchdog import (
     LivenessPolicy,
     LivenessState,
     global_liveness_config,
+    producer_silence_counters,
     set_global_liveness_config,
 )
 
@@ -71,6 +73,7 @@ __all__ = [
     "LivenessPolicy",
     "LivenessState",
     "ResourceClaim",
+    "SOURCE_WAIT_PINNED_CLASSES",
     "attach_ledger_grace_bridge",
     "await_with_liveness",
     "claims_for_rids",
@@ -80,5 +83,6 @@ __all__ = [
     "guard_generate_stream",
     "guard_streaming_response",
     "guarded_stream",
+    "producer_silence_counters",
     "set_global_liveness_config",
 ]
