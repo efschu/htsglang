@@ -49,6 +49,24 @@ from flliper.srt.pdflip import front as front_mod  # noqa: E402
 from flliper.srt.pdflip import front_health as FH  # noqa: E402
 
 P_SID, D_SID = 4711, 4712
+_FD0 = [0]
+
+
+def _fds() -> int:
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return 0
+
+
+def setUpModule():
+    _FD0[0] = _fds()
+
+
+def tearDownModule():
+    # the neighbour battery once died of EMFILE (24.10. 12:42Z): this file must not leak descriptors
+    grown = _fds() - _FD0[0]
+    assert grown <= 4, "test_dual_p_restart_1024 leaked %d file descriptors" % grown
 X = 6000
 
 
