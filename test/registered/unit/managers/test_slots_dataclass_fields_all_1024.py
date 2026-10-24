@@ -224,6 +224,22 @@ class TestSlotsDataclassFieldsAll(unittest.TestCase):
         )
         self.assertIn("weight_updater.py::SchedulerWeightUpdaterManager", find_defects({"weight_updater.py": src}))
 
+    def test_the_997b_counters_are_a_declared_slot(self):
+        import os
+
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+        from dataclasses import fields
+
+        from flliper.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+
+        self.assertIn("_997_counts", SchedulerBatchResultProcessor.__slots__)
+        f = {x.name: x for x in fields(SchedulerBatchResultProcessor)}["_997_counts"]
+        self.assertFalse(f.init)
+        self.assertFalse(f.compare)
+        self.assertEqual(f.default_factory(), {})
+
     def test_no_slots_or_frozen_class_stores_an_undeclared_attribute(self):
         self.assertEqual(find_defects(_tree_sources()), {})
 

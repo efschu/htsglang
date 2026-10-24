@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -115,6 +116,11 @@ class SchedulerBatchResultProcessor:
     # request's re-extend commits an output token there (NF y9n 10032328 D:
     # 782 victim re-extends, 0 decode rounds for 11 min, no alarm).
     record_decode_progress: Callable[[], None] = lambda: None
+    #: #997b OUTPUT-FILL counters ``seen`` / ``emitted`` / ``unreadable``. A FIELD holding a mutable dict: this class is
+    #: ``slots=True, frozen=True``, so the former lazy ``self._997_seen = ...`` raised on its first write (inside the
+    #: probe's ``try/except: pass``) and the instrument never logged a line on rc37-rc40 (27B-RC41-1024, Qwen review
+    #: point 1; guard: test_slots_dataclass_fields_all_1024.py). Not compared, not hashed, not an init parameter.
+    _997_counts: Dict[str, int] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -390,8 +396,9 @@ class SchedulerBatchResultProcessor:
                     # legitimately be 0, so 0 and None are both unusable as
                     # "not read".
                     try:
-                        self._997_seen = getattr(self, "_997_seen", 0) + 1
-                        if self._997_seen % 40 == 0:
+                        _c997 = self._997_counts
+                        _c997["seen"] = _c997.get("seen", 0) + 1
+                        if _c997["seen"] % 40 == 0:
                             try:
                                 _ol = len(req.output_ids)
                                 _fl = len(
@@ -400,10 +407,8 @@ class SchedulerBatchResultProcessor:
                                 )
                             except Exception:  # noqa: BLE001
                                 _ol = _fl = -1
-                                self._997_unreadable = (
-                                    getattr(self, "_997_unreadable", 0) + 1
-                                )
-                            self._997_emitted = getattr(self, "_997_emitted", 0) + 1
+                                _c997["unreadable"] = _c997.get("unreadable", 0) + 1
+                            _c997["emitted"] = _c997.get("emitted", 0) + 1
                             logger.warning(
                                 "#997b OUTPUT-FILL rid=%s out_len=%s fill_len=%s "
                                 "| seen=%d emitted=%d unreadable=%d. Compare the "
@@ -415,9 +420,9 @@ class SchedulerBatchResultProcessor:
                                 req.rid,
                                 _ol,
                                 _fl,
-                                self._997_seen,
-                                self._997_emitted,
-                                getattr(self, "_997_unreadable", 0),
+                                _c997["seen"],
+                                _c997["emitted"],
+                                _c997.get("unreadable", 0),
                             )
                     except Exception:  # noqa: BLE001 - a probe may never break the result path
                         pass
