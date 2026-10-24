@@ -287,3 +287,80 @@ def test_mutant_an_unstamped_record_behind_a_device_rest_reads_the_215_class():
     assert dn.store_read_depth(req, rec) == 17091            # unstamped: relative (70999 - 17091 = 53908)
     rec.span_start = 53750
     assert dn.store_read_depth(req, rec) == 70841            # stamped: absolute (70999 - 70841 = 158)
+
+
+# ------------------------------------------------------------------- review MUSS-1 / SOLL-1: the hold's cap and its reap
+
+
+def test_review_muss1_the_hold_ends_at_its_named_cap_with_a_cap_line(caplog, monkeypatch):
+    """A re-read that never terminates (wait_complete / stuck io): the hold ends HOLD_MAX_S past the bound, named."""
+    monkeypatch.setenv(sw.HOLD_MAX_ENV, "30")
+    s, r, _calls = _settle_sched()
+    _to_the_lapse(s, r)
+    assert s.pdflip_post_wake_settle == [r]
+    r._1471_since = time.monotonic() - (20.0 + 29.0)          # 29 s past the bound: still held
+    _tick(s, r)
+    assert s.pdflip_post_wake_settle == [r]
+    r._1471_since = time.monotonic() - (20.0 + 31.0)          # 31 s past the bound: the cap
+    with caplog.at_level(logging.INFO):
+        _tick(s, r)
+    assert r not in s.pdflip_post_wake_settle
+    assert sum("#1471h SETTLE-HELD-READ CAP rid=" + r.rid in m for m in caplog.messages) == 1
+    recs = rvp.take_requests(rvp.needs_p_dir())
+    assert len(recs) == 1 and recs[0]["d_extent"] == N - FIRST, "priced on the record that stands, as the bound did"
+
+
+def test_mutant_without_the_cap_the_hold_never_ends(monkeypatch):
+    """Danger direction HANGING: cap removed -> ten minutes past the wake the request is still parked."""
+    monkeypatch.setattr(sw, "hold_capped", lambda req, now, bound_s: False)
+    s, r, _calls = _settle_sched()
+    _to_the_lapse(s, r)
+    r._1471_since = time.monotonic() - 600.0
+    _tick(s, r)
+    assert s.pdflip_post_wake_settle == [r]
+
+
+def test_review_muss1_cap_zero_is_no_hold_past_the_bound(monkeypatch):
+    monkeypatch.setenv(sw.HOLD_MAX_ENV, "0")
+    s, r, _calls = _settle_sched()
+    _to_the_lapse(s, r)
+    recs = rvp.take_requests(rvp.needs_p_dir())
+    assert r not in s.pdflip_post_wake_settle and len(recs) == 1 and recs[0]["d_extent"] == 26844
+
+
+@pytest.mark.parametrize("raw,expect", [("", 30.0), ("45", 45.0), ("0", 0.0), ("-3", 30.0), ("x", 30.0)])
+def test_review_muss1_the_cap_value(raw, expect):
+    assert sw.hold_max_s({sw.HOLD_MAX_ENV: raw}) == expect
+
+
+def test_review_muss1_carry_and_held_share_one_cap(monkeypatch):
+    """A carried clock lapses at the wake: the cap counts from the wake (not from the old carried clock), and a held
+    re-read after the carry gets no second cap of its own."""
+    monkeypatch.setenv(sw.HOLD_MAX_ENV, "30")
+    now = time.monotonic()
+    r = types.SimpleNamespace(rid="pdflip-x-3", _1471_since=now - 300.0)        # carried clock, 5 min old
+    setattr(r, sw.WAKE_T_ATTR, now - 10.0)                                      # this wake, 10 s ago
+    assert not sw.hold_capped(r, now, 20.0)
+    assert sw.hold_capped(r, now + 21.0, 20.0)                                   # 31 s since the wake
+    r2 = types.SimpleNamespace(rid="pdflip-x-4", _1471_since=now - 300.0)       # no wake stamp: from since + bound
+    assert sw.hold_capped(r2, now, 20.0)
+
+
+def test_review_muss1_the_wake_stamps_the_cap_reference():
+    r = types.SimpleNamespace(rid="pdflip-x-5", _1471_since=None)
+    sw.settle_since_for_wake(r, 1234.5)
+    assert getattr(r, sw.WAKE_T_ATTR) == 1234.5
+
+
+def test_review_soll1_a_held_finding_from_before_this_wake_holds_nothing():
+    """A read that ended without a reap left the old finding standing; a later wake must not hold on it."""
+    r = types.SimpleNamespace(rid="pdflip-x-6", _1456_n=1)
+    sr.note_reap(r.rid, 100, 100, 40, 1)
+    try:
+        setattr(r, sw.WAKE_T_ATTR, time.monotonic() + 1.0)                      # the wake came after that reap
+        assert sw.held_read_holds_lapse(r, "reading") is False
+        setattr(r, sw.WAKE_T_ATTR, time.monotonic() - 1.0)                      # a reap of this wake
+        sr.note_reap(r.rid, 100, 100, 40, 1)
+        assert sw.held_read_holds_lapse(r, "reading") is True
+    finally:
+        sr.forget(r.rid)

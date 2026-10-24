@@ -9,8 +9,8 @@ Two danger directions of the hold, on the author's 26-232 harness (test_pdflip_r
 
 * HANGING (a request held without end): the hold has no clock of its own; it ends when the re-read terminates (the
   prefetch reaper under policy=timeout: up to issue + 2 x (2 s + pages x 0.98 ms), under wait_complete: never by time).
-  Review MUSS-1 asks for a NAMED upper bound. The xfail(strict) pin below is red on the author head by design and turns
-  the suite red (XPASS) once the bound exists -- then drop the marker.
+  Review MUSS-1 asked for a NAMED upper bound (now settle_writer.hold_capped); the former xfail(strict) pin below is
+  a plain test now (green on the capped head).
 """
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ import os
 import sys
 import time
 
-import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -62,9 +61,7 @@ def test_review_held_reread_landing_short_is_never_underpriced(caplog):
     assert calls == [r.rid]
 
 
-@pytest.mark.xfail(strict=True, reason="REVIEW #224 MUSS-1: the settle hold has no named upper bound of its own; a "
-                                       "re-read that never terminates (reaper off / wait_complete / stuck io) keeps "
-                                       "the request parked without end")
+# REVIEW #224 MUSS-1 met (settle_writer.hold_capped, FLLIPER_PDFLIP_SETTLE_HELD_READ_MAX_S): the strict xfail marker is gone
 def test_review_hold_has_a_named_upper_bound_when_the_reread_never_terminates():
     s, r, _calls = base._settle_sched()
     base._to_the_lapse(s, r)

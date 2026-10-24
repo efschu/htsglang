@@ -7682,19 +7682,31 @@ class Scheduler(
             # NW (30.09.): a re-read the budget refused has not spent the writer's ack
             _sw_nw.keep_ack_if_unread(req, _act)
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.PDFLIP_POST_WAKE_SETTLE_S
+            # SC (#1210): a carried clock awaits this wake's own read once; REPRICE-REST-1024 (#224, SOLL R2/R7; 26-232:
+            # 26844 priced off the superseded read, P computed 220): the store holds the whole span and its re-read is
+            # in flight -- the bound waits for that read once. Review MUSS-1: both holds share ONE named cap.
+            _hold = None
             if _sw_nw.carry_holds_lapse(req, state):
-                lapsed = False  # SC (#1210): a carried clock awaits this wake's own read once
-            if lapsed and _sw_nw.held_read_holds_lapse(req, state):
-                # REPRICE-REST-1024 (#224, SOLL R2/R7; 26-232: 26844 priced off the superseded read, P computed 220):
-                # the store holds the whole span and its re-read is in flight -- the bound waits for that read once
+                _hold = "carry"
+            elif lapsed and _sw_nw.held_read_holds_lapse(req, state):
+                _hold = "held"
+            if _hold is not None and lapsed and _sw_nw.hold_capped(req, now, self.PDFLIP_POST_WAKE_SETTLE_S):
+                if not getattr(req, "_1471h_cap_said", False):
+                    req._1471h_cap_said = True
+                    logger.warning("#1471h SETTLE-HELD-READ CAP rid=%s hold=%s state=%s held_s=%.1f re_reads=%d "
+                                   "cap_s=%.0f -- the hold past the bound reached its cap (%s): released as the bound "
+                                   "releases, priced on the record that stands", str(getattr(req, "rid", "?")), _hold,
+                                   state, now - float(getattr(req, "_1471_since", now)),
+                                   int(getattr(req, "_1456_n", 0) or 0), _sw_nw.hold_max_s(), _sw_nw.HOLD_MAX_ENV)
+            elif _hold is not None:
                 lapsed = False
-                if not getattr(req, "_1471h_said", False):
+                if _hold == "held" and not getattr(req, "_1471h_said", False):
                     req._1471h_said = True
-                    logger.info("#1471h SETTLE-HELD-READ rid=%s state=%s held_after_wake_s=%.1f re_reads=%d -- the "
-                                "store holds the whole span and its re-read is in flight: the bound waits for it once "
-                                "(a release now would price the superseded record)", str(getattr(req, "rid", "?")),
+                    logger.info("#1471h SETTLE-HELD-READ rid=%s state=%s held_after_wake_s=%.1f re_reads=%d cap_s=%.0f "
+                                "-- the store holds the whole span and its re-read is in flight: the bound waits for it "
+                                "once (a release now would price the superseded record)", str(getattr(req, "rid", "?")),
                                 state, now - float(getattr(req, "_1471_since", now)),
-                                int(getattr(req, "_1456_n", 0) or 0))
+                                int(getattr(req, "_1456_n", 0) or 0), _sw_nw.hold_max_s())
             # P4b: no writer and no read in flight = decided now (the bound would
             # release the same request "as it is" 20 s later).
             # a re-read the group issued this tick is a read in flight, on this rank too
