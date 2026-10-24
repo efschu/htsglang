@@ -74,6 +74,8 @@ RECORD_POLICY: Dict[str, str] = {
     "D_EXTEND_CAP_PER_ROW_MIB": UNIFORM,
     # VOTE-LINE-SINGLE 24.10.: one measured value for every rank (TP-symmetric shards)
     "D_EXTEND_VOTE_FIXED_MIB": UNIFORM,
+    # PDFLIP-ADMIT-BOOK 24.10.: one derived need for every rank of its form (TP-symmetric shards)
+    "D_ADMIT_NEED_MIB": UNIFORM,
     "P_PP_STAGE_FIXED_MIB": ROLE,
     "P_PP_STAGE_FIXED_YARN2_DELTA_MIB": ROLE,
     "MEASURED_MS_PER_LAYER": CLASS_MAX,
