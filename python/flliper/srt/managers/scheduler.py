@@ -242,6 +242,7 @@ from flliper.srt.pdflip import p_trim_end_anchor as _pdflip_trim
 from flliper.srt.pdflip import wake_preload as _pdflip_wake_preload  # DP-NACHLAUF WAKE-PRELOAD
 from flliper.srt.pdflip import flush_verdict as _pdflip_flush_verdict  # z30j PP0 flush verdict
 from flliper.srt.managers import pdflip_flush_nonblock as _pdflip_flush_nonblock  # B1 (30.09.)
+from flliper.srt.managers import pdflip_quiesce_loadback as _pdflip_quiesce_loadback  # QUIESCE-LOADBACK-1023
 from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
@@ -22617,6 +22618,13 @@ class Scheduler(
                     " -- B1 NONBLOCK: issued, not joined here; the sleep leg drains them "
                     "before its reset" if _b1_nowait else "")
         _fsub.mark("sweep")
+        # QUIESCE-LOADBACK-1023 (NF rc36p ..._1023_215911, D epoch 4): the vote
+        # is about the group NOW -- a finished load-back ack counts as finished.
+        # loading_check runs only in a planned prefill pass, and a parked D plans
+        # none: one undrained ack of a reverted admission refused 1602 flushes in
+        # 31 s, D's awake re-queue undid the park, the sleep met a decoding D
+        # (W120 -> W29 -> RANK-DEATH). Rank-local, never waits, no collective.
+        _pdflip_quiesce_loadback.drain_finished_loadbacks(self)
         group_idle, verdict_detail = self.group_idle_verdict(
             tp_group_verdict=tp_group_verdict or sleep_group_verdict
         )
