@@ -229,3 +229,53 @@ def wait_for_kv_fit(read_free, need_bytes, floor_bytes: int = 0, wait_s: float =
         free = read_free()
         unfit = kv_resume_fit_refusal(free, need_bytes, floor_bytes)
     return unfit, free, now() - t0
+
+
+#: WAKE-FLOOR-1024: poll cadence of the peer-staging wait below -- the
+#: sleeper's leg-end drain frees its staging within tens of ms.
+KV_STAGE_POLL_S = 0.01
+
+
+def wait_for_peer_staging(read_free, need_bytes, floor_bytes, owed_reader,
+                          wait_s: float = KV_FIT_WAIT_DEFAULT_S,
+                          poll_s: float = KV_STAGE_POLL_S, sleep=None, now=None):
+    """WAKE-FLOOR-1024: the late kv_cache resume waits for the co-located
+    sleeper's on-card IPC staging to be freed BEFORE it maps the pool, when
+    the pool would otherwise eat the card below its corridor floor.
+
+    Metal, boot ``_1024_100906`` (NVFP4 duo), PP0 on the 5090, 10:25:28:
+    wake-pre-kv card free 10432 MiB, kv_cache need 10326 MiB, floor 1024 --
+    D TP0's last staging (tag ``weights``, 1212 MiB) was still allocated and
+    freed ~10 ms later at its leg end; the resume took the card to
+    ``card_free_mib=106``, the next chunk read 1438. Waiting for that one
+    release orders the two allocations instead of overlapping them.
+
+    This is ORDER, never a reserve: the floor only decides WHETHER to wait,
+    and only while the peer still OWES bytes on this card (``owed_reader() >
+    0``); on expiry, or with nothing owed, the caller resumes exactly as
+    before (the physical fit check stays the only refusal). Returns
+    ``(free, waited_s, owed)``. An unreadable figure waits for nothing."""
+    import time as _t
+
+    sleep = _t.sleep if sleep is None else sleep
+    now = _t.monotonic if now is None else now
+
+    def _owed() -> int:
+        try:
+            return max(0, int(owed_reader() or 0))
+        except Exception:  # noqa: BLE001 -- an unreadable counter owes nothing
+            return 0
+
+    free = read_free()
+    t0 = now()
+    owed = _owed()
+    if free is None or need_bytes is None:
+        return free, 0.0, owed
+    need = int(need_bytes)
+    floor = max(0, int(floor_bytes or 0))
+    while (owed > 0 and free is not None and int(free) - floor < need
+           and now() - t0 < float(wait_s)):
+        sleep(float(poll_s))
+        free = read_free()
+        owed = _owed()
+    return free, now() - t0, owed

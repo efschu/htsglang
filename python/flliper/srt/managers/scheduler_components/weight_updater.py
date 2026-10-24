@@ -2319,6 +2319,7 @@ class SchedulerWeightUpdaterManager:
         resume_ms = park.unpark_start(
             tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
             resume=lambda t: pdflip_tms_resume(self.memory_saver_adapter, t))
+        self._pdflip_credit_landed(credit, GPU_MEMORY_TYPE_WEIGHTS_DRAFT, epoch)  # WAKE-FLOOR-1024
         self._pdflip_draft_unpark_ph0 = (phases, len(phases))
         logger.info("PDFLIP-DRAFT-UNPARK start tag=%s resume_ms=%.0f issue_ms=%.0f bytes=%d",
                     GPU_MEMORY_TYPE_WEIGHTS_DRAFT, resume_ms, park.unpark_issue_ms,
@@ -5416,7 +5417,10 @@ class SchedulerWeightUpdaterManager:
                 _floor = self._pdflip_corridor_floor_bytes()
             except Exception:  # noqa: BLE001 -- no probe, no overdraw
                 _free, _floor = None, None
-            if not credit.debit("ipc-stage", n, free_bytes=_free, floor_bytes=_floor):
+            # WAKE-FLOOR-1024: the reader too, so the debit grades the card
+            # under the counter lock (a waker claim that landed meanwhile is in it)
+            if not credit.debit("ipc-stage", n, free_bytes=_free, floor_bytes=_floor,
+                                free_reader=self._pdflip_free_bytes):
                 logger.info(
                     "PDFLIP-SEQ stage-charge REFUSED %d MiB: the card's credit balance "
                     "is what the waking rank is promised; host path for this tag",
@@ -9924,6 +9928,58 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001 -- no plan is "not measurable", never a refusal
             return None
 
+    def _pdflip_kv_wait_peer_staging(self, epoch, free, need, floor):
+        """WAKE-FLOOR-1024: bounded wait, before the late kv_cache resume, for
+        the co-located sleeper's on-card staging (booked on THIS flip's credit
+        counter) to be freed, while the pool would otherwise land below the
+        corridor floor. Order, not a reserve: returns the (re-read) free
+        figure and never refuses; with no counter, no staging owed, or an
+        unreadable figure it returns ``free`` unchanged at once."""
+        if free is None or need is None or int(need) <= 0:
+            return free
+        if int(free) - int(floor or 0) >= int(need):
+            return free
+        credit, credit_epoch = self._pdflip_credit_reader(epoch)
+        if credit is None:
+            return free
+
+        def _owed() -> int:
+            st = credit.read() or {}
+            if str(st.get("epoch")) != str(credit_epoch):
+                return 0
+            return int(st.get("staged_bytes", 0) or 0)
+
+        try:
+            from flliper.srt.pdflip.wake_kv import kv_fit_wait_s, wait_for_peer_staging
+
+            free2, waited, owed = wait_for_peer_staging(
+                self._pdflip_free_bytes, need, floor, _owed, wait_s=kv_fit_wait_s())
+        except Exception as exc:  # noqa: BLE001 -- the wait is an order, never a gate
+            logger.info("PDFLIP-WAKE-KV-STAGE-WAIT skipped (%s: %s)", type(exc).__name__, exc)
+            return free
+        if waited > 0.0:
+            logger.info(
+                "PDFLIP-WAKE-KV-STAGE-WAIT epoch=%s free=%d -> %s MiB need=%d MiB floor=%d MiB "
+                "waited_ms=%.0f peer_staged_left=%d MiB (the sleeper's on-card staging freed "
+                "before the pool maps -- order, not a reserve; WAKE-FLOOR-1024)",
+                epoch, int(free) >> 20, "n/a" if free2 is None else int(free2) >> 20,
+                int(need) >> 20, int(floor or 0) >> 20, waited * 1000, int(owed) >> 20)
+        return free if free2 is None else free2
+
+    def _pdflip_credit_landed(self, credit, tag: str, epoch) -> None:
+        """WAKE-FLOOR-1024: ``tag``'s resume returned, its claimed bytes are
+        mapped -- release them from the counter's pending book. A failure here
+        leaves them pending, which only sends the sleeper's next on-card
+        staging to the host path (the safe direction), never a waker OOM."""
+        if credit is None or not hasattr(credit, "claim_landed"):
+            return
+        try:
+            credit.claim_landed(tag, epoch=epoch)
+        except Exception as exc:  # noqa: BLE001 -- pending stays: conservative
+            logger.info("PDFLIP-CREDIT-LANDED tag=%s not recorded (%s: %s) -- the claim "
+                        "stays pending, the peer's staging takes the host path",
+                        tag, type(exc).__name__, exc)
+
     def _pdflip_await_vram_credit(self, credit, tag: str, need_bytes: int,
                                 epoch=None, submitted=None) -> None:
         if credit is None or need_bytes <= 0:
@@ -11146,6 +11202,11 @@ class SchedulerWeightUpdaterManager:
                 logger.info(
                     "L15-WAKE-NEED tag=kv_cache plan=%d mapped=%d need=%d",
                     _kv_plan, _kv_mapped, int(_kv_need or 0))
+            # WAKE-FLOOR-1024: the co-located sleeper's on-card staging is
+            # freed at ITS leg end, concurrent with this call -- map the pool
+            # after that release, not on top of it (duo _1024_100906 PP0:
+            # 10432 free - 10326 kv -> 106 MiB, the staging went 10 ms later).
+            _kv_free = self._pdflip_kv_wait_peer_staging(_kv_epoch, _kv_free, _kv_need, _kv_floor)
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
             if _unfit is not None and _kv_free is not None:
                 # z30y7: the sleeper's leg runs concurrently and may still be
@@ -11632,6 +11693,9 @@ class SchedulerWeightUpdaterManager:
                     # weg2xsn269: a refused remap raises here (rc from the
                     # hook's tms_resume_rc) instead of exit(1) inside cuMemCreate.
                     pdflip_tms_resume(self.memory_saver_adapter, tag)
+                    # WAKE-FLOOR-1024: the claim is MAPPED now -- it leaves the
+                    # pending book the sleeper's staging debit subtracts
+                    self._pdflip_credit_landed(credit, tag, credit_epoch)
                     # H31: this tag's buffers exist now -- their pad+extra rows
                     # go on the side stream while the legs run on.
                     _rearm_pf = self._pdflip_rearm_prefetch_issue(_rearm_pf, tag)
