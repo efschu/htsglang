@@ -908,6 +908,11 @@ def rewrite_tree_chain(
             if (mv is not None and torch.is_tensor(mv) and mv.numel() > 0
                     and not all(int(x) in anchor_map
                                 for x in mv.flatten().tolist())):
+                # MAMBA-EVICT-PROBE-1024 (#228b): the sleep's non-held anchor leaves the tree (no tree handle here:
+                # secured is read from the node's own host value / mark)
+                from flliper.srt.mem_cache import mamba_evict_probe as _mep
+
+                _mep.note(None, cur, cur.component_data[ComponentType.MAMBA], site="sleep_l15")
                 cur.component_data[ComponentType.MAMBA].value = None
             else:
                 cur.component_data[ComponentType.MAMBA].value = _remap_slots(

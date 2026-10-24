@@ -39,6 +39,25 @@ No reserve and no new budget: room comes from free slots, from a slot another re
 part 1: ``ARENA-DROP freed>0``, a release, an ack), or from one agreed spill of an anchor that already has its L3 copy
 (no anchor is traded for another, #257).
 
+END-ANCHOR-GUARD-1024 (#231, review MUSS-1/SOLL-3, SOLL R11): the turn-end registry's anchors (structural, the same
+on every rank) are targets too, in their OWN class between the park END anchors and the chain intermediates (key bit
+``TURN_END_BIT``: a park END always comes first, the 8-key window is never filled by turn-end anchors ahead of it). The
+pass tells the guard what it found SECURED on every rank -- only from reduced values: a target nobody needs
+(``done``), ``ISSUED``, ``HEALED``, and, when every rank's needing list fit its gather segment (the incomplete flag,
+one more slot of the same gather), every turn-end candidate key no rank posted. The turn-end candidates are
+device-resident registry nodes only (Nachpruefung MUSS-3: a replica, never a rank-local host copy), so every rank
+holds the same candidate set; a rank whose turn-end listing failed raises the incomplete flag (no rank marks off
+that gather). A mark that fails AFTER the gather is W203 (``ParkRearmDivergence``, SOLL-B), never swallowed: the
+marks would part silently. The PASS line carries ``incomplete=`` (SOLL-C).
+
+CLASS-1 QUOTA (Nachpruefung SOLL-D): turn-end keys sort ahead of the chain intermediates (class 1, #203 part 2). With
+hundreds of deferred turn-end anchors on 27B-D a rank has more than ``K_PER_RANK`` turn-end needs at nearly every
+flush, and "its k smallest keys" never reached class 1 again -- neither in its gather segment nor in the pass's
+window. Every rank's segment and the pass window therefore keep ``CHAIN_QUOTA`` of their ``K_PER_RANK`` slots for
+class 1 when class-1 keys exist -- taken from the turn-end class, never from a park END (SOLL-3 stands) -- and while
+a class-1 target is in the window the turn-end class issues at most ``MAX_ISSUES_PER_PASS - 1`` per pass, so the
+issue budget is not spent before class 1 is reached. Without turn-end keys (the pre-#231 pass) nothing changes.
+
 Switch ``FLLIPER_PDFLIP_PARK_ANCHOR_REARM`` (default on). Off = byte for byte the old W65 skip.
 """
 from __future__ import annotations
@@ -59,6 +78,12 @@ AGREE_ROUNDS = 6
 #: larger than every key (keys are < 2**61)
 INF = 1 << 62
 _DEPTH_SPAN = 1 << 31
+#: END-ANCHOR-GUARD-1024 (SOLL-3): a turn-end registry target -- class 0 (END anchors, ``allow_class1`` keeps it), but
+#: ordered AFTER every park END (bits 28..58 depth, 0..27 hash, 60 class)
+TURN_END_BIT = 1 << 59
+#: Nachpruefung SOLL-D: slots of a rank's gather segment and of the pass window kept for class 1 (chain
+#: intermediates) when class-1 keys exist; taken from the turn-end class only
+CHAIN_QUOTA = 2
 
 
 def armed() -> bool:
@@ -91,6 +116,21 @@ def victim_key(depth: int, last_hash: Any) -> int:
     return d << 28 | _crc(last_hash)
 
 
+def turn_end_key(depth: int, last_hash: Any) -> int:
+    """Order key of a turn-end registry target: after every park END, before every chain intermediate; deeper first."""
+    return target_key(0, depth, last_hash) | TURN_END_BIT
+
+
+def is_turn_end_key(key: int) -> bool:
+    return class_of_target_key(key) == 0 and bool(int(key) & TURN_END_BIT)
+
+
+def _cls_name(key: int) -> str:
+    if class_of_target_key(key) == 1:
+        return "chain"
+    return "turn_end" if is_turn_end_key(key) else "end"
+
+
 def depth_of_target_key(key: int) -> int:
     return _DEPTH_SPAN - 1 - ((int(key) >> 28) & (_DEPTH_SPAN - 1))
 
@@ -99,24 +139,54 @@ def class_of_target_key(key: int) -> int:
     return (int(key) >> 60) & 1
 
 
+def select_window(keys: Iterable[int], k: int = K_PER_RANK) -> List[int]:
+    """The ``k`` keys a rank posts / a pass takes, ascending (rank-invariant: a function of the keys alone). At most
+    ``k`` keys -> all of them. Otherwise: park END keys first (never displaced), then the turn-end class, with up to
+    ``CHAIN_QUOTA`` slots kept for class 1 when it has keys (SOLL-D); class 1 also takes any slot the turn-end class
+    leaves. Without turn-end keys this is exactly "the k smallest" (the pre-#231 order)."""
+    ks = sorted({int(x) for x in keys})
+    if len(ks) <= k:
+        return ks
+    ends = [x for x in ks if class_of_target_key(x) == 0 and not is_turn_end_key(x)]
+    tes = [x for x in ks if is_turn_end_key(x)]
+    chain = [x for x in ks if class_of_target_key(x) == 1]
+    out = ends[:k]
+    room = k - len(out)
+    q = min(len(chain), CHAIN_QUOTA, room)
+    t = min(len(tes), room - q)
+    c = min(len(chain), room - t)
+    return sorted(out + tes[:t] + chain[:c])
+
+
 def _max(group_max: Callable[[List[int]], List[int]], values: Sequence[int]) -> List[int]:
     out = group_max([int(v) for v in values])
     return [int(v) for v in (out.tolist() if hasattr(out, "tolist") else out)]
 
 
-def gather_union(local_keys: Iterable[int], rank: int, world: int, group_max, veto: bool = False,
-                 k: int = K_PER_RANK):
+def gather_union_full(local_keys: Iterable[int], rank: int, world: int, group_max, veto: bool = False,
+                      incomplete: bool = False, k: int = K_PER_RANK):
     """All-gather of each rank's ``k`` smallest keys through one group MAX (rank r fills its own segment, 0 = empty;
-    keys travel +1). Returns ``(union sorted ascending, any_veto)`` -- the same on every rank."""
-    mine = sorted({int(x) for x in local_keys})[:k]
-    vec = [0] * (world * k + 1)
+    keys travel +1), plus a busy veto and an INCOMPLETE flag (a rank had more than ``k`` keys, or could not list its
+    keys). Returns ``(union sorted ascending, any_veto, any_incomplete)`` -- the same on every rank. Not incomplete =
+    the union is EVERY key any rank asked for (END-ANCHOR-GUARD: "not in the union" = nobody needs it)."""
+    allk = sorted({int(x) for x in local_keys})
+    mine = select_window(allk, k)   # SOLL-D: class 1 keeps its quota (== allk[:k] without turn-end keys)
+    vec = [0] * (world * k + 2)
     base = int(rank) * k
     for i, x in enumerate(mine):
         vec[base + i] = x + 1
+    vec[-2] = 1 if (incomplete or len(allk) > k) else 0
     vec[-1] = 1 if veto else 0
     red = _max(group_max, vec)
-    union = sorted({v - 1 for v in red[:-1] if v > 0})
-    return union, bool(red[-1])
+    union = sorted({v - 1 for v in red[:-2] if v > 0})
+    return union, bool(red[-1]), bool(red[-2])
+
+
+def gather_union(local_keys: Iterable[int], rank: int, world: int, group_max, veto: bool = False,
+                 k: int = K_PER_RANK):
+    """``(union, any_veto)`` of :func:`gather_union_full` (the same collective)."""
+    union, any_veto, _inc = gather_union_full(local_keys, rank, world, group_max, veto=veto, k=k)
+    return union, any_veto
 
 
 def agree_min_common(local_keys: Iterable[int], group_max, rounds: int = AGREE_ROUNDS):
@@ -203,31 +273,72 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
             return default
 
     busy = bool(_safe(ops.busy, True))
-    local = _safe(ops.needing, {}) or {}
+    _fail = object()
+    local = _safe(ops.needing, _fail)
+    need_failed = local is _fail
+    local = {} if need_failed else (local or {})
     if not allow_class1:
         local = {k: v for k, v in local.items() if class_of_target_key(k) == 0}
-    union, any_busy = gather_union(local.keys(), rank, world, ph(PH_GATHER), veto=busy)
+    # MUSS-3: a rank whose turn-end candidate listing failed cannot read "not in the union" for its own set -- the
+    # incomplete flag (the same gather slot) keeps EVERY rank from marking off this gather
+    cand_failed = bool(getattr(ops, "candidates_incomplete", False))
+    union, any_busy, any_incomplete = gather_union_full(local.keys(), rank, world, ph(PH_GATHER), veto=busy,
+                                                        incomplete=need_failed or cand_failed)
+    st["agreed"] = 0
+    st["incomplete"] = int(any_incomplete)   # SOLL-C: how often the complete-gather rule could not mark
+
+    def _mark_failed(what, exc):
+        # SOLL-B: a mark that fails on one rank parts the marks -- W203 by name (the hook re-raises it, the group
+        # stops), never a swallowed warning
+        raise ParkRearmDivergence(
+            f"{MARKER} W203 the agreed '{what}' mark raised on this rank after the gather ({type(exc).__name__}: "
+            f"{exc}) -- the other ranks set it, this one did not: the guard's hold would part") from exc
+
+    def _agreed(node):
+        # END-ANCHOR-GUARD-1024 (MUSS-1, R11): called only on REDUCED outcomes -- the same targets on every rank
+        f = getattr(ops, "agreed_secured", None)
+        if callable(f):
+            try:
+                f(node)
+            except Exception as exc:  # noqa: BLE001 - re-raised as W203
+                _mark_failed("secured", exc)
+            st["agreed"] += 1
+
+    if not any_incomplete:
+        # every key any rank asked for is in the union: a turn-end candidate outside it is secured on EVERY rank
+        f_un = getattr(ops, "agreed_unneeded", None)
+        if callable(f_un):
+            try:
+                st["agreed"] += int(f_un(set(union)) or 0)
+            except Exception as exc:  # noqa: BLE001 - re-raised as W203
+                _mark_failed("unneeded", exc)
     if any_busy or not union:
         if any_busy and union:
             st["busy"] = 1
         return st
-    cand = union[:K_PER_RANK]
+    cand = select_window(union)   # SOLL-D: the same quota in the pass window (== union[:K] without turn-end keys)
     located = [_safe(lambda k=k: ops.locate(k), None) for k in cand]
     red = ph(PH_LOCATE)([0 if n is not None else 1 for n in located])
     agreed = [(k, n) for k, n, missing in zip(cand, located, red) if missing == 0]
     st["targets"] = len(agreed)
+    # SOLL-D: while a class-1 target is in the window the turn-end class leaves it one issue of the pass budget
+    te_cap = (MAX_ISSUES_PER_PASS - 1) if any(class_of_target_key(k) == 1 for k, _n in agreed) else MAX_ISSUES_PER_PASS
+    te_issued = 0
     for key, node in agreed:
         if st["issued"] >= MAX_ISSUES_PER_PASS:
             break
+        if is_turn_end_key(key) and te_issued >= te_cap:
+            continue
         s = _safe(lambda: ops.state(node), (1, 1, 1, 1))
         needs, inflight, kv_noroom, m_noroom = (int(bool(x)) for x in s)
         if not needs:
             inflight = kv_noroom = m_noroom = 0
         any_needs, any_inflight, any_kv, any_m = ph(PH_STATE)([needs, inflight, kv_noroom, m_noroom])
         depth = depth_of_target_key(key)
-        cls = "end" if class_of_target_key(key) == 0 else "chain"
+        cls = _cls_name(key)
         if not any_needs:
             st["done"] += 1
+            _agreed(node)
             continue
         if any_inflight or any_kv:
             st["skipped"] += 1
@@ -275,6 +386,8 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
             if not still:
                 st["healed"] += 1
                 st["issued"] += 1
+                te_issued += int(is_turn_end_key(key))
+                _agreed(node)
                 log.warning("%s SPLIT HEALED depth=%d class=%s spill_victim_depth=%s (a rank could not write its copy at "
                             "the first try; its same-pass join made the anchor rank-equal)", MARKER, depth, cls, spill)
                 continue
@@ -295,6 +408,8 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
                         "next flush poll asks again)", MARKER, depth, cls, spill)
             break
         st["issued"] += 1
+        te_issued += int(is_turn_end_key(key))
+        _agreed(node)
         log.info("%s ISSUED depth=%d class=%s spill_victim_depth=%s (every rank holds or writes the anchor's copy; "
                  "PARK-END-ANCHOR BACKED names each rank's ack, slot=COMPLETE the last one)", MARKER, depth, cls, spill)
     return st
@@ -308,6 +423,8 @@ class TreeOps:
         self.mp = mp
         self._busy = bool(busy)
         self._map: Optional[Dict[int, Any]] = None
+        #: MUSS-3: the turn-end candidate listing failed on THIS rank -> the pass's incomplete flag (no rank marks)
+        self.candidates_incomplete = False
 
     # -- candidates --------------------------------------------------------------------------------------------
     def busy(self) -> bool:
@@ -353,6 +470,24 @@ class TreeOps:
                 if not getattr(n, "pdflip_park_end", False) and not n.evicted and self._has_anchor(n):
                     _put(target_key(1, t.pdflip_node_depth(n), n.hash_value[-1]), n)
                 n = n.parent
+        # END-ANCHOR-GUARD-1024 (#231, SOLL R7; review MUSS-1/SOLL-3, R11): the turn-end registry's anchors (filed at
+        # the turn-end events on every rank -- never the rank-local S108 deferral) are targets in their own class
+        # AFTER the park END anchors -- the eviction guard holds them on the device until a copy exists, and on a
+        # shared-slot TP group THIS pass is the one rank-agreed way to make that copy (agreed L3-secured victim,
+        # existing votes). A node already a park target keeps its park key (one key per node).
+        try:
+            from flliper.srt.pdflip import end_anchor_guard as _eag
+
+            placed = {id(x) for x in out.values()}
+            # (MUSS-3: rearm_candidates lists device-resident nodes only, so _has_anchor is the replica cd.value here
+            # and the turn-end candidate set is the same on every rank)
+            for n in _eag.rearm_candidates(t):
+                if id(n) not in placed and self._has_anchor(n):
+                    _put(turn_end_key(t.pdflip_node_depth(n), n.hash_value[-1]), n)
+        except Exception as exc:  # noqa: BLE001 - no turn-end candidates readable: the park list alone (the old pass)
+            self.candidates_incomplete = True   # MUSS-3: and no rank marks off this pass's gather
+            logger.warning("%s turn-end candidate listing raised %s: %s (this rank's set is short -- the gather is "
+                           "flagged incomplete on every rank)", MARKER, type(exc).__name__, exc)
         for k in bad:
             out.pop(k, None)
         self._map = out
@@ -371,6 +506,22 @@ class TreeOps:
         KV-only (the drop flag, cleared only at the copy's ack). The union over the ranks is the candidate list."""
         return {k: n for k, n in self._candidates().items() if self._needs(n)
                 and (class_of_target_key(k) == 0 or getattr(n, "pdflip_park_anchor_dropped", False))}
+
+    def agreed_secured(self, n) -> None:
+        """END-ANCHOR-GUARD-1024: the pass found ``n``'s copy on every rank (``done`` / ``ISSUED`` / ``HEALED``)."""
+        from flliper.srt.pdflip import end_anchor_guard as _eag
+
+        _eag.mark_agreed(self.tree, n)
+
+    def agreed_unneeded(self, union) -> int:
+        """END-ANCHOR-GUARD-1024: the gather was complete -- every turn-end candidate whose key no rank posted is
+        secured on every rank (the candidate map is the tree's structure, the same keys on every rank)."""
+        from flliper.srt.pdflip import end_anchor_guard as _eag
+
+        nodes = [n for k, n in self._candidates().items() if is_turn_end_key(k) and k not in union]
+        for n in nodes:
+            _eag.mark_agreed(self.tree, n)
+        return len(nodes)
 
     def has_rows(self, n) -> bool:
         """Review A2: THIS rank holds mamba rows for ``n`` -- a committed host copy, a write of its anchor in flight

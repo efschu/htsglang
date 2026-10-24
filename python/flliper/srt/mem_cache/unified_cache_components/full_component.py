@@ -212,12 +212,17 @@ class FullComponent(TreeComponent):
         # request from the backed leaves; pass 2 -- only when pass 1 ended short -- peels the held leaves in the old
         # order (UD / UD-H drop, parents next). The one-pass peel dropped 14272 fresh tokens of pdflip-0-22 while
         # 78016 evictable tokens stayed behind.
+        # END-ANCHOR-GUARD-1024 (#231, pdflip/end_anchor_guard.py; SOLL R7): the same two passes hold a turn-end
+        # anchor (END mark / S108 anchor-deferred, KV backed) whose mamba state has no copy -- _evict_device_leaf
+        # asks the guard before the demotion; pass 2 evicts the held ones only when the backed rest cannot pay.
+        from flliper.srt.pdflip import end_anchor_guard as _eag
         from flliper.srt.pdflip import ud_last as _udl
 
         # (unbound calls: hermetic tests borrow _peel onto bare namespaces)
         ct = self.component_type
         prev = _udl.begin(self.cache)
-        if prev is False:   # switch off: the one-pass peel, byte for byte
+        gprev = _eag.begin(self.cache)
+        if prev is False and gprev is False:   # both switches off: the one-pass peel, byte for byte
             FullComponent._peel_heap(
                 self, [n for n in self.cache.evictable_device_leaves], request, tracker
             )
@@ -226,21 +231,27 @@ class FullComponent(TreeComponent):
             FullComponent._peel_heap(
                 self, [n for n in self.cache.evictable_device_leaves], request, tracker
             )
-            held = _udl.take(self.cache)   # pass 2 runs with no hold list: it drops as before
-            if not held:
+            # pass 2 runs with no hold list open: it drops / demotes as before
+            held = _udl.take(self.cache) if prev is not False else []
+            gheld = _eag.take(self.cache) if gprev is not False else []
+            if not held and not gheld:
                 return
             got1 = tracker[ct]
             dropped_before = int(getattr(self.cache, "_pdflip_sf_unbacked_drop", 0) or 0)
             if got1 < request:
                 FullComponent._peel_heap(
                     self,
-                    [n for n in held if n in self.cache.evictable_device_leaves],
+                    [n for n in held + gheld if n in self.cache.evictable_device_leaves],
                     request,
                     tracker,
                 )
             dropped = int(getattr(self.cache, "_pdflip_sf_unbacked_drop", 0) or 0) - dropped_before
-            _udl.note(self.cache, held, got1, request, tracker[ct], max(0, dropped))
+            if held:
+                _udl.note(self.cache, held, got1, request, tracker[ct], max(0, dropped))
+            if gheld:
+                _eag.note_pass(self.cache, gheld, got1, request, tracker[ct], "peel")
         finally:
+            _eag.end(self.cache, gprev)
             _udl.end(self.cache, prev)
 
     def _peel_heap(self, leaves, request: int, tracker: dict[ComponentType, int]) -> None:

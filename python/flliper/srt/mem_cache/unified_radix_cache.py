@@ -67,6 +67,7 @@ from flliper.srt.mem_cache.common import (
 )
 from flliper.srt.mem_cache import hicache_write_path
 from flliper.srt.mem_cache import form_a_host_shadow as _r12
+from flliper.srt.mem_cache import mamba_evict_probe as _mamba_evict_probe
 from flliper.srt.managers.scheduler_components.host_round_cost import (
     COUNTERS as _HOST_COST,
 )
@@ -219,6 +220,7 @@ from flliper.srt.observability.metrics_collector import (
 from flliper.srt.session.streaming_session import StreamingSession
 from flliper.srt.pdflip import mamba_arena_displace as _mad
 from flliper.srt.pdflip import park_anchor_rearm as _park_rearm  # PARK-REARM-1024
+from flliper.srt.pdflip import end_anchor_guard as _end_anchor_guard  # END-ANCHOR-GUARD-1024 (#231)
 from flliper.srt.pdflip import dual_anchor_release as _dar  # Q-610
 from flliper.srt.pdflip import dual_told_anchor_hold as _tah  # told-anchor hold (y9d4)
 
@@ -1763,6 +1765,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Everything _reset_full does for the tree: prefetch pins, host
         # arena values, deferred publish/cap state, counters, fresh root
         # (lock_ref 1), empty LRU lists and leaf sets, zeroed sizes.
+        self._mamba_evict_keep_ids = {id(n) for n in keep_set}   # MAMBA-EVICT-PROBE-1024: kept, not dropped
         _t1 = time.perf_counter()
         self._reset_full()
         _t2 = time.perf_counter()
@@ -2532,6 +2535,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         def _mk(name: str) -> None:
             _ts.append((name, time.perf_counter()))
+
+        # MAMBA-EVICT-PROBE-1024 (#228b): one line for the device mamba states this reset drops (secured/unsecured
+        # read BEFORE the host release below); reset_keep names its kept nodes
+        _keep_ids = self.__dict__.pop("_mamba_evict_keep_ids", None)
+        _mamba_evict_probe.note_reset(self, site="reset_keep" if _keep_ids else "reset", keep_ids=_keep_ids)
 
         # S20 (h16v3 22:48:14-22:49:08, the D arena held full by the workers' stale host rows): a Form A WORKER
         # learned its tree only from worker_keeps / worker_short -- the first of them at 22:49:08. Until then every
@@ -4750,6 +4758,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "pin covers a load-back or a running request; the caller "
                     "must select an unlocked node, never free under the pin."
                 )
+            if comp.component_type == ComponentType.MAMBA and cd.value is not None:
+                # MAMBA-EVICT-PROBE-1024 (#228b): every device mamba state that leaves the tree, with its
+                # site (caller chain) and whether a copy survives -- before evict_component frees it
+                _mamba_evict_probe.note_device_evict(self, node, cd, host_too=EvictLayer.HOST in target)
         _fcd = (node.component_data[BASE_COMPONENT_TYPE]
                 if comp.component_type == BASE_COMPONENT_TYPE else None)
         if (
@@ -5163,6 +5175,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     node._k21_orphan_ack = False
                     UnifiedRadixCache._k21_note_skip(self, node)
                     return
+                # END-ANCHOR-GUARD-1024 (#231, SOLL R7): the backup above may have gone KV-only (P-FUND: the anchor
+                # had no arena slot) -- a turn-end anchor without a mamba copy is held in the peel's pass 1 instead
+                # of being demoted with its state (the arena was just asked: no second claim, ``just_tried``)
+                if _end_anchor_guard.before_demote(self, node, just_tried=True):
+                    return
                 self._evict_to_host(node, tracker)
                 return
             else:
@@ -5205,6 +5222,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
+        # END-ANCHOR-GUARD-1024 (#231, SOLL R7; 22-194, boot 1024_012625: the S108 KV-only turn end of pdflip-22-176
+        # left node 124928 backed WITHOUT a mamba copy and this demotion freed its state with no save and no line):
+        # the K15 save runs first; a turn-end anchor still without a copy is held in pass 1 (pdflip/end_anchor_guard.py)
+        if _end_anchor_guard.before_demote(self, node):
+            return
         self._evict_to_host(node, tracker)
 
     def _ud_dual_d_order_drop(
@@ -7746,8 +7768,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            _park_rearm.MARKER, rank, type(exc).__name__, exc)
             return {}
         stats["ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
-        if stats.get("targets") or stats.get("busy"):
-            # review S3: every pass with a target names itself and its cost
+        if stats.get("targets") or stats.get("busy") or stats.get("agreed") or stats.get("incomplete"):
+            # review S3: every pass with a target names itself and its cost; END-ANCHOR-GUARD Nachpruefung SOLL-C:
+            # also a pass that marked (agreed=) or could not mark (incomplete=) -- the rate the metal reads
             logger.info("%s PASS rank=%d class1=%d %s", _park_rearm.MARKER, rank, int(bool(allow_class1)),
                         " ".join("%s=%s" % kv for kv in sorted(stats.items())))
         return stats
@@ -8239,6 +8262,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if ad is None:
                     ad = self._s108_anchor_deferred = {}
                 ad[node.id] = node
+                _end_anchor_guard.note_s108_deferred(self, node)   # END-ANCHOR-GUARD-1024 SOLL-5: its age
                 while len(ad) > 4096:
                     ad.pop(next(iter(ad)))
                 mxfer = None
@@ -9654,7 +9678,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return   # (a refused copy is undone through the arena claim: arena-bound trees only)
             rid = str(getattr(req, "rid", "?"))
             clock = _te.IssueClock()
+            self._pdflip_chain_lookup_exc = None
             chain = self._pdflip_chain_nodes(radix_key) if radix_key is not None else []
+            _cexc = self.__dict__.get("_pdflip_chain_lookup_exc")
+            if _cexc is not None:
+                # END-ANCHOR-GUARD Nachpruefung SOLL-B: the lookup raised on THIS rank (swallowed as before: the turn
+                # end goes on without a chain) -- its turn-end registry is short of the node the others file: counted
+                # and named, never silent
+                _end_anchor_guard.note_register_failed(self, "chain_lookup", _cexc)
+            # END-ANCHOR-GUARD-1024 (#231 review MUSS-1, SOLL R11): the turn end's END node enters the guard's
+            # turn-end registry on EVERY rank, BEFORE any claim of this turn end answers (the chain is the tree's
+            # structure, the device residency a replica) -- the shared-slot hold reads this, never the claim result
+            _end_anchor_guard.register_turn_end(self, chain)
             old = [n for n in list((self.__dict__.get("_s108_deferred") or {}).values())[-_rp.max_issue():]
                    if n not in chain and not n.evicted and not n.backuped and not n.l3_present
                    and self._s108_in_tree(n)]   # the newest deferred, bounded
@@ -9767,7 +9802,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = node.parent
             chain.reverse()
             return chain
-        except Exception:  # noqa: BLE001 - an accelerator, never a wall
+        except Exception as exc:  # noqa: BLE001 - an accelerator, never a wall
+            self._pdflip_chain_lookup_exc = exc   # END-ANCHOR-GUARD SOLL-B: the turn end names it (REGISTER-FAILED)
             return []
 
     def _pdflip_publish_at_chunk(self, req, radix_key) -> None:
@@ -9947,6 +9983,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _n = getattr(mr, "last_device_node", None)
             if ok and _n is not None and _n is not self.root_node:
                 _n._pdflip_end_anchor = True
+                _end_anchor_guard.register_end(self, _n)   # END-ANCHOR-GUARD-1024: the re-arm pass's candidate registry
                 self._pdflip_dual_note_end_anchor(str(getattr(req, "rid", "") or ""), _n)   # Q-610
         except Exception:  # noqa: BLE001 -- an instrument never kills a rank
             pass
@@ -16686,6 +16723,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             return
         n = len(value)
+        if ct == ComponentType.MAMBA:   # MAMBA-EVICT-PROBE-1024: the #1055 reclaim side door
+            _mamba_evict_probe.note(self, node, cd, site="reclaim", frame=sys._getframe(1))
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] -= n
         else:
