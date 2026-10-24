@@ -483,7 +483,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26009,
+    "line": 26134,
     "tree": "27b"
    },
    "status": "harvested",
@@ -542,7 +542,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26040,
+    "line": 26165,
     "tree": "27b"
    },
    "status": "harvested",
@@ -814,7 +814,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24002,
+    "line": 24127,
     "tree": "27b"
    },
    "status": "harvested",
@@ -843,7 +843,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24431,
+    "line": 24556,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1145,7 +1145,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26017,
+    "line": 26142,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1354,7 +1354,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25838,
+    "line": 25963,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1806,7 +1806,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24408,
+    "line": 24533,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1835,7 +1835,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26024,
+    "line": 26149,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1878,7 +1878,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24205,
+    "line": 24330,
     "tree": "27b"
    },
    "status": "curated",
@@ -1907,7 +1907,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24419,
+    "line": 24544,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1936,7 +1936,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24339,
+    "line": 24464,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1965,7 +1965,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25965,
+    "line": 26090,
     "tree": "27b"
    },
    "status": "harvested",
@@ -1994,7 +1994,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25978,
+    "line": 26103,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2023,7 +2023,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24286,
+    "line": 24411,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2042,7 +2042,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24641
+      "line": 24766
      }
     },
     "nf": {
@@ -2051,7 +2051,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23244
+      "line": 23369
      }
     }
    },
@@ -2075,7 +2075,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24641,
+    "line": 24766,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2118,7 +2118,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24401,
+    "line": 24526,
     "tree": "27b"
    },
    "status": "curated",
@@ -2150,7 +2150,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24604,
+    "line": 24729,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2179,7 +2179,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24614,
+    "line": 24739,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2208,7 +2208,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24618,
+    "line": 24743,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2248,7 +2248,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 5341,
-      "zeile": 5417
+      "zeile": 5540
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -2270,7 +2270,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24272,
+    "line": 24397,
     "tree": "27b"
    },
    "status": "curated",
@@ -2299,7 +2299,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24296,
+    "line": 24421,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2326,7 +2326,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23003,
-      "zeile": 24224
+      "zeile": 24349
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -2349,7 +2349,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24220,
+    "line": 24345,
     "tree": "27b"
    },
    "status": "curated",
@@ -2378,7 +2378,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25920,
+    "line": 26045,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2410,7 +2410,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24507,
+    "line": 24632,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2439,7 +2439,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24307,
+    "line": 24432,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2487,7 +2487,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24622,
+    "line": 24747,
     "tree": "27b"
    },
    "status": "curated",
@@ -2516,7 +2516,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24635,
+    "line": 24760,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2545,7 +2545,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24658,
+    "line": 24783,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2574,7 +2574,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24653,
+    "line": 24778,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2603,7 +2603,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24325,
+    "line": 24450,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2632,7 +2632,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24313,
+    "line": 24438,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2661,7 +2661,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24320,
+    "line": 24445,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2688,7 +2688,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 25570,
-      "zeile": 26879
+      "zeile": 27009
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -2707,7 +2707,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 25567,
-      "zeile": 26876
+      "zeile": 27006
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -2726,7 +2726,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22875,
-      "zeile": 24096
+      "zeile": 24221
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -2751,7 +2751,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24393,
+    "line": 24518,
     "tree": "27b"
    },
    "status": "curated",
@@ -2780,7 +2780,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24600,
+    "line": 24725,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2812,7 +2812,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24585,
+    "line": 24710,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2841,7 +2841,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24596,
+    "line": 24721,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2868,7 +2868,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 27456,
-      "zeile": 28769
+      "zeile": 28907
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -2890,7 +2890,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25859,
+    "line": 25984,
     "tree": "27b"
    },
    "status": "curated",
@@ -2919,7 +2919,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25931,
+    "line": 26056,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2948,7 +2948,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25957,
+    "line": 26082,
     "tree": "27b"
    },
    "status": "harvested",
@@ -2980,7 +2980,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25947,
+    "line": 26072,
     "tree": "27b"
    },
    "status": "harvested",
@@ -3144,7 +3144,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24010,
+    "line": 24135,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -3773,7 +3773,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24488,
+    "line": 24613,
     "tree": "27b"
    },
    "status": "harvested",
@@ -3802,7 +3802,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24486,
+    "line": 24611,
     "tree": "27b"
    },
    "status": "harvested",
@@ -3834,7 +3834,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24493,
+    "line": 24618,
     "tree": "27b"
    },
    "status": "explained",
@@ -3863,7 +3863,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24490,
+    "line": 24615,
     "tree": "27b"
    },
    "status": "harvested",
@@ -5049,7 +5049,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 3725,
-      "zeile": 3757
+      "zeile": 3880
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5087,7 +5087,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 3710,
-      "zeile": 3742
+      "zeile": 3865
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -5110,7 +5110,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24455,
+    "line": 24580,
     "tree": "27b"
    },
    "status": "curated",
@@ -5139,7 +5139,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24414,
+    "line": 24539,
     "tree": "27b"
    },
    "status": "harvested",
@@ -5168,7 +5168,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23984,
+    "line": 24107,
     "tree": "27b"
    },
    "status": "explained",
@@ -5355,7 +5355,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15166,
-      "zeile": 16155
+      "zeile": 16278
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5381,7 +5381,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24134,
+    "line": 24259,
     "tree": "27b"
    },
    "status": "curated",
@@ -5407,7 +5407,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22946,
-      "zeile": 24167
+      "zeile": 24292
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5433,7 +5433,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24166,
+    "line": 24291,
     "tree": "27b"
    },
    "status": "curated",
@@ -5462,7 +5462,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24119,
+    "line": 24244,
     "tree": "27b"
    },
    "status": "curated",
@@ -5491,7 +5491,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24089,
+    "line": 24214,
     "tree": "27b"
    },
    "status": "curated",
@@ -5521,7 +5521,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15182,
-      "zeile": 16171
+      "zeile": 16294
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5543,7 +5543,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15186,
-      "zeile": 16175
+      "zeile": 16298
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5565,7 +5565,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15190,
-      "zeile": 16179
+      "zeile": 16302
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5587,7 +5587,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15194,
-      "zeile": 16183
+      "zeile": 16306
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5609,7 +5609,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15198,
-      "zeile": 16187
+      "zeile": 16310
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -5635,7 +5635,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24127,
+    "line": 24252,
     "tree": "27b"
    },
    "status": "curated",
@@ -6523,7 +6523,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24071
+      "line": 24196
      }
     },
     "nf": {
@@ -6532,7 +6532,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22636
+      "line": 22759
      }
     }
    },
@@ -6551,7 +6551,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14762,
-      "zeile": 15749
+      "zeile": 15872
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -6573,7 +6573,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14789,
-      "zeile": 15776
+      "zeile": 15899
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -6599,7 +6599,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24071,
+    "line": 24196,
     "tree": "27b"
    },
    "status": "curated",
@@ -6629,7 +6629,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14769,
-      "zeile": 15756
+      "zeile": 15879
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6655,7 +6655,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24170,
+    "line": 24295,
     "tree": "27b"
    },
    "status": "curated",
@@ -6684,7 +6684,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24097,
+    "line": 24222,
     "tree": "27b"
    },
    "status": "curated",
@@ -6710,7 +6710,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22942,
-      "zeile": 24163
+      "zeile": 24288
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6736,7 +6736,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24162,
+    "line": 24287,
     "tree": "27b"
    },
    "status": "curated",
@@ -6765,7 +6765,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24122,
+    "line": 24247,
     "tree": "27b"
    },
    "status": "curated",
@@ -6794,7 +6794,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22918,
-      "zeile": 24139
+      "zeile": 24264
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6816,7 +6816,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15166,
-      "zeile": 16155
+      "zeile": 16278
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6842,7 +6842,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24137,
+    "line": 24262,
     "tree": "27b"
    },
    "status": "curated",
@@ -6868,7 +6868,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22865,
-      "zeile": 24086
+      "zeile": 24211
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6890,7 +6890,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22865,
-      "zeile": 24086
+      "zeile": 24211
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -6916,7 +6916,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24085,
+    "line": 24210,
     "tree": "27b"
    },
    "status": "curated",
@@ -6945,7 +6945,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22920,
-      "zeile": 24141
+      "zeile": 24266
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -6967,7 +6967,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14955,
-      "zeile": 15942
+      "zeile": 16065
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6993,7 +6993,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24140,
+    "line": 24265,
     "tree": "27b"
    },
    "status": "curated",
@@ -7022,7 +7022,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24104,
+    "line": 24229,
     "tree": "27b"
    },
    "status": "curated",
@@ -7048,7 +7048,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15166,
-      "zeile": 16155
+      "zeile": 16278
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -7074,7 +7074,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24113,
+    "line": 24238,
     "tree": "27b"
    },
    "status": "curated",
@@ -7092,7 +7092,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24079
+      "line": 24204
      }
     },
     "nf": {
@@ -7101,7 +7101,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22640
+      "line": 22763
      }
     }
    },
@@ -7120,7 +7120,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14762,
-      "zeile": 15749
+      "zeile": 15872
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -7146,7 +7146,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24079,
+    "line": 24204,
     "tree": "27b"
    },
    "status": "curated",
@@ -7173,7 +7173,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15204,
-      "zeile": 16193
+      "zeile": 16316
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -7199,7 +7199,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24124,
+    "line": 24249,
     "tree": "27b"
    },
    "status": "curated",
@@ -7228,7 +7228,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14759,
-      "zeile": 15746
+      "zeile": 15869
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -7254,7 +7254,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24158,
+    "line": 24283,
     "tree": "27b"
    },
    "status": "curated",
@@ -7282,7 +7282,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24963,
+    "line": 25088,
     "tree": "27b"
    },
    "status": "harvested",
@@ -10285,7 +10285,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24185,
+    "line": 24310,
     "tree": "27b"
    },
    "status": "curated",
@@ -10314,7 +10314,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24184,
+    "line": 24309,
     "tree": "27b"
    },
    "status": "curated",
@@ -10553,7 +10553,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24961,
+    "line": 25086,
     "tree": "27b"
    },
    "status": "harvested",
@@ -10762,7 +10762,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24186,
+    "line": 24311,
     "tree": "27b"
    },
    "status": "curated",
@@ -10821,7 +10821,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24183,
+    "line": 24308,
     "tree": "27b"
    },
    "status": "curated",
@@ -10850,7 +10850,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24187,
+    "line": 24312,
     "tree": "27b"
    },
    "status": "harvested",
@@ -11149,7 +11149,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24255,
+    "line": 24380,
     "tree": "27b"
    },
    "status": "harvested",
@@ -11239,7 +11239,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 3710,
-      "zeile": 3742
+      "zeile": 3865
      },
      "quelle": "catalog+curated",
      "rel": "trades",
@@ -11258,7 +11258,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14799,
-      "zeile": 15786
+      "zeile": 15909
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -11283,7 +11283,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24176,
+    "line": 24301,
     "tree": "27b"
    },
    "status": "curated",
@@ -11298,20 +11298,20 @@
    "abweichung": {
     "27b": {
      "default": null,
-     "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or without --force. Container: FLLIPER_FORCE=1.",
+     "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records -- unless every refusal it passed is a proof gap of its own form (#227: HW-COUNT [METAL-UNPROVEN] alone, the PP-CUT crossing-width HW-UNCALIBRATED); then its records carry forced_past (line FORCED-RECORDS). NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or without --force. Container: FLLIPER_FORCE=1.",
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23985
+      "line": 24108
      }
     },
     "nf": {
      "default": null,
-     "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or without --force. Container: FLLIPER_FORCE=1. On the NF tree only the codes the register lists as wired (HW-COUNT, HW-UNCALIBRATED, HOST-DISK) are lifted; the planner's flip-path refusals keep refusing.",
+     "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records -- unless every refusal it passed is a proof gap of its own form (#227: HW-COUNT [METAL-UNPROVEN] alone, the PP-CUT crossing-width HW-UNCALIBRATED); then its records carry forced_past (line FORCED-RECORDS). NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or without --force. Container: FLLIPER_FORCE=1. On the NF tree only the codes the register lists as wired (HW-COUNT, HW-UNCALIBRATED, HOST-DISK) are lifted; the planner's flip-path refusals keep refusing.",
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22692
+      "line": 22815
      }
     }
    },
@@ -11322,7 +11322,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or without --force. Container: FLLIPER_FORCE=1.",
+   "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records -- unless every refusal it passed is a proof gap of its own form (#227: HW-COUNT [METAL-UNPROVEN] alone, the PP-CUT crossing-width HW-UNCALIBRATED); then its records carry forced_past (line FORCED-RECORDS). NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or without --force. Container: FLLIPER_FORCE=1.",
    "id": "--force",
    "kind": "flag",
    "level": "expert",
@@ -11332,7 +11332,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23985,
+    "line": 24108,
     "tree": "27b"
    },
    "status": "harvested",
@@ -11361,7 +11361,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24818,
+    "line": 24943,
     "tree": "27b"
    },
    "status": "harvested",
@@ -11510,7 +11510,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24855,
+    "line": 24980,
     "tree": "27b"
    },
    "status": "harvested",
@@ -11569,7 +11569,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24840,
+    "line": 24965,
     "tree": "27b"
    },
    "status": "harvested",
@@ -11598,7 +11598,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24189,
+    "line": 24314,
     "tree": "27b"
    },
    "status": "harvested",
@@ -12496,7 +12496,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 19500,
-      "zeile": 20547
+      "zeile": 20670
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -12518,7 +12518,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23953,
+    "line": 24076,
     "tree": "27b"
    },
    "status": "curated",
@@ -12545,7 +12545,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22736,
-      "zeile": 23955
+      "zeile": 24078
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -12567,7 +12567,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23958,
+    "line": 24081,
     "tree": "27b"
    },
    "status": "curated",
@@ -12610,7 +12610,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14792,
-      "zeile": 15779
+      "zeile": 15902
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -12635,7 +12635,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24389,
+    "line": 24514,
     "tree": "27b"
    },
    "status": "curated",
@@ -15614,7 +15614,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26059,
+    "line": 26184,
     "tree": "27b"
    },
    "status": "harvested",
@@ -15676,7 +15676,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24416,
+    "line": 24541,
     "tree": "27b"
    },
    "status": "curated",
@@ -15918,7 +15918,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 9328,
-      "zeile": 9527
+      "zeile": 9650
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -15937,7 +15937,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 8889,
-      "zeile": 9088
+      "zeile": 9211
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -16109,7 +16109,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24257,
+    "line": 24382,
     "tree": "27b"
    },
    "status": "harvested",
@@ -16288,7 +16288,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23931,
+    "line": 24054,
     "tree": "27b"
    },
    "status": "curated",
@@ -16857,7 +16857,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26067,
+    "line": 26192,
     "tree": "27b"
    },
    "status": "harvested",
@@ -16886,7 +16886,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26074,
+    "line": 26199,
     "tree": "27b"
    },
    "status": "harvested",
@@ -16915,7 +16915,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26083,
+    "line": 26208,
     "tree": "27b"
    },
    "status": "harvested",
@@ -16934,7 +16934,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 25555
+      "line": 25680
      }
     },
     "nf": {
@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24152
+      "line": 24277
      }
     }
    },
@@ -16964,7 +16964,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25555,
+    "line": 25680,
     "tree": "27b"
    },
    "status": "harvested",
@@ -16993,7 +16993,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25584,
+    "line": 25709,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17022,7 +17022,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24815,
+    "line": 24940,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17080,7 +17080,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25802,
+    "line": 25927,
     "tree": "27b"
    },
    "status": "explained",
@@ -17382,7 +17382,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24775,
+    "line": 24900,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17414,7 +17414,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24799,
+    "line": 24924,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17443,7 +17443,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24794,
+    "line": 24919,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17472,7 +17472,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24789,
+    "line": 24914,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17501,7 +17501,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26030,
+    "line": 26155,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17544,7 +17544,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24198,
+    "line": 24323,
     "tree": "27b"
    },
    "status": "curated",
@@ -17573,7 +17573,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25604,
+    "line": 25729,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17602,7 +17602,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24366,
+    "line": 24491,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17631,7 +17631,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24373,
+    "line": 24498,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17650,7 +17650,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24351
+      "line": 24476
      }
     },
     "nf": {
@@ -17659,7 +17659,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22954
+      "line": 23079
      }
     }
    },
@@ -17680,7 +17680,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24351,
+    "line": 24476,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17709,7 +17709,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24763,
+    "line": 24888,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17738,7 +17738,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24726,
+    "line": 24851,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17767,7 +17767,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24758,
+    "line": 24883,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17794,7 +17794,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 1911,
-      "zeile": 1924
+      "zeile": 2047
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -17829,7 +17829,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24718,
+    "line": 24843,
     "tree": "27b"
    },
    "status": "curated",
@@ -17858,7 +17858,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24722,
+    "line": 24847,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17887,7 +17887,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24771,
+    "line": 24896,
     "tree": "27b"
    },
    "status": "harvested",
@@ -17930,7 +17930,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24732,
+    "line": 24857,
     "tree": "27b"
    },
    "status": "curated",
@@ -17957,7 +17957,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 1918,
-      "zeile": 1931
+      "zeile": 2054
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -17979,7 +17979,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24738,
+    "line": 24863,
     "tree": "27b"
    },
    "status": "curated",
@@ -18009,7 +18009,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 1391,
-      "zeile": 1404
+      "zeile": 1527
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -18028,7 +18028,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 1916,
-      "zeile": 1929
+      "zeile": 2052
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -18047,7 +18047,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 1391,
-      "zeile": 1404
+      "zeile": 1527
      },
      "quelle": "catalog+curated",
      "rel": "excludes",
@@ -18069,7 +18069,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24662,
+    "line": 24787,
     "tree": "27b"
    },
    "status": "curated",
@@ -18098,7 +18098,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24194,
+    "line": 24319,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18127,7 +18127,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24579,
+    "line": 24704,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18156,7 +18156,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24901,
+    "line": 25026,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18175,7 +18175,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24646
+      "line": 24771
      }
     },
     "nf": {
@@ -18184,7 +18184,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23249
+      "line": 23374
      }
     }
    },
@@ -18208,7 +18208,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24646,
+    "line": 24771,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18241,7 +18241,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25986,
+    "line": 26111,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18260,7 +18260,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 25536
+      "line": 25661
      }
     },
     "nf": {
@@ -18269,7 +18269,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24135
+      "line": 24260
      }
     }
    },
@@ -18290,7 +18290,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25536,
+    "line": 25661,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18319,7 +18319,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25573,
+    "line": 25698,
     "tree": "27b"
    },
    "status": "curated",
@@ -18351,7 +18351,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24679,
+    "line": 24804,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18380,7 +18380,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24691,
+    "line": 24816,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18409,7 +18409,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24698,
+    "line": 24823,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18438,7 +18438,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24714,
+    "line": 24839,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18467,7 +18467,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24702,
+    "line": 24827,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18496,7 +18496,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24707,
+    "line": 24832,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18525,7 +18525,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24694,
+    "line": 24819,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18554,7 +18554,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25524,
+    "line": 25649,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18583,7 +18583,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24744,
+    "line": 24869,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18612,7 +18612,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24755,
+    "line": 24880,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18641,7 +18641,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24524,
+    "line": 24649,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18670,7 +18670,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24557,
+    "line": 24682,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18697,7 +18697,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23351,
-      "zeile": 24572
+      "zeile": 24697
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -18716,7 +18716,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23345,
-      "zeile": 24566
+      "zeile": 24691
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -18738,7 +18738,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24564,
+    "line": 24689,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18767,7 +18767,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24894,
+    "line": 25019,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18796,7 +18796,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24575,
+    "line": 24700,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18829,7 +18829,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24542,
+    "line": 24667,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18858,7 +18858,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24884,
+    "line": 25009,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18887,7 +18887,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25589,
+    "line": 25714,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18916,7 +18916,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24871,
+    "line": 24996,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18945,7 +18945,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25562,
+    "line": 25687,
     "tree": "27b"
    },
    "status": "harvested",
@@ -18964,7 +18964,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24803
+      "line": 24928
      }
     },
     "nf": {
@@ -18973,7 +18973,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23406
+      "line": 23531
      }
     }
    },
@@ -18994,7 +18994,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24803,
+    "line": 24928,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19056,7 +19056,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25271,
+    "line": 25396,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19089,7 +19089,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25295,
+    "line": 25420,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19118,7 +19118,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24994,
+    "line": 25119,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19150,7 +19150,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25287,
+    "line": 25412,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19179,7 +19179,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24971,
+    "line": 25096,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19208,7 +19208,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25327,
+    "line": 25452,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19237,7 +19237,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25198,
+    "line": 25323,
     "tree": "27b"
    },
    "status": "curated",
@@ -19256,7 +19256,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 25182
+      "line": 25307
      }
     },
     "nf": {
@@ -19265,7 +19265,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23782
+      "line": 23907
      }
     }
    },
@@ -19284,7 +19284,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 8524,
-      "zeile": 8721
+      "zeile": 8844
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -19303,7 +19303,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 24946,
-      "zeile": 26197
+      "zeile": 26322
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -19322,7 +19322,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 24969,
-      "zeile": 26220
+      "zeile": 26345
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -19348,7 +19348,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25182,
+    "line": 25307,
     "tree": "27b"
    },
    "status": "curated",
@@ -19377,7 +19377,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25174,
+    "line": 25299,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19404,7 +19404,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 10654,
-      "zeile": 10927
+      "zeile": 11050
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -19426,7 +19426,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25038,
+    "line": 25163,
     "tree": "27b"
    },
    "status": "curated",
@@ -19455,7 +19455,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25013,
+    "line": 25138,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19482,7 +19482,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 10652,
-      "zeile": 10987
+      "zeile": 11110
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -19504,7 +19504,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25344,
+    "line": 25469,
     "tree": "27b"
    },
    "status": "curated",
@@ -19533,7 +19533,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25363,
+    "line": 25488,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19576,7 +19576,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25353,
+    "line": 25478,
     "tree": "27b"
    },
    "status": "curated",
@@ -19605,7 +19605,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25254,
+    "line": 25379,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19634,7 +19634,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25310,
+    "line": 25435,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19663,7 +19663,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25232,
+    "line": 25357,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19692,7 +19692,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25214,
+    "line": 25339,
     "tree": "27b"
    },
    "status": "harvested",
@@ -19975,7 +19975,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24025,
+    "line": 24150,
     "tree": "27b"
    },
    "status": "curated",
@@ -20004,7 +20004,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24017,
+    "line": 24142,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20185,7 +20185,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 8859,
-      "zeile": 9058
+      "zeile": 9181
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -20226,7 +20226,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25394,
+    "line": 25519,
     "tree": "27b"
    },
    "status": "curated",
@@ -20255,7 +20255,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26049,
+    "line": 26174,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20284,7 +20284,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25772,
+    "line": 25897,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20313,7 +20313,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25515,
+    "line": 25640,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20342,7 +20342,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25711,
+    "line": 25836,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20371,7 +20371,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25720,
+    "line": 25845,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20400,7 +20400,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25702,
+    "line": 25827,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20429,7 +20429,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25782,
+    "line": 25907,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20458,7 +20458,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25673,
+    "line": 25798,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20487,7 +20487,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25681,
+    "line": 25806,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20516,7 +20516,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25625,
+    "line": 25750,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20543,7 +20543,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21653,
-      "zeile": 22867
+      "zeile": 22990
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -20563,7 +20563,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21650,
-      "zeile": 22864
+      "zeile": 22987
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -20585,7 +20585,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25688,
+    "line": 25813,
     "tree": "27b"
    },
    "status": "curated",
@@ -20612,7 +20612,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21659,
-      "zeile": 22873
+      "zeile": 22996
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -20648,7 +20648,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25696,
+    "line": 25821,
     "tree": "27b"
    },
    "status": "curated",
@@ -20677,7 +20677,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25726,
+    "line": 25851,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20706,7 +20706,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25739,
+    "line": 25864,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20735,7 +20735,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25506,
+    "line": 25631,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20764,7 +20764,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24259,
+    "line": 24384,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20793,7 +20793,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25636,
+    "line": 25761,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20822,7 +20822,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25651,
+    "line": 25776,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20851,7 +20851,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25657,
+    "line": 25782,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20880,7 +20880,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25758,
+    "line": 25883,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20909,7 +20909,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25661,
+    "line": 25786,
     "tree": "27b"
    },
    "status": "harvested",
@@ -20967,7 +20967,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25612,
+    "line": 25737,
     "tree": "27b"
    },
    "status": "harvested",
@@ -21026,7 +21026,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26054,
+    "line": 26179,
     "tree": "27b"
    },
    "status": "harvested",
@@ -21119,7 +21119,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25400,
+    "line": 25525,
     "tree": "27b"
    },
    "status": "harvested",
@@ -21146,7 +21146,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22231,
-      "zeile": 23450
+      "zeile": 23573
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -21168,7 +21168,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25465,
+    "line": 25590,
     "tree": "27b"
    },
    "status": "curated",
@@ -21195,7 +21195,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 8859,
-      "zeile": 9058
+      "zeile": 9181
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -21252,7 +21252,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22231,
-      "zeile": 23450
+      "zeile": 23573
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -21274,7 +21274,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25381,
+    "line": 25506,
     "tree": "27b"
    },
    "status": "curated",
@@ -21633,7 +21633,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23979,
+    "line": 24102,
     "tree": "27b"
    },
    "status": "harvested",
@@ -21662,7 +21662,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23970,
+    "line": 24093,
     "tree": "27b"
    },
    "status": "harvested",
@@ -21741,7 +21741,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23932,
+    "line": 24055,
     "tree": "27b"
    },
    "status": "curated",
@@ -21768,7 +21768,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22779,
-      "zeile": 24000
+      "zeile": 24125
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -21791,7 +21791,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23994,
+    "line": 24119,
     "tree": "27b"
    },
    "status": "curated",
@@ -22000,7 +22000,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26000,
+    "line": 26125,
     "tree": "27b"
    },
    "status": "harvested",
@@ -22087,7 +22087,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15383,
-      "zeile": 16372
+      "zeile": 16495
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -22441,7 +22441,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 20242,
-      "zeile": 21378
+      "zeile": 21501
      },
      "quelle": "catalog+curated",
      "rel": "excludes",
@@ -22461,7 +22461,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21652,
-      "zeile": 22866
+      "zeile": 22989
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -22660,7 +22660,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 5024,
-      "zeile": 5094
+      "zeile": 5217
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -22679,7 +22679,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 17301,
-      "zeile": 18302
+      "zeile": 18425
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -22850,7 +22850,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24182,
+    "line": 24307,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -23217,7 +23217,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24929,
+    "line": 25054,
     "tree": "27b"
    },
    "status": "harvested",
@@ -23246,7 +23246,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25372,
+    "line": 25497,
     "tree": "27b"
    },
    "status": "harvested",
@@ -24097,7 +24097,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 2526,
-      "zeile": 2558
+      "zeile": 2681
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -24135,7 +24135,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24475,
+    "line": 24600,
     "tree": "27b"
    },
    "status": "curated",
@@ -24822,7 +24822,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 3719,
-      "zeile": 3751
+      "zeile": 3874
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -25655,7 +25655,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24064,
+    "line": 24189,
     "tree": "27b"
    },
    "status": "harvested",
@@ -25698,7 +25698,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24045,
+    "line": 24170,
     "tree": "27b"
    },
    "status": "curated",
@@ -25727,7 +25727,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24053,
+    "line": 24178,
     "tree": "27b"
    },
    "status": "explained",
@@ -25909,7 +25909,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23929,
+    "line": 24052,
     "tree": "27b"
    },
    "status": "explained",
@@ -25968,7 +25968,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 26092,
+    "line": 26217,
     "tree": "27b"
    },
    "status": "harvested",
@@ -26123,7 +26123,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23937,
+    "line": 24060,
     "tree": "27b"
    },
    "status": "harvested",
@@ -26270,7 +26270,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 4090,
-      "zeile": 4122
+      "zeile": 4245
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -26302,7 +26302,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23003,
-      "zeile": 24224
+      "zeile": 24349
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -26321,7 +26321,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22875,
-      "zeile": 24096
+      "zeile": 24221
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -26346,7 +26346,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24212,
+    "line": 24337,
     "tree": "27b"
    },
    "status": "curated",
@@ -26718,7 +26718,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24918,
+    "line": 25043,
     "tree": "27b"
    },
    "status": "harvested",
@@ -26747,7 +26747,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23928,
+    "line": 24051,
     "tree": "27b"
    },
    "status": "explained",
@@ -26886,7 +26886,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24830
+      "line": 24955
      }
     },
     "nf": {
@@ -26895,7 +26895,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23429
+      "line": 23554
      }
     }
    },
@@ -26916,7 +26916,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24830,
+    "line": 24955,
     "tree": "27b"
    },
    "status": "harvested",
@@ -27168,7 +27168,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15383,
-      "zeile": 16372
+      "zeile": 16495
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -27190,7 +27190,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25815,
+    "line": 25940,
     "tree": "27b"
    },
    "status": "curated",
@@ -27249,7 +27249,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23930,
+    "line": 24053,
     "tree": "27b"
    },
    "status": "explained",
@@ -27338,7 +27338,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24380,
+    "line": 24505,
     "tree": "27b"
    },
    "status": "harvested",
@@ -27447,7 +27447,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24180,
+    "line": 24305,
     "tree": "27b"
    },
    "status": "harvested",
@@ -28202,7 +28202,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24249,
+    "line": 24374,
     "tree": "27b"
    },
    "status": "harvested",
@@ -28229,7 +28229,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 4095,
-      "zeile": 4127
+      "zeile": 4250
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -28248,7 +28248,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22875,
-      "zeile": 24096
+      "zeile": 24221
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -28273,7 +28273,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24226,
+    "line": 24351,
     "tree": "27b"
    },
    "status": "curated",
@@ -28345,7 +28345,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24242,
+    "line": 24367,
     "tree": "27b"
    },
    "status": "curated",
@@ -28417,7 +28417,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24246,
+    "line": 24371,
     "tree": "27b"
    },
    "status": "curated",
@@ -28436,7 +28436,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24234
+      "line": 24359
      }
     },
     "nf": {
@@ -28445,7 +28445,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22837
+      "line": 22962
      }
     }
    },
@@ -28505,7 +28505,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23018,
-      "zeile": 24239
+      "zeile": 24364
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -28528,7 +28528,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24234,
+    "line": 24359,
     "tree": "27b"
    },
    "status": "curated",
@@ -28557,7 +28557,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25124,
+    "line": 25249,
     "tree": "27b"
    },
    "status": "harvested",
@@ -28586,7 +28586,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25060,
+    "line": 25185,
     "tree": "27b"
    },
    "status": "harvested",
@@ -28615,7 +28615,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24944,
+    "line": 25069,
     "tree": "27b"
    },
    "status": "harvested",
@@ -28644,7 +28644,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 25089,
+    "line": 25214,
     "tree": "27b"
    },
    "status": "harvested",
@@ -41073,7 +41073,7 @@
    "lesestellen": [
     "layers/attention/fla/l2norm.py:92",
     "managers/pdflip_p_overlap.py:184",
-    "pdflip/launcher.py:11876"
+    "pdflip/launcher.py:11999"
    ],
    "level": "expert",
    "name": "FLLIPER_FLA_L2NORM_RUNTIME_T",
@@ -42279,8 +42279,8 @@
    "kind": "env",
    "lesestellen": [
     "model_loader/gguf_qwen35.py:62",
-    "pdflip/launcher.py:10383",
-    "pdflip/launcher.py:10385"
+    "pdflip/launcher.py:10506",
+    "pdflip/launcher.py:10508"
    ],
    "level": "expert",
    "name": "FLLIPER_GGUF_DENSE_VOCAB",
@@ -43146,7 +43146,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:3778",
     "pdflip/decode_warm_handoff.py:46",
-    "pdflip/front.py:7842",
+    "pdflip/front.py:7853",
     "pdflip/handoff.py:30",
     "pdflip/tail_handoff.py:481"
    ],
@@ -43182,7 +43182,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:3832",
     "mem_cache/pool_host/arena_pool.py:1314",
-    "pdflip/launcher.py:28151"
+    "pdflip/launcher.py:28289"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_GIB",
@@ -43217,7 +43217,7 @@
     "server_args.py:9069",
     "mem_cache/pool_host/arena_pool.py:1290",
     "mem_cache/pool_host/mha.py:1463",
-    "pdflip/launcher.py:14288"
+    "pdflip/launcher.py:14411"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_HOST",
@@ -43315,9 +43315,9 @@
    "lesestellen": [
     "mem_cache/form_a_host_shadow.py:1829",
     "mem_cache/hicache_storage.py:3836",
-    "pdflip/launcher.py:30318",
-    "pdflip/launcher.py:30317",
-    "pdflip/launcher.py:30344"
+    "pdflip/launcher.py:30467",
+    "pdflip/launcher.py:30466",
+    "pdflip/launcher.py:30493"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS",
@@ -43479,7 +43479,7 @@
    "id": "FLLIPER_HICACHE_BIGRAM_KEYS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:7846"
+    "pdflip/front.py:7857"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_BIGRAM_KEYS",
@@ -43488,7 +43488,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 7846,
+    "line": 7857,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -46056,7 +46056,7 @@
    "kind": "env",
    "lesestellen": [
     "model_executor/model_runner_kv_cache_mixin.py:1057",
-    "pdflip/launcher.py:12058"
+    "pdflip/launcher.py:12181"
    ],
    "level": "expert",
    "name": "FLLIPER_KV_BUDGET_PREFILL_TRANSIENT_MIB",
@@ -54877,7 +54877,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_FROM_LEDGER",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:28148"
+    "pdflip/launcher.py:28286"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_FROM_LEDGER",
@@ -54886,7 +54886,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 28148,
+    "line": 28286,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -56517,7 +56517,7 @@
    "id": "FLLIPER_PDFLIP_CORE_CWD",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:13682"
+    "pdflip/launcher.py:13805"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_CORE_CWD",
@@ -56526,7 +56526,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 13682,
+    "line": 13805,
     "tree": "27b"
    },
    "status": "harvested",
@@ -56606,7 +56606,7 @@
    "id": "FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:4853"
+    "pdflip/front.py:4861"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP",
@@ -56615,7 +56615,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 4853,
+    "line": 4861,
     "tree": "27b"
    },
    "status": "explained",
@@ -56792,7 +56792,8 @@
    "id": "FLLIPER_PDFLIP_DC_D_RECORD",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:470"
+    "pdflip/launcher.py:473",
+    "pdflip/launcher.py:602"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DC_D_RECORD",
@@ -56801,7 +56802,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 470,
+    "line": 473,
     "tree": "27b"
    },
    "status": "harvested",
@@ -56824,8 +56825,8 @@
    "id": "FLLIPER_PDFLIP_DC_IMAGE_OFF_FLIP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:4845",
-    "pdflip/front.py:10547"
+    "pdflip/front.py:4853",
+    "pdflip/front.py:10558"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DC_IMAGE_OFF_FLIP",
@@ -56834,7 +56835,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 4845,
+    "line": 4853,
     "tree": "27b"
    },
    "status": "harvested",
@@ -57404,7 +57405,7 @@
    "id": "FLLIPER_PDFLIP_DFLASH_PLACEMENT",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:2629"
+    "pdflip/launcher.py:2752"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DFLASH_PLACEMENT",
@@ -57413,7 +57414,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 2629,
+    "line": 2752,
     "tree": "27b"
    },
    "status": "harvested",
@@ -57524,7 +57525,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/scheduler.py:1521",
-    "pdflip/front.py:5194"
+    "pdflip/front.py:5202"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DORMANT_ADMIT",
@@ -57679,7 +57680,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/front.py",
       "row_note": 17185,
-      "zeile": 25368
+      "zeile": 25459
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -58331,7 +58332,7 @@
    "id": "FLLIPER_PDFLIP_DUAL_D_AIR_TOKENS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:23764"
+    "pdflip/front.py:23849"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_D_AIR_TOKENS",
@@ -58340,7 +58341,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 23764,
+    "line": 23849,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -59534,7 +59535,7 @@
     "pdflip/dual_p_kv_stage.py:1119",
     "pdflip/dual_p_kv_stage.py:1648",
     "pdflip/dual_p_kv_stage.py:1448",
-    "pdflip/front.py:2978"
+    "pdflip/front.py:2986"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_KV_TAG",
@@ -59680,8 +59681,8 @@
    "id": "FLLIPER_PDFLIP_DUAL_MPS_OPT_IN",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:15766",
-    "pdflip/launcher.py:15772"
+    "pdflip/launcher.py:15889",
+    "pdflip/launcher.py:15895"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_MPS_OPT_IN",
@@ -59690,7 +59691,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 15766,
+    "line": 15889,
     "tree": "27b"
    },
    "status": "harvested",
@@ -61748,8 +61749,8 @@
    "id": "FLLIPER_PDFLIP_D_EXPECT_P_RECORD",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:671",
-    "pdflip/launcher.py:672"
+    "pdflip/launcher.py:794",
+    "pdflip/launcher.py:795"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_D_EXPECT_P_RECORD",
@@ -61758,7 +61759,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 671,
+    "line": 794,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -62082,7 +62083,7 @@
    "id": "FLLIPER_PDFLIP_D_KV_STAGE_LRU_FLOOR",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:3389"
+    "pdflip/launcher.py:3512"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_D_KV_STAGE_LRU_FLOOR",
@@ -62091,7 +62092,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 3389,
+    "line": 3512,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -62975,7 +62976,7 @@
    "id": "FLLIPER_PDFLIP_D_RESERVE_RECORD_MAX",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:616"
+    "pdflip/launcher.py:739"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_D_RESERVE_RECORD_MAX",
@@ -62984,7 +62985,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 616,
+    "line": 739,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -65604,7 +65605,7 @@
    "id": "FLLIPER_PDFLIP_EXPERT_BANDS_ARM",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:27897"
+    "pdflip/launcher.py:28035"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EXPERT_BANDS_ARM",
@@ -65613,7 +65614,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 27897,
+    "line": 28035,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -65668,7 +65669,7 @@
    "id": "FLLIPER_PDFLIP_EXPERT_MAP_DIR",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:21815"
+    "pdflip/launcher.py:21938"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EXPERT_MAP_DIR",
@@ -65677,7 +65678,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 21815,
+    "line": 21938,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -66417,8 +66418,8 @@
    "id": "FLLIPER_PDFLIP_FORCED_BOOT",
    "kind": "env",
    "lesestellen": [
-    "pdflip/refusals.py:239",
-    "pdflip/refusals.py:245"
+    "pdflip/refusals.py:261",
+    "pdflip/refusals.py:270"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FORCED_BOOT",
@@ -66427,7 +66428,72 @@
    "source": {
     "file": "pdflip/refusals.py",
     "kind": "os.environ",
-    "line": 239,
+    "line": 261,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_FORCED_PAST_EP": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "#227: what the ENTRYPOINT passed before the launcher existed, one ``<CODE>\\t<text>`` per line (entrypoint.sh exports it, possibly empty, whenever it runs with ``HTSGLANG_FORCE=1``). Absent under ``HTSGLANG_FORCE=1`` = unknown = the boot writes no records (an entrypoint that does not list what it passed cannot be judged).",
+   "id": "FLLIPER_PDFLIP_FORCED_PAST_EP",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/refusals.py:416"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_FORCED_PAST_EP",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/refusals.py",
+    "kind": "os.environ",
+    "line": 416,
+    "tree": "27b"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_FORCED_RECORDS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "#227: the launcher's records verdict, handed to the FRONT's environment at its spawn (``allow;<classes>``); anything else -- or nothing -- in a forced child is \"no records\". Never trusted from the launcher's own environment (:func:`arm` drops an inherited value).",
+   "id": "FLLIPER_PDFLIP_FORCED_RECORDS",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/refusals.py:531",
+    "pdflip/refusals.py:262"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_FORCED_RECORDS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/refusals.py",
+    "kind": "os.environ",
+    "line": 531,
     "tree": "27b"
    },
    "status": "harvested",
@@ -66850,7 +66916,7 @@
    "id": "FLLIPER_PDFLIP_FRONT_LOGPROB_CAP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:2030"
+    "pdflip/front.py:2038"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FRONT_LOGPROB_CAP",
@@ -66859,7 +66925,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 2030,
+    "line": 2038,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67055,7 +67121,7 @@
    "id": "FLLIPER_PDFLIP_FR_D_CAP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:5659"
+    "pdflip/launcher.py:5782"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FR_D_CAP",
@@ -67064,7 +67130,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 5659,
+    "line": 5782,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67087,8 +67153,8 @@
    "id": "FLLIPER_PDFLIP_FR_D_CEILING",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:5651",
-    "pdflip/launcher.py:5715"
+    "pdflip/launcher.py:5774",
+    "pdflip/launcher.py:5838"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FR_D_CEILING",
@@ -67097,7 +67163,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 5651,
+    "line": 5774,
     "tree": "27b"
    },
    "status": "harvested",
@@ -67348,7 +67414,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/front.py",
       "row_note": 17210,
-      "zeile": 25395
+      "zeile": 25486
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -68469,7 +68535,7 @@
    "lesestellen": [
     "managers/scheduler.py:9156",
     "managers/scheduler_components/weight_updater.py:12684",
-    "pdflip/front.py:19159",
+    "pdflip/front.py:19170",
     "pdflip/l15_deposit_hook.py:42",
     "pdflip/l15_plan.py:476"
    ],
@@ -68567,10 +68633,10 @@
     "managers/scheduler.py:9141",
     "managers/scheduler.py:23572",
     "managers/scheduler_components/weight_updater.py:12803",
-    "pdflip/front.py:19120",
-    "pdflip/front.py:9271",
-    "pdflip/front.py:21773",
-    "pdflip/front.py:9260"
+    "pdflip/front.py:19131",
+    "pdflip/front.py:9282",
+    "pdflip/front.py:21856",
+    "pdflip/front.py:9271"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L15_HOT_SHARE",
@@ -68666,7 +68732,7 @@
     "pdflip/l15_plan.py:343",
     "pdflip/l15_plan.py:498",
     "pdflip/l15_shadow.py:103",
-    "pdflip/launcher.py:6138"
+    "pdflip/launcher.py:6261"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L15_MIB",
@@ -69760,7 +69826,7 @@
    "lesestellen": [
     "mem_cache/storage/file/lru_file_evictor.py:88",
     "mem_cache/storage/file/store_journal.py:63",
-    "pdflip/launcher.py:8132"
+    "pdflip/launcher.py:8255"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_EPOCH",
@@ -69793,7 +69859,7 @@
    "kind": "env",
    "lesestellen": [
     "mem_cache/storage/file/lru_file_evictor.py:89",
-    "pdflip/launcher.py:8149"
+    "pdflip/launcher.py:8272"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_INHERITED_SUFFIXES",
@@ -70702,7 +70768,7 @@
    "id": "FLLIPER_PDFLIP_LEG1_EARLY",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:1929"
+    "pdflip/front.py:1937"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_LEG1_EARLY",
@@ -70712,7 +70778,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 1929,
+    "line": 1937,
     "tree": "27b"
    },
    "status": "explained",
@@ -70735,7 +70801,7 @@
    "id": "FLLIPER_PDFLIP_LEG1_INPUT_IDS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:1954"
+    "pdflip/front.py:1962"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_LEG1_INPUT_IDS",
@@ -70744,7 +70810,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 1954,
+    "line": 1962,
     "tree": "27b"
    },
    "status": "harvested",
@@ -70942,7 +71008,7 @@
    "id": "FLLIPER_PDFLIP_MAMBA_ANCHOR_MIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:8902"
+    "pdflip/launcher.py:9025"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MAMBA_ANCHOR_MIB",
@@ -70951,7 +71017,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 8902,
+    "line": 9025,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -71706,7 +71772,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:7670"
+    "pdflip/front.py:7681"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -71715,7 +71781,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 7670,
+    "line": 7681,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -72688,8 +72754,8 @@
    "id": "FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:23690",
-    "pdflip/launcher.py:23696"
+    "pdflip/launcher.py:23813",
+    "pdflip/launcher.py:23819"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB",
@@ -72698,7 +72764,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 23690,
+    "line": 23813,
     "tree": "27b"
    },
    "status": "harvested",
@@ -72721,7 +72787,7 @@
    "id": "FLLIPER_PDFLIP_PCUT_CAP_FLOOR",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:23465"
+    "pdflip/launcher.py:23588"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PCUT_CAP_FLOOR",
@@ -72730,7 +72796,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 23465,
+    "line": 23588,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -72753,8 +72819,8 @@
    "id": "FLLIPER_PDFLIP_PCUT_LANE_PRICE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:20440",
-    "pdflip/launcher.py:13257"
+    "pdflip/launcher.py:20563",
+    "pdflip/launcher.py:13380"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PCUT_LANE_PRICE",
@@ -72763,7 +72829,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 20440,
+    "line": 20563,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -73698,7 +73764,7 @@
    "id": "FLLIPER_PDFLIP_PREFIX_FP_PATH",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:19303"
+    "pdflip/front.py:19314"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFIX_FP_PATH",
@@ -73707,7 +73773,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 19303,
+    "line": 19314,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -74262,7 +74328,7 @@
    "id": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3843"
+    "pdflip/front.py:3851"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
@@ -74271,7 +74337,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3843,
+    "line": 3851,
     "tree": "27b"
    },
    "status": "harvested",
@@ -74645,7 +74711,7 @@
    "id": "FLLIPER_PDFLIP_P_QUEUE_AHEAD",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:24600"
+    "pdflip/front.py:24691"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_QUEUE_AHEAD",
@@ -74654,7 +74720,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 24600,
+    "line": 24691,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -75172,8 +75238,8 @@
    "id": "FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3065",
-    "pdflip/front.py:21996"
+    "pdflip/front.py:3073",
+    "pdflip/front.py:22079"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_QUIESCE_BUSY_ABORT",
@@ -75182,7 +75248,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3065,
+    "line": 3073,
     "tree": "27b"
    },
    "status": "harvested",
@@ -78366,7 +78432,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/scheduler.py:1025",
-    "pdflip/launcher.py:4221"
+    "pdflip/launcher.py:4344"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_TAIL_X",
@@ -78677,7 +78743,7 @@
     "pdflip/dual_p_kv_stage.py:1119",
     "pdflip/dual_p_kv_stage.py:1648",
     "pdflip/dual_p_kv_stage.py:1448",
-    "pdflip/front.py:2979"
+    "pdflip/front.py:2987"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_TAG",
@@ -80271,11 +80337,11 @@
    "id": "FLLIPER_PDFLIP_TORCH_CACHE_CAP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:5681",
-    "pdflip/launcher.py:5717",
-    "pdflip/launcher.py:15192",
-    "pdflip/launcher.py:21123",
-    "pdflip/launcher.py:15206",
+    "pdflip/launcher.py:5804",
+    "pdflip/launcher.py:5840",
+    "pdflip/launcher.py:15315",
+    "pdflip/launcher.py:21246",
+    "pdflip/launcher.py:15329",
     "pdflip/torch_cache_cap.py:35",
     "pdflip/torch_cache_cap.py:75",
     "planner/profile_couplings.py:1149"
@@ -80287,7 +80353,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 5681,
+    "line": 5804,
     "tree": "27b"
    },
    "status": "harvested",
@@ -80562,7 +80628,7 @@
    "id": "FLLIPER_PDFLIP_VENV",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:3810"
+    "pdflip/launcher.py:3933"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VENV",
@@ -80571,7 +80637,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 3810,
+    "line": 3933,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -80747,8 +80813,8 @@
    "id": "FLLIPER_PDFLIP_VISION_FLIP_URGENT",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:5038",
-    "pdflip/front.py:1156"
+    "pdflip/front.py:5046",
+    "pdflip/front.py:1164"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_FLIP_URGENT",
@@ -80757,7 +80823,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 5038,
+    "line": 5046,
     "tree": "27b"
    },
    "status": "harvested",
@@ -80780,7 +80846,7 @@
    "id": "FLLIPER_PDFLIP_VISION_PLACE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:11664",
+    "pdflip/launcher.py:11787",
     "pdflip/vision_rank_stage.py:805",
     "pdflip/vision_rank_stage.py:809"
    ],
@@ -80791,7 +80857,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 11664,
+    "line": 11787,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -80943,7 +81009,7 @@
    "id": "FLLIPER_PDFLIP_VISION_SOURCE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:11660",
+    "pdflip/launcher.py:11783",
     "pdflip/vision_rank_stage.py:663",
     "pdflip/vision_rank_stage.py:668"
    ],
@@ -80954,7 +81020,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 11660,
+    "line": 11783,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -81762,7 +81828,7 @@
    "id": "FLLIPER_PDFLIP_WAKE_DEFER_BELOW_MIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3361"
+    "pdflip/front.py:3369"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_WAKE_DEFER_BELOW_MIB",
@@ -81771,7 +81837,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3361,
+    "line": 3369,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -84157,7 +84223,7 @@
    "lesestellen": [
     "mem_ledger/activation_probe.py:55",
     "mem_ledger/activation_probe.py:292",
-    "pdflip/launcher.py:11560",
+    "pdflip/launcher.py:11683",
     "pdflip/xchg_manifest.py:1673"
    ],
    "level": "expert",
@@ -85505,7 +85571,7 @@
    "kind": "env",
    "lesestellen": [
     "distributed/utils.py:2336",
-    "pdflip/launcher.py:28544"
+    "pdflip/launcher.py:28682"
    ],
    "level": "expert",
    "name": "FLLIPER_PP_CROSSING_WIRE",
@@ -85696,10 +85762,10 @@
     "distributed/utils.py:2579",
     "distributed/utils.py:2608",
     "distributed/utils.py:2680",
-    "pdflip/launcher.py:2159",
-    "pdflip/launcher.py:28584",
-    "pdflip/launcher.py:19262",
-    "pdflip/launcher.py:28542"
+    "pdflip/launcher.py:2282",
+    "pdflip/launcher.py:28722",
+    "pdflip/launcher.py:19385",
+    "pdflip/launcher.py:28680"
    ],
    "level": "expert",
    "name": "FLLIPER_PP_LAYER_SET",
@@ -94592,28 +94658,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2996,
-  "envs": 2117,
+  "entries": 2998,
+  "envs": 2119,
   "explained": 310,
   "flags": 864,
-  "harvested": 1853,
+  "harvested": 1855,
   "trees": {
    "abweichung": 31,
-   "beide": 2719,
+   "beide": 2721,
    "nur_27b": 235,
    "nur_nf": 24
   },
   "unexplained": 708
  },
- "tree_rev": "27b=ed3434905c+nf=5578a2fe93",
+ "tree_rev": "27b=d179b6742e+nf=413725cf47",
  "trees": {
   "27b": {
-   "entries": 2954,
-   "rev": "ed3434905c"
+   "entries": 2956,
+   "rev": "d179b6742e"
   },
   "nf": {
-   "entries": 2743,
-   "rev": "5578a2fe93"
+   "entries": 2745,
+   "rev": "413725cf47"
   }
  },
  "warnungen": []
