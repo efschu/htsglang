@@ -697,7 +697,7 @@ class TheReviewRound(CustomTestCase):
     def test_s3_the_effective_kv_dtype_is_in_the_form(self):
         with _store():
             a = _digest(DREI_MODEL, PRE._cards())
-            with mock.patch.dict(L._VFL_ARGV, {"kv": "auto"}):
+            with mock.patch.dict(L._VFL_ARGV, {"kv": "fp8_e5m2-test"}):
                 b = _digest(DREI_MODEL, PRE._cards())
         self.assertNotEqual(a, b)
 
