@@ -86,9 +86,15 @@ def test_default_on_and_switch(monkeypatch):
     assert mds.enabled() is True
 
 
-def test_spec_algorithm_support_is_the_eagle_family_only():
+def test_spec_algorithm_support_is_the_eagle_family_and_dflash():
+    """27B-MIXEDD-DFLASH-1024 (SOLL R2, user 18.10. "mixed chunk fuer kurze D-Prefills wieder an"): the 27B D group runs
+    DFLASH, and the EAGLE-only exclusion (S32, written for NF's EAGLE D) kept MIXED-D disarmed in all 376 27B boots --
+    D decode halted for every short D prefill (int4ar _1024_003732: 142 D-DECODE-GAP cause=d_prefill, 204.7 s,
+    mixed_tokens=0). DSPARK stays out (not run here); ngram cannot join (its relay skips output_tokens_buf)."""
     S = SpeculativeAlgorithm
     assert S.EAGLE.supports_mixed_chunk() and S.EAGLE3.supports_mixed_chunk()
+    assert S.DFLASH.supports_mixed_chunk()
+    assert not S.DSPARK.supports_mixed_chunk()
     assert not S.NONE.supports_mixed_chunk() and not S.NGRAM.supports_mixed_chunk()
 
 
