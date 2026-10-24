@@ -17156,6 +17156,18 @@ class Scheduler(
             deliverable = (int(_dend) if _dend is not None
                            else deliverable + int(_synced_end) - int(outcome.synced))
             delivered = int(_synced_end)
+        # SHORT-FLIP-REPRICE-1024 (SOLL R2/R7/R11; 27B rc41 D 11:40:21-22, pdflip-21-215): off the END vote the
+        # record is SPAN-RELATIVE (deliverable = len(span), materialized from the span start), while every reader
+        # of the witness takes it as the ABSOLUTE depth. 215 read [53750, 70994) behind its L1.5-retained device
+        # prefix and got 17091: the witness said 17091, D-NORECOMPUTE priced 70999 - 17091 = 53908 > front X and
+        # sent a kurz request (real remainder 158) through P. The span start is added here (0 = the old reading:
+        # END vote, no stamp, a span from 0, or a stamp that cannot be this read's start).
+        from flliper.srt.pdflip import d_norecompute as _dnr_w
+
+        _base = _dnr_w.span_base(req, outcome)
+        if _base:
+            delivered += _base
+            deliverable += _base
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
@@ -17168,8 +17180,9 @@ class Scheduler(
         self._pdflip_store_short_seen = getattr(self, "_pdflip_store_short_seen", 0) + 1
         # DASHBOARD-AUS-IPC (30.09., FEHLT 5): the tokens these incomplete reads
         # delivered and could have delivered, summed (rankstats cache block)
-        self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered
-        self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable
+        # (store tokens: the span start a SHORT-FLIP-REPRICE base added is device-resident, not read)
+        self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered - _base
+        self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable - _base
         n = self._pdflip_store_short_seen
         # S18 (h16v3 1017_224250, pdflip-1-14/-15/-16): the store HELD the whole span (the probe's hit covers the
         # deliverable prefix; TAIL-CONSUME hit=118400) and D's read was cut by its own full arena (PDFLIP-READ-DEPTH

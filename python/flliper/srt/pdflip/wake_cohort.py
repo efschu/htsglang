@@ -132,6 +132,10 @@ def new_tokens(req, records=None) -> Optional[int]:
     mat = getattr(rec, "materialized", None)
     if mat is None:
         return None
+    # SHORT-FLIP-REPRICE-1024: ``materialized`` counts from the read's span start; the extend starts at the depth
+    from flliper.srt.pdflip.d_norecompute import store_read_depth as _depth
+
+    mat = _depth(req, rec)
     try:
         from flliper.srt.pdflip import tail_adopt as _ta
 
