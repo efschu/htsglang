@@ -64,8 +64,9 @@ PASSES = _passes()
 
 
 def _line(rank):
-    """The single line of this boot's rank (its measured floor: 767 / 701 / 700)."""
-    return ET.line_for_floor_mib({0: 767, 1: 701, 2: 700}[rank], FIXED)
+    """The single line of this boot's rank (its measured floor: 767 / 701 / 700) with the SHIPPED record."""
+    rec = F.PROFILES[F.PROFILE_QWEN27B].constants[BR.VOTE_FIXED_RECORD].value
+    return ET.line_for_floor_mib({0: 767, 1: 701, 2: 700}[rank], rec[rank])
 
 
 def _truth_holds(p, line):
