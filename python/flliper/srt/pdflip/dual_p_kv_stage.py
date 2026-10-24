@@ -496,12 +496,31 @@ def card_law(led, group: str):
     return best, ("boot-peak " + ",".join(parts)) if best else "none"
 
 
+def full_context_tokens(top: int) -> int:
+    """The level one full-context P request asks: min(stage top, --max-kv-per-request, else
+    --context-length) -- the user order 06.10. ("P carries the full context") is per REQUEST; the stage top
+    (--dual-p-kv-max-tokens) caps a GRANT-SUM, which no order requires. The stage top when no server
+    args are reachable."""
+    cap = None
+    try:
+        from flliper.srt.server_args import get_global_server_args
+
+        sa = get_global_server_args()
+        cap = getattr(sa, "max_kv_per_request", None) or getattr(sa, "context_length", None)
+    except Exception:  # noqa: BLE001 -- no context: the stage top (the stricter level)
+        cap = None
+    return min(int(top), int(cap)) if cap else int(top)
+
+
 def _p_top_need(actor, led) -> Optional[int]:
-    """Bytes P's TOP grant asks of this card (the stage table's last level), or None when unknown.
-    The P actor has its own table; D reads P's published stage file for this ledger (cached)."""
+    """Bytes ONE full-context P request asks of this card (``full_context_tokens`` on the stage lattice), or
+    None when unknown. The P actor has its own table; D reads P's published stage file for this ledger
+    (cached)."""
     if hasattr(actor, "bytes_for") and hasattr(actor, "top") and getattr(led, "group", "") == "P":
         try:
-            return int(actor.bytes_for(int(actor.top)) - actor.bytes_for(0))
+            step = int(getattr(actor, "step", 1) or 1)
+            lvl = round_up(full_context_tokens(int(actor.top)), step)
+            return int(actor.bytes_for(lvl) - actor.bytes_for(0))
         except Exception:  # noqa: BLE001
             return None
     cached = getattr(actor, "_p_top_need", None)
@@ -517,7 +536,9 @@ def _p_top_need(actor, led) -> Optional[int]:
         except (OSError, ValueError):
             continue
         if str(d.get("ledger", "")) == str(getattr(led, "path", "")) and d.get("bytes"):
-            actor._p_top_need = int(d["bytes"][-1])
+            step = max(1, int(d.get("step", 1) or 1))
+            k = min(len(d["bytes"]) - 1, round_up(full_context_tokens(int(d.get("top", 0) or 0)), step) // step)
+            actor._p_top_need = int(d["bytes"][k])
             return int(actor._p_top_need)
     return None
 
@@ -603,8 +624,8 @@ def phys_check(actor, group: str) -> None:
                 lawn = int(n) - use                                           # the law part
                 if use > 0:
                     logger.warning("%s LEDGER-PHYS BOOKED %d B of unbooked card use into the budget (group=%s, "
-                                   "%d checks over %.0f s)", MARK, use, group, PHYS_BOOK_AFTER,
-                                   PHYS_BOOK_AFTER * PHYS_CHECK_S)
+                                   "%d checks over %.0f s) law=%d law_src=%s", MARK, use, group, PHYS_BOOK_AFTER,
+                                   PHYS_BOOK_AFTER * PHYS_CHECK_S, int(law), law_src)
                 if lawn > 0:
                     actor._law_booked = int(getattr(actor, "_law_booked", 0) or 0) + lawn
                     logger.warning("%s LEDGER-PHYS LAW-BOOKED %d B (group=%s law=%d law_src=%s): the card's free "

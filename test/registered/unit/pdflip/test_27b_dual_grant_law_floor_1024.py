@@ -44,6 +44,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
+from flliper.srt.model_executor import vram_peak_window as VPW
 from flliper.srt.pdflip import budget_rest as BR
 from flliper.srt.pdflip import card_kv_ledger as K
 from flliper.srt.pdflip import dual_p_kv_stage as S
@@ -314,7 +315,92 @@ def test_a_law_that_makes_the_top_grant_infeasible_is_said_once(monkeypatch):
         assert len(hit) == said, hit
 
 
+def _rank_max(tag):
+    """The largest chunk/round transient_mib of rank ``tag`` (e.g. 'TP1') in the fixture, bytes."""
+    vals = [int(m.group(1)) for m in (re.search(r"%s\] PDFLIP-VRAM-PEAK .*phase=(?:chunk|round).* transient_mib=(\d+) "
+                                                % tag, l) for l in _lines()) if m]
+    assert vals, tag
+    return max(vals) * MIB
+
+
+#: card ordinal -> (P rank, D rank) on it (PP-k and TP-k share card k in the dual layout)
+CARDS = {0: ("PP0", "TP0"), 1: ("PP1", "TP1"), 2: ("PP2", "TP2")}
+
+
+def _three_card_laws(monkeypatch):
+    """Each card's law from ITS ranks' measured transients, the device keyed like the metal ranks."""
+    monkeypatch.setitem(VPW._STATE, "transient_by_dev", {})
+    out = {}
+    for dev, (pr, dr) in CARDS.items():
+        path = os.path.join(tempfile.mkdtemp(prefix="wkv3c"), "card")
+        for grp, rank in (("P", pr), ("D", dr)):
+            VPW.note_transient(dev, _rank_max(rank), "chunk" if grp == "P" else "round")
+            monkeypatch.setattr(VPW, "_current_device", lambda cuda=None, d=dev: d)
+            out.setdefault(dev, []).append(S.card_law(types.SimpleNamespace(path=path), grp))
+    return {dev: v[-1] for dev, v in out.items()}
+
+
+def test_measured_transient_is_per_device():
+    """Qwen #2: the measuring seam itself -- one process, three devices, three values."""
+    saved = dict(VPW._STATE["transient_by_dev"])
+    try:
+        VPW._STATE["transient_by_dev"].clear()
+        VPW.note_transient(0, 380 * MIB, "round")
+        VPW.note_transient(1, 324 * MIB, "round")
+        VPW.note_transient(1, 100 * MIB, "chunk")                 # a smaller window never lowers it
+        assert VPW.measured_transient(0) == (380 * MIB, "round")
+        assert VPW.measured_transient(1) == (324 * MIB, "round")
+        assert VPW.measured_transient(2) == (0, "")
+    finally:
+        VPW._STATE["transient_by_dev"].clear()
+        VPW._STATE["transient_by_dev"].update(saved)
+
+
+def test_three_cards_three_laws_each_its_own_max(monkeypatch):
+    """Qwen #1: one card, one law -- its OWN max(P, D): 380 / 324 / 324 MiB, never the 5090's 380 on a 3080."""
+    laws = _three_card_laws(monkeypatch)
+    want = {dev: max(_rank_max(pr), _rank_max(dr)) for dev, (pr, dr) in CARDS.items()}
+    assert want == {0: 380 * MIB, 1: 324 * MIB, 2: 324 * MIB}
+    assert {dev: v[0] for dev, v in laws.items()} == want
+    assert "380MiB" not in laws[1][1] and "380MiB" not in laws[2][1], "law_src names the card's own value"
+
+
+def test_full_context_need_is_one_request_not_the_stage_top(monkeypatch):
+    """(3): P's top need is min(stage top 266240, --max-kv-per-request 262144) = 64 steps, not 65."""
+    import flliper.srt.server_args as SA
+
+    monkeypatch.setattr(SA, "get_global_server_args",
+                        lambda: types.SimpleNamespace(max_kv_per_request=262144, context_length=262144))
+    assert S.full_context_tokens(266240) == 262144
+    path = os.path.join(tempfile.mkdtemp(prefix="wkvfc"), "card")
+    pl = K.CardKvLedger(path, "P")
+    assert S._p_top_need(_PActor(pl), pl) == 64 * 58720256 == 3758096384
+    monkeypatch.setattr(SA, "get_global_server_args", lambda: (_ for _ in ()).throw(RuntimeError("no ctx")))
+    assert S.full_context_tokens(266240) == 266240, "no server args: the stage top (the stricter level)"
+
+
+def test_booked_line_names_the_law_too(monkeypatch):
+    path, d, _p = _card(M.d_comm)
+    lines = []
+    _checks(monkeypatch, d, M.have - 100 * MIB, M.tr_d, lines=lines)   # a real card-use gap AND the law
+    booked = [l for l in lines if "LEDGER-PHYS BOOKED" in l]
+    assert booked and all("law_src=boot-peak" in l for l in booked), booked
+    assert BR._PHYS_BOOKED.search("[t TP1] " + booked[0]), "budget_rest still reads the card-use line"
+
+
 # -- mutants in the danger directions ------------------------------------------------------
+
+
+def test_m5_process_wide_max_turns_the_three_card_test_red(monkeypatch):
+    src = textwrap.dedent(inspect.getsource(VPW.measured_transient))
+    fixed = 'cur = _STATE["transient_by_dev"].get(d)'
+    assert src.count(fixed) == 1, "the guarded line moved -- re-aim the mutant"
+    ns = dict(vars(VPW))
+    exec(compile(src.replace(fixed, 'cur = max(_STATE["transient_by_dev"].values(), default=None)'),
+                 VPW.__file__, "exec"), ns)
+    monkeypatch.setattr(VPW, "measured_transient", ns["measured_transient"])
+    laws = _three_card_laws(monkeypatch)
+    assert laws[1][0] == 380 * MIB, "the mutant puts the 5090's law on the 3080"
 
 
 def test_m1_oom_without_the_law_term_the_grant_takes_the_card_to_64_mib(monkeypatch):

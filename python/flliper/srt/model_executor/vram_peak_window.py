@@ -84,17 +84,38 @@ _STATE: Dict[str, Any] = {
     # compare per forward, the window end hands it to pdflip/vram_actual
     "seats": 0,
     # DUAL-GRANT-1024: the largest transient (peak_allocated - start_allocated) of a
-    # chunk or round window of THIS process -- the boot's own measurement of its form,
-    # read by the dual card ledger's law (dual_p_kv_stage.card_law)
-    "transient_max": 0,
-    "transient_max_phase": "",
+    # chunk or round window, PER CUDA DEVICE (one card, one law) -- the boot's own
+    # measurement of its form, read by the dual card ledger's law (dual_p_kv_stage.card_law)
+    "transient_by_dev": {},
 }
 
 
-def measured_transient():
-    """(bytes, phase) of the largest chunk/round transient this process measured so far; (0, '') before
-    the first window."""
-    return int(_STATE.get("transient_max") or 0), str(_STATE.get("transient_max_phase") or "")
+def _current_device(cuda=None) -> int:
+    try:
+        if cuda is None:
+            import torch
+
+            cuda = torch.cuda
+        return int(cuda.current_device())
+    except Exception:  # noqa: BLE001 -- no device: one shared key, never a death
+        return -1
+
+
+def note_transient(dev: int, nbytes: int, phase: str) -> None:
+    """Keep the largest chunk/round transient of device ``dev`` (bytes)."""
+    by = _STATE["transient_by_dev"]
+    cur = by.get(int(dev))
+    if cur is None or int(nbytes) > int(cur[0]):
+        by[int(dev)] = (int(nbytes), str(phase))
+
+
+def measured_transient(dev: Optional[int] = None):
+    """(bytes, phase) of the largest chunk/round transient measured on device ``dev`` (default: this
+    thread's current device) -- the card's own, never another card's of the same process; (0, '') before
+    the device's first window."""
+    d = _current_device() if dev is None else int(dev)
+    cur = _STATE["transient_by_dev"].get(d)
+    return (int(cur[0]), str(cur[1])) if cur else (0, "")
 
 #: H59: the two cumulative allocator counters the line reports as a delta per
 #: window. ``num_alloc_retries`` counts ``release_cached_blocks`` + retry in
@@ -238,9 +259,8 @@ def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time, *,
         f"alloc_retries_total={'na' if retries is None else retries}"
     )
     logger.info(line)
-    if phase in ("chunk", "round") and start_alloc is not None and pa - int(start_alloc) > int(_STATE["transient_max"]):
-        _STATE["transient_max"] = int(pa - int(start_alloc))
-        _STATE["transient_max_phase"] = phase
+    if phase in ("chunk", "round") and start_alloc is not None:
+        note_transient(_current_device(cuda), int(pa - int(start_alloc)), phase)
     seats = int(_STATE.get("seats") or 0)
     _STATE["seats"] = 0
     from flliper.srt.pdflip import vram_actual
