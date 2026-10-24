@@ -211,10 +211,13 @@ def test_the_1220_gap_of_zero_is_priced_at_ps_law(monkeypatch):
     assert p.book_unpriced(M.booked_before_1220) == M.booked_before_1220
     assert K.peek(path).free == M.have_1220, "the 12:20:27 ledger, rebuilt from JOIN + bookings + commits"
     assert (M.have_1220 >> 20) == (M.phys_1220 >> 20), "gap 0 on the line"
-    _checks(monkeypatch, p, M.phys_1220, _floor(M.law_p, source=CG.FLOOR_SOURCE_FALLBACK))
+    # card_free_mib is a whole-MiB reading (1810) of a ledger free of 1810.125 MiB: the card's free bytes
+    # at MiB resolution ARE the ledger's -- feed the ledger's bytes, gap exactly 0
+    phys = M.have_1220
+    _checks(monkeypatch, p, phys, _floor(M.law_p, source=CG.FLOOR_SOURCE_FALLBACK))
     assert K.peek(path).free == M.have_1220, "old rule (unmeasured): nothing booked at gap 0"
-    _checks(monkeypatch, p, M.phys_1220, _floor(M.law_p, source="MEASURED-P"))
-    assert K.peek(path).free == M.phys_1220 - (M.law_p << 20)
+    _checks(monkeypatch, p, phys, _floor(M.law_p, source="MEASURED-P"))
+    assert K.peek(path).free == phys - (M.law_p << 20)
 
 
 def test_a_card_already_under_its_law_never_breaks_i1(monkeypatch):
