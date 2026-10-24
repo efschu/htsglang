@@ -136,15 +136,63 @@ def agree_min_common(local_keys: Iterable[int], group_max, rounds: int = AGREE_R
     return None, int(rounds)
 
 
-def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    """One group-synchronous re-arm pass on THIS rank (module head). ``ops`` is the rank's adapter (``TreeOps``)."""
+#: self-identifying collectives (review A1): every pass collective carries [TAG, -TAG]; the group MAX gives back the
+#: largest and (negated) the smallest tag -- unequal = a rank is inside another collective (gloo pairs equal-sized
+#: foreign buffers silently), a named HiCacheCollectiveDesyncError on every rank
+TAG_BASE = 20310240
+PH_GATHER, PH_LOCATE, PH_STATE, PH_AGREE, PH_RELEASE, PH_ISSUE, PH_REISSUE = range(1, 8)
+
+
+try:
+    from flliper.srt.mem_cache.hicache_collective import HiCacheCollectiveDesyncError, HiCacheCollectiveError
+except Exception:  # noqa: BLE001 - a stand-in without the HiCache package: same names, same hierarchy
+    class HiCacheCollectiveError(RuntimeError):  # type: ignore[no-redef]
+        pass
+
+    class HiCacheCollectiveDesyncError(HiCacheCollectiveError):  # type: ignore[no-redef]
+        pass
+
+
+class ParkRearmDivergence(HiCacheCollectiveError):
+    """W203 (review A3, RAENGE-NIE-UNEINS, user 29.08.: "ränge dürfen sich niemals uneins sein. wenn uneins crash
+    stop."): the pass left the ranks uneven -- an agreed victim released on some ranks only, or an anchor copy written
+    on some ranks while the others could not join it even in the same pass. Raised on EVERY rank (the decision is a
+    reduced value); the scheduler hook re-raises it, the group stops by name."""
+
+
+def tagged(group_max, phase: int):
+    """``group_max`` with the [TAG, -TAG] pair of ``phase`` in front; checks it and strips it."""
+    tag = TAG_BASE + int(phase)
+
+    def f(values):
+        red = _max(group_max, [tag, -tag] + [int(v) for v in values])
+        hi, lo = red[0], -red[1]
+        if hi != tag or lo != tag:
+            raise HiCacheCollectiveDesyncError(
+                f"{MARKER} collective phase {phase} returned a foreign payload (tag max={hi} min={lo}, expected {tag} on "
+                "every rank): the ranks were not all inside this collective -- continuing would pair the pass with "
+                "another site's reduce")
+        return red[2:]
+    return f
+
+
+def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.Logger] = None,
+             allow_class1: bool = True) -> Dict[str, Any]:
+    """One group-synchronous re-arm pass on THIS rank (module head). ``ops`` is the rank's adapter (``TreeOps``).
+    ``allow_class1`` (rank-uniform: the flush kind) admits the chain intermediates (class 1); off, END anchors only.
+    Raises ``HiCacheCollectiveDesyncError`` / ``ParkRearmDivergence`` on every rank alike; never on one rank alone
+    (rank-local errors fail closed into the votes)."""
     log = log or logger
-    st: Dict[str, Any] = {"targets": 0, "issued": 0, "split": 0, "spilled": 0, "done": 0, "skipped": 0,
+    st: Dict[str, Any] = {"targets": 0, "issued": 0, "split": 0, "healed": 0, "spilled": 0, "done": 0, "skipped": 0,
                           "collectives": 0}
 
-    def gm(values):
-        st["collectives"] += 1
-        return _max(group_max, values)
+    def ph(phase):
+        g = tagged(group_max, phase)
+
+        def f(values):
+            st["collectives"] += 1
+            return g(values)
+        return f
 
     def _safe(fn, default):
         try:
@@ -156,14 +204,16 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
 
     busy = bool(_safe(ops.busy, True))
     local = _safe(ops.needing, {}) or {}
-    union, any_busy = gather_union(local.keys(), rank, world, gm, veto=busy)
+    if not allow_class1:
+        local = {k: v for k, v in local.items() if class_of_target_key(k) == 0}
+    union, any_busy = gather_union(local.keys(), rank, world, ph(PH_GATHER), veto=busy)
     if any_busy or not union:
         if any_busy and union:
             st["busy"] = 1
         return st
     cand = union[:K_PER_RANK]
     located = [_safe(lambda k=k: ops.locate(k), None) for k in cand]
-    red = gm([0 if n is not None else 1 for n in located])
+    red = ph(PH_LOCATE)([0 if n is not None else 1 for n in located])
     agreed = [(k, n) for k, n, missing in zip(cand, located, red) if missing == 0]
     st["targets"] = len(agreed)
     for key, node in agreed:
@@ -173,56 +223,80 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
         needs, inflight, kv_noroom, m_noroom = (int(bool(x)) for x in s)
         if not needs:
             inflight = kv_noroom = m_noroom = 0
-        any_needs, any_inflight, any_kv, any_m = gm([needs, inflight, kv_noroom, m_noroom])
+        any_needs, any_inflight, any_kv, any_m = ph(PH_STATE)([needs, inflight, kv_noroom, m_noroom])
         depth = depth_of_target_key(key)
-        cls = class_of_target_key(key)
+        cls = "end" if class_of_target_key(key) == 0 else "chain"
         if not any_needs:
             st["done"] += 1
             continue
         if any_inflight or any_kv:
             st["skipped"] += 1
-            log.info("%s WAIT depth=%d class=%s why=%s (a write of it in flight / no KV-arena room on a rank; the "
-                     "next flush poll asks again)", MARKER, depth, "end" if cls == 0 else "chain",
+            log.info("%s WAIT depth=%d class=%s why=%s (a write of it in flight / pin budget / no KV-arena room on a "
+                     "rank; the next flush poll asks again)", MARKER, depth, cls,
                      "inflight" if any_inflight else "kv_room")
             continue
         spill = "none"
         if any_m:
-            vic = _safe(ops.victims, {}) or {}
-            vkey, rounds = agree_min_common(vic.keys(), gm)
+            vic = _safe(lambda: ops.victims(node), {}) or {}
+            vkey, rounds = agree_min_common(vic.keys(), ph(PH_AGREE))
             if vkey is None:
                 log.warning("%s SPILL depth=%d class=%s victim=none rounds=%d (no anchor every rank may release: "
                             "settled, off every park chain, on L3, referenced by this group only -- the anchor "
-                            "stays un-backed on every rank alike, named)", MARKER, depth,
-                            "end" if cls == 0 else "chain", rounds)
+                            "stays un-backed on every rank alike, named)", MARKER, depth, cls, rounds)
                 break
-            dropped = int(_safe(lambda: ops.release(vic[vkey]), 0) or 0) if vkey in vic else 0
-            (freed,) = gm([1 if dropped > 0 else 0])   # the barrier: every rank let go before any rank claims
+            rel = _safe(lambda: (1, int(ops.release(vic[vkey]) or 0)), (0, 0)) if vkey in vic else (0, 0)
+            ok, dropped = rel
+            # the release vote is the barrier too: every rank let go (or failed) before any rank claims
+            any_bad, any_ok, freed = ph(PH_RELEASE)([1 - ok, ok, 1 if dropped > 0 else 0])
+            if any_bad and any_ok:
+                raise ParkRearmDivergence(
+                    f"{MARKER} W203 release split: the agreed victim (depth {vkey >> 28}) was released on some ranks and "
+                    f"not on others (this rank ok={ok}) -- its anchor is gone on part of the group")
+            if any_bad:
+                log.warning("%s SPILL depth=%d victim_depth=%d release failed on EVERY rank -- nothing released "
+                            "anywhere, the pass ends", MARKER, depth, vkey >> 28)
+                break
             if not freed:
-                log.warning("%s SPILL depth=%d victim_depth=%d freed=0 (every rank released the agreed victim, no "
-                            "slot freed: another process still references it) -- the pass ends", MARKER, depth,
-                            vkey >> 28)
+                log.warning("%s SPILL depth=%d victim_depth=%d freed=0 (every rank released the agreed victim -- the "
+                            "release vote was unanimous -- and no slot freed: another process still references it) -- "
+                            "the pass ends", MARKER, depth, vkey >> 28)
                 break
             st["spilled"] += 1
             spill = str(vkey >> 28)
         issued = bool(_safe(lambda: ops.issue(node), False)) if needs else True
-        any_failed, any_issued = gm([0 if issued else 1, 1 if (issued and needs) else 0])
-        if any_failed and any_issued:
+        any_failed, any_new, any_holder = ph(PH_ISSUE)(
+            [0 if issued else 1, 1 if (issued and needs) else 0, 0 if needs else 1])
+        if any_failed and (any_new or any_holder):
+            # same-pass join (review A3a): the ranks without the copy write again -- the stem is claimed by the others,
+            # their claim JOINS it, no room needed
+            if needs and not issued:
+                issued = bool(_safe(lambda: ops.issue(node), False))
+            (still,) = ph(PH_REISSUE)([0 if issued else 1])
+            if not still:
+                st["healed"] += 1
+                st["issued"] += 1
+                log.warning("%s SPLIT HEALED depth=%d class=%s spill_victim_depth=%s (a rank could not write its copy at "
+                            "the first try; its same-pass join made the anchor rank-equal)", MARKER, depth, cls, spill)
+                continue
+            if any_new:
+                raise ParkRearmDivergence(
+                    f"{MARKER} W203 split: the anchor copy at depth {depth} ({cls}) was written on some ranks this pass "
+                    f"and the others could not join it even at the second try (this rank needs={needs} "
+                    f"issued={int(issued)}) -- the ranks' trees would part")
             st["split"] += 1
-            log.warning("%s SPLIT depth=%d class=%s this_rank needs=%d issued=%d spill_victim_depth=%s (a rank could "
-                        "not write its copy while another did; the next pass retries it -- its claim joins the stem "
-                        "the others claimed, no room needed)", MARKER, depth, "end" if cls == 0 else "chain", needs,
-                        int(issued), spill)
+            log.warning("%s PRE-SPLIT depth=%d class=%s (the copy stood on some ranks BEFORE this pass -- not written by "
+                        "it -- and the others could not join; named, not created here) -- the pass ends",
+                        MARKER, depth, cls)
             break
         if any_failed:
             st["refused"] = st.get("refused", 0) + 1
-            log.warning("%s REFUSED depth=%d class=%s spill_victim_depth=%s (no rank could write the copy -- the "
-                        "refusal is #1421's line on every rank; the pass ends, the next flush poll asks again)",
-                        MARKER, depth, "end" if cls == 0 else "chain", spill)
+            log.warning("%s REFUSED depth=%d class=%s spill_victim_depth=%s (no rank could claim the anchor's slot -- a "
+                        "KV-only write is no copy; #1421's line names the refusal on every rank; the pass ends, the "
+                        "next flush poll asks again)", MARKER, depth, cls, spill)
             break
         st["issued"] += 1
-        log.info("%s ISSUED depth=%d class=%s spill_victim_depth=%s writers=%s (every rank holds or writes the "
-                 "anchor's copy; PARK-END-ANCHOR BACKED names the ack)", MARKER, depth,
-                 "end" if cls == 0 else "chain", spill, "all-needing" if any_issued else "none-needed")
+        log.info("%s ISSUED depth=%d class=%s spill_victim_depth=%s (every rank holds or writes the anchor's copy; "
+                 "PARK-END-ANCHOR BACKED names each rank's ack, slot=COMPLETE the last one)", MARKER, depth, cls, spill)
     return st
 
 
@@ -253,21 +327,34 @@ class TreeOps:
         return cd is not None and (cd.value is not None or cd.host_value is not None) and bool(n.hash_value)
 
     def _candidates(self) -> Dict[int, Any]:
+        """Every park END node and every chain intermediate that carries an anchor (device or host) -- the tree's
+        STRUCTURE, a replica on every rank (review A2: never the rank-local drop flag, which a successful copy on one
+        rank changes). A key two different nodes share is dropped (review S6: no rank-dependent tie)."""
         if self._map is not None:
             return self._map
         t = self.tree
         out: Dict[int, Any] = {}
+        bad = set()
         ends = [n for n in (t.__dict__.get("_pdflip_park_end_nodes") or ()) if n.parent is not None]
         root = t.root_node
+
+        def _put(k, node):
+            prev = out.get(k)
+            if prev is None:
+                out[k] = node
+            elif prev is not node:
+                bad.add(k)
+
         for end in ends:
             if not end.evicted and self._has_anchor(end):
-                out.setdefault(target_key(0, t.pdflip_node_depth(end), end.hash_value[-1]), end)
+                _put(target_key(0, t.pdflip_node_depth(end), end.hash_value[-1]), end)
             n = end.parent
             while n is not None and n is not root:
-                if (getattr(n, "pdflip_park_anchor_dropped", False) and not getattr(n, "pdflip_park_end", False)
-                        and not n.evicted and self._has_anchor(n)):
-                    out.setdefault(target_key(1, t.pdflip_node_depth(n), n.hash_value[-1]), n)
+                if not getattr(n, "pdflip_park_end", False) and not n.evicted and self._has_anchor(n):
+                    _put(target_key(1, t.pdflip_node_depth(n), n.hash_value[-1]), n)
                 n = n.parent
+        for k in bad:
+            out.pop(k, None)
         self._map = out
         return out
 
@@ -280,7 +367,21 @@ class TreeOps:
         return True
 
     def needing(self) -> Dict[int, Any]:
-        return {k: n for k, n in self._candidates().items() if self._needs(n)}
+        """What THIS rank asks for: END anchors without a host copy, and the chain intermediates THIS rank gave up
+        KV-only (the drop flag, cleared only at the copy's ack). The union over the ranks is the candidate list."""
+        return {k: n for k, n in self._candidates().items() if self._needs(n)
+                and (class_of_target_key(k) == 0 or getattr(n, "pdflip_park_anchor_dropped", False))}
+
+    def has_rows(self, n) -> bool:
+        """Review A2: THIS rank holds mamba rows for ``n`` -- a committed host copy, a write of its anchor in flight
+        (``_pdflip_direct_mamba_rows``: the direct and the anchor-only write file them there), or a secured detached
+        anchor-only slot. A KV-only write is none of these."""
+        cd = self._mamba_cd(n)
+        if cd is not None and cd.host_value is not None:
+            return True
+        if n.id in (self.tree.__dict__.get("_pdflip_direct_mamba_rows") or {}):
+            return True
+        return bool(getattr(n, "pdflip_anchor_secured", False))
 
     def locate(self, key: int):
         return self._candidates().get(int(key))
@@ -315,7 +416,7 @@ class TreeOps:
         m_noroom = bool(probe_m([n.hash_value[-1]])) if callable(probe_m) else True
         return (1, int(inflight), int(kv_noroom), int(m_noroom))
 
-    def victims(self) -> Dict[int, Any]:
+    def victims(self, target=None) -> Dict[int, Any]:
         """Anchors THIS rank may give up for the agreed spill: settled (slots), off every park chain, not the node of a
         tree deletion (an evicted childless node without KV host would leave the tree), L3-secured (the victim's next
         reader takes it from the store, #257 -- no anchor traded for another), and every slot referenced by no
@@ -330,10 +431,19 @@ class TreeOps:
         chain = t._pdflip_park_chain()
         cands = _mad.tree_anchors(root=t.root_node, anchor_of=lambda n: t._pdflip_anchor_of(n, mp),
                                   include_untagged=True)
+        if target is not None:
+            # review S1: LANE-ANCHOR-RANK as in the park spill -- a lower lane's claim never spills a higher lane's
+            # anchor (the lanes are replicated: the same filter on every rank)
+            try:
+                lane = t._pdflip_claim_lane(target, park=True)
+            except Exception:  # noqa: BLE001 - no lane readable: no lane filter (lanes off)
+                lane = None
+            cands = _mad.lane_filter(cands, lane)
         refs = getattr(arena, "slot_refs", None)
         world = int(getattr(t, "tp_world_size", 1) or 1)
         backend = getattr(mp, "_backend", None)
         out: Dict[int, Any] = {}
+        bad = set()
         unsecured = []
         for a in cands:
             n = a.node
@@ -349,7 +459,13 @@ class TreeOps:
                     continue
             except Exception:  # noqa: BLE001 - unreadable = not a victim
                 continue
-            out.setdefault(victim_key(a.depth, n.hash_value[-1]), a)
+            k = victim_key(a.depth, n.hash_value[-1])
+            if k in out and out[k].node is not n:
+                bad.add(k)   # review S6: two anchors, one key -- no rank-dependent tie, the key is no victim
+            else:
+                out[k] = a
+        for k in bad:
+            out.pop(k, None)
         if not out and unsecured:
             # S109b: no synchronous L3 write in the scheduler thread -- the shallowest candidate is QUEUED for the
             # write-behind; the next pass finds it secured
@@ -366,16 +482,18 @@ class TreeOps:
         return int(t._pdflip_release_anchor(victim, self.mp, st, why="park_rearm", for_rid="park") or 0)
 
     def issue(self, n) -> bool:
-        """Write THIS rank's copy: anchor-only when the KV is backed, else the full backup. During the issue a park
-        chain INTERMEDIATE above an END goes KV-only without asking the arena (the END is what the room is for)."""
+        """Write THIS rank's copy: anchor-only when the KV is backed, else the full backup. During the issue every OTHER
+        park chain intermediate of the write goes KV-only without asking the arena (the target is what the room is
+        for); the target itself passes the drop gate (``_pdflip_park_rearm_active``). True only when THIS rank now holds
+        mamba rows for the target (review A2: "issued" = the anchor's claim, never a KV-only write); the drop flag is
+        cleared at the copy's ACK (``UnifiedRadixCache._pdflip_park_anchor_acked``), never before."""
         t = self.tree
-        t._pdflip_park_rearm_active = n   # the target: every OTHER park chain intermediate of this write goes KV-only
+        t._pdflip_park_rearm_active = n
         try:
-            n.pdflip_park_anchor_dropped = False   # PARK-REARM: given up for want of room -- room is there now
             if self._kv_backed(n):
-                got = t.write_backup_anchor_only(n)
+                t.write_backup_anchor_only(n)
             else:
-                got = t.write_backup(n)
+                t.write_backup(n)
         finally:
             t._pdflip_park_rearm_active = None
-        return int(got or 0) > 0
+        return self.has_rows(n)

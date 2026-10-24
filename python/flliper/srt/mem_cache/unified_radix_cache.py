@@ -6037,7 +6037,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if self._s104_byteless_anchor_rank():
             return False    # S104: a Form A worker's anchor has no bytes -- nothing to back up, nothing un-backed
-        if getattr(node, "pdflip_park_anchor_dropped", False) and not UnifiedRadixCache._pdflip_park_rearm_local(self, node):
+        if (getattr(node, "pdflip_park_anchor_dropped", False)
+                and self.__dict__.get("_pdflip_park_rearm_active") is not node
+                and not UnifiedRadixCache._pdflip_park_rearm_local(self, node)):
             return False    # PARK-END-ANCHOR-FIRST: given up for want of room; PARK-REARM-1024 takes it back once room is there
         if not (node.backuped or node.l3_present):
             if not kv_on_device:
@@ -7648,7 +7650,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return False
         except Exception:  # noqa: BLE001 - unreadable room / a bare tree = not re-armed (the old answer)
             return False
-        node.pdflip_park_anchor_dropped = False
+        # review S7: the flag stays until the copy ACKS (``_pdflip_park_anchor_acked``) -- a write that fails keeps the
+        # node a candidate for the next sweep
         n = getattr(UnifiedRadixCache, "_park_rearm_local_n", 0) + 1
         UnifiedRadixCache._park_rearm_local_n = n
         if n <= 16 or n % 64 == 0:
@@ -7679,12 +7682,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - no process group readable: no pass (every rank alike: the same setup)
             return None
 
-    def pdflip_park_rearm_group(self, busy: bool = False) -> dict:
+    def pdflip_park_rearm_group(self, busy: bool = False, allow_class1: bool = True) -> dict:
         """PARK-REARM-1024 (parts 1+2, ``pdflip/park_anchor_rearm.py``): the group-synchronous re-arm pass. Called by
         the scheduler's group-verdict flush on EVERY rank of the group at the same point (right before the idle
         verdict's own collective). Gate, all rank-uniform: the switch, a pure TP group sharing the mamba slot (W65
         class), a mamba tree with a bound arena -- a rank without its arena still posts every collective (it needs
-        nothing, locates nothing, vetoes the spill). Never raises."""
+        nothing, locates nothing, vetoes the spill). ``allow_class1``: the chain intermediates too (rank-uniform: the
+        flush kind). Review A1: anything raised AFTER the first collective is re-raised (a collective error as itself,
+        anything else as W203 ParkRearmDivergence) -- a rank never runs on to the idle verdict's reduce while its peers
+        are still in the pass; before the first collective a rank-local error is logged and no pass runs."""
         if not _park_rearm.armed() or not UnifiedRadixCache._k15_tp_slot_shared(self):
             return {}
         if ComponentType.MAMBA not in self.tree_components or self.cache_controller is None:
@@ -7693,12 +7699,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if _g is None:
             return {}
         rank, world = _g
-        mp = self._pdflip_mamba_pool()
-        ops = _park_rearm.TreeOps(self, mp, busy=busy or mp is None)
-        stats = _park_rearm.run_pass(
-            ops, lambda v: self.hicache_group_max(v, label="flush_cache/park_rearm"), rank, world, log=logger)
-        if stats.get("issued") or stats.get("split") or stats.get("spilled") or stats.get("refused"):
-            logger.info("%s PASS rank=%d %s", _park_rearm.MARKER, rank,
+        posted = [0]
+
+        def _gm(v):
+            posted[0] += 1
+            return self.hicache_group_max(v, label="flush_cache/park_rearm")
+
+        t0 = time.perf_counter()
+        try:
+            mp = self._pdflip_mamba_pool()
+            ops = _park_rearm.TreeOps(self, mp, busy=busy or mp is None)
+            stats = _park_rearm.run_pass(ops, _gm, rank, world, log=logger, allow_class1=allow_class1)
+        except _park_rearm.HiCacheCollectiveError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - see the docstring: never a silent rank-local exit mid-pass
+            if posted[0]:
+                raise _park_rearm.ParkRearmDivergence(
+                    "%s W203 rank %d raised %s inside the pass after %d collective(s): %s" % (
+                        _park_rearm.MARKER, rank, type(exc).__name__, posted[0], exc)) from exc
+            logger.warning("%s rank %d raised %s before the first collective: %s (no pass on this rank -- the peers' "
+                           "gather meets the idle verdict's reduce of another size and gloo stops the group loudly)",
+                           _park_rearm.MARKER, rank, type(exc).__name__, exc)
+            return {}
+        stats["ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        if stats.get("targets") or stats.get("busy"):
+            # review S3: every pass with a target names itself and its cost
+            logger.info("%s PASS rank=%d class1=%d %s", _park_rearm.MARKER, rank, int(bool(allow_class1)),
                         " ".join("%s=%s" % kv for kv in sorted(stats.items())))
         return stats
 
@@ -8812,20 +8838,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001
             return False
 
+    def _pdflip_park_anchor_acked(self, node, via: str) -> None:
+        """PARK-REARM-1024: the anchor copy of ``node`` acked on this rank -- a park chain intermediate given up KV-only
+        is no longer given up (review A2/S7: the drop flag is cleared HERE, at the fact, never before the write), and a
+        park END names its BACKED line."""
+        try:
+            if getattr(node, "pdflip_park_anchor_dropped", False):
+                node.pdflip_park_anchor_dropped = False
+        except Exception:  # noqa: BLE001
+            pass
+        UnifiedRadixCache._pdflip_park_note_backed(self, node, via)
+
     def _pdflip_park_note_backed(self, node, via: str) -> None:
         """PARK-REARM-1024 (part 4, the MARK contract): ``PARK-END-ANCHOR-FIRST MARK`` names a claim PRIORITY; this
-        line names the fact -- the park END node's anchor copy ACKED into its arena slot on this rank (``via`` = the
-        write that carried it). Once per node and rank; never raises."""
+        line names the fact -- the park END node's anchor copy ACKED into its arena slot on THIS rank (``via`` = the
+        write that carried it). Review S2: an ack is per rank; ``slot=COMPLETE`` only once every rank's extent is in
+        (``anchor_held``: COMPLETE slot or L3 copy), else ``slot=partial`` -- the resume reads the anchor only from a
+        COMPLETE slot, a monitor asks BACKED with slot=COMPLETE (or BACKED on every TP rank). Once per node and rank;
+        never raises."""
         try:
             if not getattr(node, "pdflip_park_end", False) or node.__dict__.get("_pdflip_park_backed_logged"):
                 return
             node._pdflip_park_backed_logged = True
+            slot = "?"
+            try:
+                mp = self._pdflip_mamba_pool()
+                held = mp.anchor_held(node.hash_value[-1]) if (mp is not None and node.hash_value) else None
+                slot = "?" if held is None else ("COMPLETE" if held else "partial")
+            except Exception:  # noqa: BLE001
+                slot = "?"
             n = getattr(UnifiedRadixCache, "_park_backed_n", 0) + 1
             UnifiedRadixCache._park_backed_n = n
-            logger.info("PDFLIP PARK-END-ANCHOR BACKED rid=%s node=%s depth=%d via=%s n=%d (the park END anchor's copy "
-                        "acked into its arena slot -- the resume reads it from L2/L3)",
+            logger.info("PDFLIP PARK-END-ANCHOR BACKED rid=%s node=%s depth=%d via=%s slot=%s n=%d (this rank's copy of "
+                        "the park END anchor acked; the resume reads it once the slot is COMPLETE -- every TP rank's "
+                        "extent in)",
                         str(node.__dict__.get("pdflip_park_rid") or "?")[:16], getattr(node, "id", "?"),
-                        self.pdflip_node_depth(node), via, n)
+                        self.pdflip_node_depth(node), via, slot, n)
         except Exception:  # noqa: BLE001 - an instrument never breaks an ack
             pass
 
@@ -8860,7 +8908,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     else:
                         if secured:
                             node.pdflip_anchor_secured = True
-                            UnifiedRadixCache._pdflip_park_note_backed(self, node, "anchor_only_store")
+                            UnifiedRadixCache._pdflip_park_anchor_acked(self, node, "anchor_only_store")
                 return True
             mhv = node.component_data[ComponentType.MAMBA].host_value
             if mp is not None and mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
@@ -8871,7 +8919,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     logger.warning("ANCHOR-ONLY complete raised: %r", exc)
                 else:
                     if not lost_anchor:
-                        UnifiedRadixCache._pdflip_park_note_backed(self, node, "anchor_only")
+                        UnifiedRadixCache._pdflip_park_anchor_acked(self, node, "anchor_only")
                         self._pdflip_release_inner_anchor(node, mp)
             return True
         pool = getattr(cc, "mem_pool_host", None)
@@ -8902,7 +8950,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     logger.warning("#1427 mamba complete raised: %r", exc)
                 else:
                     if not lost_anchor:
-                        UnifiedRadixCache._pdflip_park_note_backed(self, node, "full")
+                        UnifiedRadixCache._pdflip_park_anchor_acked(self, node, "full")
                         self._pdflip_release_inner_anchor(node, mp)
         UnifiedRadixCache._k12_direct_l3_verdict(self, node, orphaned)
         n = getattr(self, "_1427_direct_n", 0) + 1
