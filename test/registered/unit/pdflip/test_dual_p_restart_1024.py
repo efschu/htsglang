@@ -872,7 +872,8 @@ class RealDualPass(unittest.TestCase):
             mk = lambda rid, u: front_mod.Pending(rid, "/generate", {}, "t", time.time(), loop.create_future(),
                                                   est_prompt=u, est_uncached=u)
             f.queue.extend([mk("pdflip-0-6", 120000), mk("pdflip-0-7", 50000)])
-            await self._pass(f)()
+            # bounded: without the leg gate a requeued head is re-dispatched to the dead P forever (base / M9)
+            await asyncio.wait_for(self._pass(f)(), timeout=15)
             return list(f.queue)
         ps = self._patches(leg1)
         for p_ in ps:
