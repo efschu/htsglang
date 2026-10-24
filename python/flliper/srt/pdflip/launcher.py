@@ -14636,7 +14636,59 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
         res = _budget_rest.resolve(vals, _pconst_boots(name, profile), len(cards), group, name)
     except ValueError as exc:
         raise PdFlipLaunchRefused(f"{_budget_rest.MARKER}: {exc}") from None
-    return {"booked_rest_mib": list(res.values), "booked_rest_provenance": res.provenance}
+    rests = list(res.values)
+    prov = res.provenance
+    deltas = booked_rest_vote_line_deltas(cards, rests, name, profile, group, log)
+    if any(deltas):
+        rests = [None if v is None else int(v) + int(d) for v, d in zip(rests, deltas)]
+        prov = (f"{prov} + vote-line delta {','.join(str(d) for d in deltas)} "
+                f"({_budget_rest.VOTE_LINE_MARKER})")
+    return {"booked_rest_mib": rests, "booked_rest_provenance": prov}
+
+
+def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int]], name: str,
+                                 profile: Optional[str] = None, group: str = "D",
+                                 log: Optional[Log] = None) -> List[int]:
+    """PDFLIP-VOTE-LINE-BOOK (desk/27b-int8-tp1corridor-1024, pdflip/budget_rest.py):
+    per card the MiB the extend width vote now keeps free beyond the line the booked
+    rest ``name`` was measured under -- ``max(0, max(300, floor) - record_line)`` where the
+    card's corridor floor is MEASURED (reserve 0, as the booked path charges none; an
+    unmeasured or hand-set law books nothing), 0 elsewhere. The caller books it beside the rest, so
+    the budget and the vote are ONE fixpoint again: the vote's line comes out of the KV
+    pool, not out of the chunk."""
+    n = len(cards)
+    if not _budget_rest.vote_line_switch_on():
+        if log is not None:
+            log(f"{_budget_rest.VOTE_LINE_MARKER} group={group}: {_budget_rest.VOTE_LINE_ENV}=0 -- no delta "
+                f"booked (the KV pool keeps the vote's room, the vote narrows the chunk)")
+        return [0] * n
+    prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
+    row = pdflip_form.profile_row(prof)
+    rec = row.constants.get(name) if row is not None else None
+    boots = tuple(getattr(rec, "boots", ()) or ()) if rec is not None else ()
+    rec_line = _budget_rest.record_vote_line(name, boots)
+    if rec_line is None:
+        if log is not None:
+            log(f"{_budget_rest.VOTE_LINE_MARKER} group={group}: the vote line {name} was measured "
+                f"under is unknown (boots {','.join(boots) or '-'}) -- no delta booked (named, not "
+                f"guessed); re-measured under the current line the rest already contains it")
+        return [0] * n
+    from flliper.srt.pdflip.extend_trim import CHUNKING_FLOOR_MIB
+
+    floors = corridor_budget.floors_for_cards(cards, group, 0)
+    lines = [max(float(CHUNKING_FLOOR_MIB), float(floors[c.uuid].mib)) for c in cards]
+    act = [bool(floors[c.uuid].measured) for c in cards]
+    deltas = _budget_rest.vote_line_deltas(rests, lines, act, rec_line)
+    if log is not None:
+        for i, c in enumerate(cards):
+            cf = floors[c.uuid]
+            log(f"{_budget_rest.VOTE_LINE_MARKER} group={group} ordinal={i} nvml{c.nvml_index}: "
+                f"delta {deltas[i]} MiB = vote line {lines[i]:.0f} (max(300, floor {cf.mib} "
+                f"source={cf.source})) - record line {rec_line} ({name}, rc12g halt line of its "
+                f"boots)" + ("" if act[i] else " -> 0: the floor is not measured (an unmeasured or hand-set "
+                             "law cuts no KV for the vote line)")
+                + ("" if rests[i] is not None else " -> 0: no booked rest on this card"))
+    return deltas
 
 
 def torch_cache_cap_armed(ns) -> bool:

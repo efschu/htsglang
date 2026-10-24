@@ -213,6 +213,107 @@ def resolve(values: Optional[Sequence[Optional[int]]], boots: str, n_cards: int,
 
 
 # --------------------------------------------------------------------------
+# PDFLIP-VOTE-LINE-BOOK (desk/27b-int8-tp1corridor-1024): the rest is
+# measured UNDER A VOTE LINE, and that line has moved since.
+#
+# The rest above is ``card_total - min card_free - budget - dormant_other`` at
+# the tightest instant of its boots. That instant is the extend chunk the
+# width vote (extend_trim.width_vote) funded down to ITS line: the eight
+# boots of 28./29.09. ran rc12g, whose line was the 300 MiB halt line
+# (extend_trim.CHUNKING_FLOOR_MIB) -- the 3080s ended at 4 / 14 MiB free. On
+# 21.10. (786fe038dc) the vote's line became the corridor law and on 22.10.
+# (NACHT2 port) the card's MEASURED floor (767 / 701 / 700 on the 27B D): the
+# vote now keeps ``line - 300`` MiB more free at exactly that instant. The
+# record does not contain that room (it was measured without it), and the
+# budget gave it to the KV pool -- so the vote takes it out of the chunk.
+#
+# METAL (boot boot_weg2_dkr27bbar1drei10240803_b9cddabda1_1024_080355, rc39a,
+# D.log 08:16:36): TP1 (3080, budget 17384 = 20480 - 425 - 592 - 2079) post
+# 790 / 734 MiB after the trim, line 701, rate 0.3091 -> cap 287 / 105 rows
+# (#794 GROUP-NARROWED 4096 -> 287 / 256); 741 GROUP-NARROWED lines, mode
+# 256. The card rested at the record's served-transient room (~750 MiB) and
+# the vote kept 701 of it as line.
+#
+# THE FIX books the moved line beside the rest, per card,
+#
+#     delta = max(0, line_now - record_line)      line_now = max(300, floor)
+#
+# only where the floor is MEASURED (corridor_guard.CorridorFloor.measured): an
+# unmeasured card's vote line is the stated law 1024, and UNMEASURED-FALLBACK
+# is verdict-only -- it never spends KV pool (corridor_guard #1257c). A hand-set law (ENV-OVERRIDE) is a moved TARGET with its
+# +-20 % band, not a measured requirement -- it books no delta either (the
+# planner mirror, which prices the stated law, stays the launcher's twin). No reserve: the delta is the
+# vote's own line, which the vote enforces anyway; it moves those bytes from
+# the KV pool to the chunk instead of from the chunk to nothing. The end
+# state at the tightest instant is unchanged by construction -- the vote
+# still ends at its line -- so this is NOT the OOM direction; what changes is
+# the width: rows_cap(post + delta, rate, page, line_now) ==
+# rows_cap(post, rate, page, record_line).
+#
+# A record re-measured under another line (its boots differ from the ones
+# named here) books no delta and says so: the regime of an unknown boot set
+# is not guessed.
+# --------------------------------------------------------------------------
+
+VOTE_LINE_MARKER = "PDFLIP-VOTE-LINE-BOOK"
+#: the KV-vs-width choice (user law 30.08.: a KV<->performance trade is selectable). Default ON
+#: (user order 14.10.: new features on); =0 = the pre-fix budgets: the KV pool keeps the vote's
+#: room and the vote narrows the chunk (rc39a: 4096 -> 256..691 rows on the 27B D).
+VOTE_LINE_ENV = "FLLIPER_PDFLIP_VOTE_LINE_BOOK"
+
+
+def vote_line_switch_on(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """:data:`VOTE_LINE_ENV` unless it says off (0/false/no/off); default on."""
+    env = os.environ if environ is None else environ
+    return str(env.get(VOTE_LINE_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+#: the eight row-authority boots of D_AWAKE_REST_BOOKED_MIB / D_AWAKE_REST_CAPPED_MIB (28./29.09.)
+BOOTS_0929: Tuple[str, ...] = (
+    "dkr27browauthoritybar1fs09291152",
+    "dkr27browauthoritybar1fs09290956",
+    "dkr27browauthoritybar1w109290020",
+    "dkr27browauthoritybar1w109290002",
+    "dkr27browauthoritybar1w109281851",
+    "dkr27browauthoritybar1w109281715",
+    "dkr27browauthoritybar1w109281556",
+    "dkr27browauthoritybar1w109281300",
+)
+
+#: record name -> (the boots it was measured on, the extend width vote's line in force on them).
+#: Not a VRAM measurement: the code state of those boots (rc12g ``CHUNKING_FLOOR_MIB``; the
+#: line moved in 786fe038dc 21.10. and the NACHT2 port 22.10.).
+RECORD_VOTE_LINE_MIB: Dict[str, Tuple[Tuple[str, ...], int]] = {
+    "D_AWAKE_REST_BOOKED_MIB": (BOOTS_0929, 300),
+    "D_AWAKE_REST_CAPPED_MIB": (BOOTS_0929, 300),
+}
+
+
+def record_vote_line(name: str, boots: Sequence[str]) -> Optional[int]:
+    """The vote line the record ``name`` was measured under, or ``None`` when its
+    boots are not the ones named in :data:`RECORD_VOTE_LINE_MIB` (unknown regime)."""
+    ent = RECORD_VOTE_LINE_MIB.get(str(name))
+    if ent is None or tuple(boots or ()) != tuple(ent[0]):
+        return None
+    return int(ent[1])
+
+
+def vote_line_deltas(rests: Sequence[Optional[int]], lines_now: Sequence[float],
+                     measured: Sequence[bool], record_line: Optional[int]) -> List[int]:
+    """Per card ``max(0, ceil(line_now) - record_line)`` -- 0 where the card has no
+    booked rest, where its floor is not measured, or where the record's line is unknown. Pure."""
+    if not (len(rests) == len(lines_now) == len(measured)):
+        raise ValueError(f"{VOTE_LINE_MARKER}: {len(rests)} rests, {len(lines_now)} lines, "
+                         f"{len(measured)} floors -- a partial vector never prices a card it never saw")
+    out: List[int] = []
+    for r, ln, act in zip(rests, lines_now, measured):
+        if r is None or record_line is None or not bool(act):
+            out.append(0)
+            continue
+        out.append(max(0, int(-(-float(ln) // 1)) - int(record_line)))
+    return out
+
+
+# --------------------------------------------------------------------------
 # PDFLIP-ALLOC-OVERHANG (desk/27b-d-alloc-overhang-0929): the rest SPLIT into its
 # posts, and the part the torch cache cap (pdflip/torch_cache_cap.py, P0
 # 5f33ec18836a) takes away.

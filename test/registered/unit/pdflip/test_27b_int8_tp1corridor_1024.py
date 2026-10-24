@@ -11,9 +11,9 @@ was rc12g's 300 MiB halt line (786fe038dc moved it 21.10., the NACHT2 port to th
 measured floor 22.10.): the room the vote now keeps (701 - 300 = 401 MiB on TP1) is not
 in the rest, the budget handed it to the KV pool, and the vote took it out of the chunk.
 
-Fix (pdflip/budget_rest.py PDFLIP-BUDGET-REST-VOTE-LINE, launcher.booked_rest_vote_line_deltas):
+Fix (pdflip/budget_rest.py PDFLIP-VOTE-LINE-BOOK, launcher.booked_rest_vote_line_deltas):
 the delta ``max(0, max(300, floor) - 300)`` is booked beside the rest where the floor
-actuates. Danger direction named: a budget that does NOT book it is the pre-fix budget
+is measured. Danger direction named: a budget that does NOT book it is the pre-fix budget
 (higher, the KV pool takes the vote's room); the tests below pin the booked budget and
 the identity that the vote's end state is unchanged (no OOM direction).
 """
@@ -122,7 +122,14 @@ class NoDeltaWhereTheFloorDoesNotActuateOrTheRegimeIsUnknown(CustomTestCase):
                                                values={U5090: 1024, U_TP1: 1024, U_TP2: 1024}))
         self.assertEqual(budgets, HEAD_BUDGETS)
         self.assertNotIn(BR.VOTE_LINE_MARKER, kw["booked_rest_provenance"])
-        self.assertTrue(any("does not actuate" in ln for ln in lines))
+        self.assertTrue(any("is not measured" in ln for ln in lines))
+
+    def test_a_hand_set_law_books_nothing(self):
+        # ENV-OVERRIDE actuates a corridor cut, but it is a moved TARGET, not a measured
+        # requirement: no vote-line delta (the planner mirror prices the stated law alike)
+        _, budgets, _ = _d_pass([], _floors(source=CG.FLOOR_SOURCE_ENV,
+                                            values={U5090: 1024, U_TP1: 1024, U_TP2: 1024}))
+        self.assertEqual(budgets, HEAD_BUDGETS)
 
     def test_a_record_of_unknown_boots_books_nothing_and_says_so(self):
         self.assertIsNone(BR.record_vote_line("D_AWAKE_REST_BOOKED_MIB", ("someotherboot",)))
@@ -132,6 +139,15 @@ class NoDeltaWhereTheFloorDoesNotActuateOrTheRegimeIsUnknown(CustomTestCase):
             _, budgets, _ = _d_pass(lines, _floors())
         self.assertEqual(budgets, HEAD_BUDGETS)
         self.assertTrue(any(BR.VOTE_LINE_MARKER in ln and "unknown" in ln for ln in lines))
+
+    def test_the_switch_off_restores_the_pre_fix_budgets(self):
+        lines = []
+        with mock.patch.dict(os.environ, {BR.VOTE_LINE_ENV: "0"}):
+            _, budgets, _ = _d_pass(lines, _floors())
+        self.assertEqual(budgets, HEAD_BUDGETS)
+        self.assertTrue(any(BR.VOTE_LINE_ENV + "=0" in ln for ln in lines))
+        self.assertTrue(BR.vote_line_switch_on({}))
+        self.assertFalse(BR.vote_line_switch_on({BR.VOTE_LINE_ENV: "off"}))
 
     def test_the_registry_record_carries_the_named_boots(self):
         rec = F.PROFILES[F.PROFILE_QWEN27B].constants[BR.record_name("D")]
