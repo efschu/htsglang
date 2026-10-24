@@ -282,12 +282,15 @@ def _wu_src():
 
 def test_wiring_resume_lands_charge_reads_kv_waits():
     src = _wu_src()
-    # every weights tag: resume, then landed
-    i = src.index("pdflip_tms_resume(self.memory_saver_adapter, tag)\n")
-    assert "self._pdflip_credit_landed(credit, tag, credit_epoch)" in src[i:i + 400]
-    # the parked draft too
-    j = src.index("resume=lambda t: pdflip_tms_resume(self.memory_saver_adapter, t))")
-    assert "_pdflip_credit_landed(credit, GPU_MEMORY_TYPE_WEIGHTS_DRAFT, epoch)" in src[j:j + 300]
+    # every weights tag and the parked draft: resume THROUGH resume_then_land
+    assert "resume_then_land as _pdflip_resume_then_land" in src
+    i = src.index("lambda: pdflip_tms_resume(self.memory_saver_adapter, tag),")
+    assert "_pdflip_resume_then_land(" in src[i - 120:i]
+    assert "credit, tag, credit_epoch)" in src[i:i + 200]
+    j = src.index("lambda: pdflip_tms_resume(self.memory_saver_adapter, t), credit, t, epoch))")
+    assert "resume=lambda t: _pdflip_resume_then_land(" in src[j - 200:j]
+    # no bare resume of a claimed tag left in the leg loop
+    assert "                    pdflip_tms_resume(self.memory_saver_adapter, tag)\n" not in src
     # the staging debit gets the reader (graded under the lock)
     k = src.index("def _charge(nbytes: int):")
     assert "_reader = self._pdflip_free_bytes" in src[k:k + 1200]
@@ -376,8 +379,124 @@ def test_mutant_m3_kv_without_the_staging_wait_reproduces_the_106():
     assert waited == 0.0 and after < NEAR_OOM_MIB          # 10432 - 10326 = 106
 
 
-def test_mutant_m4_landed_never_called_is_caught_by_wiring():
+def _landed_scenario(mod, tmp_path, name, *, stale_free_to_debit=False):
+    """TP0 claims weights_5 (pending), then maps it through resume_then_land;
+    PP0's staging attempt lands INSIDE the map window (before the bytes are
+    taken off the card) -- or, with ``stale_free_to_debit``, after the map,
+    handing the debit its pre-map reading (only the under-lock read sees it)."""
+    wakes, floors, stage_b, _ = _drei_wakes()
+    w = wakes["1792829161.11"]
+    need = w["begin"]["weights_5"][0] * MIB
+    c, ep = _book(mod, tmp_path, name, w)
+    card = _Card(w["grant_free"])
+    pre_map = card.free()
+    spent = c.claim("weights_5", need, epoch=ep, overdraw=True, recheck=(card.free, floors["D"] * MIB))
+    assert spent["claimed_bytes"] == need
+    got = {"staged": False}
+
+    def _stage(free_hint):
+        if c.debit("ipc-stage", stage_b, free_bytes=free_hint,
+                   floor_bytes=floors["P"] * MIB, free_reader=card.free):
+            card.alloc(stage_b)
+            got["staged"] = True
+
+    def _resume():
+        if not stale_free_to_debit:
+            _stage(card.free())            # the sleeper stages during the map window
+        card.alloc(need)                   # the map itself
+
+    mod.resume_then_land(_resume, c, "weights_5", ep)
+    if stale_free_to_debit:
+        _stage(pre_map)                    # landed; the debit's argument is stale
+    return card.free() >> 20, got["staged"]
+
+
+def test_resume_then_land_keeps_the_claim_pending_through_the_map(tmp_path):
+    free_after, staged = _landed_scenario(PMS, tmp_path, "GPU-wf-l1")
+    assert not staged and free_after >= NEAR_OOM_MIB
+
+
+def test_debit_reads_the_card_under_its_lock(tmp_path):
+    free_after, staged = _landed_scenario(PMS, tmp_path, "GPU-wf-l2", stale_free_to_debit=True)
+    assert not staged and free_after >= NEAR_OOM_MIB
+
+
+def test_mutant_m4_landed_before_resume_reproduces_the_dip(tmp_path):
+    m = _mutant(PMS,
+                "    resume()\n    if credit is None or not hasattr(credit, \"claim_landed\"):\n        return\n",
+                "    if credit is not None and hasattr(credit, \"claim_landed\"):\n"
+                "        credit.claim_landed(tag, epoch=epoch)\n    resume()\n    return\n", "m4")
+    free_after, staged = _landed_scenario(m, tmp_path, "GPU-wf-m4")
+    assert staged and free_after < NEAR_OOM_MIB            # 3596 - 1656 - 1678 = 262
+
+
+def test_mutant_m5_debit_without_the_under_lock_read_reproduces_the_dip(tmp_path):
+    m = _mutant(PMS, "                        free_bytes = _fr\n", "                        pass\n", "m5")
+    free_after, staged = _landed_scenario(m, tmp_path, "GPU-wf-m5", stale_free_to_debit=True)
+    assert staged and free_after < NEAR_OOM_MIB
+
+
+# --------------------------------------------- review MUSS-2 / SOLL-3/4/5 --
+def test_open_leg_with_nothing_published_books_pending(tmp_path):
+    c = PMS.VramCredit("GPU-wf-o", credit_dir=str(tmp_path))
+    c.begin_leg("e7")
+    card = _Card(3600)
+    rec = c.wait_for(1678 * MIB, budget_s=0.3, tag="weights_0", free_bytes_now=card.free(),
+                     free_reader=card.free, floor_bytes=767 * MIB, epoch="e7")
+    assert rec["waited_s"] == 0.0
+    assert (c.read().get("pending_claims") or {}) == {"weights_0": 1678 * MIB}
+    assert int(c.read().get("consumed_bytes", 0)) == 0      # the balance is untouched
+
+
+def test_single_group_early_exit_still_writes_nothing(tmp_path):
+    c = PMS.VramCredit("GPU-wf-s", credit_dir=str(tmp_path))
+    rec = c.wait_for(1678 * MIB, budget_s=0.3, tag="weights_0", free_bytes_now=8000 * MIB,
+                     free_reader=lambda: 8000 * MIB, floor_bytes=767 * MIB, epoch="e7")
+    assert rec["waited_s"] == 0.0
+    assert not c.read()
+
+
+def test_mutant_m6_open_leg_without_pending_reproduces_the_dip(tmp_path):
+    m = _mutant(PMS, "_bp = self.book_pending(tag, need, epoch=epoch,",
+                "_bp = {} if True else self.book_pending(tag, need, epoch=epoch,", "m6")
+    c = m.VramCredit("GPU-wf-m6", credit_dir=str(tmp_path))
+    c.begin_leg("e7")
+    card = _Card(3600)
+    c.wait_for(1678 * MIB, budget_s=0.3, tag="weights_0", free_bytes_now=card.free(),
+               free_reader=card.free, floor_bytes=767 * MIB, epoch="e7")
+    m_book = c.read().get("pending_claims") or {}
+    assert not m_book                                        # the mutant booked nothing ...
+    if c.debit("ipc-stage", 1656 * MIB, free_bytes=card.free(), floor_bytes=1055 * MIB,
+               free_reader=card.free):
+        card.alloc(1656 * MIB)
+    card.alloc(1678 * MIB)
+    assert card.free() >> 20 < NEAR_OOM_MIB                        # ... and the card ends at 266
+
+
+def test_pre_leg_overdraw_is_dated_and_carried_by_begin_leg(tmp_path):
+    c = PMS.VramCredit("GPU-wf-p", credit_dir=str(tmp_path))
+    c.begin_leg("e6")                                        # last flip's counter
+    c.claim("weights_3", 1678 * MIB, epoch="e7", overdraw=True)   # waker first, this flip
+    st = c.read()
+    assert st["epoch"] == "e7" and st.get("pre_leg") is True
+    c.begin_leg("e7")                                        # the sleeper opens THIS flip
+    st = c.read()
+    assert (st.get("pending_claims") or {}) == {"weights_3": 1678 * MIB}
+    assert int(st["consumed_bytes"]) == 1678 * MIB and not st.get("pre_leg")
+    # the debit sees it: 4000 - 1055 - 1678 < 1656
+    assert not c.debit("ipc-stage", 1656 * MIB, free_bytes=4000 * MIB, floor_bytes=1055 * MIB)
+    # the NEXT flip's begin_leg does not carry it (#1349)
+    c.begin_leg("e8")
+    st = c.read()
+    assert not (st.get("pending_claims") or {}) and int(st["consumed_bytes"]) == 0
+
+
+def test_resume_begin_prints_na_not_zero_and_kv_line_always():
     src = _wu_src()
-    mutated = src.replace("self._pdflip_credit_landed(credit, tag, credit_epoch)", "pass", 1)
-    i = mutated.index("pdflip_tms_resume(self.memory_saver_adapter, tag)\n")
-    assert "self._pdflip_credit_landed(credit, tag, credit_epoch)" not in mutated[i:i + 400]
+    i = src.index('"PDFLIP-RESUME begin tag=%s need_mib=%d credit=%s epoch=%s "')
+    blk = src[i:i + 900]
+    assert '"n/a" if (_fb_begin := self._pdflip_free_bytes()) is None' in blk
+    assert "self._pdflip_free_bytes() or 0" not in blk
+    k = src.index("def _pdflip_kv_wait_peer_staging(")
+    body = src[k:k + 4000]
+    assert "if waited > 0.0:" not in body and "no-counter" in body

@@ -989,6 +989,24 @@ def staging_to_subtract(before: Dict[str, Any], after: Dict[str, Any]) -> int:
     return max(0, staged_a - int(after.get("live_bytes", 0) or 0))
 
 
+def resume_then_land(resume, credit, tag: str, epoch) -> None:
+    """WAKE-FLOOR-1024: map a CLAIMED tag, and only THEN take it off the
+    counter's pending book. The order is the guard: landed before the map
+    would let the co-located sleeper's staging grade bytes the resume is about
+    to take (review SOLL-2 -- the OOM-direction mutant of this function).
+    ``resume()`` raising leaves the claim pending (sleeper -> host path until
+    the next begin_leg), never a waker OOM. ``credit`` None: just the resume."""
+    resume()
+    if credit is None or not hasattr(credit, "claim_landed"):
+        return
+    try:
+        credit.claim_landed(tag, epoch=epoch)
+    except Exception as exc:  # noqa: BLE001 -- pending stays: conservative
+        logger.info("PDFLIP-CREDIT-LANDED tag=%s not recorded (%s: %s) -- the claim "
+                    "stays pending, the peer's staging takes the host path",
+                    tag, type(exc).__name__, exc)
+
+
 class StageBooking:
     """H11: one IPC staging booked against a leg's :class:`VramCredit`.
     Called, it refunds (the refund-callable contract of
@@ -1103,6 +1121,14 @@ class VramCredit:
         compare equal to this boot's.
         """
         with self._locked(True) as handle:
+            # WAKE-FLOOR-1024 review SOLL-5: a waker that overdrew THIS flip
+            # before the sleeper opened its leg left a dated ``pre_leg`` record
+            # (see :meth:`claim`). Its claims are this flip's spending, not a
+            # previous leg's -- they are carried, so the sleeper's debit sees
+            # them; anything else (another epoch, a sleeper's own state) is
+            # reset exactly as before (#1349).
+            prev = self._load(handle)
+            carry = bool(prev) and bool(prev.get("pre_leg")) and str(prev.get("epoch")) == str(epoch)
             self._store(
                 handle,
                 {
@@ -1111,11 +1137,13 @@ class VramCredit:
                     # #1349: the debit half is reset by the SAME step that
                     # resets the credit half, so a leg can never open with a
                     # previous leg's spending against this leg's releases.
-                    "consumed_bytes": 0,
+                    "consumed_bytes": int(prev.get("consumed_bytes", 0) or 0) if carry else 0,
                     "leg_complete": False,
                     "publisher_pid": int(pid if pid is not None else os.getpid()),
                     "tags": [],
-                    "claims": [],
+                    "claims": list(prev.get("claims", []) or []) if carry else [],
+                    **({"pending_claims": dict(prev.get("pending_claims") or {})}
+                       if carry and prev.get("pending_claims") else {}),
                 },
             )
 
@@ -1363,6 +1391,13 @@ class VramCredit:
             if gate is not None and (covered or not require_full or overdraw):
                 gate_value = gate(available)  # may raise; nothing is written
             if claimed > 0:
+                if epoch is not None and str(state.get("epoch")) != str(epoch):
+                    # review SOLL-5: a claim on a stale or absent counter used
+                    # to write a record WITHOUT an epoch, which the sleeper's
+                    # begin_leg then wiped (its consumed and pending unseen by
+                    # the debit). Dated now, and marked pre-leg so begin_leg
+                    # of THIS epoch carries it.
+                    state = {"epoch": str(epoch), "pre_leg": True}
                 state["credit_bytes"] = credit
                 state["consumed_bytes"] = consumed + claimed
                 claims = list(state.get("claims", []))
@@ -1392,6 +1427,35 @@ class VramCredit:
                 "pending_claim_bytes": sum(
                     int(v or 0) for v in (state.get("pending_claims") or {}).values()),
             }
+
+    def book_pending(self, tag: str, nbytes: int, *, epoch: Optional[Any] = None,
+                     recheck=None) -> Dict[str, Any]:
+        """WAKE-FLOOR-1024 review MUSS-2: book ``nbytes`` of ``tag`` as
+        claimed-not-mapped WITHOUT touching the counter balance -- for a
+        resume the card funds on its own while a co-located sleeper's leg of
+        THIS epoch is open (nothing published yet). Writes only into a counter
+        of this epoch (``booked`` False otherwise: no counter, no peer, nothing
+        to protect). ``recheck`` as in :meth:`claim`: re-graded under the lock,
+        ``recheck_refused`` when the card no longer holds it."""
+        want = max(0, int(nbytes))
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            if not state or epoch is None or str(state.get("epoch")) != str(epoch) or want == 0:
+                return {"booked": False, "recheck_refused": False, "recheck_free_bytes": None}
+            rc_free = None
+            if recheck is not None:
+                _rd, _fl = recheck
+                rc_free = self._free_now(_rd)
+                _bnl = max(0, int(state.get("staged_bytes", 0) or 0)
+                           - int(state.get("live_bytes", 0) or 0))
+                if rc_free is not None and rc_free - max(0, int(_fl or 0)) - _bnl < want:
+                    return {"booked": False, "recheck_refused": True,
+                            "recheck_free_bytes": rc_free}
+            pend = dict(state.get("pending_claims") or {})
+            pend[str(tag)] = int(pend.get(str(tag), 0) or 0) + want
+            state["pending_claims"] = pend
+            self._store(handle, state)
+            return {"booked": True, "recheck_refused": False, "recheck_free_bytes": rc_free}
 
     def claim_landed(self, tag: str, *, epoch: Optional[Any] = None) -> int:
         """W's resume of ``tag`` returned: its claimed bytes are MAPPED now and
@@ -1537,7 +1601,28 @@ class VramCredit:
             # short sends the tag into the loop, whose gate re-reads free
             # against the balance the peer cannot exceed.
             spent = self.claim(tag, need, epoch=epoch, require_full=True)
-            if int(spent["claimed_bytes"]) >= need or int(spent["credit_bytes"]) == 0:
+            _bp_refused = False
+            if int(spent["claimed_bytes"]) < need and int(spent["credit_bytes"]) == 0:
+                # WAKE-FLOOR-1024 review MUSS-2: "no peer counter licenses them
+                # away" is only true when there IS no counter of this flip. An
+                # OPEN leg with nothing published yet is a live sleeper whose
+                # overdraw staging grades the same free bytes -- book the tag as
+                # pending (re-graded under the lock); a single-group boot has no
+                # counter of this epoch and still writes nothing.
+                _bp = self.book_pending(tag, need, epoch=epoch,
+                                        recheck=(free_reader, floor) if free_reader else None)
+                if _bp.get("recheck_refused"):
+                    _bp_refused = True
+                    logger.info(
+                        "PDFLIP-CREDIT-RECHECK tag=%s path=early-open-leg overdraw REFUSED "
+                        "under the counter lock: free=%s MiB (was %d outside it) floor=%d "
+                        "MiB need=%d MiB -- the co-located peer staged between the reading "
+                        "and the booking; not resuming on its bytes (WAKE-FLOOR-1024)",
+                        tag, "n/a" if _bp.get("recheck_free_bytes") is None
+                        else int(_bp["recheck_free_bytes"]) // MIB,
+                        int(free_bytes_now) // MIB, floor // MIB, need // MIB)
+            if not _bp_refused and (
+                    int(spent["claimed_bytes"]) >= need or int(spent["credit_bytes"]) == 0):
                 return {
                     "waited_s": 0.0,
                     "free_bytes": int(free_bytes_now),
@@ -1577,8 +1662,8 @@ class VramCredit:
                 if spent.get("recheck_refused"):
                     _rc_early = spent
                     logger.info(
-                        "PDFLIP-CREDIT-RECHECK tag=%s overdraw REFUSED under the counter "
-                        "lock: free=%s MiB (was %d outside it) floor=%d MiB need=%d MiB -- "
+                        "PDFLIP-CREDIT-RECHECK tag=%s path=early overdraw REFUSED under the "
+                        "counter lock: free=%s MiB (was %d outside it) floor=%d MiB need=%d MiB -- "
                         "the co-located peer staged between the reading and the claim; "
                         "waiting instead of spending its bytes (WAKE-FLOOR-1024)",
                         tag, "n/a" if spent.get("recheck_free_bytes") is None
@@ -1646,6 +1731,7 @@ class VramCredit:
         # stuck lane stays full; the lockstep drains.
         _stuck_since = None
         _stuck_persist_s = _w108_persist_s()
+        _recheck_logged = False   # WAKE-FLOOR-1024 review MUSS-1
 
         # weg2xsn258: the allocatable poll's own clock, started at the first
         # short reading and cleared by the first reading that covers `need`.
@@ -1878,6 +1964,19 @@ class VramCredit:
                     _spent_loop = self.claim(tag, need, epoch=epoch, overdraw=True,
                                              recheck=(free_reader, floor))
                     if _spent_loop.get("recheck_refused"):
+                        # review MUSS-1: the metal case ran HERE -- name it, once per tag
+                        if not _recheck_logged:
+                            _recheck_logged = True
+                            logger.info(
+                                "PDFLIP-CREDIT-RECHECK tag=%s path=loop overdraw REFUSED "
+                                "under the counter lock: free=%s MiB (was %d outside it) "
+                                "floor=%d MiB need=%d MiB %.1f s into the wait -- the "
+                                "co-located peer staged between the reading and the claim; "
+                                "waiting instead of spending its bytes (WAKE-FLOOR-1024)",
+                                tag, "n/a" if _spent_loop.get("recheck_free_bytes") is None
+                                else int(_spent_loop["recheck_free_bytes"]) // MIB,
+                                _free_loop // MIB, floor // MIB, need // MIB,
+                                time.perf_counter() - t0)
                         _spent_loop = None   # the peer staged meanwhile: keep waiting
                 if _spent_loop is not None:
                     spent = _spent_loop
