@@ -22,6 +22,18 @@ WHAT MUST HOLD.
 (6) Gap 2: an unprotected backed leaf gets the K15 save before its demotion (outcome does not change the demotion).
 (7) The interior branch (#1481 gap): a BACKED END anchor without a copy is held in pass 1, tombstoned in pass 2.
 (8) Switch off / dual layout / Form A worker: the old path.
+
+REVIEW 24.10. (review-endanchor-guard-1024.md, JA MIT AUFLAGEN) -- red on 2fb3bbd61b, green after:
+MUSS-1 (SOLL R11) on a pure TP group sharing the mamba slot the hold reads the turn-end REGISTRY (filed at the turn-end
+       events on every rank, never from a claim result), the AGREED mark (reduced values of the PARK-REARM pass) and
+       the device residency -- never ``_s108_anchor_deferred`` (each rank's own free-claim on the shared arena; metal:
+       18 of 307 turn ends rank-uneven) nor the rank-local copy state. Two ranks uneven at the deferral decide the same
+       hold; in-test code mutants ("read the rank-local deferral again", "read the rank-local copy state") part them.
+       The re-arm candidates come from the registry only, as their own class AFTER the park END anchors (SOLL-3).
+MUSS-2 the guard's K15 saves have their own timed, counted line (``END-ANCHOR-GUARD SAVE``) apart from #1465.
+SOLL-1 unprotected leaves keep the old demotion (no save); SOLL-2 a node is held once per pass; SOLL-4 the real hybrid
+       tree pays the whole evictable request with held anchors (KV peel and mamba slots); SOLL-5 age bound
+       (PROTECT_NEWEST = REARM_SCAN); SOLL-6 the pass sets keep the nodes, an id() given back never matches.
 """
 
 from __future__ import annotations
@@ -59,6 +71,8 @@ def _env(monkeypatch):
         EAG = None
     if EAG is not None:
         monkeypatch.setattr(EAG, "_N", {k: 0 for k in EAG._N})   # fresh line samplers per test
+        if hasattr(EAG, "_SAVE"):
+            monkeypatch.setattr(EAG, "_SAVE", {k: [0, 0, 0.0, 0.0] for k in EAG._SAVE})
     yield
 
 
@@ -324,11 +338,12 @@ def test_mamba_slot_eviction_is_paid_from_a_held_leaf_when_it_must():
 # ---------------------------------------------------------------------------------------------------- (4) danger (b)
 def test_shared_slot_tp_group_holds_without_a_rank_local_claim(monkeypatch):
     """R11: on a pure TP group sharing the mamba blob slot a claim landing on some ranks only would decide the hold per
-    rank -- no K15 claim in pass 1; the hold reads replicas only (the mark, the copy state)."""
+    rank -- no K15 claim in pass 1; the hold reads the structural turn-end registry (MUSS-1)."""
     from flliper.srt.pdflip import end_anchor_guard as EAG
 
     monkeypatch.setattr(EAG, "_role", lambda: None)
     t, nodes = _metal(tp=3, save_ok=True)
+    EAG.register_turn_end(t, [nodes["P"], nodes["X"]])
     _peel(t, 5000)
     assert "X" not in t.saves, "a rank-local claim decided the hold on a shared-slot TP group"
     assert t.lost == [] and t.demoted == ["Y"]
@@ -432,27 +447,29 @@ def test_a_held_node_claims_nothing_on_the_shared_slot_group(monkeypatch):
 
     monkeypatch.setattr(EAG, "_role", lambda: None)
     t, nodes = _metal(tp=3)
+    EAG.register_turn_end(t, [nodes["P"], nodes["X"]])
     _peel(t, 5000)
     assert "X" not in t.saves and t.backups == []
+    assert t.demoted == ["Y"], "held through the registry"
 
 
 # ---------------------------------------------------------------------------------------------------- (6) gap 2
-def test_unprotected_leaf_gets_the_k15_save_before_its_demotion():
-    """A backed leaf whose anchor has no copy and that is no turn-end anchor: the K15 save runs before the demotion
-    (it was never asked on this branch); a refused save does not stop the demotion."""
+def test_unprotected_leaf_keeps_the_old_demotion_without_a_save():
+    """SOLL-1 (Ruecknahme): a backed leaf whose anchor has no copy and that is no turn-end anchor is demoted as before
+    #231 -- no synchronous K15 save in the scheduler thread (the 27 metal cases were all turn-end anchors)."""
     t, root = _fake_tree()
     z = _Node("Z", root, 3000, prio=1.0)
     t.evictable_device_leaves = {z}
     _peel(t, 2000)
-    assert t.saves == ["Z"] and t.demoted == ["Z"]
+    assert t.saves == [] and t.demoted == ["Z"]
 
 
-def test_unprotected_leaf_saved_keeps_its_copy():
+def test_unprotected_leaf_is_not_saved_even_when_a_save_would_succeed():
     t, root = _fake_tree(save_ok=True)
     z = _Node("Z", root, 3000, prio=1.0)
     t.evictable_device_leaves = {z}
     _peel(t, 2000)
-    assert t.saves == ["Z"] and t.demoted == ["Z"] and t.lost == []
+    assert t.saves == [] and t.demoted == ["Z"] and t.lost == ["Z"], "the pre-#231 demotion, unchanged"
 
 
 def test_secured_anchor_is_neither_saved_nor_held():
@@ -540,3 +557,513 @@ def test_probe_names_the_reason_through_the_two_pass_frames():
                          "drive_eviction", "evict", "alloc_token_slots"]) == ("alloc", "alloc_token_slots")
     assert MEP.classify(["_cascade_evict", "_tombstone_interior", "_drive_eviction_pass", "drive_eviction", "evict",
                          "_alloc_mamba_slot"]) == ("alloc", "_alloc_mamba_slot")
+
+
+# ==================================================================================================== review 24.10.
+# ---------------------------------------------------------------------------------------------------- MUSS-1 (R11)
+def _eag():
+    from flliper.srt.pdflip import end_anchor_guard as EAG
+
+    return EAG
+
+
+def _eag_mutant(monkeypatch, old, new):
+    """The guard module with ``old`` replaced by ``new`` in its SOURCE, executed as a separate module and wired in where
+    the callers look it up (a code mutant)."""
+    import sys
+
+    import flliper.srt.pdflip as pkg
+    from flliper.srt.mem_cache import unified_radix_cache as U
+
+    EAG = _eag()
+    src = open(EAG.__file__, encoding="utf-8").read()
+    assert src.count(old) == 1, old
+    mod = types.ModuleType(EAG.__name__)
+    mod.__file__ = EAG.__file__
+    exec(compile(src.replace(old, new), EAG.__file__, "exec"), mod.__dict__)
+    monkeypatch.setattr(pkg, "end_anchor_guard", mod)
+    monkeypatch.setitem(sys.modules, EAG.__name__, mod)
+    monkeypatch.setattr(U, "_end_anchor_guard", mod)
+    monkeypatch.setattr(mod, "_role", lambda: None)
+    return mod
+
+
+def _local_copy(t, x, how):
+    """Rank B's own free-claim on the shared arena succeeded (the W65 asymmetry): its anchor copy is in flight /
+    acked / marked secured -- rank-local state the other rank does not have."""
+    if how == "in_flight":
+        t._pdflip_direct_mamba_rows = {x.id: object()}
+    elif how == "acked":
+        x.component_data[M].host_value = object()
+    else:
+        x.pdflip_anchor_secured = True
+
+
+def _two_ranks(how, register=True, end_mark=True):
+    """Two replicas of the 22-194 tree on a 2-rank shared-slot D group. Rank A: the turn end's free-claim was refused
+    (anchor deferred BY NAME, no copy). Rank B: its claim got the slot (``how``). Both filed the turn end in the
+    structural registry when ``register``."""
+    EAG = _eag()
+    out = []
+    for r in (0, 1):
+        t, nodes = _metal(tp=2, deferred=(r == 0), end_mark=end_mark)
+        if register:
+            EAG.register_end(t, nodes["X"])
+        if r == 1:
+            _local_copy(t, nodes["X"], how)
+        out.append((t, nodes))
+    return out
+
+
+def _residency(t, nodes):
+    return {k: n.component_data[M].value is not None for k, n in sorted(nodes.items())}
+
+
+@pytest.mark.parametrize("how", ["in_flight", "acked", "secured_mark"])
+def test_r11_two_ranks_uneven_at_the_deferral_decide_the_same_hold(monkeypatch, how):
+    """MUSS-1, SOLL R11 (metal: boot ..._93eae72472_1024_012625, anchor_deferred TP0=605 TP1=607 from n=290 on). Red on
+    2fb3bbd61b: rank A (deferred, no copy) held X, rank B (its claim landed) demoted it -- the trees' device residency
+    parted (K21: "a rank-local skip on TP0 alone parted the trees"). Green: both hold, both pay from Y."""
+    EAG = _eag()
+    monkeypatch.setattr(EAG, "_role", lambda: None)
+    (ta, na), (tb, nb) = _two_ranks(how)
+    _peel(ta, 5000)
+    _peel(tb, 5000)
+    assert ta.demoted == tb.demoted, f"ranks parted: A demoted {ta.demoted}, B demoted {tb.demoted}"
+    assert _residency(ta, na) == _residency(tb, nb)
+    assert ta.demoted == ["Y"] and ta.saves == [] and tb.saves == []
+
+
+def test_r11_a_rank_local_deferral_alone_never_holds_on_the_shared_slot(monkeypatch):
+    """No turn-end registry entry, only rank A's deferral by name: red on 2fb3bbd61b (A held X from its own
+    ``_s108_anchor_deferred``, B demoted it); green: neither holds -- the same old demotion on both."""
+    EAG = _eag()
+    monkeypatch.setattr(EAG, "_role", lambda: None)
+    (ta, na), (tb, nb) = _two_ranks("in_flight", register=False, end_mark=False)
+    _peel(ta, 5000)
+    _peel(tb, 5000)
+    assert ta.demoted == tb.demoted == ["X"], (ta.demoted, tb.demoted)
+
+
+def _interior_ranks(how):
+    """The interior branch on two shared-slot ranks: END anchor X (registered on both), another state Z pays."""
+    from flliper.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
+
+    EAG = _eag()
+    res = []
+    for r in (0, 1):
+        x, z = _inode("X", end=True), _inode("Z")
+        evicted, order = [], [x, z]
+        lru = types.SimpleNamespace(
+            get_lru_no_lock=lambda o=order: o[0] if o else None,
+            get_prev_no_lock=lambda n, o=order: o[o.index(n) + 1] if o.index(n) + 1 < len(o) else None,
+            in_list=lambda n, o=order: n is not None and n in o)
+
+        def tomb(n, comp, target=None, tracker=None, ev=evicted, o=order):
+            ev.append(n.id)
+            o.remove(n)
+            tracker[M] += 1
+
+        cache = types.SimpleNamespace(
+            lru_lists={M: lru}, evictable_device_leaves=[], tree_components=(F, M), tp_world_size=2,
+            root_node=None, _evict_component_and_detach_lru=tomb, _cascade_evict=lambda n, comp, tracker: None,
+            _s108_anchor_deferred=({"X": x} if r == 0 else {}))
+        EAG.register_end(cache, x)
+        if r == 1:
+            if how == "acked":
+                x.component_data[M].host_value = object()
+            else:
+                cache._pdflip_direct_mamba_rows = {"X": object()}
+        comp = types.SimpleNamespace(cache=cache, component_type=M)
+        MambaComponent.drive_eviction(comp, types.SimpleNamespace(mamba_num=1), {M: 0})
+        res.append(evicted)
+    return res
+
+
+@pytest.mark.parametrize("how", ["in_flight", "acked"])
+def test_r11_interior_branch_holds_alike_on_both_ranks(monkeypatch, how):
+    """Red on 2fb3bbd61b: rank B (local copy) tombstoned the registered END anchor, rank A held it."""
+    monkeypatch.setattr(_eag(), "_role", lambda: None)
+    a, b = _interior_ranks(how)
+    assert a == b == ["Z"], (a, b)
+
+
+def test_r11_mutant_reading_the_rank_local_deferral_parts_the_ranks(monkeypatch):
+    """MUTANT (MUSS-1): the shared-slot branch of ``protected`` reads ``_s108_anchor_deferred`` again -- the same two
+    ranks part (A holds X, B demotes it). Proves the R11 test above load-bearing."""
+    _eag_mutant(monkeypatch, "        return None   # R11 shared slot", "        pass   # R11 shared slot")
+    (ta, _), (tb, _) = _two_ranks("in_flight", register=False, end_mark=False)
+    _peel(ta, 5000)
+    _peel(tb, 5000)
+    assert ta.demoted != tb.demoted, "the mutant did not part the ranks -- the R11 test is not load-bearing"
+
+
+def test_r11_mutant_reading_the_rank_local_copy_state_parts_the_ranks(monkeypatch):
+    """MUTANT (MUSS-1): the shared-slot hold also asks the rank's own copy state (``unsecured``) -- B demotes X."""
+    _eag_mutant(monkeypatch,
+                "        if _hold(tree, node, kind):\n            return True\n    if kind is not None and unsecured",
+                "        if unsecured(tree, node, cd) and _hold(tree, node, kind):\n            return True\n"
+                "    if kind is not None and unsecured")
+    (ta, _), (tb, _) = _two_ranks("in_flight")
+    _peel(ta, 5000)
+    _peel(tb, 5000)
+    assert ta.demoted != tb.demoted, "the mutant did not part the ranks -- the R11 test is not load-bearing"
+
+
+def test_r11_agreed_mark_lifts_the_hold_on_every_rank_alike(monkeypatch):
+    """'Secured' only as the PARK-REARM pass's reduced result: the mark on both ranks -> both demote X (the copy
+    exists on every rank); before the mark both hold, whatever their local copy state."""
+    EAG = _eag()
+    monkeypatch.setattr(EAG, "_role", lambda: None)
+    (ta, na), (tb, nb) = _two_ranks("acked")
+    for t, nodes in ((ta, na), (tb, nb)):
+        EAG.mark_agreed(t, nodes["X"])
+    _peel(ta, 5000)
+    _peel(tb, 5000)
+    assert ta.demoted == tb.demoted and ta.demoted[0] == "X"
+
+
+def test_turn_end_registry_files_the_deepest_device_anchor_of_the_chain():
+    EAG = _eag()
+    t, nodes = _metal(deferred=False)
+    nodes["X"].component_data[M].value = None          # the END node without a device state: the parent is filed
+    assert EAG.register_turn_end(t, [nodes["P"], nodes["X"]]) is nodes["P"]
+    nodes["X"].component_data[M].value = object()
+    assert EAG.register_turn_end(t, [nodes["P"], nodes["X"]]) is nodes["X"]
+    assert EAG.protected(t, nodes["X"]) == "turn_end"
+    assert nodes["X"] in EAG.rearm_candidates(t) and nodes["P"] in EAG.rearm_candidates(t)
+
+
+def test_turn_end_registration_is_wired_before_the_claims():
+    """The S108 turn end files the chain's END node BEFORE ``_s108_turn_end_active`` (before any claim answers on this
+    rank); the deferral by name only stamps its generation."""
+    import inspect
+
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    src = inspect.getsource(UnifiedRadixCache._s108_turn_end_l2)
+    i = src.index("_end_anchor_guard.register_turn_end(self, chain)")
+    assert i < src.index("self._s108_turn_end_active = True")
+    assert "_end_anchor_guard.note_s108_deferred(self, node)" in inspect.getsource(UnifiedRadixCache)
+
+
+# ---------------------------------------------------------------------------------------------------- re-arm (R11 + SOLL-3)
+class _MarkOps:
+    """Fake re-arm adapter with the guard's two mark hooks (records what it was told)."""
+
+    def __init__(self, needs, boom=False):
+        self.n = needs
+        self.boom = boom
+        self.secured, self.unneeded = [], []
+
+    def busy(self):
+        return False
+
+    def needing(self):
+        if self.boom:
+            raise RuntimeError("rank-local defect")
+        return {k: k for k in self.n}
+
+    def locate(self, k):
+        return k
+
+    def state(self, node):
+        return (1 if node in self.n else 0, 0, 0, 0)
+
+    def victims(self, node=None):
+        return {}
+
+    def release(self, v):
+        return 1
+
+    def issue(self, node):
+        return True
+
+    def agreed_secured(self, node):
+        self.secured.append(node)
+
+    def agreed_unneeded(self, union):
+        self.unneeded.append(sorted(union))
+        return 0
+
+
+def test_rearm_marks_secured_only_on_reduced_outcomes():
+    """ISSUED / done marks the target on EVERY rank (reduced values); the complete gather tells every rank which
+    registry keys no rank needs."""
+    R = _rearm_world()
+    from flliper.srt.pdflip import park_anchor_rearm as par
+
+    ops = {0: _MarkOps([5]), 1: _MarkOps([]), 2: _MarkOps([5, 7])}
+    res, g = R._run_ranks(3, lambda r, gm: par.run_pass(ops[r], gm, r, 3))
+    assert all(o.secured == [5, 7] for o in ops.values()), {r: o.secured for r, o in ops.items()}
+    assert all(o.unneeded == [[5, 7]] for o in ops.values())
+
+
+@pytest.mark.parametrize("why", ["more_than_k", "raised"])
+def test_rearm_incomplete_gather_marks_nothing_as_unneeded(why):
+    """A rank whose needing list does not fit its gather segment (or raised) makes the union incomplete -- no rank may
+    read "not in the union" as "nobody needs it" (fail closed, the same on every rank)."""
+    R = _rearm_world()
+    from flliper.srt.pdflip import park_anchor_rearm as par
+
+    big = list(range(100, 100 + par.K_PER_RANK + 1))
+    ops = {0: _MarkOps([5]), 1: _MarkOps(big if why == "more_than_k" else [], boom=(why == "raised")),
+           2: _MarkOps([])}
+    res, g = R._run_ranks(3, lambda r, gm: par.run_pass(ops[r], gm, r, 3))
+    assert all(o.unneeded == [] for o in ops.values())
+
+
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
+def test_rearm_issued_turn_end_is_agreed_secured_on_every_rank(tmp_path, monkeypatch):
+    """The real pass over ONE shared arena: rank 0 already holds END's copy (its own claim landed), ranks 1/2 do not.
+    The pass issues (rank 0 the holder) and marks END secured on EVERY rank -> the guard lifts the hold everywhere.
+    A registered node whose copy every rank holds (A) is marked off the complete gather."""
+    R = _rearm_world()
+    from flliper.srt.mem_cache import form_a_host_shadow as _r12
+    from flliper.srt.mem_cache import l3_secured as _l3s
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    import torch
+
+    EAG = _eag()
+    monkeypatch.setattr(_r12, "role", lambda: None)
+    monkeypatch.setenv("FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT", "0")
+    monkeypatch.delenv("FLLIPER_PDFLIP_PARK_ANCHOR_REARM", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP", raising=False)
+    monkeypatch.setattr(UnifiedRadixCache, "_spill_tp_skip_n", 0, raising=False)
+    monkeypatch.setattr(R._Ops, "raise_issue_left", {}, raising=False)
+    monkeypatch.setattr(_l3s, "secured", lambda arena, slots, backend=None, evicting_ok=False:
+                        __import__("numpy").ones(len(list(slots)), dtype=bool))
+    W = R._World(tmp_path, 6, off=2)
+    for r, rk in enumerate(W.ranks):
+        a, end = W.nodes["A"][r], W.nodes["END"][r]
+        a.component_data[M].host_value = torch.zeros(1, dtype=torch.int64)   # A: every rank holds the copy
+        EAG.register_end(rk.cache, a)
+        EAG.register_end(rk.cache, end)
+        assert EAG.protected(rk.cache, end) == "turn_end"
+    W.node(0, "END").component_data[M].host_value = torch.zeros(1, dtype=torch.int64)   # rank 0's own claim landed
+    res, err = W.run_pass()
+    R._ok(res, err, issued=1, split=0)
+    assert [EAG.protected(rk.cache, W.node(r, "END")) for r, rk in enumerate(W.ranks)] == [None, None, None]
+    assert [EAG.protected(rk.cache, W.node(r, "A")) for r, rk in enumerate(W.ranks)] == [None, None, None]
+
+
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
+def test_rearm_park_end_goes_before_turn_end_candidates(tmp_path, monkeypatch):
+    """SOLL-3: nine turn-end anchors DEEPER than the park END fill the 8-key window under "class 0, deeper first";
+    red on 2fb3bbd61b (the park END never entered the window, not issued). Green: the park END comes first."""
+    R = _rearm_world()
+    from flliper.srt.mem_cache import form_a_host_shadow as _r12
+    from flliper.srt.mem_cache import l3_secured as _l3s
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    EAG = _eag()
+    monkeypatch.setattr(_r12, "role", lambda: None)
+    monkeypatch.setenv("FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT", "0")
+    monkeypatch.delenv("FLLIPER_PDFLIP_PARK_ANCHOR_REARM", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP", raising=False)
+    monkeypatch.setattr(UnifiedRadixCache, "_spill_tp_skip_n", 0, raising=False)
+    monkeypatch.setattr(R._Ops, "raise_issue_left", {}, raising=False)
+    monkeypatch.setattr(_l3s, "secured", lambda arena, slots, backend=None, evicting_ok=False:
+                        __import__("numpy").ones(len(list(slots)), dtype=bool))
+    tes = [f"T{i}" for i in range(9)]
+    W = R._World(tmp_path, 2 + 12, off=2, chain=("END",) + tuple(tes))
+    for r, rk in enumerate(W.ranks):
+        end = W.nodes["END"][r]
+        end.pdflip_park_end = True
+        rk.cache._pdflip_park_end_nodes = [end]
+        for h in tes:
+            EAG.register_end(rk.cache, W.nodes[h][r])
+    res, err = W.run_pass()
+    assert err == {}, err
+    assert W.anchor_on("END") == [True, True, True], "the park END lost the window to turn-end candidates"
+
+
+# ---------------------------------------------------------------------------------------------------- MUSS-2
+def test_save_instrument_times_and_counts_each_occasion(caplog):
+    """MUSS-2: the guard's K15 save prints its own line (ms, occasion, site) and counts per occasion -- apart from
+    #1465 WRITE-BACK DRAIN; the pass's save sum rides the HELD line."""
+    EAG = _eag()
+    t, nodes = _metal()
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        _peel(t, 5000)
+    saves = _msgs(caplog, "END-ANCHOR-GUARD SAVE ")
+    assert len(saves) == 1 and "why=pass1" in saves[0] and "site=leaf" in saves[0] and "ok=0" in saves[0], saves
+    assert " ms=" in saves[0] and "ms_sum=" in saves[0] and "ms_max=" in saves[0]
+    c = EAG.counters()
+    assert c["save_pass1_n"] == 1 and c["save_pass1_ok"] == 0 and c["save_pass2_n"] == 0
+    assert c["save_pass1_ms_sum"] >= 0.0
+    held = _msgs(caplog, "HELD")
+    assert held and "save_n=1" in held[0] and "save_ms_sum=" in held[0], held
+
+
+def test_save_instrument_names_the_no_pass_and_pass2_occasions():
+    """Outside a guarded pass the save counts as ``no_pass``; a pass-1 hold right after the write-back branch's own
+    refused backup (``just_tried``: no save) gets its save in pass 2 (``pass2``); one claim per node and pass."""
+    EAG = _eag()
+    t, nodes = _metal()
+    assert EAG.before_demote(t, nodes["X"]) is False
+    c = EAG.counters()
+    assert c["save_no_pass_n"] == 1 and c["save_pass1_n"] == 0, c
+    t, nodes = _metal(rest=0)
+    x = nodes["X"]
+    x.backuped = False
+    x.component_data[F].host_value = None
+    _peel(t, 5000)
+    c = EAG.counters()
+    assert c["save_pass2_n"] == 1 and t.demoted == ["X"], (c, t.demoted)
+
+
+# ---------------------------------------------------------------------------------------------------- SOLL-2
+def test_a_node_is_held_once_per_pass_across_the_walks_restart_round(monkeypatch):
+    """SOLL-2: the mamba walk restarts at the LRU end after progress and meets the held leaf again -- red on 2fb3bbd61b
+    (held twice: it counted twice against MAX_HELD and inflated the HELD line)."""
+    from flliper.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
+
+    EAG = _eag()
+    t, root = _fake_tree()
+    x = _Node("X", root, 3000, prio=1.0)
+    y1 = _Node("Y1", root, 1000, mamba_host=True, prio=2.0)
+    y2 = _Node("Y2", root, 1000, mamba_host=True, prio=3.0)
+    t._s108_anchor_deferred[x.id] = x
+    t.evictable_device_leaves = {x, y1, y2}
+    order = [x, y1, y2]
+
+    def in_list(n):
+        return n is not None and n in order and n.component_data[M].value is not None
+
+    t.lru_lists = {M: types.SimpleNamespace(
+        get_lru_no_lock=lambda: next((n for n in order if in_list(n)), None),
+        get_prev_no_lock=lambda n: next((m for m in order[order.index(n) + 1:] if in_list(m)), None),
+        in_list=in_list)}
+
+    def evict_to_host(n, tracker, _orig=t._evict_to_host):
+        _orig(n, tracker)
+        tracker[M] += 1
+
+    t._evict_to_host = evict_to_host
+    seen = []
+    monkeypatch.setattr(EAG, "note_pass", lambda tree, held, *a, **k: seen.append(list(held)))
+    comp = types.SimpleNamespace(cache=t, component_type=M)
+    MambaComponent.drive_eviction(comp, types.SimpleNamespace(mamba_num=3), {F: 0, M: 0})
+    assert seen and [n.id for n in seen[0]] == ["X"], [[n.id for n in s] for s in seen]
+    assert t.demoted == ["Y1", "Y2", "X"]
+
+
+# ---------------------------------------------------------------------------------------------------- SOLL-5
+def test_age_bound_protects_only_the_newest_registry_generations():
+    """SOLL-5: a turn-end anchor older than PROTECT_NEWEST registry generations (the window the re-arm pass can still
+    secure) no longer protects -- red on 2fb3bbd61b (the registry protected nothing, the deferral set forever)."""
+    EAG = _eag()
+    t, nodes = _metal(deferred=False)
+    EAG.register_turn_end(t, [nodes["X"]])
+    _peel(t, 5000)
+    assert t.demoted == ["Y"], "fresh: held"
+    t2, n2 = _metal(deferred=False)
+    EAG.register_turn_end(t2, [n2["X"]])
+    for i in range(EAG.PROTECT_NEWEST):
+        EAG.register_end(t2, types.SimpleNamespace(id=f"later{i}"))
+    assert EAG.registry_age(t2, n2["X"]) == EAG.PROTECT_NEWEST
+    assert EAG.protected(t2, n2["X"]) is None and n2["X"] not in EAG.rearm_candidates(t2)
+    _peel(t2, 5000)
+    assert t2.demoted[0] == "X", "stale: the old demotion"
+
+
+def test_age_bound_covers_the_s108_deferral_off_the_shared_slot():
+    EAG = _eag()
+    t, nodes = _metal()                                   # deferred by name, one rank
+    EAG.note_s108_deferred(t, nodes["X"])
+    assert EAG.protected(t, nodes["X"]) == "s108"
+    for i in range(EAG.PROTECT_NEWEST):
+        EAG.register_end(t, types.SimpleNamespace(id=f"later{i}"))
+    assert EAG.protected(t, nodes["X"]) is None
+
+
+# ---------------------------------------------------------------------------------------------------- SOLL-6
+def test_pass_sets_keep_the_node_an_id_given_back_never_matches():
+    """SOLL-6: a node deleted mid-pass gives its id() back; a new node with that id is NOT 'already tried' / 'held'.
+    Simulated: the pass set maps the new node's id to another (dead) node -- red on 2fb3bbd61b (id sets)."""
+    EAG = _eag()
+    t, nodes = _metal()
+    old, new = nodes["Y"], nodes["X"]
+    setattr(t, EAG.TRIED_ATTR, {id(new): old})
+    setattr(t, EAG.PASS2_ATTR, {id(new): old})
+    assert not EAG.already_tried(t, new) and not EAG.in_pass2(t, new)
+    setattr(t, EAG.TRIED_ATTR, {id(new): new})
+    assert EAG.already_tried(t, new)
+
+
+# ---------------------------------------------------------------------------------------------------- SOLL-4 real tree
+def _real_tree():
+    from array import array
+
+    import torch
+
+    from flliper.srt.mem_cache.base_prefix_cache import InsertParams
+    from flliper.srt.mem_cache.radix_cache import RadixKey
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    b = os.path.join(here, "..", "mem_cache", "_hybrid_tree_builder.py")
+    if not os.path.exists(b):
+        b = os.path.join(here, "test_pdflip_d_seat_compact_0930.py")
+    spec = importlib.util.spec_from_file_location("_t_build_eag1024", b)
+    T = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(T)
+    cache, pool, kalloc = T._build()
+    leaves = []
+    for start in (1000, 3000, 5000):
+        before = {id(n) for n in cache._collect_all_nodes()}
+        slot = pool.mamba_allocator.alloc(1)
+        toks = list(range(start, start + 64))
+        cache.insert(InsertParams(key=RadixKey(array("q", toks)), value=kalloc.alloc(64),
+                                  mamba_value=slot.reshape(1)))
+        node = next(n for n in cache._collect_all_nodes() if id(n) not in before and n is not cache.root_node)
+        node.component_data[F].host_value = torch.arange(64, dtype=torch.int64)   # KV backed (KV-only: no mamba copy)
+        cache._update_evictable_leaf_sets(node)
+        leaves.append(node)
+    return cache, pool, kalloc, leaves
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_real_tree_pays_the_whole_evictable_request_with_held_anchors(monkeypatch, caplog, tp):
+    """SOLL-4 (danger d): the real hybrid UnifiedRadixCache, two of three backed leaves are registered turn-end anchors
+    without a mamba copy; the request is the whole evictable KV -- evict() delivers all of it (no extend OOM), the
+    held anchors go in pass 2, named."""
+    from flliper.srt.mem_cache import form_a_host_shadow as _r12
+    from flliper.srt.mem_cache.base_prefix_cache import EvictParams
+
+    EAG = _eag()
+    monkeypatch.setattr(_r12, "role", lambda: None)
+    monkeypatch.setattr(EAG, "_role", lambda: None)
+    cache, pool, kalloc, leaves = _real_tree()
+    cache.tp_world_size = tp
+    for n in leaves[:2]:
+        EAG.register_turn_end(cache, [n])
+    free0 = kalloc.available_size()
+    total = sum(len(n.key) for n in leaves)
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        res = cache.evict(EvictParams(num_tokens=total, mamba_num=0))
+    assert res.num_tokens_evicted >= total, res
+    assert kalloc.available_size() == free0 + total
+    assert all(n.component_data[F].value is None for n in leaves)
+    assert len(_msgs(caplog, "DEMOTE-AFTER")) == 2, caplog.messages
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_real_tree_serves_the_mamba_slots_with_held_anchors(monkeypatch, tp):
+    """SOLL-4: ``alloc_req_slots`` with mamba_available short -> evict(mamba_num=all states): every slot comes back and
+    the allocation is served, the held turn-end leaves included (pass 2)."""
+    from flliper.srt.mem_cache import form_a_host_shadow as _r12
+    from flliper.srt.mem_cache.base_prefix_cache import EvictParams
+
+    EAG = _eag()
+    monkeypatch.setattr(_r12, "role", lambda: None)
+    monkeypatch.setattr(EAG, "_role", lambda: None)
+    cache, pool, kalloc, leaves = _real_tree()
+    cache.tp_world_size = tp
+    for n in leaves[:2]:
+        EAG.register_turn_end(cache, [n])
+    m0 = pool.mamba_allocator.available_size()
+    res = cache.evict(EvictParams(num_tokens=0, mamba_num=3))
+    assert res.mamba_num_evicted == 3, res
+    assert pool.mamba_allocator.available_size() == m0 + 3
+    assert pool.mamba_allocator.alloc(3) is not None
