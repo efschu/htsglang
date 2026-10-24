@@ -495,3 +495,154 @@ def test_q_a_displaced_decode_gives_its_reserve_back_in_the_age_plan():
     basis["reserve_by_rid"] = {}
     st.get("age_plan", {}).clear()
     assert Front._arrival_seat_age_verdict(f, "head", now - 30.0, True, 31000, basis=basis) is None
+
+
+# ======================================================================== review 1024 (A1, S1-S5)
+def test_a1_age_plan_grant_charges_its_own_need_not_an_older_candidates():
+    """Review A1: in the AGE PLAN path ``_asr_older_blocked`` runs the KV test for an OLDER P candidate (another need)
+    between this waiter's KV test and its grant; the grant must charge THIS waiter's need for the burst debit --
+    a smaller foreign need would let the next grant overbook the same reading (class B back)."""
+
+    async def body():
+        kv = {"available": 200000, "evictable": 0, "decode_clip": 4096, "running_rids": [], "displaceable_rids": []}
+        f = _front({"kv": kv})
+        st = f._asr_st()
+        now = time.time()
+        st["waiters"]["older"] = now - 50.0
+        st["waiters"]["me"] = now - 10.0
+
+        async def _older_blocked(rid, t_mine, free):
+            await Front._arrival_seat_kv(f, 1000, 64000, "older-p", 0)     # an older candidate's test: need 5096
+            return True
+
+        f._asr_older_blocked = _older_blocked
+        got = await Front._arrival_seat_wait_age(f, "me", 30000, 64000, 0, now - 10.0, True, 0, f.d_bs)
+        assert got is True
+        assert st["kv_priced"]["me"][0] == 30000 + 4096, st["kv_priced"]["me"]
+
+    asyncio.run(body())
+
+
+def test_a1b_the_d_line_charges_the_need_of_its_own_probe():
+    async def body():
+        kv = {"available": 200000, "evictable": 0, "decode_clip": 4096, "running_rids": ["run"],
+              "displaceable_rids": ["run"]}
+        f = _front({"kv": kv})
+        await _seat(f, "run", 10000)
+        fut = asyncio.get_running_loop().create_future()
+        head = F.Pending("hd", "/generate", {"max_tokens": 64000}, "x", time.time(), fut,
+                         est_prompt=58911, est_uncached=415, leg1_prompt_tokens=58911, d_eligible=True)
+        f._ready_for_d.append(head)
+        await Front._arrival_seat_kv(f, 7, 64000, "someone-else", 0)          # a foreign test before
+        assert await Front._d_line_kv_holds(f, head) is False
+        assert f._asr_st()["kv_priced"]["hd"][0] == 58911 + 4096
+
+    asyncio.run(body())
+
+
+def test_s1_cap_waiver_the_front_admits_what_ds_cap_blind_gate_admits():
+    """Review S1: with an engaged residency cap D's gate admits up to rem_total + gap when the IMMEDIATE demand (born =
+    price - decode) fits rem_total (``_cap_lifetime_waiver``)."""
+    rd = {"available": 50000, "evictable": 0, "lifetime_budget": 49999, "cap_blind_gap": 8000,
+          "decode_reserve": 0, "ledger_outstanding": 0}
+    assert asr.kv_fits(52000, rd, decode=4096)[0] is True          # born 47904 <= 49999, 52000 <= 49999 + 8000
+    assert asr.kv_fits(52000, rd, decode=1000)[0] is False         # born 51000 > 49999
+    assert asr.kv_fits(60000, rd, decode=12000)[0] is False        # beyond the gap
+    assert asr.kv_fits(52000, dict(rd, cap_blind_gap=0), decode=4096)[0] is False
+
+
+def test_s1b_the_reading_publishes_the_cap_blind_gap():
+    from flliper.srt.mem_cache import common as cm
+
+    tree = _Tree(0)
+    setattr(tree, cm.CAP_GAP_ATTR, 8000)
+    assert dlr.lifetime_reading(_sched(1000, tree))["cap_blind_gap"] == 8000
+
+
+def test_s2_ladder_room_carries_the_dcp_deficit():
+    rd = {"available": 10000, "evictable": 0, "ladder_ceiling": 524288, "ladder_used": 77000,
+          "lifetime_budget": 9000, "decode_reserve": 2000, "ledger_outstanding": 500, "dcp_deficit": 3000}
+    assert asr.kv_free(rd) == 524288 - 77000 - 2000 - 500 - 3000 - 1
+
+
+def test_s3_unread_hold_is_named_and_ends_without_a_live_d_seat(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+
+    async def body():
+        f = _front({"kv": None})
+        st = f._asr_st()
+        st["waiters"]["w"] = time.time() - 100.0
+        st.setdefault("wait_named", {})["w"] = "kv"
+        fits, why, _ = await Front._arrival_seat_kv(f, 50000, 64000, "w", 0)
+        assert fits is True, "no live D seat: no finish can free a row -- never held (as the D line)"
+        await _seat(f, "run", 1000)
+        fits, why, _ = await Front._arrival_seat_kv(f, 50000, 64000, "w", 0)
+        assert fits is False
+        assert "ARRIVAL-SEAT-KV-UNREAD-HELD rid=w" in caplog.text
+
+    asyncio.run(body())
+
+
+class _HT(MagicMock):
+    """A hybrid-SSM tree double the deliverable lookup (``type(tree).deliverable_evictable_size``) can read."""
+
+    def deliverable_evictable_size(self):
+        return 3000
+
+
+def _pool(kind, avail, evict):
+    from flliper.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator, SWATokenToKVPoolAllocator
+
+    tc = _HT() if kind == "hybrid_ssm" else MagicMock()
+    tc.supports_mamba.return_value = kind == "hybrid_ssm"
+    for n in ("evictable_size", "full_evictable_size", "swa_evictable_size"):
+        getattr(tc, n).return_value = evict
+    tc.disable = False
+    tc.uniform_avail_floor = None
+    spec = {"swa": SWATokenToKVPoolAllocator, "all_swa": PureSWATokenToKVPoolAllocator}.get(kind)
+    alloc = MagicMock(spec=spec) if spec else MagicMock()
+    for n in ("available_size", "full_available_size", "swa_available_size"):
+        getattr(alloc, n).return_value = avail
+    return tc, alloc
+
+
+@pytest.mark.parametrize("kind", ["plain", "hybrid_ssm", "swa", "all_swa"])
+def test_s4_published_budget_equals_rem_total_tokens_for_every_pool_kind(kind):
+    from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    tc, alloc = _pool(kind, 150000, 7000)
+    running = [_req("r1", 98000, out=10), _req("r2", 30000, out=4000, max_new=6000)]
+    rb = MagicMock()
+    rb.reqs = running
+    led = _Ledger({"ch": 1234})
+    adder = sp.PrefillAdder(page_size=1, tree_cache=tc, token_to_kv_pool_allocator=alloc, running_batch=rb,
+                            new_token_ratio=0.4321, rem_input_tokens=10**9, rem_chunk_tokens=None,
+                            num_mixed_decode_tokens=2, priority_scheduling_preemption_threshold=0,
+                            commitment_ledger=led)
+    s = _sched(0, None, running, ratio=0.4321, mixed=True, ledger=led)
+    s.token_to_kv_pool_allocator, s.tree_cache = alloc, tc
+    rd = dlr.lifetime_reading(s)
+    assert rd["lifetime_budget"] == int(math.ceil(adder.rem_total_tokens)) - 1
+    if kind == "hybrid_ssm":
+        assert rd["deliverable_evictable"] == 3000
+
+
+def test_s4b_rem_total_tokens_calls_the_shared_functions():
+    import inspect
+
+    src = inspect.getsource(sp.PrefillAdder.rem_total_tokens.fget)
+    assert "lifetime_available_and_evictable(" in src and "lifetime_budget(" in src
+
+
+def test_s5_form_a_host_publishes_its_own_ratio(monkeypatch):
+    running = [_req("r1", 50000)]
+    s = _sched(100000, _Tree(0), running, ratio=0.10, group=0.30)
+    s._form_a_is_host = lambda: True
+    monkeypatch.setattr(dlr, "_form_a_token_cut", lambda: False)
+    rd = dlr.lifetime_reading(s)
+    assert rd["decode_reserve_scope"] == "host" and rd["decode_reserve"] == int(math.ceil(CLIP * 0.10))
+    monkeypatch.setattr(dlr, "_form_a_token_cut", lambda: True)   # under the token cut every rank's gate counts
+    assert dlr.lifetime_reading(s)["decode_reserve_scope"] == "group"

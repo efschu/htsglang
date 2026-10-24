@@ -343,6 +343,46 @@ def test_2_1_a_rank_without_a_reading_still_enters_the_min_exactly_once(monkeypa
     assert any("UNREAD" in m for m in _lines(caplog, dpr.RESUME_HELD_MARK))
 
 
+class _RaisingLedger:
+    def outstanding_tokens(self):
+        raise RuntimeError("ledger gone")
+
+
+def test_2_1b_a_rank_whose_budget_terms_raise_still_enters_the_min_exactly_once(monkeypatch):
+    """KVOFFSET-1024 review A2 (S75 2.1 for the lifetime reading): the resume reading now reads more terms than the pool
+    (dcp deficit, ledger, decode reserve). A rank that raises on ANY of them sends the sentinel into the one MIN --
+    never leaves before the collective (a peer alone in the gloo MIN hangs: W17)."""
+    monkeypatch.delenv(dpr.RESUME_FIT_EVICTABLE_ENV, raising=False)
+
+    def _boom():
+        raise RuntimeError("deficit gone")
+
+    bad_req = types.SimpleNamespace(rid="bad", output_ids=None, finished=lambda: False,
+                                    sampling_params=types.SimpleNamespace(max_new_tokens=100))
+    entered, sent = {}, {}
+
+    def make(i):
+        def gm(vals):
+            entered[i] = entered.get(i, 0) + 1
+            sent[i] = list(vals)
+            return [0, 0]
+        return gm
+
+    kinds = {
+        0: dict(uniform_budget_deficit=_boom),
+        1: dict(chunked_commitment_ledger=_RaisingLedger()),
+        2: dict(running_batch=types.SimpleNamespace(reqs=[bad_req])),
+    }
+    results = []
+    for i, extra in kinds.items():
+        s = types.SimpleNamespace(token_to_kv_pool_allocator=_Alloc(FREE), tree_cache=_Tree(EVICT),
+                                  uniform_min_avail=lambda: FREE, _pdflip_group_min_ints=make(i), **extra)
+        results.append(dpr._resume_fit_reading(s, getattr(s, "running_batch", None))())
+    assert entered == {0: 1, 1: 1, 2: 1}, "every rank enters the group MIN exactly once"
+    assert all(v[1] == 0 for v in sent.values()), "a rank whose terms raise sends the sentinel (ok=0)"
+    assert results == [None, None, None]
+
+
 def _p_then_d(rid, delivered):
     assert ho.write(rid, list(range(6400)), _keys(100), writer="P")    # P prefilled, record read at admission
     r = _req(rid, 7000, delivered)
