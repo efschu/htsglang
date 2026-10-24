@@ -55,8 +55,9 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           # VOTE-LINE-SINGLE (24.10.): the measured non-row part per rank (env, read once), and whether
           # this rank's line is the single line (near-OOM + that part) -- set with "line"
           "vote_fixed": _UNSET, "single": False,
-          # TRIM-LAW (#201): the static threshold was checked against this rank's own line (once per process)
-          "law_lifted": False}
+          # TRIM-LAW (#201): the static threshold was checked against this rank's own line; "law_line" is the line
+          # of the last check (re-checked when the line rises live, VOTE-FIXED-LIVE)
+          "law_lifted": False, "law_line": None}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -112,6 +113,7 @@ def reset_for_tests() -> None:
     _CACHE["vote_fixed"] = _UNSET
     _CACHE["single"] = False
     _CACHE["law_lifted"] = False
+    _CACHE["law_line"] = None
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -329,7 +331,14 @@ def _read_corridor_line() -> "tuple[float, str]":
 
         law = int(corridor_law_mib())
         return float(law), f"stated-law:{law}"
-    except Exception:  # noqa: BLE001 -- no reader at all: the HALT line
+    except Exception as exc:  # noqa: BLE001 -- no reader at all: the HALT line
+        # review R5 (#201): the everyday gap of SOLL 1 -- the line is "read" but silently the halt line, so the
+        # TRIM-LAW-LIFT-UNCHECKED warning never fires. Named here (once per process: the line is read once); the
+        # behaviour is unchanged (the halt line is still the line).
+        logger.warning(f"{LINE_FALLBACK_MARKER} line_mib={float(CHUNKING_FLOOR_MIB):.0f} source=halt-line: neither the "
+                       f"card's derived corridor floor nor the stated law could be read ({type(exc).__name__}: {exc}) "
+                       f"-- this rank's line is the halt line, the TRIM-LAW lift prices the threshold on it "
+                       f"(unchanged behaviour, named)")
         return float(CHUNKING_FLOOR_MIB), "halt-line"
 
 
@@ -740,6 +749,11 @@ def flip_trim_thresholds(rates_text: str, configured: int, page_size: int, line_
 LAW_LIFT_MARKER = "TRIM-LAW-LIFT"
 #: review SOLL 1: the lift check could not run (the line was unreadable) -- WARNING, so metal sees the gap
 LAW_LIFT_UNCHECKED_MARKER = "TRIM-LAW-LIFT-UNCHECKED"
+#: review R4 (#201): the live re-lift (the line rose after the first check, VOTE-FIXED-LIVE) and its no-op twin
+LAW_RELIFT_MARKER = "TRIM-LAW-RELIFT"
+LAW_RELIFT_HOLDS_MARKER = "TRIM-LAW-RELIFT-HOLDS"
+#: review R5 (#201): the line reader fell back to the halt line without a word (named now, behaviour unchanged)
+LINE_FALLBACK_MARKER = "TRIM-LAW-LINE-FALLBACK"
 
 
 def law_bound_threshold(rank: int, start_rate: float, configured: int, page_size: int) -> Optional[float]:
@@ -752,24 +766,46 @@ def law_bound_threshold(rank: int, start_rate: float, configured: int, page_size
 
 
 def lift_threshold_to_law(rank: int, start_rate: float, configured: int, page_size: int) -> Optional[float]:
-    """Once per process: raise this rank's entry of the parsed static threshold to :func:`law_bound_threshold` when
-    it is under it, log the lift; returns the threshold in force for the rank afterwards (``None`` = no static
-    threshold). Never raises (an unreadable line lifts nothing)."""
-    if _CACHE["law_lifted"]:
-        return threshold_for(int(rank), thresholds())
+    """Raise this rank's entry of the parsed static threshold to :func:`law_bound_threshold` when it is under it, log
+    the lift; returns the threshold in force for the rank afterwards (``None`` = no static threshold). Never raises
+    (an unreadable line lifts nothing).
+
+    Checked at the first vote, and AGAIN whenever the rank's line is higher than at the last check (review R4, formal
+    OOM direction of VOTE-FIXED-LIVE: the line is ``400 + fixed_effective`` and the fixed part rises live, so the
+    once-per-process check priced a line the card no longer keeps): same rule, raise only -- never lowered, no
+    collective, rank-local memory care (R11 untouched). Named ``TRIM-LAW-RELIFT`` (lifted) / ``TRIM-LAW-RELIFT-HOLDS``
+    (the threshold already covers the higher line); the unchanged line costs one cached read per vote."""
+    first = not _CACHE["law_lifted"]
     _CACHE["law_lifted"] = True
     vals = thresholds()
     thr = threshold_for(int(rank), vals)
     if thr is None or thr <= 0:
         return thr
     try:
-        need = law_bound_threshold(int(rank), start_rate, configured, page_size)
+        line_now = float(corridor_line_mib(int(rank)))
     except Exception as exc:  # noqa: BLE001 -- no line, no lift (the launcher's value stands)
-        # review SOLL 1: WARNING, named -- metal check "TRIM-LAW-LIFT soll 0" must also see a check that never ran
+        if first:
+            # review SOLL 1: WARNING, named -- metal check "TRIM-LAW-LIFT soll 0" must also see a check that never ran
+            logger.warning(f"{LAW_LIFT_UNCHECKED_MARKER} rank={int(rank)} threshold={thr:.0f} stays: this card's line "
+                           f"is unreadable ({type(exc).__name__}: {exc}) -- no lift, the launcher's value stands "
+                           f"unchecked")
+        return thr
+    last = _CACHE["law_line"]
+    if not first and last is not None and line_now <= float(last):
+        return thr  # the line did not rise since the last check: the check stands
+    _CACHE["law_line"] = line_now
+    relift = last is not None  # a later check of a line that rose (review R4)
+    try:
+        need = law_bound_threshold(int(rank), start_rate, configured, page_size)
+    except Exception as exc:  # noqa: BLE001 -- no bound, no lift (the launcher's value stands)
         logger.warning(f"{LAW_LIFT_UNCHECKED_MARKER} rank={int(rank)} threshold={thr:.0f} stays: this card's line is "
                        f"unreadable ({type(exc).__name__}: {exc}) -- no lift, the launcher's value stands unchecked")
         return thr
     if need is None or thr >= need:
+        if relift:
+            logger.info(f"{LAW_RELIFT_HOLDS_MARKER} rank={int(rank)} threshold={thr:.0f} holds: the line rose "
+                        f"{float(last):.0f} -> {line_now:.0f} live and the threshold still covers line + floor chunk "
+                        f"({'-' if need is None else f'{need:.0f}'})")
         return thr
     new = list(vals or [])
     if len(new) == 1:
@@ -779,11 +815,13 @@ def lift_threshold_to_law(rank: int, start_rate: float, configured: int, page_si
     else:
         return thr
     _CACHE["thresholds"] = new
-    logger.info(f"{LAW_LIFT_MARKER} rank={int(rank)} threshold={thr:.0f} -> {need:.0f} (= ceil(line "
-                f"{corridor_line_mib(int(rank)):.0f} + floor chunk {floor_rows(configured, page_size)} x rate "
-                f"{float(start_rate):.4f}); the launcher priced a line under this card's own -- under it the vote "
-                f"could not fund the floor chunk above the card's law with the cache untrimmed; never lowered, no "
-                f"reserve")
+    logger.info(f"{LAW_RELIFT_MARKER if relift else LAW_LIFT_MARKER} rank={int(rank)} threshold={thr:.0f} -> "
+                f"{need:.0f} (= ceil(line {line_now:.0f} + floor chunk {floor_rows(configured, page_size)} x rate "
+                f"{float(start_rate):.4f})"
+                + (f"; the line rose {float(last):.0f} -> {line_now:.0f} live (VOTE-FIXED-LIVE) after the last check"
+                   if relift else "; the launcher priced a line under this card's own")
+                + "; under it the vote could not fund the floor chunk above the card's law with the cache untrimmed; "
+                  "raise only, never lowered, no reserve)")
     return float(need)
 
 

@@ -479,6 +479,18 @@ def admit_trim_bound(values: Sequence[float]) -> List[Tuple[float, bool]]:
     return out
 
 
+#: review R1 (#201): a hand value in ``--env-d`` under the basis is named, not overruled
+ADMIT_TRIM_HAND_MARKER = "HANDWERT-UNTER-BASIS"
+
+
+def admit_trim_hand_under_basis(values: Sequence[float]) -> List[Tuple[int, float]]:
+    """Review R1: ``(rank, value)`` for every rank of a USER-given threshold list whose value is armed (``> 0``) and
+    under :data:`ADMIT_TRIM_BASIS`. The value stays in force (a hand value is the user's regime, not overruled); the
+    caller names it. Pure."""
+    basis = float(ADMIT_TRIM_BASIS[1])
+    return [(r, float(v)) for r, v in enumerate(values) if 0 < float(v) < basis]
+
+
 @dataclass(frozen=True)
 class ExtendPass:
     """One width vote paired with the chunk it funded (one D rank).

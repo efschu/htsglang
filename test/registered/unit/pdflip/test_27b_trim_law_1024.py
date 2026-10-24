@@ -345,6 +345,117 @@ class RankLift(CustomTestCase):
         self.assertEqual(ET.thresholds(), [0.0, 0.0])
 
 
+class LiveReLift(CustomTestCase):
+    """Nachzug R4 (VOTE-FIXED-LIVE, formal OOM direction): the line is ``400 + fixed_effective`` and the fixed part
+    rises live, the lift used to be checked once per process. The rank re-checks when its line is higher than at the
+    last check: raise only, named."""
+
+    def _vote(self, box, free, releasable, trim="1104,1104"):
+        cuda = _Cuda(free, releasable)
+        env = {RATE_ENV: f"{RATE},{RATE}", "FLLIPER_PDFLIP_EXTEND_CAP_FLOOR": "1", TRIM_ENV: trim}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(ET, "corridor_line_mib", lambda rank=None: float(box[0])):
+            os.environ.pop("FLLIPER_PDFLIP_TORCH_CACHE_CAP", None)
+            vote = ET.width_vote(cuda, 1, 4096, 1, True)
+        return vote, cuda
+
+    def test_line_rises_live_threshold_follows(self):
+        """Line 700 (threshold 1104 covers 780), then the fixed part rises: line 1100 -> 1180 > 1104. At 1150 MiB
+        driver free with 300 MiB returnable cache the re-lifted threshold trims; the once-checked 1104 would not."""
+        box = [700.0]
+        self._vote(box, 2000, 0)
+        self.assertEqual(ET.threshold_for(1, ET.thresholds()), 1104.0)
+        box[0] = 1100.0
+        with self.assertLogs(ET.logger, level="INFO") as cm:
+            vote, cuda = self._vote(box, 1150, 300)
+        self.assertEqual(ET.threshold_for(1, ET.thresholds()), 1180.0)
+        self.assertEqual(cuda.emptied, 1)
+        relift = [m for m in cm.output if ET.LAW_RELIFT_MARKER + " " in m]
+        self.assertEqual(len(relift), 1, cm.output)
+        self.assertIn("rank=1 threshold=1104 -> 1180", relift[0])
+        self.assertIn("700 -> 1100", relift[0])
+
+    def test_unchanged_line_is_not_rechecked(self):
+        box = [1300.0]
+        with mock.patch.object(ET, "law_bound_threshold", wraps=ET.law_bound_threshold) as lb:
+            self._vote(box, 1200, 300)
+            self._vote(box, 1200, 300)
+            self._vote(box, 1200, 300)
+        self.assertEqual(lb.call_count, 1)
+        self.assertEqual(ET.thresholds(), [1104.0, 1380.0])
+
+    def test_lower_line_never_lowers_the_threshold(self):
+        box = [1300.0]
+        self._vote(box, 2000, 0)
+        self.assertEqual(ET.threshold_for(1, ET.thresholds()), 1380.0)
+        box[0] = 900.0
+        self._vote(box, 2000, 0)
+        self.assertEqual(ET.threshold_for(1, ET.thresholds()), 1380.0)
+
+    def test_rise_under_a_covering_threshold_holds_named(self):
+        box = [700.0]
+        self._vote(box, 2000, 0)
+        box[0] = 800.0  # need 880 < 1104
+        with self.assertLogs(ET.logger, level="INFO") as cm:
+            self._vote(box, 2000, 0)
+        self.assertTrue(any(ET.LAW_RELIFT_HOLDS_MARKER in m and "700 -> 800" in m for m in cm.output), cm.output)
+        self.assertEqual(ET.threshold_for(1, ET.thresholds()), 1104.0)
+
+    def test_no_static_threshold_no_relift(self):
+        """Nothing armed where nothing was: a rank without an env threshold (or ``0``) never lifts on a rising line."""
+        box = [700.0]
+        for trim in ("0,0",):
+            ET.reset_for_tests()
+            self._vote(box, 2000, 0, trim=trim)
+            box[0] = 1500.0
+            self._vote(box, 2000, 0, trim=trim)
+            self.assertEqual(ET.thresholds(), [0.0, 0.0])
+            box[0] = 700.0
+
+
+class LineFallbackNamed(CustomTestCase):
+    """Nachzug R5: the everyday gap of SOLL 1 -- ``corridor_line_mib`` silently falls back to the halt line (300), so
+    the lift's unreadable-line warning never fires. The fallback is named; the behaviour is unchanged."""
+
+    def test_halt_line_fallback_is_a_named_warning_and_still_the_line(self):
+        def boom(*a, **k):
+            raise RuntimeError("no corridor reader")
+
+        with mock.patch.object(CG, "corridor_floor_for_current_device", boom), \
+                mock.patch.object(CG, "corridor_law_mib", boom), \
+                self.assertLogs(ET.logger, level="WARNING") as cm:
+            mib, src = ET._read_corridor_line()
+        self.assertEqual((mib, src), (300.0, "halt-line"))
+        self.assertTrue(any(ET.LINE_FALLBACK_MARKER in m and "source=halt-line" in m and "RuntimeError" in m
+                            for m in cm.output), cm.output)
+
+    def test_behaviour_unchanged_line_300_and_no_lift(self):
+        def boom(*a, **k):
+            raise RuntimeError("no corridor reader")
+
+        cuda = _Cuda(2000, 0)
+        env = {RATE_ENV: f"{RATE},{RATE}", "FLLIPER_PDFLIP_EXTEND_CAP_FLOOR": "1", TRIM_ENV: "1104,1104"}
+        with mock.patch.object(CG, "corridor_floor_for_current_device", boom), \
+                mock.patch.object(CG, "corridor_law_mib", boom), \
+                mock.patch.dict(os.environ, env, clear=False), \
+                self.assertLogs(ET.logger, level="INFO") as cm:
+            os.environ.pop("FLLIPER_PDFLIP_TORCH_CACHE_CAP", None)
+            os.environ.pop(FIXED_ENV, None)
+            ET.width_vote(cuda, 1, 4096, 1, True)
+        self.assertEqual(ET.corridor_line_mib(1), 300.0)
+        self.assertEqual(len([m for m in cm.output if ET.LINE_FALLBACK_MARKER in m]), 1, cm.output)
+        self.assertFalse(any(ET.LAW_LIFT_UNCHECKED_MARKER in m for m in cm.output), cm.output)  # the gap, named
+        self.assertEqual(ET.thresholds(), [1104.0, 1104.0])
+
+    def test_a_readable_line_is_not_named(self):
+        with mock.patch.object(CG, "corridor_floor_for_current_device",
+                               lambda: CG.CorridorFloor(card_uuid="x", group="D", transient_mib=701, reserve_mib=0,
+                                                        source="MEASURED-D", provenance="p")):
+            with self.assertNoLogs(ET.logger, level="WARNING"):
+                mib, src = ET._read_corridor_line()
+        self.assertEqual(src, "MEASURED-D:701")
+
+
 # --------------------------------------------------------------------------
 # Review MUSS 1 (ADMIT-BASIS): the same parsed threshold list is the admission trim's (extend_trim.before_admission,
 # #217 ADMIT-TRIM: ``maybe_trim(cuda, rank, threshold_for(rank, thresholds()))``), and the admission records were
@@ -440,6 +551,46 @@ class AdmitBasis(CustomTestCase):
             now = L._d_extend_flip_trim_env(ns, lines.append, "D", f"{RATE},{RATE}", cards)
         self.assertEqual(now, "1104,1104")
         self.assertFalse(any("ADMIT-BASIS" in x for x in lines), lines)
+
+    def test_hand_value_under_the_basis_is_named_and_stays(self):
+        """Nachzug R1: the INT8 hand value 1200,1100,800 stays byte for byte, but rank 1 (1100) and rank 2 (800) are
+        under the basis 1104 -- named per rank (HANDWERT-UNTER-BASIS), none for rank 0 (1200)."""
+        from flliper.srt.pdflip import launcher as L
+
+        ns, cards, lines = _ns(env_d=f"{TRIM_ENV}=1200,1100,800"), _cards(), []
+        path = _store(self.tmp, [c.uuid for c in cards])
+        with mock.patch.object(L.corridor_budget, "floors_for_cards", _floors((767, 701, 700), "MEASURED-D", path)):
+            now = L._d_extend_flip_trim_env(ns, lines.append, "D", RATES3, cards)
+        self.assertEqual(now, "1200,1100,800")
+        warn = [x for x in lines if "HANDWERT-UNTER-BASIS" in x]
+        self.assertEqual(len(warn), 2, lines)
+        self.assertIn("TRIM-LAW HANDWERT-UNTER-BASIS rank=1 value=1100 basis=1104", warn[0])
+        self.assertIn("TRIM-LAW HANDWERT-UNTER-BASIS rank=2 value=800 basis=1104", warn[1])
+        self.assertTrue(all("unveraendert" in x for x in warn), warn)
+
+    def test_hand_value_over_the_basis_or_never_trims_is_not_named(self):
+        """A hand value >= 1104 or 0 (never trims) is not under the basis; a computed value never warns."""
+        from flliper.srt.pdflip import launcher as L
+
+        for env_d in (f"{TRIM_ENV}=1200,1104", f"{TRIM_ENV}=0,1300", ""):
+            ns, lines = _ns(env_d=env_d), []
+            cards = _int4ar_cards()
+            path = _store(self.tmp, [c.uuid for c in cards], tp=2)
+            with mock.patch.object(L.corridor_budget, "floors_for_cards", _floors((700, 700), "MEASURED-D", path)):
+                L._d_extend_flip_trim_env(ns, lines.append, "D", f"{RATE},{RATE}", cards)
+            self.assertFalse(any("HANDWERT-UNTER-BASIS" in x for x in lines), (env_d, lines))
+
+    def test_scalar_hand_value_under_the_basis_names_every_rank(self):
+        ns, now, lines = self._int4ar_measured(env_d=f"{TRIM_ENV}=1000")
+        self.assertEqual(now, "1000")
+        warn = [x for x in lines if "HANDWERT-UNTER-BASIS" in x]
+        self.assertEqual(len(warn), 2, lines)
+        self.assertIn("rank=0 value=1000", warn[0])
+        self.assertIn("rank=1 value=1000", warn[1])
+
+    def test_hand_under_basis_helper(self):
+        self.assertEqual(BR.admit_trim_hand_under_basis([1200.0, 1100.0, 800.0, 0.0, 1104.0]),
+                         [(1, 1100.0), (2, 800.0)])
 
     def test_review_example_at_the_real_admission_trim(self):
         """The same example through #217's ``extend_trim.before_admission`` (the pass's vote did not trim): it reads

@@ -20665,6 +20665,21 @@ def _d_extend_flip_trim_env(ns, log, label: str, rtext: str,
         f"{' (aus --env-d gesetzt, unveraendert; berechnet ' + value + ')' if _given else ''} (je Rang ceil(Linie der "
         f"eigenen Karte + Bodenchunk {_rows} x Rate); darunter gibt D vor dem Extend die ganz freien Cache-Segmente an "
         f"den Treiber zurueck, damit die Breitenabstimmung den echten Kartenstand liest) [{TRIM_LAW_MARKER} {_per}]")
+    if _given:
+        # review R1 (#201): a hand value under the basis stays in force (the user's regime, not overruled) but is
+        # named: the admission records were measured at the basis, so an untrimmed pass can enter the admission under
+        # 400 + A_peak on that rank
+        try:
+            _hv = [float(x) for x in _now.split(",") if x.strip()]
+            _hv = (_hv * n) if len(_hv) == 1 else _hv
+            for _r, _v in _budget_rest.admit_trim_hand_under_basis(_hv):
+                log(f"{D_RANK_SOLVE_MARKER} {label} WARNUNG {TRIM_LAW_MARKER} {_budget_rest.ADMIT_TRIM_HAND_MARKER} "
+                    f"rank={_r} value={_v:.0f} basis={_basis_mib}: der Handwert aus --env-d {EXTEND_TRIM_ENV} liegt "
+                    f"unter der Basis, unter der die Admissions-Records gemessen sind (Schwelle >= 400 + A_peak 522 = "
+                    f"922) -- bleibt unveraendert wirksam (Nutzer-Handwert, nicht ueberstimmt); eine ADMIT-NEED-Form "
+                    f"(int4ar/duo) laeuft damit ausserhalb ihres gemessenen Regimes")
+        except ValueError:
+            pass  # an unreadable hand value is the rank's own parse_thresholds warning (trim off), not ours
     return _now
 
 
