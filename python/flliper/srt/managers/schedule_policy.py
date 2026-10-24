@@ -1412,26 +1412,39 @@ def mamba_slot_full_token_cost(allocator) -> int:
     return 0
 
 
-def lifetime_available_and_evictable(allocator, tree_cache) -> Tuple[int, int]:
-    """``(available, evictable)`` exactly as ``rem_total_tokens`` reads them, per pool kind (all-SWA, hybrid SWA,
-    hybrid SSM with the peel's DELIVERABLE evictable -- not the reported count --, plain)."""
-    if isinstance(allocator, PureSWATokenToKVPoolAllocator):
-        return int(allocator.swa_available_size()), int(tree_cache.swa_evictable_size())
-    if isinstance(allocator, (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator)):
-        return int(allocator.full_available_size()), int(tree_cache.full_evictable_size())
-    _sm = getattr(tree_cache, "supports_mamba", None)
-    if callable(_sm) and _sm():
-        return int(allocator.available_size()), int(
-            deliverable_evictable_cap_aware_or(tree_cache, tree_cache.full_evictable_size))
-    return int(allocator.available_size()), int(tree_cache.evictable_size())
+def lifetime_available_and_evictable(allocator, tree_cache, is_all_swa: Optional[bool] = None,
+                                     is_hybrid_swa: Optional[bool] = None,
+                                     is_hybrid_ssm: Optional[bool] = None):
+    """``(available, evictable)`` as the lifetime gate reads them, per pool kind (all-SWA, hybrid SWA, hybrid SSM with
+    the peel's DELIVERABLE evictable -- not the reported count --, plain). ``PrefillAdder.rem_total_tokens`` /
+    ``cur_rem_tokens`` call this with their own flags (review S4: one formula, not a copy); None derives each flag as
+    ``PrefillAdder.__init__`` does (the publisher, ``pdflip/d_lifetime_reading.py``)."""
+    if is_all_swa is None:
+        is_all_swa = isinstance(allocator, PureSWATokenToKVPoolAllocator)
+    if is_hybrid_swa is None:
+        is_hybrid_swa = isinstance(allocator, (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator))
+    if is_hybrid_ssm is None:
+        _sm = getattr(tree_cache, "supports_mamba", None)
+        is_hybrid_ssm = bool(callable(_sm) and _sm())
+    if is_all_swa:
+        return allocator.swa_available_size(), tree_cache.swa_evictable_size()
+    if is_hybrid_swa:
+        return allocator.full_available_size(), tree_cache.full_evictable_size()
+    if is_hybrid_ssm:
+        # ED (rc12o b1): the peel's deliverable count, not the reported one
+        # (mamba-locked nodes and their ancestors are counted but unpeelable).
+        return allocator.available_size(), deliverable_evictable_cap_aware_or(
+            tree_cache, tree_cache.full_evictable_size)
+    return allocator.available_size(), tree_cache.evictable_size()
 
 
 def lifetime_budget(available: int, evictable: int, offset: float, dcp_deficit: int = 0,
                     fundable_floor: Optional[int] = None, ledger_outstanding: int = 0) -> float:
-    """``rem_total_tokens`` from its terms: ``min(A + E - offset - dcp, floor - offset) - ledger``."""
-    local = int(available) + int(evictable) - offset - int(dcp_deficit or 0)
-    budget = local if fundable_floor is None else min(local, int(fundable_floor) - offset)
-    return budget - int(ledger_outstanding or 0)
+    """``rem_total_tokens`` from its terms: ``min(A + E - offset - dcp, floor - offset) - ledger`` (the adder applies
+    the ledger itself through ``effective_rem_total_tokens``; it passes 0 here)."""
+    local = available + evictable - offset - dcp_deficit
+    budget = local if fundable_floor is None else min(local, fundable_floor - offset)
+    return budget - ledger_outstanding if ledger_outstanding else budget
 
 
 class PrefillAdder:
@@ -1841,47 +1854,23 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_all_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
-            )
-        elif self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        elif self.is_hybrid_ssm_cache:
-            # ED (rc12o b1): the peel's deliverable count, not the reported one
-            # (mamba-locked nodes and their ancestors are counted but unpeelable).
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
+        # KVOFFSET-1024 review S4: the pool terms and the budget are the shared functions D publishes from
+        # (``lifetime_available_and_evictable`` / ``lifetime_budget``) -- one formula, called here, not a copy.
+        _avail, _evict = lifetime_available_and_evictable(
+            self.token_to_kv_pool_allocator, self.tree_cache,
+            self.is_all_swa, self.is_hybrid_swa, self.is_hybrid_ssm_cache)
         # dcp_avail_deficit (0 off the uneven-DCP kv-session-offload path) pins
         # the budget to the binding rank's available_size -> rank-uniform.
-        local_budget = (
-            available_and_evictable
-            - self.rem_total_token_offset
-            - self.dcp_avail_deficit
-        )
         # #681: cap by what the GROUP can fund. The floor is already the
         # group MIN (`uniform_avail_for_evict`), so `dcp_avail_deficit` -- the
         # other mechanism for pinning a local number to the binding rank -- is
-        # deliberately NOT subtracted a second time here. `rem_total_token_offset`
+        # deliberately NOT subtracted a second time there. `rem_total_token_offset`
         # IS, so the floor is spent down by this round's admissions exactly as
         # the local term is. None -> no reduce published -> untouched.
-        if self.fundable_extend_floor is None:
-            budget = local_budget
-        else:
-            budget = min(
-                local_budget, self.fundable_extend_floor - self.rem_total_token_offset
-            )
+        budget = lifetime_budget(
+            _avail, _evict, self.rem_total_token_offset, self.dcp_avail_deficit,
+            self.fundable_extend_floor, 0,
+        )
         # #701 defect (b): CROSS-PASS RESERVATION. PrefillAdder is rebuilt every
         # pass and reserves only remaining DECODE, so a resident chunked
         # request's remaining PREFILL is invisible here and later admissions
@@ -1932,28 +1921,11 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_all_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
-            )
-        elif self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        elif self.is_hybrid_ssm_cache:
-            # ED (rc12o b1): the peel's deliverable count, not the reported one
-            # (mamba-locked nodes and their ancestors are counted but unpeelable).
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
+        # KVOFFSET-1024 review S4: the same pool terms as rem_total_tokens (one formula)
+        _avail, _evict = lifetime_available_and_evictable(
+            self.token_to_kv_pool_allocator, self.tree_cache,
+            self.is_all_swa, self.is_hybrid_swa, self.is_hybrid_ssm_cache)
+        available_and_evictable = _avail + _evict
 
         # dcp_avail_deficit (0 off the uneven-DCP kv-session-offload path) pins
         # the budget to the binding rank's available_size -> rank-uniform.

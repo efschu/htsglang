@@ -273,7 +273,7 @@ def test_e_three_arrival_seat_grants_are_not_priced_against_one_reading_34_281_2
         fits, why, _ = await Front._arrival_seat_kv(f, 64119 - 17967, 64000, "pdflip-34-281", 0)
         assert fits is True
         f._asr_st()["granted"]["pdflip-34-281"] = time.time()
-        Front._asr_note_kv_priced(f, "pdflip-34-281")
+        Front._asr_note_kv_priced(f, "pdflip-34-281", Front._asr_kv_basis(f).get("need"))
         await _seat(f, "pdflip-34-281", 64119)                   # seated, D has not run it yet
         fits, why, _ = await Front._arrival_seat_kv(f, 104944, 64000, "pdflip-34-283", 0)
         assert fits is False, why                                 # 114674 - 50248 = 64426 < 109040
@@ -317,6 +317,7 @@ def test_h_an_absent_reading_does_not_release_a_waiter_that_waits_for_kv_32_276(
     async def body():
         box = {"kv": None}
         f = _front(box)
+        await _seat(f, "pdflip-30-269", 98000)                    # a decode runs on D: a finish can free its rows
         st = f._asr_st()
         st["waiters"]["pdflip-32-276"] = time.time() - 158.0
         st.setdefault("wait_named", {})["pdflip-32-276"] = "kv"
@@ -455,7 +456,7 @@ def test_o_a_seat_is_charged_the_need_its_verdict_priced_not_its_prompt():
         fits, why, _ = await Front._arrival_seat_kv(f, 64193, 64000, "kurz", 545)
         assert fits is True and "shared 63648" in why             # need 545 + 4096 = 4641
         f._asr_st()["granted"]["kurz"] = time.time()
-        Front._asr_note_kv_priced(f, "kurz")
+        Front._asr_note_kv_priced(f, "kurz", Front._asr_kv_basis(f).get("need"))
         await _seat(f, "kurz", 64193)
         fits, why, _ = await Front._arrival_seat_kv(f, 60000, 64000, "next", 0)
         assert "D-line debit 4641 of 1 seat(s)" in why and fits is True   # 70000 - 4641 >= 64096

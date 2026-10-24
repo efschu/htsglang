@@ -243,7 +243,10 @@ def lifetime_room(kv_reading: Optional[Mapping], ladder: Optional[Tuple[int, int
             return None
         room = int(lb)
         if ladder is not None:
-            terms = int(kv_reading.get("decode_reserve", 0) or 0) + int(kv_reading.get("ledger_outstanding", 0) or 0)
+            # review S2: the grown stage carries the same reserve, ledger and uneven-DCP deficit (the deficit pins TP0's
+            # number to the binding rank's); the ladder ceiling and its used tokens are group numbers already
+            terms = (int(kv_reading.get("decode_reserve", 0) or 0) + int(kv_reading.get("ledger_outstanding", 0) or 0)
+                     + int(kv_reading.get("dcp_deficit", 0) or 0))
             room = max(room, int(ladder[0]) - terms - 1)
         return room
     except (TypeError, ValueError, AttributeError):
@@ -251,15 +254,20 @@ def lifetime_room(kv_reading: Optional[Mapping], ladder: Optional[Tuple[int, int
 
 
 def _kv_room(kv_reading: Optional[Mapping]) -> Tuple[Optional[int], str]:
+    free, tail, _life = _kv_room_terms(kv_reading)
+    return free, tail
+
+
+def _kv_room_terms(kv_reading: Optional[Mapping]) -> Tuple[Optional[int], str, bool]:
     """``(free, tail)``: the ONE room :func:`kv_free` and :func:`kv_fits` test against -- the larger of D's stage
     reading and its ladder room, under D's backup wall never more than its payable room (S94), and never more than
     the largest price D's lifetime gate admits (KVOFFSET-1024, :func:`lifetime_room`). None without a reading."""
     if not kv_reading:
-        return None, ""
+        return None, "", False
     try:
         free = int(kv_reading.get("available", 0) or 0) + int(kv_reading.get("evictable", 0) or 0)
     except (TypeError, ValueError, AttributeError):
-        return None, ""
+        return None, "", False
     lad = ladder_free(kv_reading)
     tail = ""
     if lad is not None:
@@ -282,7 +290,8 @@ def _kv_room(kv_reading: Optional[Mapping]) -> Tuple[Optional[int], str]:
                  f"{kv_reading.get('decode_reserve', '-')}@{kv_reading.get('decode_reserve_scope', '-')} - ledger "
                  f"{kv_reading.get('ledger_outstanding', '-')}]")
         free = max(0, life)
-    return free, tail
+        return free, tail, True
+    return free, tail, False
 
 
 def kv_free(kv_reading: Optional[Mapping]) -> Optional[int]:
@@ -425,7 +434,7 @@ def ladder_free(kv_reading: Optional[Mapping]) -> Optional[Tuple[int, int, int]]
     return max(0, ceiling - used), ceiling, used
 
 
-def kv_fits(need: int, kv_reading: Optional[Mapping], debit: int = 0) -> Tuple[bool, str]:
+def kv_fits(need: int, kv_reading: Optional[Mapping], debit: int = 0, decode: int = 0) -> Tuple[bool, str]:
     """``(fits, why)`` against D's reading ``{"available", "evictable"}`` (TP0's
     ``/server_info`` ``pdflip_kv``) -- and, when D publishes its KV ladder, against
     the ladder's ceiling (:func:`ladder_free`): the larger of the two decides.
@@ -435,13 +444,22 @@ def kv_fits(need: int, kv_reading: Optional[Mapping], debit: int = 0) -> Tuple[b
     the front promised to requests D does not run yet in this reading (the burst debit) comes off it."""
     if not kv_reading:
         return True, "kv=unread"
-    free, tail = _kv_room(kv_reading)
+    free, tail, life_binds = _kv_room_terms(kv_reading)
     if free is None:
         return True, "kv=unreadable"
     if int(debit or 0) > 0:
         free = free - int(debit)    # the caller names the debit (front: ``D-line debit ...``)
     if int(need) <= free:
         return True, f"kv need={int(need)} free={free}{tail}"
+    try:
+        gap = int(kv_reading.get("cap_blind_gap", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        gap = 0
+    born = int(need) - max(0, int(decode or 0))
+    if life_binds and gap > 0 and born <= free and int(need) <= free + gap:
+        # review S1: D's cap waiver (``PrefillAdder._cap_lifetime_waiver``) -- with an engaged residency cap the gate
+        # admits up to its budget + the group's cap-blind gap when the IMMEDIATE demand (price - decode) fits
+        return True, f"kv need={int(need)} free={free}{tail} [D cap waiver: born {born} <= {free}, gap {gap}]"
     return False, f"kv need={int(need)} > free={free}{tail}"
 
 

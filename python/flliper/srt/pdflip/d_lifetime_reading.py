@@ -91,10 +91,35 @@ def _reserve_sum(reqs, ratio: float, mixed: int) -> float:
     return mixed + sum(_reserve_of(r, ratio) for r in reqs)
 
 
+def _form_a_token_cut() -> bool:
+    try:
+        from flliper.srt.rank_role import form_a_token_cut_active
+
+        return bool(form_a_token_cut_active())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _form_a_host(sched) -> bool:
+    """True on the Form A attention host (TP0, the publisher) whose gate verdict every rank adopts (H105)."""
+    fn = getattr(sched, "_form_a_is_host", None)
+    if not callable(fn):
+        return False
+    try:
+        return fn() is True
+    except Exception:  # noqa: BLE001 -- a split is the scheduler's own named stop, never this instrument's
+        return False
+
+
 def reserve_ratio(sched) -> Tuple[float, str]:
     """``(ratio, scope)``: the ratio the published reserve is priced with -- the group MAX of the last reduce, never
-    below this rank's current one; ``tp0`` when no reduce published a group value (kv-session-offload path)."""
+    below this rank's current one; ``tp0`` when no reduce published a group value (kv-session-offload path).
+    Review S5 (NF Form A, H105): the attention host's gate verdict is the group's -- the workers' ratios never decide --
+    so the host publishes ITS OWN ratio (``host``); under the token cut every rank's gate counts again (MIN gather):
+    the group MAX."""
     local = local_ratio(sched)
+    if _form_a_host(sched) and not _form_a_token_cut():
+        return local, "host"
     group = getattr(sched, "_kvoffset_group_ratio", None)
     if group is None:
         return local, "tp0"
@@ -115,7 +140,7 @@ def lifetime_reading(sched) -> Dict[str, Any]:
     """The fields above, from THIS scheduler (TP0 when served on ``/server_info``). Raises on a missing pool -- the
     caller (``get_internal_state``) catches, an instrument never breaks the info route."""
     from flliper.srt.managers import schedule_policy as _sp
-    from flliper.srt.mem_cache.common import published_fundable_floor
+    from flliper.srt.mem_cache.common import cap_blind_gap_published, published_fundable_floor
     from flliper.srt.pdflip.d_seat_vram import _unmerged_extend
 
     alloc = sched.token_to_kv_pool_allocator
@@ -163,6 +188,9 @@ def lifetime_reading(sched) -> Dict[str, Any]:
         "ledger_rids": [str(r) for r in ledger_rids][:64],
         "fundable_floor": None if floor is None else int(floor),
         "dcp_deficit": int(dcp),
+        # review S1: D's gate lifts the lifetime budget by this group gap for a request whose IMMEDIATE demand fits
+        # (``PrefillAdder._cap_lifetime_waiver``, an engaged residency cap); 0 without one
+        "cap_blind_gap": int(cap_blind_gap_published(tree)),
     }
 
 
@@ -171,32 +199,33 @@ def resume_budget(sched, running_reqs) -> Optional[int]:
     takes the group MIN): ``available + deliverable evictable - this rank's own offset - dcp deficit - ledger``,
     capped by the published floor -- the adder this pass will build, before any admission of the pass. Own ratio, not
     the group's: the MIN over the ranks' own budgets IS the group verdict the gate takes (every rank must admit).
-    None without a pool reading."""
-    from flliper.srt.managers import schedule_policy as _sp
-    from flliper.srt.mem_cache.common import published_fundable_floor
 
+    NEVER RAISES (review A2, S75 2.1 -- "every path enters the group MIN exactly once"): the caller sends the result
+    into a gloo MIN its peers enter too; a raise on ANY term (pool, dcp deficit, ledger, a request's reserve, the
+    floor) would leave this rank out of the collective and its peers hung (W17). Any failure is None -- the caller's
+    sentinel (ok=0), and the group refuses the early resume on every rank alike."""
     try:
+        from flliper.srt.managers import schedule_policy as _sp
+        from flliper.srt.mem_cache.common import published_fundable_floor
+
         alloc = sched.token_to_kv_pool_allocator
         tree = sched.tree_cache
         avail, evict = _sp.lifetime_available_and_evictable(alloc, tree)
-    except Exception:  # noqa: BLE001 -- no reading
-        return None
-    ratio = local_ratio(sched)
-    running = _live(running_reqs)
-    mixed = len(running) if getattr(sched, "is_mixed_chunk", False) else 0
-    reserve = _reserve_sum(running, ratio, mixed)
-    ledger = getattr(sched, "chunked_commitment_ledger", None)
-    ledger_out = int(ledger.outstanding_tokens()) if ledger is not None else 0
-    dcp = 0
-    ubd = getattr(sched, "uniform_budget_deficit", None)
-    if callable(ubd):
-        dcp = int(ubd() or 0)
-    try:
+        ratio = local_ratio(sched)
+        running = _live(running_reqs)
+        mixed = len(running) if getattr(sched, "is_mixed_chunk", False) else 0
+        reserve = _reserve_sum(running, ratio, mixed)
+        ledger = getattr(sched, "chunked_commitment_ledger", None)
+        ledger_out = int(ledger.outstanding_tokens()) if ledger is not None else 0
+        dcp = 0
+        ubd = getattr(sched, "uniform_budget_deficit", None)
+        if callable(ubd):
+            dcp = int(ubd() or 0)
         floor = published_fundable_floor(tree)
-    except Exception:  # noqa: BLE001
-        floor = None
-    budget = _sp.lifetime_budget(avail, evict, reserve, dcp, floor, ledger_out)
-    return int(math.ceil(budget)) - 1
+        budget = _sp.lifetime_budget(avail, evict, reserve, dcp, floor, ledger_out)
+        return int(math.ceil(budget)) - 1
+    except Exception:  # noqa: BLE001 -- the sentinel, never a skipped collective
+        return None
 
 
 def resume_price(req, sched) -> int:

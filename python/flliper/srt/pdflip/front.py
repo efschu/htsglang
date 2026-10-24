@@ -14035,7 +14035,6 @@ class Front:
         st.pop("need_terms", None)         # an ARRIVAL-SEAT grant's counter input, never the D line's
         # KVOFFSET-1024: the burst debit (THE BURST, 27B 23:10:49-52: 30-273/274/275 within 3 s, 59k each) is applied
         # inside the KV test itself now (:meth:`_arrival_seat_kv`), for the D line and ARRIVAL-SEAT alike
-        st.setdefault("kv_priced_last", {})[p.rid] = Front._kv_need_of_last(self)
         return bool(fits), str(why), int(deficit or 0), basis
 
     def _d_line_kv_debit(self, basis: Dict[str, Any], exclude_rid: str) -> Tuple[int, int]:
@@ -14106,19 +14105,13 @@ class Front:
             #                       seat is kept: it is seated after the semaphor)
         return tokens, n
 
-    def _kv_need_of_last(self) -> Optional[int]:
-        """KVOFFSET-1024: the need the KV test that JUST returned priced (no await between)."""
-        got = self._asr_st().get("last_kv_need")
-        return None if got is None else int(got)
-
-    def _asr_note_kv_priced(self, rid: str) -> None:
-        """KVOFFSET-1024: a KV verdict let ``rid`` go -- the need it priced is what the burst debit charges for it
-        until D runs it (:meth:`_d_line_kv_debit`)."""
-        got = Front._kv_need_of_last(self)
-        if got is None:
-            got = (self._asr_st().get("kv_priced_last") or {}).get(rid)
-        if got is not None:
-            self._asr_st().setdefault("kv_priced", {})[rid] = (int(got), time.time())
+    def _asr_note_kv_priced(self, rid: str, need: Optional[int]) -> None:
+        """KVOFFSET-1024: a KV verdict let ``rid`` go -- ``need`` (the need ITS OWN KV test priced, taken from that
+        test's basis right after it returned: review A1, a shared slot is overwritten by every other waiter's and the
+        older P candidates' KV tests during the caller's awaits) is what the burst debit charges for it until D runs
+        it (:meth:`_d_line_kv_debit`). None (no number): nothing is noted, the seat is charged its tokens + clip."""
+        if need is not None:
+            self._asr_st().setdefault("kv_priced", {})[rid] = (int(need), time.time())
 
     async def _d_line_kv_holds(self, p: "Pending") -> bool:
         """HANDOVER-KVFITS 1024 (SOLL R5, R11): True = the D line's head ``p`` takes no D seat now -- D's DEVICE KV
@@ -14166,7 +14159,7 @@ class Front:
             return False
         if fits:
             Front._d_line_kv_hold_end(self, p.rid, why)
-            Front._asr_note_kv_priced(self, p.rid)   # KVOFFSET-1024: the burst debit charges this need until D runs it
+            Front._asr_note_kv_priced(self, p.rid, basis.get("need"))   # KVOFFSET-1024: charged until D runs it
             return False
         if basis.get("running") is not None and not basis.get("running"):
             # review S3: D runs no decode at all in this reading -- no finish can free a row for it (all seats are
@@ -14181,7 +14174,7 @@ class Front:
                 st.setdefault("age_victims", {})[p.rid] = list(plan)
                 st.setdefault("dline_claims", {})[p.rid] = now
                 holds.pop(p.rid, None)
-                Front._asr_note_kv_priced(self, p.rid)   # KVOFFSET-1024
+                Front._asr_note_kv_priced(self, p.rid, basis.get("need"))   # KVOFFSET-1024
                 self.counters["d_admit_kv_age_to_d"] += 1
                 logger.info("PDFLIP D-ADMIT-KV-AGE rid=%s victims=%s %s (HANDOVER-KVFITS + AGE PLAN, PRIO=ALTER: the "
                             "older hand-off goes to D, D's SEAT-AGE displaces the younger decodes for it on its real "
@@ -17045,7 +17038,7 @@ class Front:
         # _1024_003732 01:18:25,947 pdflip-30-296 granted against free=278852 = the whole pool while D had retracted
         # BOTH running decodes 30-294 / 26-255 for one pass, their spans evictable, re-admitted the next pass)
         debit, n_debit = (Front._d_line_kv_debit(self, basis, rid) if reading else (0, 0))
-        fits, why = _asr.kv_fits(need, reading, debit)
+        fits, why = _asr.kv_fits(need, reading, debit, decode)
         free = _asr.kv_free(reading)
         if free is not None and debit > 0:
             free = int(free) - int(debit)
@@ -17054,10 +17047,14 @@ class Front:
                 why, debit, n_debit, "-" if free is None else int(free))
         self._asr_st()["last_kv_free"] = free   # S60 F2: the room this tick's verdicts were formed on
         self._asr_st()["last_kv_basis"] = basis
-        self._asr_st()["last_kv_need"] = int(need)   # KVOFFSET-1024: what a grant on this test is charged
+        basis["need"] = int(need)   # KVOFFSET-1024 review A1: what a grant on THIS test is charged (per test, no slot)
         st0 = self._asr_st()
+        _uh = st0.setdefault("unread_held", {})
+        if reading:
+            _uh.pop(rid, None)
         if not reading and rid is not None and rid in (st0.get("waiters") or {}) and \
-                (st0.get("wait_named") or {}).get(rid) == "kv":
+                (st0.get("wait_named") or {}).get(rid) == "kv" and \
+                (getattr(self, "_d_seats_live", None) or ()):
             # KVOFFSET-1024 (class C, SOLL R5; 27B _1023_223241 pdflip-32-276: ``wait_seat why=kv need=63165 >
             # free=40361`` at 23:11:31, then ``d_prefill ... kv=unread kv=absent age_ms=1034`` at 23:14:10 after 158 s
             # -- D refused it 34 times in 7.1 s): a waiter that is waiting FOR KV keeps waiting when D gives no number
@@ -17065,6 +17062,17 @@ class Front:
             # tick without a number still goes (EZ-S1 A10, R2: the seat plan decides, D's admission is the guard).
             self.counters["arrival_seat_kv_unread_held"] += 1
             fits, why = False, "kv=unread held (it waited for KV; no number this tick -- it keeps waiting)"
+            # review S3: named -- at the first held tick and then every 10 s of the same unread series (the WAIT_SEAT
+            # line is printed only on a change of why_wait, and a KV waiter's is "kv" already). The hold needs a live
+            # D seat (the D line's rule): with none, no finish can free a row and it goes (D's admission guards).
+            _now = time.time()
+            _t0, _last = _uh.get(rid, (_now, 0.0))
+            if _now - _last >= 10.0:
+                logger.info("%s ARRIVAL-SEAT-KV-UNREAD-HELD rid=%s held_s=%.1f seats_live=%d (KVOFFSET-1024 class C, "
+                            "SOLL R5: it waits FOR KV and D gave no number -- an absent reading neither admits nor "
+                            "refuses)", _asr.MARKER, rid, _now - _t0, len(getattr(self, "_d_seats_live", ()) or ()))
+                _last = _now
+            _uh[rid] = (_t0, _last)
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
             why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
@@ -17228,7 +17236,8 @@ class Front:
             # (``d_park_runtime.kv_displace_would_fit``: "a victim's retained KV goes back to the tree and is as
             # unpayable as the rest"). The front plans with D's numbers: a KV deficit is not coverable by victims, only
             # a missing SEAT is (the head then still has to fit D's payable room).
-            tokens = {r: 0 for r in tokens}
+            tokens = {r: int(_rb.get(r, 0) or 0) for r in tokens}   # KVOFFSET review NIT: D still gives the reserve
+            #                                                                 share back under the wall (0 + reserve)
         plan = _asr.displace_plan(head_arrival, seat_is_free, deficit, running, arrivals, tokens,
                                   lane_of={r: Front._prio_lane(self, r) for r in running},  # PRIO-AS-AGE 1014
                                   head_lane=Front._prio_lane(self, head_rid))
@@ -17489,6 +17498,8 @@ class Front:
                     continue
                 fits, why, deficit = (await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
                                       if free else (True, "no seat", 0))
+                # KVOFFSET-1024 review A1: THIS test's need, taken before any further await
+                my_need = Front._asr_kv_basis(self).get("need") if free else None
                 if free:
                     # H16V F4: the seat count again after the KV await (see the AGE PLAN path)
                     taken, n = self._arrival_seat_taken(for_rid=rid)
@@ -17515,7 +17526,7 @@ class Front:
                     st["granted"][rid] = time.time()
                     self.counters["arrival_seat_d_prefill"] += 1
                     self._asr_note_need_terms()
-                    Front._asr_note_kv_priced(self, rid)   # KVOFFSET-1024: the burst debit charges this need
+                    Front._asr_note_kv_priced(self, rid, my_need)   # KVOFFSET-1024: the burst debit charges it
                     if backfill:
                         self.counters["arrival_seat_backfill"] += 1
                     ms = self._asr_verdict_ms(rid, None)
@@ -17629,7 +17640,7 @@ class Front:
                 st.setdefault("age_victims", {})[rid] = list(plan)   # H16V A4: these victims are spoken for
             self.counters["arrival_seat_d_prefill"] += 1
             self._asr_note_need_terms()
-            Front._asr_note_kv_priced(self, rid)   # KVOFFSET-1024: the burst debit charges this need
+            Front._asr_note_kv_priced(self, rid, kv_basis.get("need"))   # KVOFFSET-1024 review A1: its OWN need
             if not first and fits:
                 self.counters["arrival_seat_backfill"] += 1
             if to_d:
