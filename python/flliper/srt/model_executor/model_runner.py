@@ -1419,7 +1419,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 publish_boot_floor_profile(self.server_args)
             except Exception as e:  # noqa: BLE001 - best effort, never a boot failure
-                logger.debug("#233 corridor profile not published: %s", e)
+                # SOLL 1 (review #233): the self-correction hangs on this
+                # publish; a failure is named, never DEBUG-silent.
+                logger.warning(
+                    "#233 CORRIDOR-RECORD-PUBLISH FAILED (alloc_memory_pool): %s "
+                    "-- the corridor pointer is not updated by this rank", e
+                )
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
