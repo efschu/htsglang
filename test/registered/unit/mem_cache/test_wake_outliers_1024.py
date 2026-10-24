@@ -110,10 +110,20 @@ class TestTouchLinesOfTpPeers(_Env):
     def test_review_muss2_structural_gates_keep_every_line(self):
         """dcp owner form (#239: the host may abstain from a read its peers do), DP attention (disjoint requests) and
         a phase-changing rank identity (Weg 1) -- the peer keeps its KV line."""
-        for kw in ({"dcp_owner_mode": True}, {"dp_attention": True}, {"rank_identity_stable": False}):
+        for kw in ({"dcp_owner_mode": True, "dcp_owner_rows": True}, {"dp_attention": True},
+                   {"rank_identity_stable": False}):
             peer = _ev(self.d, tp=1, **kw)
             self._touch(peer, KV)
             assert _t_lines(peer) == KV, kw
+
+    def test_page1_dcp_owner_form_dedupes_the_read_path_only(self):
+        """task #60 page-1 owner form: reads are rank-symmetric, writes owner-sharded (a page's write-path line is
+        its only one) -- test_wake_outliers_dcp_1024.py drives the real backend."""
+        peer = _ev(self.d, tp=1, dcp_owner_mode=True)
+        for s in KV[:3]:
+            peer.touch(s, os.path.join(self.d, s + ".bin"), mtime=False, read=True)
+        self._touch(peer, KV[3:])                    # write path (_touch_present form)
+        assert _t_lines(peer) == KV[3:]
 
     def test_live_suffix_from_the_backend_decides(self):
         """The backend re-derives its KV suffix when the canonical page is installed after construction: the evictor
@@ -312,13 +322,16 @@ def test_hicache_file_hands_the_evictor_the_structural_facts_and_the_live_suffix
     from flliper.srt.mem_cache import hicache_storage as H
 
     src = inspect.getsource(H.HiCacheFile.__init__)
-    for frag in ("dcp_owner_mode=self.dcp_owner_mode", "dp_attention=_dp_attention_on()",
+    for frag in ("dcp_owner_mode=self.dcp_owner_mode", "dcp_owner_rows=self._kv_owner_rows is not None",
+                 "dp_attention=_dp_attention_on()",
                  'rank_identity_stable=self._l3p_group() in ("P", "D")', "touch_dedupe_suffix=self._touch_dedupe_suffix"):
         assert frag in src, frag
     fake = types.SimpleNamespace(dcp_owner_mode=False, _kv_config_suffix_is_group_wide=True, kv_config_suffix="_m_h")
     assert H.HiCacheFile._touch_dedupe_suffix(fake) == "_m_h"
-    fake.dcp_owner_mode = True
-    assert H.HiCacheFile._touch_dedupe_suffix(fake) is None
+    fake.dcp_owner_mode, fake._kv_owner_rows = True, (64, 64, 0, 46)
+    assert H.HiCacheFile._touch_dedupe_suffix(fake) is None, "#239 owner rows: the host abstains"
+    fake._kv_owner_rows = None
+    assert H.HiCacheFile._touch_dedupe_suffix(fake) == "_m_h", "page-1 owner form: read-path dedupe (evictor)"
     fake.dcp_owner_mode, fake._kv_config_suffix_is_group_wide = False, False
     assert H.HiCacheFile._touch_dedupe_suffix(fake) is None
 

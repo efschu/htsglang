@@ -275,6 +275,7 @@ class LRUFileEvictor:
         pins: Optional[Any] = None,
         require_watermark: bool = False,
         dcp_owner_mode: bool = False,
+        dcp_owner_rows: bool = False,
         dp_attention: bool = False,
         rank_identity_stable: bool = True,
         touch_dedupe_suffix: Optional[Callable[[], Optional[str]]] = None,
@@ -389,14 +390,21 @@ class LRUFileEvictor:
         # WAKE-OUTLIERS-1024: a pure TP peer of the owner (same pp stage and cp position, tp_rank > 0) reads the
         # SAME group-wide KV page files as the owner (identical PDFLIP-READ-STAGES page counts on every D TP rank), so
         # its T lines for them duplicate the owner's -- see _journal_touch. PP stages read different page sets and keep
-        # theirs. Review 1024 MUSS 2: never where that premise is not shown -- dcp_owner_mode (the #239 owner-row form
-        # lets the host rank ABSTAIN from a read its peers do), DP attention (disjoint requests per attention rank) and
-        # a rank identity that changes with the phase (Weg 1 cutover: this flag is computed once, here).
+        # theirs. Review 1024 MUSS 2: never where that premise is not shown -- the #239 owner-row dcp form (the host
+        # rank ABSTAINS from a read its peers do), DP attention (disjoint requests per attention rank) and a rank
+        # identity that changes with the phase (Weg 1 cutover: this flag is computed once, here).
+        # The page-1 dcp owner form (task #60, the 27B D groups) is split by PATH (test_wake_outliers_dcp_1024.py):
+        # every rank reads the group's key list from the same rank-shared file (PDFLIP-READ-STAGES 8776008 pages on
+        # each int8 D rank; a read reaped short on one rank is cut to the group MIN and re-issued, so the owner's
+        # reads cover every page a peer reads -- duo 07:03-07:05), but a page is WRITTEN only by its owner rank
+        # (cache_controller._page_backup kv_page_owner_mask), so a write-path T line (``_touch_present``) is that
+        # page's only one. There only READ-path lines are deduplicated.
         self._journal_touch_tp_peer = bool(
             self._writes_shared_keys and not self._is_storage_owner
             and tp_rank > 0 and pp_rank == 0 and attn_cp_rank == 0
-            and not dcp_owner_mode and not dp_attention and rank_identity_stable
+            and not (dcp_owner_mode and dcp_owner_rows) and not dp_attention and rank_identity_stable
         )
+        self._journal_touch_read_only = bool(dcp_owner_mode)
         self._touch_tp_rank = int(tp_rank)
         # the backend's CURRENT group-wide KV suffix (it is re-derived when the canonical page is installed after
         # construction); None = no key qualifies. Without it: the static suffix pair of this constructor.
@@ -1254,14 +1262,14 @@ class LRUFileEvictor:
             if cur is not None:
                 self._total_bytes -= cur
 
-    def touch(self, suffixed_key: str, tensor_path: str, mtime: bool = True) -> None:
+    def touch(self, suffixed_key: str, tensor_path: str, mtime: bool = True, read: bool = False) -> None:
         """Mark key as MRU, adopting an untracked on-disk file if needed.
 
         ``mtime=False`` skips the utime: the batched reader (#1402) already
         bumped the inode through its open fd, and a second syscall here would
         be a second GIL hand-off per page for nothing.
         """
-        self._journal_touch(suffixed_key)
+        self._journal_touch(suffixed_key, read=read)
         if not self._eviction_enabled:
             return
         if mtime:
@@ -1284,7 +1292,7 @@ class LRUFileEvictor:
                 self._lru[suffixed_key] = size
                 self._total_bytes += size
 
-    def _journal_touch(self, suffixed_key: str) -> None:
+    def _journal_touch(self, suffixed_key: str, read: bool = False) -> None:
         """L3-READ-RECENCY-1014: a read hit as a ``T`` journal line, so the
         storage OWNER (it rebuilds its LRU from journal lines at wake and never
         walks st_mtime since the 28.09. journal index) sees the SIBLING's reads.
@@ -1299,7 +1307,9 @@ class LRUFileEvictor:
         try:
             if not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH.get():
                 return
-            if (getattr(self, "_journal_touch_tp_peer", False) and self._is_group_wide_kv_key(suffixed_key)
+            if (getattr(self, "_journal_touch_tp_peer", False)
+                    and (read or not getattr(self, "_journal_touch_read_only", False))
+                    and self._is_group_wide_kv_key(suffixed_key)
                     and not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS.get()):
                 # WAKE-OUTLIERS-1024: the owner journals this canonical KV page's read hit itself (TP peers read the
                 # identical page set); a peer's line is a duplicate the other group's owner parses at its wake
