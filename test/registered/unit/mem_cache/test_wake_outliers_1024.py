@@ -223,3 +223,44 @@ def test_run_batch_brackets_the_forward_with_the_launch_hooks():
     i_fin = src.index("finally:", i_fwd)
     i_end = src.index("_pdflip_wake_cpu_defer.launch_end()", i_fin)
     assert i_begin < i_fwd < i_fin < i_end, "begin before the forward, end in its finally (also when it raises)"
+
+
+# ------------------------------------------------------------------------------------------------ (3) park demote
+def test_park_demote_waits_while_the_wake_deferral_is_armed(wcd, monkeypatch):
+    from flliper.srt.pdflip import park_demote as PD
+
+    calls = []
+    monkeypatch.setattr(PD, "demote_once", lambda backend, pools, **kw: calls.append(time.monotonic()))
+    monkeypatch.setenv(wcd.ENV_MAX_MS, "60000")
+    assert wcd.arm(has_work=True)
+    d = PD._Demoter(object(), lambda: [], 0.01)
+    d.thread.start()
+    try:
+        time.sleep(0.2)
+        assert calls == [], "no copy beside the wake's first launches"
+        t_rel = time.monotonic()
+        wcd.release("extends=2")
+        deadline = time.monotonic() + 2.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert calls and calls[0] >= t_rel
+    finally:
+        d.stop.set()
+        d.thread.join(2.0)
+
+
+def test_park_demote_runs_when_no_wake_is_deferred(wcd, monkeypatch):
+    from flliper.srt.pdflip import park_demote as PD
+
+    calls = []
+    monkeypatch.setattr(PD, "demote_once", lambda backend, pools, **kw: calls.append(1))
+    d = PD._Demoter(object(), lambda: [], 0.01)
+    d.thread.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while len(calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(calls) >= 3
+    finally:
+        d.stop.set()
+        d.thread.join(2.0)

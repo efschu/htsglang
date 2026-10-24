@@ -143,6 +143,16 @@ def _note_incomplete(rid, role, prole, pages: int, tot: dict) -> None:
         int(tot.get("missing", 0)), int(tot.get("busy", 0)))
 
 
+def _wake_deferred() -> bool:
+    """WAKE-OUTLIERS-1024: the wake deferral (``wake_cpu_defer``) of this process is armed. Never raises."""
+    try:
+        from flliper.srt.pdflip import wake_cpu_defer as _wcd
+
+        return _wcd.armed()
+    except Exception:  # noqa: BLE001 -- the deferral is never a gate
+        return False
+
+
 class _Demoter:
     def __init__(self, backend, pools_fn, every: float):
         self.backend, self.pools_fn, self.every = backend, pools_fn, float(every)
@@ -152,7 +162,20 @@ class _Demoter:
 
     def _run(self):
         n = 0
+        skipped = 0
         while not self.stop.wait(self.every):
+            if _wake_deferred():
+                # WAKE-OUTLIERS-1024: while this process's wake deferral is armed (the wake's first launches), the
+                # demote waits -- duo boot ..._1024_100906 D TP0 (the only rank with this thread): pdflip-park-demote
+                # 1.2-2.5 s CPU in the wake window, TP0 compute 212-414 ms vs TP1 54-139 ms, TP1 waiting 247-460 ms
+                # in tp.all_reduce; int8 ..._1024_080355 08:48:22: 1165 ms beside TP0's 2879 ms first extend. The
+                # sibling group P is asleep then (no claim takes a kept page); the deferral is bounded.
+                skipped += 1
+                continue
+            if skipped:
+                logger.info("#248 PARK-DEMOTE resumed after %d tick(s) held by the wake deferral (WAKE-OUTLIERS-1024: "
+                            "no copy beside the wake's first launches)", skipped)
+                skipped = 0
             try:
                 demote_once(self.backend, list(self.pools_fn()), state=self.state)
             except Exception as exc:  # noqa: BLE001 - the demoter never takes the process down
