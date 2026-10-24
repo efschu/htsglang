@@ -655,6 +655,14 @@ def park_form_key() -> str:
     return f"{_form.model_key(boot_form.model)}|{axes}"
 
 
+def park_form_key_with_cards(key: str, cards_by_uuid: Optional[Mapping[str, object]]) -> str:
+    """#227 review S1: ``key|cards=<sorted uuid prefixes>`` -- the card set of this boot (the front's
+    ``--dc-reserve`` names every card); unchanged without a key or without cards."""
+    if not key or not cards_by_uuid:
+        return key
+    return key + "|cards=" + ",".join(sorted(str(u)[:12] for u in cards_by_uuid))
+
+
 class SidecarView:
     """H78: the measured-record sidecar as the sleep-leg gate reads it --
     parsed once per FILE VERSION, not once per flip.
@@ -5456,7 +5464,10 @@ class Front:
         self._park_window_sent: Optional[tuple] = None
         #: PARK-COLLECT-WINDOW: checkpoint x form of this boot (the round-trip
         #: record's key, qwen27b and nextflash never share one); "" = no form.
-        self._park_form_key = park_form_key()
+        # #227 review S1: the round-trip and the X cost line are TIME measurements of one D topology -- duo
+        # (5090+3080) and dual (5090+3080+3080) share checkpoint x form, so the card set joins their key.
+        # The x-curves key (x_curves, park_form_key() itself) is unchanged.
+        self._park_form_key = park_form_key_with_cards(park_form_key(), getattr(self, "dc_reserve", None))
         #: PARK-COLLECT-WINDOW: the newest recorded round trip of this form,
         #: x until this boot measured its own; None = none recorded.
         self._park_rt_seed: Optional[dict] = (
@@ -21523,10 +21534,82 @@ class Front:
                 ),
             },
         )
+        if group == "D" and isinstance(rec, dict) and isinstance(rec.get("vram_residue_mib"), dict) \
+                and rec.get("vram_residue_mib"):
+            # #227 MUSS-1: this boot's D samples are measured on the new rule -- the first sleep, then one
+            # max_over_sleeps sample whenever a later sleep raises a card's maximum (_note_d_residue_reading);
+            # the launcher books the per-boot maximum bare. A sample WITHOUT the kind is a legacy first-sleep
+            # value and keeps the #1444 margin (launcher.dc_residue_max_from_records).
+            rec["vram_residue_kind"] = "first_sleep"
+            # #227 R1: how many D sleeps this sample rests on (the first sleep = 1); a later sample carries the
+            # count at its writing (_note_d_residue_reading). The launcher books a boot's maximum bare only
+            # when it rests on >= 2 sleeps; a one-sleep boot has not reached its maximum yet (measured growth
+            # +244..+484 MiB) and keeps the first sleep + margin (launcher.dc_residue_max_from_records).
+            rec["vram_residue_sleeps"] = 1
         self.dormant_image[group] = rec
         logger.info("%s", host_ledger.format_dormant_image(rec))
         if persist:
             self._persist_dormant_image(rec)
+        return rec
+
+    def _note_d_residue_reading(self, src: str, dc: Dict[str, int],
+                                l15_held: Optional[Dict[str, int]] = None) -> Optional[dict]:
+        """#227 MUSS-1: a LATER D sleep's residue reading (W19 grades only the first one).
+
+        * ``DC-OVER-RESERVE``: a card above the reserve P's budget booked is named loudly and counted --
+          an instrument, it never stops anything (W19 stays the first-sleep gate).
+        * When the reading raises a card's maximum of this boot, one more group-D sample is appended: the
+          first-sleep record with ``vram_residue_mib`` = the per-card maximum so far and
+          ``vram_residue_kind="max_over_sleeps"`` -- so the next boot books what D really held (measured on
+          24.10.: int4ar 1258 -> 1600, int8 5090 1762 -> 2246), not the first sleep plus a margin.
+        * R1: every reading counts the boot's D sleeps (``vram_residue_sleeps``); the SECOND sleep writes a sample
+          even when it raised nothing, so a boot that saw two sleeps is told apart from one that saw one (the
+          launcher books only the former bare). Later samples carry the count at their writing.
+        The L1.5 hold is stripped exactly as at the first sleep (L15-13c). Returns the appended sample."""
+        if src != "D" or not dc or getattr(self, "weights_resident", False):
+            return None
+        first = (getattr(self, "dormant_image", None) or {}).get("D")
+        if not isinstance(first, dict) or not isinstance(first.get("vram_residue_mib"), dict) \
+                or not first.get("vram_residue_mib"):
+            return None
+        hold_on = l15_held is not None and l15_plan.master_on(os.environ)
+        vals: Dict[str, int] = {}
+        for uuid, r in dc.items():
+            r = int(r)
+            if hold_on:
+                h = l15_held.get(uuid)
+                r = l15_plan.residue_without_hold(r, None if h is None else int(h))
+            vals[uuid] = r
+        reserve = getattr(self, "dc_reserve", None) or {}
+        for uuid, w in sorted(vals.items()):
+            res = reserve.get(uuid)
+            if res is not None and w > int(res):
+                self.counters["dc_over_reserve"] += 1
+                logger.warning(
+                    "PDFLIP DC-OVER-RESERVE epoch=%d group=D uuid=%s measured=%d MiB reserve=%d MiB over=%d MiB "
+                    "(a LATER D sleep above what P's budget booked; W19 grades only the first sleep -- no stop "
+                    "here, the next boot books this boot's maximum, #227)",
+                    int(getattr(self, "epoch", 0)), uuid, w, int(res), w - int(res))
+        # #227 R1: this boot's D sleep count (the first sleep, read by sample_dormant_image, is 1).
+        n_sleeps = int(self.__dict__.get("_d_sleeps_seen", 1)) + 1
+        self.__dict__["_d_sleeps_seen"] = n_sleeps
+        cur = self.__dict__.setdefault("_d_residue_max", {u: int(v) for u, v in first["vram_residue_mib"].items()})
+        grew = {u: w for u, w in vals.items() if u in cur and w > int(cur[u])}
+        if not grew and n_sleeps != 2:
+            return None
+        cur.update(grew)
+        rec = dict(first)
+        rec["vram_residue_mib"] = dict(cur)
+        rec["vram_residue_kind"] = "max_over_sleeps"
+        rec["vram_residue_max_epoch"] = int(getattr(self, "epoch", 0))
+        rec["vram_residue_sleeps"] = n_sleeps
+        rec["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.counters["dc_max_sample"] += 1
+        logger.info("PDFLIP-DC-MAX group=D epoch=%d sleeps=%d boot maximum now %s MiB (raised: %s) -- max_over_sleeps "
+                    "sample appended for the next boot's D reserve (#227)", rec["vram_residue_max_epoch"], n_sleeps,
+                    {u: v for u, v in sorted(cur.items())}, {u: v for u, v in sorted(grew.items())})
+        if getattr(self, "measured_record", None):
+            self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)
         return rec
 
     def _persist_dormant_image(self, rec: dict) -> None:
@@ -22424,6 +22507,8 @@ class Front:
         if not dc_off_path:
             for uuid, mib in sorted(dc.items()):
                 logger.info("PDFLIP-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
+            if src == "D" and self.dc_measured_d and dc:
+                self._note_d_residue_reading(src, dc, _l15_held)   # #227 MUSS-1: a later D sleep
             if src == "D" and not self.dc_measured_d and dc:
                 self.dc_measured_d = dc
                 over = dormant_residue_over(dc, self.dc_reserve, self.weights_resident)
@@ -22607,7 +22692,7 @@ class Front:
             Front._dp_ppfwd_arm(self, t_flip0)  # FLIPZEIT D>P: P's first stage's first forward from here
         Front._ipc_live_kick(self)
         if dc_off_path:
-            _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))
+            _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec, l15_held=_l15_held))
             self._dc_tasks.add(_t)
             _t.add_done_callback(self._dc_tasks.discard)
         self.counters["flips"] += 1
@@ -24448,7 +24533,8 @@ class Front:
             return False
         return src != "D" or bool(self.dc_measured_d)
 
-    async def _dc_reading_off_path(self, src: str, sid: int, rec: dict) -> None:
+    async def _dc_reading_off_path(self, src: str, sid: int, rec: dict,
+                                   l15_held: Optional[Dict[str, int]] = None) -> None:
         """F1: the reading the flip used to take inline, same lines, same record
         field -- run in the default executor so the event loop never blocks on
         ``ps``/``nvidia-smi``. An instrument: it never stops anything."""
@@ -24466,6 +24552,11 @@ class Front:
             logger.info("PDFLIP-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
         rec["dc_mib"] = dc
         self.counters["dc_off_path"] += 1
+        try:
+            self._note_d_residue_reading(src, dc, l15_held)   # #227 MUSS-1: max over sleeps + DC-OVER-RESERVE
+        except Exception as e:  # noqa: BLE001 -- an instrument never breaks serving
+            self.counters["dc_max_sample_failed"] += 1
+            logger.warning("PDFLIP-DC-MAX epoch=%s group=%s failed: %s: %s", rec.get("epoch"), src, type(e).__name__, e)
         logger.info("PDFLIP-DC-OFFPATH epoch=%s group=%s cards=%d ms=%.0f (the post-wake residue "
                     "reading of this flip, taken in a worker thread after the flip closed; W19 "
                     "settled at the first D sleep and this group's dormant image is sampled, so "

@@ -412,6 +412,9 @@ DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
 #: the tag has travelled with the exchange since, and P's budget paid for
 #: bytes that are no longer there.
 DC_RECORD_MARGIN_MIB = 256
+#: #227 R1: the named log marker of a boot whose D maximum rests on fewer than this many D sleeps.
+DC_MAX_MIN_SLEEPS = 2
+DC_ONE_SLEEP_MARK = "DC-ONE-SLEEP-BOOT"
 #: ``=0`` prices the xsn14 constant again (the pre-#1444 form).
 DC_RECORD_ENV = "FLLIPER_PDFLIP_DC_D_RECORD"
 
@@ -490,6 +493,126 @@ def dc_residue_from_record(
         parts.append(f"nvml{c.nvml_index} {c.name} {int(v)}+{DC_RECORD_MARGIN_MIB}={out[c.uuid]}")
     return out, (f"boot {tag} at {rec.get('at', '?')} form {form!r}: "
                  + ", ".join(parts) + " MiB")
+
+
+def pick_d_residue_record(rows: Sequence[Dict[str, object]], cards: Sequence[Card]
+                          ) -> Tuple[Optional[Dict[str, object]], str]:
+    """#227: which group-D dormant-image sample prices THIS boot's D residue (``rows`` oldest first, already
+    through the calibration identity). The newest whose ``vram_residue_mib`` names EXACTLY this boot's cards
+    (same card set = same D topology); else the newest that covers every card (the pre-#227 answer: a sample
+    of a bigger card set); else the newest at all, so :func:`dc_residue_from_record` names what is missing.
+    ``(None, why)`` without any sample."""
+    want = {c.uuid for c in cards}
+    if not rows:
+        return None, "no sample"
+
+    def _keys(r):
+        v = r.get("vram_residue_mib")
+        return set(v) if isinstance(v, dict) else set()
+
+    for how, ok in (("exact card set", lambda k: k == want), ("covering card set", lambda k: want <= k)):
+        hit = [r for r in rows if ok(_keys(r))]
+        if hit:
+            r = max(hit, key=lambda e: str(e.get("at", "")))
+            return r, f"{how}: boot {r.get('boot_tag', '?')}"
+    r = max(rows, key=lambda e: str(e.get("at", "")))
+    return r, f"newest, no sample covers this card set: boot {r.get('boot_tag', '?')}"
+
+
+def d_residue_record_for(path: str, accept: Optional[Callable[[dict], bool]], cards: Sequence[Card]
+                         ) -> Tuple[Optional[Dict[str, object]], str]:
+    """#227: the group-D dormant-image sample of the sidecar at ``path`` that prices this boot's D residue
+    (:func:`pick_d_residue_record` over every D sample through ``accept``), and the provenance note -- empty
+    when the pick is the plain newest sample, so the pre-#227 DC-RESIDUE line stays byte-identical."""
+    rows = host_ledger.read_measured_records(path, "D", accept=accept)
+    rec, how = pick_d_residue_record(rows, cards)
+    if rec is None or rec is max(rows, key=lambda e: str(e.get("at", ""))):
+        return rec, ""
+    return rec, f" [#227 card-set pick, {how}]"
+
+
+def dc_residue_max_from_records(rows: Sequence[Dict[str, object]], cards: Sequence[Card], weight_source: str,
+                                n: Optional[int] = None) -> Tuple[Optional[Dict[str, int]], str]:
+    """#227 MUSS-1: group D's dormant residue per card = the MAXIMUM over ALL D sleeps of the newest ``n``
+    (default :data:`P_DORMANT_EXPECT_N`) boots whose samples name EXACTLY this boot's cards under the same
+    weight form -- bare, no margin ("a maximum of measurements, not a reserve"; the caller adds the slack).
+
+    A boot measured on the #227 rule stamps ``vram_residue_kind`` (``first_sleep`` + one
+    ``max_over_sleeps`` sample per new maximum, front ``_note_d_residue_reading``); its value is the maximum
+    over its samples. A LEGACY boot (first sleep only, no kind) contributes first sleep +
+    :data:`DC_RECORD_MARGIN_MIB` (the #1444 form: its later sleeps were never recorded -- measured growth
+    +244..+484 MiB, so the bare first sleep would book too little). ``(None, why)`` when no exact-card-set
+    boot exists, or when none of the selected boots carries the kind (all legacy: the caller keeps the
+    pre-#227 newest-sample form, byte for byte).
+
+    R1: a measured boot's samples carry ``vram_residue_sleeps`` (how many D sleeps they rest on). A boot with
+    FEWER than :data:`DC_MAX_MIN_SLEEPS` has not reached its maximum yet (it ended early; the growth after the
+    first sleep was measured up to +484 MiB), so it contributes first sleep + :data:`DC_RECORD_MARGIN_MIB` like a
+    legacy boot, named :data:`DC_ONE_SLEEP_MARK`. A measured boot WITHOUT the counter (written by a build
+    between the first #227 head and R1 -- none ran on metal) keeps the kind-based rule: bare."""
+    n = P_DORMANT_EXPECT_N if n is None else int(n)
+    want = {c.uuid for c in cards}
+    by_boot: Dict[str, List[Dict[str, object]]] = {}
+    for r in rows or ():
+        if not isinstance(r, dict):
+            continue
+        vals = r.get("vram_residue_mib")
+        if not isinstance(vals, dict) or set(vals) != want:
+            continue
+        if str(r.get("vram_residue_form", "") or "") != str(weight_source):
+            continue
+        if any(not isinstance(vals[u], (int, float)) or isinstance(vals[u], bool) or vals[u] <= 0 for u in want):
+            continue
+        by_boot.setdefault(str(r.get("boot_tag", "?")), []).append(r)
+    if not by_boot:
+        return None, f"no group-D sample of exactly this card set under form {str(weight_source)!r}"
+    boots = sorted(by_boot.items(), key=lambda kv: max(str(x.get("at", "")) for x in kv[1]), reverse=True)[:n]
+    if not any(x.get("vram_residue_kind") for _t, rs in boots for x in rs):
+        return None, "only legacy first-sleep samples (no vram_residue_kind) -> pre-#227 newest-sample form"
+    out: Dict[str, int] = {}
+    parts = []
+    for tag, rs in boots:
+        measured = any(x.get("vram_residue_kind") for x in rs)
+        counted = [int(x["vram_residue_sleeps"]) for x in rs
+                   if isinstance(x.get("vram_residue_sleeps"), int) and not isinstance(x.get("vram_residue_sleeps"), bool)]
+        one_sleep = bool(measured and counted and max(counted) < DC_MAX_MIN_SLEEPS)
+        add = DC_RECORD_MARGIN_MIB if (not measured or one_sleep) else 0
+        for u in want:
+            v = max(int(x["vram_residue_mib"][u]) for x in rs) + add
+            out[u] = max(out.get(u, 0), v)
+        kind = ("max_over_sleeps" if any(x.get("vram_residue_kind") == "max_over_sleeps" for x in rs)
+                else f"{DC_ONE_SLEEP_MARK} first sleep +{DC_RECORD_MARGIN_MIB}: {max(counted)} D sleep seen, "
+                     f"the maximum is not reached yet" if one_sleep
+                else "first_sleep" if measured else f"LEGACY first sleep +{DC_RECORD_MARGIN_MIB}")
+        parts.append(f"{tag} [{kind}]")
+    return out, (f"MAX over all D sleeps of the newest {len(boots)} of {len(by_boot)} boot(s) of exactly this "
+                 f"card set, form {str(weight_source)!r}, bare: "
+                 + ", ".join(f"nvml{c.nvml_index} {c.name} {out[c.uuid]}" for c in cards)
+                 + " MiB; boots " + ", ".join(parts))
+
+
+def dc_residue_for(path: str, accept: Optional[Callable[[dict], bool]], cards: Sequence[Card],
+                   weight_source: str) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, int]], str, str]:
+    """#227: ``(sample for the RoPE context term, per-uuid residue or None, provenance, pick note)`` of the
+    sidecar at ``path`` for this boot's group-D reserve. Order: (1) the measured maximum of exact-card-set
+    boots (:func:`dc_residue_max_from_records`); (2) otherwise the pre-#227 form -- newest sample of exactly
+    this card set, else of a COVERING card set (another D topology: named, keeps the #1444 margin), through
+    :func:`dc_residue_from_record`."""
+    rows = host_ledger.read_measured_records(path, "D", accept=accept)
+    if os.environ.get(DC_RECORD_ENV, "1").strip() != "0":
+        vals, prov = dc_residue_max_from_records(rows, cards, weight_source)
+        if vals is not None:
+            want = {c.uuid for c in cards}
+            exact = [r for r in rows if isinstance(r.get("vram_residue_mib"), dict) and set(r["vram_residue_mib"]) == want]
+            return max(exact, key=lambda e: str(e.get("at", ""))), vals, prov, ""
+    rec, how = pick_d_residue_record(rows, cards)
+    vals, prov = dc_residue_from_record(rec, cards, weight_source)
+    note = ("" if rec is None or rec is max(rows, key=lambda e: str(e.get("at", "")))
+            else f" [#227 card-set pick, {how}]")
+    if vals is not None and how.startswith("covering"):
+        prov = (f"COVERING card set (a sample of another D topology, pre-#227 form with the "
+                f"{DC_RECORD_MARGIN_MIB} MiB margin; this card set has no sample of its own yet): " + prov)
+    return rec, vals, prov, note
 
 
 P_DORMANT_EXPECT_ENV = "FLLIPER_PDFLIP_D_EXPECT_P_RECORD"
@@ -23986,7 +24109,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, "
              "card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed "
-             "is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation "
+             "is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records -- unless every refusal it "
+             "passed is a proof gap of its own form (#227: HW-COUNT [METAL-UNPROVEN] alone, the PP-CUT crossing-width "
+             "HW-UNCALIBRATED); then its records carry forced_past (line FORCED-RECORDS). NOT lifted: the occupation "
              "check (another process or window on a card), a missing or broken model/file, an unsupported "
              "architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, "
              "the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or "
@@ -26698,8 +26823,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if getattr(ns, "force", False):
         # PROFIL-EDITOR S1: one switch for all VALUE refusals (pdflip/refusals.py); the sink writes each one to state.json events
         refusals.arm(True, sink=lambda code, text: boot_state_write(log, event=("forced_past", {"code": code, "text": text})))
-        log("FORCED BOOT (--force): value refusals are lifted and listed as FORCED-PAST <CODE>; this boot writes NO records; "
-            "not lifted: card occupation, missing/broken files, unsupported architecture")
+        log("FORCED BOOT (--force): value refusals are lifted and listed as FORCED-PAST <CODE>; this boot writes NO records "
+            "unless every refusal it passed is a proof gap of its own form (#227, verdict line FORCED-RECORDS before the "
+            "front starts; records held until then); not lifted: card occupation, missing/broken files, unsupported architecture")
+        _ep_forced = refusals.entrypoint_forced()
+        log("FORCED-RECORDS entrypoint list (" + refusals.ENV_FORCED_PAST_EP + "): "
+            + ("ABSENT under " + refusals.ENV_FORCE_REQUEST + "=1 -> no records" if _ep_forced is None
+               else ("; ".join(f"{c} {' '.join(t.split())[:160]}" for c, t in _ep_forced) or "nothing passed")))
     # THE PIN RESOLVER'S CONTRACT LINE, and it must stay in exactly this shape:
     # `line_gate.BOOT_TREE_RE` is `^tree\s*:\s*\S+\s+@\s+([0-9a-f]{7,40})\b`, so
     # the header above -- which carries the same two facts -- does NOT match it.
@@ -27011,10 +27141,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _dc_accept = (d_residue_record_accept(calib_identity, d_bs)
                   if calib_identity is not None and calib_identity.uses_d_capture_set
                   else calib_sample_accept)
-    _dc_rec_d = host_ledger.read_measured_record(
-        measured_record_path(), accept=_dc_accept).get("D")
-    _dc_from_record, _dc_record_prov = dc_residue_from_record(
-        _dc_rec_d, cards, ns.pdflip_weight_source)
+    # #227: with forced boots writing records again, forms of ONE checkpoint and form on DIFFERENT card sets
+    # write into the same identity (NVFP4: duo 5090+3080 writes D samples, dual 5090+3080+3080 reads them). The
+    # newest sample alone would hand dual a 2-card duo sample, which dc_residue_from_record refuses card by card
+    # (-> the constant, ~1 GiB per card off P). Prefer the newest sample of EXACTLY this boot's card set, then the
+    # newest that covers it (the pre-#227 answer), then the newest at all (for the refusal's wording).
+    _dc_rec_d, _dc_from_record, _dc_record_prov, _dc_pick_note = dc_residue_for(
+        measured_record_path(), _dc_accept, cards, ns.pdflip_weight_source)
     # D-EXPECT: group P's measured dormant residue, same calibration identity,
     # read only where the expectation uses it (27B: not read at all).
     _p_dormant_recs = p_dormant_records(ns.profile, calib_sample_accept)
@@ -27025,6 +27158,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"in the sidecar -- samples of another checkpoint or form are not this "
             f"boot's residue (PDFLIP-FORM; xsn418 died W19 on fnFL2x144's) -> constant")
     elif calib_sample_accept is not None:
+        _dc_record_prov += _dc_pick_note
         _dc_record_prov += (
             f" [PDFLIP-FORM calibration identity: {boot_form.model}, "
             f"{' '.join(a + '=' + getattr(boot_form, a) for a in pdflip_form.RESIDUE_AXES)}]")
@@ -27049,6 +27183,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{'RECORD' if _dc_from_record is not None else 'CONSTANT'}: {_dc_record_prov}; "
         f"reserve incl. {slack_mib} MiB slack = "
         + ", ".join(f"nvml{c.nvml_index} {dc_expect_d[c.uuid]}" for c in cards) + " MiB")
+    if _dc_from_record is not None and DC_ONE_SLEEP_MARK in _dc_record_prov:
+        log(f"#227 R1 {DC_ONE_SLEEP_MARK}: at least one of the boots behind this D reserve saw fewer than "
+            f"{DC_MAX_MIN_SLEEPS} D sleeps (its maximum is not reached yet) -> its first sleep is booked with "
+            f"the {DC_RECORD_MARGIN_MIB} MiB margin, not bare (boots listed in the DC-RESIDUE line above)")
     refusals.flush(log)         # AP1 1006: the W19 twin borrow (dc_measured_d_mib has no logger); nothing without --force
     if ns.transport == "nccl":
         log(
@@ -29465,6 +29603,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         x_mode_argv=x_mode_launch.front_argv,
     )
     fenv = dict(os.environ)
+    # #227 FORCED-RECORDS: the front is the record writer and spawns LAST, after every refusal site of main --
+    # the verdict is final here. Held records (the launcher's own P image) are written or dropped by it, and the
+    # front gets it in its environment (no seal = no records in a forced child, as before).
+    refusals.seal_records()
+    if refusals.forced_boot():
+        log(refusals.records_verdict_line())
+    host_ledger.flush_held_records(log)
+    refusals.export_records_verdict(fenv)
+    if refusals.forced_boot():
+        boot_state_write(log, event=("forced_records", {"allow": refusals.records_allowed(),
+                                                        "line": refusals.records_verdict_line()}))
     fenv["PYTHONPATH"] = f"{tree}/python"
     # L3-INDEX PRICE (02.10.): the front asks the shared L3 stem index with the
     # groups' own page-key scheme and arena dir (group_env's values, so the

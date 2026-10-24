@@ -1,0 +1,647 @@
+"""#227 FORCED-RECORDS (24.10.): which forced boots still write measured records.
+
+Befund 24.10.: alle 45 Rotations-Boots seit 23.10. 05:18Z laufen mit HTSGLANG_FORCE=1 und gingen an genau zwei
+Ablehnungen vorbei -- HW-COUNT [METAL-UNPROVEN] (2-Karten-Formen) und HW-UNCALIBRATED der PP-CUT-Kreuzungsbreite
+(Switch x16, Tabelle x4/x8). Mit "forced = keine Records" (PROFIL-EDITOR S1) schrieb seitdem kein Boot ein Sample:
+der 27B-Sidecar endet 22.10. 02:04Z, int4ar bucht den D-Ruherest als Konstante 2652 MiB gegen gemessene 1258 MiB.
+
+Gepinnt:
+  * Klassifikator: nur HW-COUNT mit dem EINZIGEN Blocker METAL-UNPROVEN und die Kreuzungsbreiten-HW-UNCALIBRATED
+    (Vollabgleich, kein ``||``-Anhang) sind record-neutral; Inventar-Fremdheit, geborgte Rueckstaende/Census,
+    Kapazitaetsurteile, Entrypoint-Schwellen nicht.
+  * Ein erzwungener Launcher HAELT, was er vor dem Siegel schreibt; das Siegel schreibt (WRITES, mit ``forced_past``)
+    oder verwirft (NONE). Kinder schreiben nur mit dem Siegel in ihrer Umgebung.
+  * Entrypoint: ``HTSGLANG_FORCE=1`` ohne die Liste ``FLLIPER_PDFLIP_FORCED_PAST_EP`` = unbekannt = keine Records.
+  * GEFAHRENRICHTUNG (Mutant): ein Record aus fremder Form darf kein kleineres Budget erzeugen -- der D-Ruherest bleibt
+    dann die Konstante, nie die fremde (kleinere) Messung.
+  * Verdrahtung: das Siegel steht in ``main`` vor dem Front-Start, das Entrypoint exportiert die Liste.
+GPU-frei, NVML-frei.
+"""
+
+import json
+import os
+import re
+import subprocess
+import tempfile
+import unittest
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+from flliper.srt.pdflip import host_ledger
+from flliper.srt.pdflip import launcher as L
+from flliper.srt.pdflip import refusals as R
+from flliper.srt.pdflip import topology as T
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.join(HERE, "..", "..", "..", "..")
+LAUNCHER_SRC = os.path.join(ROOT, "python", "flliper", "srt", "pdflip", "launcher.py")
+ENTRYPOINT_SRC = os.path.join(ROOT, "docker", "pdflip-release", "entrypoint.sh")
+
+#: verbatim from boot_weg2_dkr27bint4arrc4bar1int4ar10241254_c07b574410_1024_125438.front.log (FORCED-PAST lines 15/53)
+INT4AR_HW_COUNT = (
+    "HW-COUNT: 2 cards would be P = TP1 x PP2, D = TP2 x PP1 (host ordinal 0); not yet runnable, 1 blocker(s): "
+    "[METAL-UNPROVEN] no release boot on 2 cards yet (proven: [3]) (pdflip/topology.py PROVEN_CARD_COUNTS) || "
+    "visible: nvml0 NVIDIA GeForce RTX 3080 20480 MiB sm86 800 GB/s PCIe gen4 x16 BAR1 256 MiB class=RTX3080; "
+    "nvml1 NVIDIA GeForce RTX 3080 20480 MiB sm86 800 GB/s PCIe gen4 x16 BAR1 256 MiB class=RTX3080")
+INT4AR_CROSSING = (
+    "HW-UNCALIBRATED: PP-CUT crossing prices are measured at PCIe widths x4, x8 only; ordinal 0 (RTX3080) x16 -> x8; "
+    "ordinal 1 (RTX3080) x16 -> x8 -- --force prices these at the nearest measured width not faster than their own: "
+    "UNMEASURED on this board (a crossing measurement of this rig writes the table)")
+
+ENV_KEYS = (R.ENV_FORCED_BOOT, R.ENV_FORCED_RECORDS, R.ENV_FORCED_PAST_EP) + tuple(R.ENV_FORCE_REQUEST_NAMES)
+
+
+def card(i, name, mib, cc, uuid=None):
+    return L.Card(i, uuid or f"GPU-{i:04d}", name, mib, reserved_mib=0, cc=cc)
+
+
+def two_3080():
+    return [card(0, "NVIDIA GeForce RTX 3080", 20480, (8, 6), "GPU-aaaa"),
+            card(1, "NVIDIA GeForce RTX 3080", 20480, (8, 6), "GPU-bbbb")]
+
+
+def d_sample(tag, mib_by_uuid, form="exchange"):
+    """A group-D dormant-image sample in the shape the front writes (sample_dormant_image)."""
+    return {"group": "D", "at": "2026-10-24T12:57:05Z", "boot_tag": tag, "commit": "c07b574410",
+            "rss_shmem_gib": 3.4, "weight_tags_gib": 27.15, "vram_residue_mib": dict(mib_by_uuid),
+            "vram_residue_form": form, "vram_residue_capture_bs": 6}
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.pop(k, None) for k in ENV_KEYS}
+        R.arm(False)
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "weg2_measured_record.json")
+        self.lines = []
+
+    def tearDown(self):
+        R.arm(False)
+        for k in ENV_KEYS:
+            os.environ.pop(k, None)
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    def samples(self):
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path) as fh:
+            return json.load(fh)["samples"]
+
+    def force(self, *passes):
+        R.arm(True)
+        for code, text in passes:
+            R.refuse_value(code, text, L.PdFlipLaunchRefused, self.lines.append)
+
+
+class Classifier(Base):
+    def test_the_two_int4ar_passes_are_record_neutral_verbatim(self):
+        self.assertEqual(R.records_class("HW-COUNT", INT4AR_HW_COUNT), "HW-COUNT/METAL-UNPROVEN")
+        self.assertEqual(R.records_class("HW-UNCALIBRATED", INT4AR_CROSSING), "HW-UNCALIBRATED/pp-crossing-width")
+
+    def test_lane_borrow_text_from_the_launcher_itself_is_neutral(self):
+        self.force()
+        cards = L.order_cards(two_3080())
+        self.assertEqual(L.forced_lane_borrow(cards, [16, 16], self.lines.append), [8, 8])
+        (got,) = R.forced_list()
+        self.assertEqual(R.records_class(got["code"], got["text"]), "HW-UNCALIBRATED/pp-crossing-width")
+
+    def test_metal_only_built_by_topology_format_is_neutral_any_further_blocker_is_not(self):
+        metal = T.Blocker("METAL-UNPROVEN", "pdflip/topology.py PROVEN_CARD_COUNTS", "no release boot on 2 cards yet (proven: [3])")
+        nvec = T.Blocker("RECORDS-NVEC", "pdflip/profile_records_data/qwen27b.json",
+                         "3 measured records are 3-vectors of one inventory that cannot be derived for this one (a, b); "
+                         "2 cards of this inventory need a calibration boot that writes their records (plan K1/P3a)")
+        head = "HW-COUNT: 2 cards would be P = TP1 x PP2, D = TP2 x PP1 (host ordinal 0); not yet runnable, "
+        self.assertEqual(R.records_class("HW-COUNT", head + "1 blocker(s): " + metal.text()), "HW-COUNT/METAL-UNPROVEN")
+        both = head + "2 blocker(s): " + "; ".join(b.text() for b in (nvec, metal))
+        self.assertIsNone(R.records_class("HW-COUNT", both))
+        lying = head + "1 blocker(s): " + "; ".join(b.text() for b in (metal, nvec))   # count says 1, list has 2
+        self.assertIsNone(R.records_class("HW-COUNT", lying))
+
+    def test_every_real_topology_refusal_is_judged_by_its_own_blocker_list(self):
+        """Over every N the planner can refuse with HW-COUNT (generic context and a profile context with
+        positional vectors), the verdict follows the refusal's OWN blocker objects: neutral iff all METAL-UNPROVEN."""
+        seen = {True: 0, False: 0}
+        ctxs = (T.TopologyContext(),
+                T.TopologyContext(vectors={"p_budget": 3}))     # a 3-vector on N != 3 cards: PROFILE-VECTORS
+        for ctx in ctxs:
+            for n in range(T.MIN_CARDS, T.MAX_CARDS_BAR1 + 1):
+                try:
+                    T.plan_topology(n, ctx)
+                except T.TopologyRefused as exc:
+                    if not str(exc).startswith(T.CODE_COUNT):
+                        continue
+                    metal_only = all(b.code == "METAL-UNPROVEN" for b in exc.blockers)
+                    got = R.records_class("HW-COUNT", str(exc) + " || visible: x")
+                    self.assertEqual(got is not None, metal_only, str(exc)[:300])
+                    seen[metal_only] += 1
+        self.assertGreater(seen[True], 0)
+        self.assertGreater(seen[False], 0)
+
+    def test_count_mismatch_of_order_cards_is_a_foreign_configuration(self):
+        self.force()
+        L.order_cards(two_3080()[:1] + [card(2, "NVIDIA GeForce RTX 5090", 32607, (12, 0))], 3)
+        (got,) = R.forced_list()
+        self.assertEqual(got["code"], "HW-COUNT")
+        self.assertIsNone(R.records_class(got["code"], got["text"]))
+
+    def test_foreign_inventory_is_not_neutral(self):
+        self.force()
+        three_090 = [card(i, "NVIDIA GeForce RTX 3090", 24576, (8, 6)) for i in range(3)]
+        ns = L.build_parser().parse_args(["--tree", "/t", "--tag", "t", "--profile", "nextflash"])
+        L.inventory_check_line(ns, L.order_cards(three_090))
+        (got,) = R.forced_list()
+        self.assertEqual(got["code"], "HW-UNCALIBRATED")
+        self.assertIsNone(R.records_class(got["code"], got["text"]))
+
+    def test_crossing_joined_with_another_message_or_altered_is_not_neutral(self):
+        self.assertIsNone(R.records_class("HW-UNCALIBRATED", INT4AR_CROSSING + " || HW-UNCALIBRATED: profile records"))
+        self.assertIsNone(R.records_class("HW-UNCALIBRATED", "HW-UNCALIBRATED: profile 'qwen27b' positional records"))
+        self.assertIsNone(R.records_class("HW-COUNT", INT4AR_CROSSING))          # right text, wrong code
+        self.assertIsNone(R.records_class("HW-UNCALIBRATED", INT4AR_HW_COUNT))
+
+    def test_capacity_borrow_and_threshold_codes_are_never_neutral(self):
+        for code in ("D-BUDGET", "P-CARD", "WAKE-CREDIT", "HW-BORROWED", "HOST-DISK", "SHM", "STORE", "MEMAVAIL",
+                     "PROFIL-STATUS", "PP-CUT"):
+            self.assertIsNone(R.records_class(code, INT4AR_CROSSING), code)
+            self.assertIsNone(R.records_class(code, INT4AR_HW_COUNT), code)
+
+
+class LauncherSeal(Base):
+    def test_unforced_boot_writes_at_once_without_stamp(self):
+        host_ledger.append_measured_record(self.path, {"group": "D", "x": 1})
+        self.assertEqual(self.samples(), [{"group": "D", "x": 1}])
+        self.assertEqual(host_ledger.flush_held_records(self.lines.append), (0, 0))
+
+    def test_neutral_forced_boot_holds_then_writes_stamped(self):
+        self.force(("HW-COUNT", INT4AR_HW_COUNT), ("HW-UNCALIBRATED", INT4AR_CROSSING))
+        self.assertTrue(R.records_pending())
+        host_ledger.append_measured_record(self.path, {"group": "P", "x": 1})
+        self.assertEqual(self.samples(), [])                        # held: the verdict is not final yet
+        allow, why = R.seal_records()
+        self.assertTrue(allow, why)
+        self.assertIn("FORCED-RECORDS WRITES", R.records_verdict_line())
+        self.assertEqual(host_ledger.flush_held_records(self.lines.append), (1, 0))
+        self.assertEqual(self.samples(), [{"group": "P", "x": 1,
+                                           "forced_past": ["HW-COUNT/METAL-UNPROVEN", "HW-UNCALIBRATED/pp-crossing-width"]}])
+        host_ledger.append_measured_record(self.path, {"group": "D", "x": 2})   # after the seal: direct
+        self.assertEqual(len(self.samples()), 2)
+
+    def test_forced_boot_that_passed_nothing_writes(self):
+        self.force()
+        self.assertEqual(R.seal_records()[0], True)
+        host_ledger.append_measured_record(self.path, {"group": "D"})
+        self.assertEqual(self.samples(), [{"group": "D", "forced_past": []}])
+
+    def test_a_capacity_pass_keeps_the_boot_record_free_and_drops_the_held(self):
+        self.force(("HW-COUNT", INT4AR_HW_COUNT), ("D-BUDGET", "KV does not fit by 1840 MiB"))
+        host_ledger.append_measured_record(self.path, {"group": "P"})
+        allow, why = R.seal_records()
+        self.assertFalse(allow)
+        self.assertIn("D-BUDGET", why)
+        line = R.records_verdict_line()
+        self.assertTrue(line.startswith("FORCED-RECORDS NONE: this boot writes NO records"), line)
+        self.assertEqual(host_ledger.flush_held_records(self.lines.append), (0, 1))
+        host_ledger.append_measured_record(self.path, {"group": "D"})
+        self.assertEqual(self.samples(), [])
+
+    def test_a_pass_after_the_seal_withdraws_the_verdict_in_this_process(self):
+        self.force(("HW-COUNT", INT4AR_HW_COUNT))
+        self.assertTrue(R.seal_records()[0])
+        R.refuse_value("P-CARD", "chunk does not fit", L.PdFlipLaunchRefused, self.lines.append)
+        self.assertFalse(R.records_allowed())
+        self.assertIn("AFTER the records seal", R.records_verdict_line())
+        host_ledger.append_measured_record(self.path, {"group": "D"})
+        self.assertEqual(self.samples(), [])
+
+    def test_arm_resets_seal_held_and_drops_an_inherited_verdict(self):
+        os.environ[R.ENV_FORCED_RECORDS] = "allow;HW-COUNT/METAL-UNPROVEN"
+        self.force(("D-BUDGET", "x"))
+        self.assertNotIn(R.ENV_FORCED_RECORDS, os.environ)
+        host_ledger.append_measured_record(self.path, {"group": "D"})
+        R.arm(True)
+        self.assertEqual(R.take_held(), [])
+        self.assertFalse(R.records_allowed())
+
+
+class Entrypoint(Base):
+    def test_force_request_without_the_list_is_unknown_and_writes_nothing(self):
+        for name in R.ENV_FORCE_REQUEST_NAMES:
+            os.environ[name] = "1"
+            self.force(("HW-COUNT", INT4AR_HW_COUNT))
+            allow, why = R.seal_records()
+            self.assertFalse(allow, name)
+            self.assertIn(R.ENV_FORCED_PAST_EP, why)
+            os.environ.pop(name)
+
+    def test_empty_list_counts_as_nothing_passed(self):
+        os.environ[R.ENV_FORCE_REQUEST] = "1"
+        os.environ[R.ENV_FORCED_PAST_EP] = ""
+        self.force(("HW-COUNT", INT4AR_HW_COUNT), ("HW-UNCALIBRATED", INT4AR_CROSSING))
+        self.assertTrue(R.seal_records()[0])
+
+    def test_an_entrypoint_threshold_pass_keeps_records_off(self):
+        os.environ[R.ENV_FORCE_REQUEST] = "1"
+        os.environ[R.ENV_FORCED_PAST_EP] = "SHM\t/dev/shm = 8 GiB < 48 GiB\n"
+        self.force(("HW-COUNT", INT4AR_HW_COUNT))
+        allow, why = R.seal_records()
+        self.assertFalse(allow)
+        self.assertIn("SHM (entrypoint)", why)
+        self.assertEqual(R.entrypoint_forced(), [("SHM", "/dev/shm = 8 GiB < 48 GiB")])
+
+    def test_no_entrypoint_at_all_is_a_bare_launcher_call(self):
+        self.assertEqual(R.entrypoint_forced(), [])
+
+    @unittest.skipUnless(os.path.exists(ENTRYPOINT_SRC), "no docker/pdflip-release/entrypoint.sh in this tree (NF line)")
+    def test_entrypoint_source_lists_every_pass_and_exports_it(self):
+        src = open(ENTRYPOINT_SRC, encoding="utf-8").read()
+        rv = next(ln for ln in src.splitlines() if ln.startswith("refuse_value()"))
+        self.assertIn('forced_past_ep "$2" "$3"', rv)
+        self.assertIn('say "FORCED-PAST HW-COUNT $msg"; forced_past_ep HW-COUNT "$msg"', src)
+        self.assertIn('say "FORCED-PAST HW-UNCALIBRATED $msg"; forced_past_ep HW-UNCALIBRATED "$msg"', src)
+        block = src[src.index("LAUNCH+=(--force)"):]
+        self.assertIn('export FLLIPER_PDFLIP_FORCED_PAST_EP="$FORCED_PAST_EP"', block[:400])
+        # the register's pin on the entrypoint codes is untouched by the new helper
+        self.assertEqual(sorted(R.ENTRYPOINT_FORCE_CODES), R.entrypoint_wired_codes(src))
+
+    @unittest.skipUnless(os.path.exists(ENTRYPOINT_SRC), "no docker/pdflip-release/entrypoint.sh in this tree (NF line)")
+    def test_the_shell_helper_builds_the_list_the_launcher_parses(self):
+        fn = next(ln for ln in open(ENTRYPOINT_SRC, encoding="utf-8").read().splitlines()
+                  if ln.startswith("forced_past_ep()"))
+        script = ('FORCED_PAST_EP=""\n' + fn + '\nforced_past_ep HW-COUNT "HW-COUNT: a\nb"\n'
+                  'forced_past_ep SHM "low"\nprintf "%s" "$FORCED_PAST_EP"\n')
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(R.entrypoint_forced({R.ENV_FORCED_PAST_EP: out, R.ENV_FORCE_REQUEST: "1"}),
+                         [("HW-COUNT", "HW-COUNT: a b"), ("SHM", "low")])
+
+
+class ChildProcess(Base):
+    def test_child_without_seal_writes_nothing(self):
+        os.environ[R.ENV_FORCED_BOOT] = "1"
+        host_ledger.append_measured_record(self.path, {"group": "D"})
+        self.assertEqual(self.samples(), [])
+        self.assertFalse(R.records_pending())                       # a child never holds
+
+    def test_child_with_the_launcher_seal_writes_stamped(self):
+        self.force(("HW-UNCALIBRATED", INT4AR_CROSSING))
+        R.seal_records()
+        fenv = {R.ENV_FORCED_RECORDS: "stale"}
+        R.export_records_verdict(fenv)
+        self.assertEqual(fenv[R.ENV_FORCED_RECORDS], "allow;HW-UNCALIBRATED/pp-crossing-width")
+        R.arm(False)                                                # become the front: no arm, inherited env only
+        os.environ[R.ENV_FORCED_BOOT] = "1"
+        os.environ[R.ENV_FORCED_RECORDS] = fenv[R.ENV_FORCED_RECORDS]
+        host_ledger.append_measured_record(self.path, {"group": "D"})
+        self.assertEqual(self.samples(), [{"group": "D", "forced_past": ["HW-UNCALIBRATED/pp-crossing-width"]}])
+
+    def test_none_verdict_removes_the_seal_from_the_child_env(self):
+        self.force(("D-BUDGET", "x"))
+        R.seal_records()
+        fenv = {R.ENV_FORCED_RECORDS: "allow;"}
+        R.export_records_verdict(fenv)
+        self.assertNotIn(R.ENV_FORCED_RECORDS, fenv)
+
+
+class DangerDirection(Base):
+    """A record from a FOREIGN form must never price a smaller D residue (-> bigger P budget -> OOM)."""
+
+    def test_foreign_inventory_boot_record_never_lowers_the_residue(self):
+        three_090 = [card(i, "NVIDIA GeForce RTX 3090", 24576, (8, 6), f"GPU-{i:04d}") for i in range(3)]
+        ns = L.build_parser().parse_args(["--tree", "/t", "--tag", "t", "--profile", "nextflash"])
+        self.force()
+        L.inventory_check_line(ns, L.order_cards(three_090))        # FORCED-PAST HW-UNCALIBRATED (foreign inventory)
+        R.seal_records()
+        fenv = {}
+        R.export_records_verdict(fenv)
+        R.arm(False)                                                # the front of that boot
+        os.environ[R.ENV_FORCED_BOOT] = "1"
+        os.environ.update(fenv)
+        host_ledger.append_measured_record(self.path, d_sample("foreign", {c.uuid: 900 for c in three_090}))
+        self.assertEqual(self.samples(), [])
+        os.environ.pop(R.ENV_FORCED_BOOT, None)                     # the next (unforced) boot reads the sidecar
+        rec = host_ledger.read_measured_record(self.path).get("D")
+        got, why = L.dc_residue_from_record(rec, three_090, "exchange")
+        self.assertIsNone(got, why)                                 # -> the constant, never 900+256
+
+    def test_neutral_boot_record_prices_the_next_boot_from_the_measurement(self):
+        cards = two_3080()
+        self.force(("HW-COUNT", INT4AR_HW_COUNT), ("HW-UNCALIBRATED", INT4AR_CROSSING))
+        R.seal_records()
+        fenv = {}
+        R.export_records_verdict(fenv)
+        R.arm(False)
+        os.environ[R.ENV_FORCED_BOOT] = "1"
+        os.environ.update(fenv)
+        host_ledger.append_measured_record(self.path, d_sample("dkr27bint4ar", {c.uuid: 1258 for c in cards}))
+        for k in (R.ENV_FORCED_BOOT, R.ENV_FORCED_RECORDS):
+            os.environ.pop(k, None)
+        rec = host_ledger.read_measured_record(self.path).get("D")
+        got, why = L.dc_residue_from_record(rec, cards, "exchange")
+        self.assertEqual(got, {c.uuid: 1258 + L.DC_RECORD_MARGIN_MIB for c in cards}, why)
+        self.assertEqual(rec["forced_past"], ["HW-COUNT/METAL-UNPROVEN", "HW-UNCALIBRATED/pp-crossing-width"])
+
+
+class CardSetPick(unittest.TestCase):
+    """duo (5090+3080) and dual (5090+3080+3080) share the NVFP4 identity; once forced boots write records, a duo
+    D sample must not push dual onto the constant, and duo prefers its own sample over dual's bigger card set."""
+
+    U5, UA, UB = "GPU-31d7ef41", "GPU-62dbbae1", "GPU-5c648f96"
+
+    def cards(self, *uuids):
+        names = {self.U5: ("NVIDIA GeForce RTX 5090", 32607, (12, 0)), self.UA: ("NVIDIA GeForce RTX 3080", 20480, (8, 6)),
+                 self.UB: ("NVIDIA GeForce RTX 3080", 20480, (8, 6))}
+        return [card(i, *names[u], uuid=u) for i, u in enumerate(uuids)]
+
+    def rows(self):
+        dual = dict(d_sample("dual1007", {self.U5: 1848, self.UA: 1364, self.UB: 1364}), at="2026-10-07T04:37:34Z")
+        duo = dict(d_sample("duo1025", {self.U5: 1682, self.UA: 1332}), at="2026-10-25T01:00:00Z")
+        return [dual, duo]
+
+    def test_dual_keeps_its_exact_three_card_sample_although_duo_wrote_later(self):
+        cards = self.cards(self.U5, self.UA, self.UB)
+        rec, how = L.pick_d_residue_record(self.rows(), cards)
+        self.assertEqual(rec["boot_tag"], "dual1007")
+        self.assertTrue(how.startswith("exact card set"), how)
+        got, _ = L.dc_residue_from_record(rec, cards, "exchange")
+        self.assertEqual(got, {self.U5: 1848 + 256, self.UA: 1364 + 256, self.UB: 1364 + 256})
+
+    def test_duo_prefers_its_own_sample_and_falls_back_to_the_covering_one(self):
+        cards = self.cards(self.U5, self.UA)
+        rec, how = L.pick_d_residue_record(self.rows(), cards)
+        self.assertEqual((rec["boot_tag"], how.split(":")[0]), ("duo1025", "exact card set"))
+        rec, how = L.pick_d_residue_record(self.rows()[:1], cards)
+        self.assertEqual((rec["boot_tag"], how.split(":")[0]), ("dual1007", "covering card set"))
+
+    def test_no_covering_sample_returns_the_newest_and_the_reader_refuses_it(self):
+        cards = self.cards(self.U5, self.UA, self.UB)
+        rec, how = L.pick_d_residue_record(self.rows()[1:], cards)
+        self.assertEqual(rec["boot_tag"], "duo1025")
+        self.assertIn("no sample covers", how)
+        got, why = L.dc_residue_from_record(rec, cards, "exchange")
+        self.assertIsNone(got)
+        self.assertIn(self.UB, why)
+        self.assertEqual(L.pick_d_residue_record([], cards), (None, "no sample"))
+
+    def test_the_launcher_reads_all_d_samples_through_the_pick(self):
+        src = open(LAUNCHER_SRC, encoding="utf-8").read()
+        self.assertIn("_dc_rec_d, _dc_from_record, _dc_record_prov, _dc_pick_note = dc_residue_for(\n"
+                      "        measured_record_path(), _dc_accept, cards, ns.pdflip_weight_source)", src)
+
+    def test_the_sidecar_reader_applies_the_pick_and_names_it_only_when_it_differs(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "rec.json")
+        with open(p, "w") as fh:
+            json.dump({"samples": self.rows()}, fh)
+        dual = self.cards(self.U5, self.UA, self.UB)
+        rec, note = L.d_residue_record_for(p, None, dual)
+        self.assertEqual(rec["boot_tag"], "dual1007")
+        self.assertIn("#227 card-set pick, exact card set: boot dual1007", note)
+        rec, note = L.d_residue_record_for(p, None, self.cards(self.U5, self.UA))
+        self.assertEqual((rec["boot_tag"], note), ("duo1025", ""))     # the newest anyway: line unchanged
+        self.assertEqual(L.d_residue_record_for(os.path.join(d, "absent.json"), None, dual), (None, ""))
+
+
+class _FrontStub:
+    """The attributes Front._note_d_residue_reading reads -- no Front construction (GPU-free)."""
+
+    def __init__(self, path, first, reserve):
+        import collections
+        self.counters = collections.Counter()
+        self.dormant_image = {"D": first}
+        self.dc_reserve = dict(reserve)
+        self.epoch = 3
+        self.measured_record = path
+        self.weights_resident = False
+
+    def _sidecar_submit(self, fn, *args):
+        fn(*args)
+
+
+class MaxOverSleeps(Base):
+    """#227 review MUSS-1: D residue = the MEASURED maximum of all D sleeps (W19 grades only the first)."""
+
+    U = ("GPU-aaaa", "GPU-bbbb")
+
+    def first(self, a=1258, b=1258):
+        rec = d_sample("int4arA", {self.U[0]: a, self.U[1]: b})
+        rec["vram_residue_kind"] = "first_sleep"
+        rec["vram_residue_sleeps"] = 1                                         # #227 R1: the sleep counter
+        return rec
+
+    def stub(self, reserve=1578):
+        from flliper.srt.pdflip.front import Front
+        st = _FrontStub(self.path, self.first(), {u: reserve for u in self.U})
+        return st, (lambda dc, held=None: Front._note_d_residue_reading(st, "D", dc, held))
+
+    def test_a_later_sleep_that_raises_a_card_appends_the_boot_maximum(self):
+        st, note = self.stub()
+        rec2 = note({self.U[0]: 1250, self.U[1]: 1258})                        # nothing new, but the 2nd sleep (R1)
+        self.assertEqual((rec2["vram_residue_mib"], rec2["vram_residue_sleeps"]),
+                         ({self.U[0]: 1258, self.U[1]: 1258}, 2))
+        rec = note({self.U[0]: 1400, self.U[1]: 1300})
+        self.assertEqual(rec["vram_residue_sleeps"], 3)
+        self.assertEqual(rec["vram_residue_mib"], {self.U[0]: 1400, self.U[1]: 1300})
+        self.assertEqual(rec["vram_residue_kind"], "max_over_sleeps")
+        rec = note({self.U[0]: 1350, self.U[1]: 1600})
+        self.assertEqual(rec["vram_residue_mib"], {self.U[0]: 1400, self.U[1]: 1600})
+        self.assertEqual([x["vram_residue_mib"] for x in self.samples()],
+                         [{self.U[0]: 1258, self.U[1]: 1258}, {self.U[0]: 1400, self.U[1]: 1300},
+                          {self.U[0]: 1400, self.U[1]: 1600}])
+        self.assertEqual([x["vram_residue_sleeps"] for x in self.samples()], [2, 3, 4])
+        self.assertEqual(st.counters["dc_over_reserve"], 1)                    # 1600 > 1578, named, no stop
+
+    @unittest.skipUnless(os.path.exists(os.path.join(ROOT, "python", "flliper", "srt", "pdflip", "l15_plan.py")),
+                         "no L1.5 on this tree (NF line)")
+    def test_the_l15_hold_is_stripped_like_at_the_first_sleep(self):
+        os.environ["FLLIPER_PDFLIP_L15"] = "1"
+        try:
+            st, note = self.stub()
+            rec = note({self.U[0]: 9400, self.U[1]: 1300}, {self.U[0]: 7616})
+            self.assertEqual(rec["vram_residue_mib"][self.U[0]], 1784)
+        finally:
+            os.environ.pop("FLLIPER_PDFLIP_L15", None)
+
+    def test_group_p_resident_weights_and_no_first_sample_write_nothing(self):
+        from flliper.srt.pdflip.front import Front
+        st, note = self.stub()
+        self.assertIsNone(Front._note_d_residue_reading(st, "P", {self.U[0]: 9999}))
+        st.weights_resident = True
+        self.assertIsNone(note({self.U[0]: 9999, self.U[1]: 9999}))
+        st.weights_resident = False
+        st.dormant_image = {}
+        self.assertIsNone(note({self.U[0]: 9999, self.U[1]: 9999}))
+        self.assertEqual(self.samples(), [])
+
+    def cards(self):
+        return two_3080()
+
+    def test_danger_direction_the_next_boot_books_at_least_the_measured_maximum(self):
+        """int4ar 10231444: first sleep 1258, a later sleep 1600 -- the next boot must book >= 1600."""
+        st, note = self.stub()
+        host_ledger.append_measured_record(self.path, st.dormant_image["D"])     # the first-sleep record
+        note({self.U[0]: 1600, self.U[1]: 1600})
+        _rec, vals, prov, _note = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1600, self.U[1]: 1600}, prov)        # bare: + slack 64 by the caller
+        self.assertIn("MAX over all D sleeps", prov)
+        self.assertGreaterEqual(min(vals.values()), 1600)
+
+    def test_max_over_the_newest_boots_legacy_keeps_its_margin(self):
+        rows = []
+        legacy = dict(d_sample("old", {self.U[0]: 1258, self.U[1]: 1258}), at="2026-10-20T00:00:00Z")
+        rows.append(legacy)
+        b = dict(self.first(), boot_tag="new", at="2026-10-25T00:00:00Z")
+        rows += [b, dict(b, vram_residue_kind="max_over_sleeps", vram_residue_mib={self.U[0]: 1500, self.U[1]: 1400},
+                         vram_residue_sleeps=3, at="2026-10-25T01:00:00Z")]
+        vals, prov = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1514, self.U[1]: 1514})              # legacy 1258+256 still dominates
+        self.assertIn("LEGACY first sleep +256", prov)
+        vals, _ = L.dc_residue_max_from_records(rows, self.cards(), "exchange", n=1)
+        self.assertEqual(vals, {self.U[0]: 1500, self.U[1]: 1400})              # only the newest boot
+
+    def test_all_legacy_keeps_the_pre_227_line_byte_for_byte(self):
+        legacy = d_sample("old", {self.U[0]: 1258, self.U[1]: 1258})
+        with open(self.path, "w") as fh:
+            json.dump({"samples": [legacy]}, fh)
+        rec, vals, prov, note = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        old_vals, old_prov = L.dc_residue_from_record(legacy, self.cards(), "exchange")
+        self.assertEqual((vals, prov, note), (old_vals, old_prov, ""))
+        self.assertIsNone(L.dc_residue_max_from_records([legacy], self.cards(), "exchange")[0])
+
+    def test_a_covering_card_set_is_named_and_keeps_the_margin(self):
+        U5 = "GPU-cccc"
+        cover = dict(d_sample("dual", {self.U[0]: 1364, self.U[1]: 1364, U5: 1848}), vram_residue_kind="first_sleep")
+        with open(self.path, "w") as fh:
+            json.dump({"samples": [cover]}, fh)
+        _rec, vals, prov, _n = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1364 + 256, self.U[1]: 1364 + 256})
+        self.assertTrue(prov.startswith("COVERING card set"), prov)
+
+    def test_the_front_wires_both_later_reading_paths(self):
+        src = open(os.path.join(ROOT, "python", "flliper", "srt", "pdflip", "front.py"), encoding="utf-8").read()
+        self.assertTrue(re.search(r"if src == \"D\" and self\.dc_measured_d and dc:\n\s+self\._note_d_residue_reading\(src, dc, ", src))
+        self.assertIn("self._dc_reading_off_path(src, S.sid, rec, l15_held=", src)
+        self.assertIn("self._note_d_residue_reading(src, dc, l15_held)", src)
+        self.assertIn('rec["vram_residue_kind"] = "first_sleep"', src)
+        self.assertIn('rec["vram_residue_sleeps"] = 1', src)                    # R1: the first sleep counts 1
+        self.assertIn('rec["vram_residue_sleeps"] = n_sleeps', src)             # R1: later samples carry the count
+        lsrc = open(LAUNCHER_SRC, encoding="utf-8").read()
+        self.assertRegex(lsrc, r"DC_ONE_SLEEP_MARK in _dc_record_prov:\n\s+log\(f\"#227 R1 \{DC_ONE_SLEEP_MARK\}")
+
+    # ---- #227 R1: a boot that saw ONE D sleep has not reached its maximum -> first sleep + 256, named ----
+    def _boot(self, tag, rows_vals, sleeps=None, at="2026-10-25T00:00:00Z", kinds=None):
+        rows = []
+        for i, vals in enumerate(rows_vals):
+            r = dict(d_sample(tag, {self.U[0]: vals[0], self.U[1]: vals[1]}), at=at[:-3] + ":%02dZ" % i)
+            kind = (kinds or ["first_sleep"] + ["max_over_sleeps"] * 9)[i]
+            if kind:
+                r["vram_residue_kind"] = kind
+            if sleeps is not None:
+                r["vram_residue_sleeps"] = sleeps[i]
+            rows.append(r)
+        return rows
+
+    def test_r1_a_one_sleep_boot_books_first_sleep_plus_256_and_says_so(self):
+        rows = self._boot("one", [(1258, 1258)], sleeps=[1])
+        vals, prov = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258 + 256, self.U[1]: 1258 + 256})
+        self.assertIn(L.DC_ONE_SLEEP_MARK, prov)
+
+    def test_r1_a_two_sleep_boot_books_bare(self):
+        rows = self._boot("two", [(1258, 1258), (1258, 1258)], sleeps=[1, 2])      # 2nd sleep raised nothing
+        vals, prov = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258, self.U[1]: 1258})
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
+        rows = self._boot("two", [(1258, 1258), (1600, 1500)], sleeps=[1, 2])
+        vals, _ = L.dc_residue_max_from_records(rows, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1600, self.U[1]: 1500})
+
+    def test_r1_boots_without_the_counter_keep_their_old_rule(self):
+        # legacy (no kind): first sleep + 256, as before R1
+        legacy = self._boot("old", [(1258, 1258)], kinds=[None])
+        mixed = legacy + self._boot("new", [(1000, 1000), (1100, 1100)], sleeps=[1, 2], at="2026-10-26T00:00:00Z")
+        vals, prov = L.dc_residue_max_from_records(mixed, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258 + 256, self.U[1]: 1258 + 256})
+        self.assertIn("LEGACY first sleep +256", prov)
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
+        # a measured boot without the counter (a build between the first #227 head and R1; none ran on metal)
+        # stays kind-based: bare
+        nocount = self._boot("nocount", [(1258, 1258)])
+        vals, prov = L.dc_residue_max_from_records(nocount, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258, self.U[1]: 1258})
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
+
+    def test_r1_end_to_end_through_the_front_stub_and_the_sidecar(self):
+        # one sleep only: the sidecar holds the first-sleep sample alone -> +256
+        st, note = self.stub()
+        host_ledger.append_measured_record(self.path, st.dormant_image["D"])
+        _r, vals, prov, _n = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258 + 256, self.U[1]: 1258 + 256}, prov)
+        self.assertIn(L.DC_ONE_SLEEP_MARK, prov)
+        # the second sleep arrives (nothing raised) -> the boot is told apart: bare
+        note({self.U[0]: 1250, self.U[1]: 1258})
+        _r, vals, prov, _n = L.dc_residue_for(self.path, None, self.cards(), "exchange")
+        self.assertEqual(vals, {self.U[0]: 1258, self.U[1]: 1258}, prov)
+        self.assertNotIn(L.DC_ONE_SLEEP_MARK, prov)
+
+
+class ReviewSoll(Base):
+    def test_s1_park_and_x_cost_key_carries_the_card_set(self):
+        from flliper.srt.pdflip.front import park_form_key_with_cards
+        self.assertEqual(park_form_key_with_cards("ckpt|arch=dense", {"GPU-62dbbae1-e859": 1, "GPU-31d7ef41-f574": 2}),
+                         "ckpt|arch=dense|cards=GPU-31d7ef41,GPU-62dbbae1")
+        self.assertEqual(park_form_key_with_cards("", {"GPU-1": 1}), "")
+        self.assertEqual(park_form_key_with_cards("k", {}), "k")
+
+    def _front_log(self, *lines):
+        p = os.path.join(self.dir, "boot_weg2_t_0123456789_1024_000000.front.log")
+        with open(p, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return p
+
+    def test_s5_hand_tools_obey_the_boot_verdict(self):
+        self.assertEqual(R.front_log_records_verdict(self._front_log("x"))[0], True)
+        self.assertEqual(R.front_log_records_verdict(self._front_log("PDFLIP-LAUNCH FORCED BOOT (--force): ..."))[0], False)
+        self.assertEqual(R.front_log_records_verdict(self._front_log(
+            "PDFLIP-LAUNCH FORCED BOOT (--force): ...", "PDFLIP-LAUNCH FORCED-RECORDS WRITES: ..."))[0], True)
+        self.assertEqual(R.front_log_records_verdict(os.path.join(self.dir, "absent.front.log"))[0], False)
+        from flliper.srt.pdflip.tools import pd_free0_record
+        src = open(pd_free0_record.__file__, encoding="utf-8").read()
+        self.assertIn("_refusals.front_log_records_verdict(ns.front_log)", src)
+        from flliper.srt.pdflip.tools import owned_miss_record
+        self.assertIn('_refusals.front_log_records_verdict(_stem + ".front.log")',
+                      open(owned_miss_record.__file__, encoding="utf-8").read())
+
+    @unittest.skipUnless(os.path.exists(ENTRYPOINT_SRC), "no docker/pdflip-release/entrypoint.sh in this tree (NF line)")
+    def test_s6_the_operator_escape_is_listed_not_silent(self):
+        src = open(ENTRYPOINT_SRC, encoding="utf-8").read()
+        self.assertEqual(src.count("Operator-Ausnahme HTSGLANG_EXPECT_GPUS=${HTSGLANG_EXPECT_GPUS}"), 3)
+        self.assertIsNone(R.records_class("HW-COUNT", "HW-COUNT: 3 cards visible, profile wants 2 "
+                                                      "(Operator-Ausnahme HTSGLANG_EXPECT_GPUS=0)"))
+
+
+class LauncherWiring(unittest.TestCase):
+    def test_seal_flush_and_export_precede_the_front_spawn_after_every_refusal_site(self):
+        src = open(LAUNCHER_SRC, encoding="utf-8").read()
+        main = src[src.index("\ndef main("):src.index("\ndef xchg_census_is_reserve(")]
+        seal = main.index("refusals.seal_records()")
+        spawn = main.index("fp = subprocess.Popen(front_argv")
+        self.assertLess(seal, main.index("host_ledger.flush_held_records(log)"))
+        self.assertLess(main.index("refusals.export_records_verdict(fenv)"), spawn)
+        self.assertLess(main.index("fenv = dict(os.environ)"), seal)
+        # every refusal site main reaches directly or through its solvers runs before the seal
+        for call in ("refuse_value(", "log_d_rank_vram_solve(", "log_wake_credit_solve(", "p_card_verdict(",
+                     "inventory_check_line(", "topology_check_line(", "forced_lane_borrow(", "dc_measured_d_mib(",
+                     "prepare_weight_exchange(", "xchg_form_dormant_reserve(", "order_cards(", "host_preflight(",
+                     "apply_inventory_derivation("):
+            for m in re.finditer(re.escape(call), main):
+                self.assertLess(m.start(), seal, f"{call} at offset {m.start()} after the seal")
+
+    def test_help_and_header_name_the_narrowed_rule(self):
+        src = open(LAUNCHER_SRC, encoding="utf-8").read()
+        self.assertIn("unless every refusal it passed is a proof gap of its own form (#227", src)
+        self.assertIn("FORCED-RECORDS entrypoint list", src)
+
+
+if __name__ == "__main__":
+    unittest.main()
