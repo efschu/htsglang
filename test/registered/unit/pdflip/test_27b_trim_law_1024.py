@@ -441,6 +441,20 @@ class AdmitBasis(CustomTestCase):
         self.assertEqual(now, "1104,1104")
         self.assertFalse(any("ADMIT-BASIS" in x for x in lines), lines)
 
+    def test_review_example_at_the_real_admission_trim(self):
+        """The same example through #217's ``extend_trim.before_admission`` (the pass's vote did not trim): it reads
+        the launcher-written list and trims at 900 < 1104, so the admission starts at 1200 - 522 >= 400."""
+        if not hasattr(ET, "before_admission"):  # pragma: no cover -- the #201 branch alone has no admission trim
+            pytest.skip("no extend_trim.before_admission on this tree (#217 not merged)")
+        _ns_, now, _ = self._int4ar_measured()
+        with mock.patch.dict(os.environ, {TRIM_ENV: now}, clear=False):
+            ET.reset_for_tests()
+            cuda = _Cuda(900, 300)
+            line = ET.before_admission(cuda, 1)
+        self.assertIsNotNone(line)
+        self.assertIn("site=admit", line)
+        self.assertGreaterEqual(cuda.free - A_PEAK, NEAR_OOM)
+
 
 # --------------------------------------------------------------------------
 # Review SOLL 2: the line is the rank's OWN card's by NVML UUID, not the floor at the rank's list index / NVML index.
