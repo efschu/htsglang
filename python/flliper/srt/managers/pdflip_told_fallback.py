@@ -1281,6 +1281,13 @@ def apply_floor(scheduler, rid: str, floor: int) -> None:
         _st._pop_credit_keep_pin(scheduler.tree_cache, rid)
     except Exception:  # noqa: BLE001 - bookkeeping; the satisfied mark decides
         pass
+    # TWIN-REREAD review MUSS 1: an S90b state pinned deeper than the floor is not what this rank admits -- released
+    _unpin_s90b = getattr(getattr(scheduler, "tree_cache", None), "_pdflip_s90b_unpin", None)
+    if callable(_unpin_s90b):
+        try:
+            _unpin_s90b(rid, above=int(floor))
+        except Exception:  # noqa: BLE001 - bookkeeping
+            pass
     sat = getattr(scheduler, "_pdflip_store_told_satisfied", None)
     if sat is None:
         sat = scheduler._pdflip_store_told_satisfied = {}
@@ -1533,6 +1540,33 @@ def _satisfied_resumable(scheduler, req, rid: str, told: int) -> Optional[int]:
     return int(res)
 
 
+def _state_at_own(scheduler, req, rid: str, own: int, res: int) -> int:
+    """TWIN-REREAD-1024: S90b FOLLOWER-STATE-AT-TOLD on the plain ack -- before acking "cannot resume at own",
+    read the anchor of ``own`` from the store, attach it to this rank's node at ``own`` and return the probe's
+    NEW answer (``res`` unchanged when nothing was attached). The dual layout keeps its ack byte for byte (the
+    other two S90b sites skip it as well); ``FLLIPER_PDFLIP_FOLLOWER_STATE_AT_TOLD=0`` switches the attach off."""
+    if own <= 0 or res >= own:
+        return res
+    if (os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+        return res
+    from flliper.srt.managers import pdflip_store_told as _st
+
+    got = int(_st._s90b_state_at_told(scheduler, req, int(own), int(res)))
+    if got >= own:
+        n = _bump(scheduler, "_pf_ack_state_at_own_n")
+        if n <= 32 or n % _LOG_EVERY == 0:
+            _ms = getattr(req, "_pdflip_s90b_attach_ms", None)
+            logger.warning(
+                "PF TOLD-ACK STATE-AT-OWN rank pp=%s rid=%s kv=%d resumable_before=%d attach_ms=%s (n=%d): this "
+                "rank's read completed the KV span without its recurrent state; the anchor of that depth was read "
+                "from the store, attached (S90b) and pinned under the rid until the seat -- the ack names the full "
+                "depth instead of PP0 answering told=0 for every rank",
+                getattr(scheduler.ps, "pp_rank", "?"), str(rid), int(own), int(res),
+                "-" if _ms is None else "%.1f" % float(_ms), n,
+            )
+    return got
+
+
 def _resumable_own(scheduler, req, rid: str, own: int) -> Optional[int]:
     """ACK-RESUMABLE (N1 dkr27browauthoritybar1fs10010740, PP1 07:46:10Z,
     pdflip-10-16): a follower's read can complete the told KV span while its
@@ -1559,6 +1593,18 @@ def _resumable_own(scheduler, req, rid: str, own: int) -> Optional[int]:
     except Exception:  # noqa: BLE001 - a probe never breaks the ack
         return own
     if res is None or int(res) >= own:
+        return _room_own(scheduler, req, rid, own)
+    # TWIN-REREAD-1024 (#194-Rest-1; 27B rc39a b9cddabda1 boot _1024_080355 P, 08:06:43): a held twin's re-read
+    # completed told=16384 on PP1/PP2 ('HiCache prefetch success ... matched=16384 loaded=0' -- the KV was in the
+    # tree, the store HELD the anchor: '#1028B FETCH CAP ... claimed=16384 caps={mamba: 16384}'), yet the ack
+    # said 'PF TOLD-ACK UNRESUMABLE kv=16384 resumable=0' unread and PP0 fell back to told=0 for every rank
+    # (pdflip-0-2/0-4; 0-3 floor 8192 then retract 0): the whole shared prefix recomputed after a 30-40 s TW hold.
+    # S90b read the anchor of the acked depth only on the OVER and SATISFIED acks; this plain ack now reads it
+    # too (the anchor of ``own``, attached to this rank's node at ``own``) and asks the SAME probe again -- only
+    # the probe's new answer counts, never the attach's return value (#968 danger direction). PP0's told stays
+    # the one verdict (SOLL R11); the follower only materialises the depth its ack names.
+    res = _state_at_own(scheduler, req, rid, own, int(res))
+    if int(res) >= own:
         return _room_own(scheduler, req, rid, own)
     n = _bump(scheduler, "_pf_ack_unresumable_n")
     if n <= 32 or n % _LOG_EVERY == 0:

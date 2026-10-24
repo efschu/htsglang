@@ -2552,6 +2552,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # -- and before the arena release below, which skips host-locked nodes.
         for _rid in list(getattr(self, "_prefetch_span_pins", None) or ()):
             self._unpin_prefetched_span(_rid)
+        # TWIN-REREAD review MUSS 1: the S90b state pins name nodes of this tree too
+        for _rid in list(self.__dict__.get("_pdflip_s90b_pins") or ()):
+            self._pdflip_s90b_unpin(_rid)
         _mk("unpin")
         # H81: the old tree's arena references go back FIRST -- see
         # `_release_host_values_before_reset` (fnNV4f2 mamba_full).
@@ -7035,6 +7038,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return self._pdflip_aor_read_attach(req, mp, backend, depth, 0, site=site)
 
     def pdflip_follower_state_at_told(self, req, told: int, site: str = "follower_told") -> int:
+        """S90b FOLLOWER-STATE-AT-TOLD, timed and pinned (TWIN-REREAD review MUSS 1 / SOLL 1): the attach's wall
+        ms (read + copy + sync) lands on ``req._pdflip_s90b_attach_ms`` for the caller's line; an attached state is
+        locked under the rid (:meth:`_pdflip_s90b_pin`) until the seat or the request's exit."""
+        t0 = time.perf_counter()
+        got = int(self._pdflip_follower_state_at_told_impl(req, told, site) or 0)
+        try:
+            req._pdflip_s90b_attach_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:  # noqa: BLE001
+            pass
+        if got >= int(told) > 0:
+            self._pdflip_s90b_pin(req, int(told))
+        return got
+
+    def _pdflip_follower_state_at_told_impl(self, req, told: int, site: str = "follower_told") -> int:
         """S90b FOLLOWER-STATE-AT-TOLD (NF rc16 bf9ca46f45, P PP2 09:13:10, pdflip-1-23): PP0 told 19200;
         PP2's device KV reached 47808 but its recurrent states there had been tombstoned (state only at
         3072): ``#1400 OVER-UNRESUMABLE told=19200 own=47808 resumable_at_told=3072``, the ack named 3072 and
@@ -13861,7 +13878,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         pins = getattr(self, "_prefetch_span_pins", None)
         if pins is None:
             pins = self._prefetch_span_pins = {}
-        self._unpin_prefetched_span(req_id)
+        self._unpin_span_only(req_id)
         held = []
         node = deepest
         while node is not None and node is not stop_at and node is not self.root_node:
@@ -13873,7 +13890,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if held:
             pins[str(req_id)] = held
         while len(pins) > self._PREFETCH_SPAN_PINS_MAX:
-            self._unpin_prefetched_span(next(iter(pins)))
+            self._unpin_span_only(next(iter(pins)))
         return len(held)
 
     def _told_head_ids(self) -> set:
@@ -13897,6 +13914,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return out
 
     def _unpin_prefetched_span(self, req_id: str) -> int:
+        """The #1417 exits (admission pop / settle_told, abort, reset): the span pin AND, since TWIN-REREAD review
+        MUSS 1, the S90b state pin of the rid."""
+        n = self._unpin_span_only(req_id)
+        if self.__dict__.get("_pdflip_s90b_pins"):
+            self._pdflip_s90b_unpin(req_id)
+        return n
+
+    def _unpin_span_only(self, req_id: str) -> int:
         pins = getattr(self, "_prefetch_span_pins", None)
         held = pins.pop(str(req_id), None) if pins else None
         for node, params in held or []:
@@ -13905,6 +13930,74 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             except Exception:  # noqa: BLE001
                 pass
         return len(held or [])
+
+    #: TWIN-REREAD review MUSS 1: upper bound on rids with an S90b state pin (rids that never reach admission)
+    _S90B_PINS_MAX = 64
+
+    def _pdflip_s90b_pin(self, req, depth: int) -> int:
+        """TWIN-REREAD review MUSS 1 (27B rc39a _1024_080355 class): the state an S90b attach put on the node at
+        ``depth`` is locked under the rid until the request is seated or leaves -- the device attach's LOAD_BACK
+        commit files it EVICTABLE on the device LRU, the e1 host attach unlocked on the host LRU, and the #1417
+        span pin does not cover it (it exists only for an inserted span; live ``loaded=0``). Evicted between the
+        ack and the seat, a non-twin met #928/#968, a twin W27 STILL SHORT -> RETRACT / TOO LATE.
+        Device state: the request-style lock of the node (``inc_lock_ref``: its Mamba lock, its KV path with it --
+        a state without its KV is no prefix). Host state: ``inc_host_lock_ref``. Released at the #1417 exits
+        (``_unpin_prefetched_span``: admission pop / settle_told, abort = follower_release / retract, reset), at a
+        floor below ``depth`` (``pdflip_told_fallback.apply_floor``) and when the request leaves the queue
+        unadmitted (``pdflip_store_told.forget_left_queue``). Returns 1 on a pin, 0 otherwise (named)."""
+        rid = str(getattr(req, "rid", "") or "")
+        if not rid:
+            return 0
+        try:
+            node = self._pdflip_kv_chain_end(
+                req.full_untruncated_fill_ids, getattr(req, "extra_key", None), int(depth))
+            if node is None:
+                return 0
+            cd = node.component_data[ComponentType.MAMBA]
+            if cd.value is not None:
+                host = False
+                params = self.inc_lock_ref(node).to_dec_params()
+            elif cd.host_value is not None and cd.host_value.numel() > 0:
+                host = True
+                params = self.inc_host_lock_ref(node).to_dec_params()
+            else:
+                return 0
+        except Exception as exc:  # noqa: BLE001 - a pin never breaks the attach; named
+            logger.warning("S90b STATE-PIN failed rid=%s depth=%d (%s: %s)", rid, int(depth), type(exc).__name__, exc)
+            return 0
+        pins = self.__dict__.get("_pdflip_s90b_pins")
+        if pins is None:
+            pins = self.__dict__["_pdflip_s90b_pins"] = {}
+        pins.setdefault(rid, []).append((node, params, host, int(depth)))
+        while len(pins) > self._S90B_PINS_MAX:
+            self._pdflip_s90b_unpin(next(iter(pins)))
+        return 1
+
+    def _pdflip_s90b_unpin(self, req_id: str, above: Optional[int] = None) -> int:
+        """Release the rid's S90b state pins -- all, or (``above``) only those deeper than ``above``."""
+        pins = self.__dict__.get("_pdflip_s90b_pins")
+        if not pins:
+            return 0
+        rid = str(req_id)
+        held = pins.get(rid)
+        if not held:
+            pins.pop(rid, None)
+            return 0
+        go = [h for h in held if above is None or h[3] > int(above)]
+        keep = [h for h in held if not (above is None or h[3] > int(above))]
+        if keep:
+            pins[rid] = keep
+        else:
+            pins.pop(rid, None)
+        for node, params, host, _d in go:
+            try:
+                if host:
+                    self.dec_host_lock_ref(node, params)
+                else:
+                    self.dec_lock_ref(node, params)
+            except Exception:  # noqa: BLE001
+                pass
+        return len(go)
 
     def completed_prefetch_tokens(self, req_id: str) -> Optional[int]:
         """#1175: how many prefix tokens THIS rank's storage prefetch has
