@@ -743,6 +743,13 @@ class SchedulerWeightUpdaterManager:
     #: ran, so under ``--pdflip-d-adopt on`` the placeholder guard could never
     #: fall. None outside a placeholder wake.
     _pdflip_adopt_acc: Any = None
+    #: WAKEEXT-1023 (d525298b88): set at the wake's late site (_pdflip_kv_clear_part) to "this wake holds
+    #: parked or queued work", read by _pdflip_rescan_store_index to arm the async-rescan deferral.  True is
+    #: the reader's own default (a rescan with no wake before it defers).  The FIFTH time for the slots
+    #: lesson above: d525298b88 assigned it as an ad-hoc attribute and the three-card boot
+    #: dkr27bbar1drei_6776c55923 (24.10. 06:46:52) died on AttributeError in the assignment on its first
+    #: flip's wake; the P rank's leg abort turned every other rank's collect into a W68/W29 stop.
+    _pdflip_wake_defer_work: bool = True
     #: PAUSE-OVERLAP (0a78051a4d): the per-tag resident-byte census taken ONCE
     #: before an overlapped sleep loop, read by the deposit's gap check while a
     #: pause runs; None outside such a loop. The fourth time for the slots
