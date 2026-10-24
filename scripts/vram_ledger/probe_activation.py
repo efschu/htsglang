@@ -214,6 +214,25 @@ def _ingest_one_group(
                 "the workload."
             )
             return 1
+        # #233 review MUSS 2 / SOLL 6: the corridor reader refuses a footprint
+        # measured over less than one chunk of prefill (RECORD_THIN_TAG in
+        # managers/corridor_guard.py); say so HERE, where the dump is taken
+        # in, so the operator re-drives a full chunk instead of finding the
+        # refusal at the next boot. The file is still written: it is a true
+        # measurement of a short prefill, only not a corridor floor.
+        _pt = d.get("prefill_tokens")
+        try:
+            _short = int(_pt) < int(profile.chunked_prefill_size or 0) or int(profile.chunked_prefill_size or 0) <= 0
+        except (TypeError, ValueError):
+            _short = True
+        if _short:
+            print(
+                f"WARNING #233 CORRIDOR-RECORD-THIN-EVIDENCE: rank {d.get('rank')} on "
+                f"{uuid} measured a prefill of {_pt!r} tokens against chunk "
+                f"{profile.chunked_prefill_size} -- less than one full chunk; the "
+                "corridor floor reader will refuse this footprint (never MEASURED, "
+                "never actuating). Drive at least one full chunk and re-ingest."
+            )
         footprints[uuid] = PhaseFootprint(
             activation_mib=activation,
             capture_mib=capture,

@@ -1404,6 +1404,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extra={"draft_worker": bool(self.is_draft_worker)},
         )
 
+        # #233 (a): every Weg-2 group rank publishes its activation-profile
+        # digest under its model identity -- footprint hit OR miss -- so the
+        # corridor pointer self-corrects from the next boot instead of
+        # serving another model's floors forever (#232: NF read the 27B INT8
+        # 767/701/700). The target runner only (the draft runner shares the
+        # ServerArgs and would publish the same digest); outside Weg-2
+        # (no FLLIPER_PDFLIP_GROUP) this returns without touching anything.
+        if not self.is_draft_worker:
+            try:
+                from flliper.srt.managers.corridor_guard import (
+                    publish_boot_floor_profile,
+                )
+
+                publish_boot_floor_profile(self.server_args)
+            except Exception as e:  # noqa: BLE001 - best effort, never a boot failure
+                # SOLL 1 (review #233): the self-correction hangs on this
+                # publish; a failure is named, never DEBUG-silent.
+                logger.warning(
+                    "#233 CORRIDOR-RECORD-PUBLISH FAILED (alloc_memory_pool): %s "
+                    "-- the corridor pointer is not updated by this rank", e
+                )
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.

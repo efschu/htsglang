@@ -12197,6 +12197,14 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # every other boot's environment stays exactly what it was.
     if fp8_uniform_marlin:
         env.update(FP8_UNIFORM_MARLIN_ENV)
+    # #233 review MUSS 1/2: the frozen corridor pointer state and the recipes are
+    # launcher OUTPUT armed per group in launch_group
+    # (corridor_guard.arm_group_recipe_env), not here: this env is printed as
+    # PDFLIP-GROUP-ENV into the dry-run plan dump, which must not carry box state
+    # (the pointer file's resolution, a freeze timestamp).
+    for _k in (corridor_guard.POINTER_FROZEN_ENV, corridor_guard.RECIPE_ENV,
+               corridor_guard.RECIPE_SELF_ENV):
+        env.pop(_k, None)
     return env
 
 
@@ -13946,6 +13954,12 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     # records -- a strictly worse channel than /proc, which is inherent.
     log(f"group {spec.name} argv: " + " ".join(
         shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv)))
+    if spec.name in ("P", "D"):
+        # #233 review MUSS 1 + 2: the group's REAL argv recipe (the key its
+        # ranks publish under, for the next boot), the frozen pointer state and
+        # the boot's recipes re-asserted; a probe/argv drift is named.
+        for _rline in corridor_guard.arm_group_recipe_env(spec.name, spec.argv, spec.env):
+            log_boot_state(log, _rline)
     if dry:
         return
     # IPC Phase 1: the ranks write their RankState next to the group log;
@@ -15768,6 +15782,70 @@ def d_lend_floor_env(ledger) -> str:
     """D-TRANSIENT-LEND: ``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB`` = the card ledger's
     near-OOM floor per rank (MiB, rounded up)."""
     return ",".join(str(int(math.ceil(float(f)))) for f in ledger.floor_mib)
+
+
+def log_boot_state(log, msg: str) -> None:
+    """#233 review: a BOOT-STATE line (the frozen corridor pointer, a group's
+    recipe) goes into the launcher log FILE and stderr, never stdout. The
+    dry-run plan dump (``propose_oracle``: the golden is the normalised stdout
+    of ``main``) is a PLAN and must not move with the box's pointer file or a
+    recipe hash (``test_planer_referenz_n3_1006`` goldens); a boot's
+    launcher.log still carries the line for the metal check."""
+    line = f"[{_now()}] PDFLIP-LAUNCH {msg}"
+    print(line, file=sys.stderr, flush=True)
+    fh = getattr(log, "fh", None)
+    if fh:
+        fh.write(line + "\n")
+        fh.flush()
+
+
+def corridor_recipe_probe(ns, cards, p_bs: int, d_bs: int, hicache_disabled: bool) -> Dict[str, Dict[str, object]]:
+    """#233 review MUSS 2: each group's RECIPE, read off the group argv this
+    launcher builds -- BEFORE the first floor of the boot is read.
+
+    The budget needs the floor and the real argv needs the budget, so the real
+    argv does not exist yet where the floor is read. The probe builds each
+    group's argv with the SAME builders (``argv_p`` / ``argv_d``) and SENTINEL
+    budgets of the boot's card count -- the pattern ``_max_running_requests``
+    and ``_p_page_size`` already read flags by ("the number is READ OFF THE
+    ARGV this launcher builds, never restated") -- with no cut (H68c) and the
+    operator's ``--extra-*`` reduced to the recipe flags
+    (``corridor_guard.recipe_relevant_tokens``: the items are the same, and the
+    W100 budget refusal must not judge an operator budget against a sentinel).
+    ``launch_group`` compares this with the REAL argv and names any drift
+    (``#233 CORRIDOR-RECIPE-DRIFT``). No ``profile_from_server_args`` here: the
+    #1257c refusal to restate it stands.
+
+    A group whose probe raises gets no recipe -> no reader finds an own record
+    -> the law, named; never a guessed recipe.
+    """
+    n = max(1, len(cards))
+    sentinel = [1] * n
+    extra_p = corridor_guard.recipe_relevant_tokens(shlex.split(getattr(ns, "extra_p", "") or ""))
+    extra_d_full = shlex.split(getattr(ns, "extra_d", "") or "")
+    extra_d = corridor_guard.recipe_relevant_tokens(extra_d_full)
+    vision = getattr(ns, "pdflip_vision", VISION_OFF)
+    profile = getattr(ns, "profile", PROFILE_QWEN27B)
+    out: Dict[str, Dict[str, object]] = {}
+    try:
+        out["P"] = corridor_guard.recipe_from_argv(argv_p(
+            "py", ns.model, sentinel, 1, 1, RING_FORM_SENTINEL_STORE_CFG, extra_p,
+            p_bs=int(p_bs), stage_ratio="", attn_stage_ratio="",
+            draft_kv_on_p=(getattr(ns, "draft_kv_on_p", "on") == "on" and not hicache_disabled),
+            spec_flags=p_draft_kv_flags(extra_d_full), vision=vision, profile=profile,
+            hicache_disabled=hicache_disabled))
+    except Exception as exc:  # noqa: BLE001 - named, the law follows
+        print(f"{corridor_guard.RECIPE_DRIFT_TAG} group=P: recipe probe failed ({exc!r}); "
+              "no own record can be found this boot (the law)", file=sys.stderr, flush=True)
+    try:
+        out["D"] = corridor_guard.recipe_from_argv(argv_d(
+            "py", ns.model, sentinel, 1, 1, RING_FORM_SENTINEL_STORE_CFG, extra_d,
+            d_bs=int(d_bs), disable_cuda_graph=bool(getattr(ns, "d_disable_cuda_graph", False)),
+            hicache_disabled=hicache_disabled, profile=profile, vision=vision))
+    except Exception as exc:  # noqa: BLE001 - named, the law follows
+        print(f"{corridor_guard.RECIPE_DRIFT_TAG} group=D: recipe probe failed ({exc!r}); "
+              "no own record can be found this boot (the law)", file=sys.stderr, flush=True)
+    return out
 
 
 D_ONLY_LABEL = "D(d-only, expectation)"
@@ -26715,6 +26793,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --dflash-produce-on-p), and PUBLISHED into this process's own environment
     # so build_env (dict(os.environ)) and the front hand the SAME value to every
     # rank -- the #1273 B4k pattern below. A teardown boots nothing: no form.
+    # #233 review MUSS 1/2: a frozen corridor pointer or recipe inherited from
+    # a shell or an earlier main() in this process never describes THIS boot;
+    # they are re-derived below, before the first floor read.
+    corridor_guard.clear_boot_pointer_env()
     boot_form = None
     if not ns.teardown:
         boot_form = pdflip_form.resolve_form(
@@ -27386,6 +27468,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # keyed by CARD UUID -- never by NVML index, which is not stable across
     # boots on this rig. Everything downstream (both budget solves, the
     # corridor floor, the front's sampler) reads THIS dict.
+    # #233 review MUSS 1 + 2: ONE corridor pointer state for the whole boot.
+    # The recipe of each group (its argv's footprint-relevant flags) is
+    # published first, then the pointer is read ONCE and its resolution frozen
+    # into this process's environment -- before the first floor of the boot is
+    # read (the P budget pass right below). The budget, the lend floor, the
+    # front (dict(os.environ)) and every rank (build_env; launch_group
+    # re-asserts it) read THIS state; the ranks' publish in alloc_memory_pool
+    # is for the next boot.
+    os.environ[corridor_guard.RECIPE_ENV] = json.dumps(
+        corridor_recipe_probe(ns, cards, p_bs, d_bs, hicache_disabled), sort_keys=True)
+    for _frozen_line in corridor_guard.freeze_boot_pointer():
+        log_boot_state(log, _frozen_line)
     user_reserve_by_card = parse_user_reserve(ns.user_reserve_mib, cards)
     log(
         "PDFLIP-USER-RESERVE PROVENANCE (#1257c, line shape #1342): "

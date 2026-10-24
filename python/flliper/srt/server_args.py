@@ -14734,29 +14734,35 @@ class ServerArgs:
 
                 uuid = registry_nvml.current_device_uuid()
             live = live_fingerprint()
+            _profile = profile_from_server_args(self, _model_architectures(self))
             footprint = resolve_phase_footprint(
                 uuid,
                 hw_fingerprint=live[0] if live else None,
-                profile=profile_from_server_args(self, _model_architectures(self)),
+                profile=_profile,
+            )
+            # #1257c: PUBLISH WHICH PROFILE THIS BOOT MEASURED AGAINST.
+            # The corridor floor needs the same footprint in two processes
+            # that own no ServerArgs (the Weg-2 front and its launcher),
+            # and ``launcher.p_activation_reserve_provenance`` refuses BY
+            # NAME to restate ``profile_from_server_args`` there. This is
+            # the alternative: the process that HAS the profile writes its
+            # digest once, and they key the one store with it. A DIGEST,
+            # never a MiB -- there is no second set of books.
+            #
+            # #233 (a): published on a MISS too, under this boot's model
+            # identity and the RIG fingerprint. Publishing only on a hit
+            # meant a boot without a record of its own never wrote, so a
+            # foreign pointer (the 27B one copied into the NF cache) stood
+            # forever. The main writer is ``ModelRunner.alloc_memory_pool``;
+            # this site is kept so no path that resolves a footprint is mute.
+            from flliper.srt.managers.corridor_guard import (
+                publish_boot_floor_profile,
+            )
+
+            publish_boot_floor_profile(
+                self, profile=_profile, footprint_hit=footprint is not None
             )
             if footprint is not None:
-                # #1257c: PUBLISH WHICH PROFILE THIS BOOT MEASURED AGAINST.
-                # The corridor floor needs the same footprint in two processes
-                # that own no ServerArgs (the Weg-2 front and its launcher),
-                # and ``launcher.p_activation_reserve_provenance`` refuses BY
-                # NAME to restate ``profile_from_server_args`` there. This is
-                # the alternative: the process that HAS the profile writes its
-                # digest once, and they key the one store with it. A DIGEST,
-                # never a MiB -- there is no second set of books.
-                from flliper.srt.managers.corridor_guard import (
-                    publish_floor_profile,
-                )
-
-                publish_floor_profile(
-                    os.environ.get("FLLIPER_PDFLIP_GROUP", ""),
-                    profile_from_server_args(self, _model_architectures(self)),
-                    live[0] if live else None,
-                )
                 return float(footprint.activation_mib)
         except Exception as e:  # pragma: no cover - probe/NVML availability
             logger.debug("activation footprint unavailable (%s)", e)

@@ -129,7 +129,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +538,155 @@ def verdict_floor_for_mib(floor_mib: int, source: str) -> int:
 FLOOR_DIGEST_FILE_ENV = "FLLIPER_CORRIDOR_FLOOR_DIGEST_FILE"
 FLOOR_DIGEST_FILE_DEFAULT = "corridor_floor_digest.json"
 
+#: #233 (24.10., fund #232): THE POINTER IS KEYED BY MODEL IDENTITY, NOT BY
+#: GROUP ALONE. The NF boot read the 27B INT8 corridor floors (767/701/700 MiB
+#: on D, stamped MEASURED-D, actuates=yes) because the pointer said only
+#: ``{"groups": {"D": digest}}`` and the NF cache directory was a ``cp -a``
+#: copy of the 27B one: nothing on the read path compared the model. The
+#: pointer now carries, next to the legacy ``groups`` map (left untouched for
+#: older trees), a ``records`` map keyed by :func:`record_identity_key`::
+#:
+#:     {"hw_fingerprint": "...", "groups": {...legacy...},
+#:      "records": {"<checkpoint>|<arch>|<recipe>": {
+#:          "identity": {"checkpoint": ..., "arch": ..., "profile": ...,
+#:                       "recipe": ..., (review MUSS 2, :data:`RECIPE_ENV`)
+#:                       "architectures": [...HF config architectures...]},
+#:          "groups": {"D": digest, "P": digest}}}}
+#:
+#: The identity terms are the CALIBRATION IDENTITY the launcher already uses
+#: (``pdflip_form.calibration_identity``: checkpoint = ``model_key`` + form),
+#: read from the ONE rank contract ``FLLIPER_PDFLIP_FORM`` -- so the launcher,
+#: the front and every rank derive the same key without a new channel. A
+#: record of another identity is refused BY NAME (:data:`RECORD_FOREIGN_TAG`),
+#: a legacy entry without identity is "unknown origin"
+#: (:data:`RECORD_UNKNOWN_TAG`) unless the footprint it names states this
+#: boot's architectures in its own content (:data:`RECORD_LEGACY_TAG`, the
+#: migration rule). Either refusal falls back to the stated law (1024, or
+#: ``FLLIPER_CORRIDOR_LAW_FLOOR_MIB``), named in the provenance. DANGER
+#: DIRECTION: a foreign record with a LOWER floor must never price this boot.
+RECORD_FOREIGN_TAG = "#233 CORRIDOR-RECORD-FOREIGN"
+RECORD_UNKNOWN_TAG = "#233 CORRIDOR-RECORD-UNKNOWN-ORIGIN"
+RECORD_LEGACY_TAG = "#233 CORRIDOR-RECORD-LEGACY-ADOPTED"
+RECORD_OWN_TAG = "#233 CORRIDOR-RECORD-OWN"
+RECORD_PUBLISH_TAG = "#233 CORRIDOR-RECORD-PUBLISH"
+#: The identity check is ON by default (user order 14.10.: new features ship
+#: on). ``0``/``off`` restores the pre-#233 group-keyed read -- only on an
+#: explicit user word, because off is the OOM direction #232 measured.
+RECORD_IDENTITY_ENV = "FLLIPER_CORRIDOR_RECORD_IDENTITY"
+
+#: #233 review MUSS 1 (24.10.): ONE POINTER STATE PER BOOT. Since #233 every
+#: group rank publishes in ``alloc_memory_pool``, so the pointer file changes
+#: WHILE the boot runs. The launcher's budget, its lend floor
+#: (``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB``) and EXTEND_TRIM were fixed before the
+#: ranks started; every rank-local reader (credit floor, extend line, preempt,
+#: vram_dial, front) asked the file per call -- a rank with TWO floors at once,
+#: the state #232's digest section 4 forbids ("nicht tun"). The launcher now
+#: reads the pointer ONCE, before any floor of the boot is read, resolves it
+#: for both groups (:func:`freeze_boot_pointer`) and hands the resolution to
+#: every process of the boot in this variable (the front's env starts from
+#: ``os.environ``; ``launch_group`` arms each group's env with it -- ``build_env``
+#: pops it, so the dry-run's PDFLIP-GROUP-ENV plan line carries no box state). Every
+#: reader takes the frozen resolution; the writer keeps writing for the NEXT
+#: boot. Chosen over "readers ignore records of their own boot" (review
+#: option b) because (b) still lets a reader see a record a CONCURRENT boot of
+#: another container wrote mid-boot, needs a boot id in every record, and keeps
+#: the per-call file read on the hot path; the frozen value is one parse.
+POINTER_FROZEN_ENV = "FLLIPER_CORRIDOR_POINTER_FROZEN"
+POINTER_FROZEN_TAG = "#233 CORRIDOR-POINTER-FROZEN"
+POINTER_READ_TAG = "#233 CORRIDOR-POINTER-READ"
+#: The ``source=`` of a pointer read: the launcher's frozen record (a digest),
+#: the frozen state says "no record" (the law), the frozen state is a named
+#: refusal (foreign / unknown origin / other recipe -> the law), or no frozen
+#: state at all (a process the launcher did not start: desk, planner CLI).
+POINTER_SOURCE_FROZEN = "FROZEN"
+POINTER_SOURCE_LAW = "LAW"
+POINTER_SOURCE_FOREIGN = "FOREIGN"
+POINTER_SOURCE_LIVE = "LIVE"
+
+#: #233 review MUSS 2: THE RECIPE IS PART OF THE RECORD KEY. ``checkpoint|arch``
+#: separates models, not recipes, and the footprint store is keyed by the
+#: activation-profile digest -- so a pointer that names the LAST boot's digest
+#: hands the next boot of another recipe that recipe's measured footprint
+#: (store evidence: a 122-token P footprint, chunk 512, 39/20/20 MiB). The key
+#: is ``checkpoint|arch|recipe``; a boot of another recipe finds no record of
+#: its own and takes the law, named (:data:`RECORD_OTHER_RECIPE_TAG`).
+#:
+#: ``recipe`` hashes the FOOTPRINT-RELEVANT flags of the group argv the
+#: launcher builds (:data:`RECIPE_FLAGS`), never ``profile_from_server_args``
+#: restated in the launcher (the #1257c refusal stands). This variable carries
+#: the launcher's recipe of BOTH groups, ``{"P": {"hash", "items"}, "D": ...}``,
+#: computed before the first floor read; :data:`RECIPE_SELF_ENV` carries the
+#: hash of the REAL argv of the group a rank belongs to (the writer's key).
+RECIPE_ENV = "FLLIPER_CORRIDOR_RECIPE"
+RECIPE_SELF_ENV = "FLLIPER_CORRIDOR_RECIPE_SELF"
+RECORD_OTHER_RECIPE_TAG = "#233 CORRIDOR-RECORD-OTHER-RECIPE"
+RECIPE_DRIFT_TAG = "#233 CORRIDOR-RECIPE-DRIFT"
+RECIPE_TAG = "#233 CORRIDOR-RECIPE"
+#: The flags whose value moves the prefill transient a footprint measures, read
+#: from the code that builds the footprint's key and sizes the forward:
+#:
+#: * ``mem_ledger.activation.profile_from_server_args`` -- the ActivationProfile
+#:   fields: ``--chunked-prefill-size`` (tokens per forward), ``--tp-size`` /
+#:   ``--pp-size`` (shard width, stage depth), ``--kv-cache-dtype``,
+#:   ``--speculative-num-draft-tokens``, and the decode graph's ``max_bs``
+#:   (``--cuda-graph-max-bs[-decode]``; unstated, server_args derives it from a
+#:   memory tier and ``--max-running-requests``, server_args.py
+#:   ``cuda_graph_config.decode.max_bs`` / ``max_running_requests or ...``);
+#: * the draft forward that runs inside a prefill: ``--speculative-algorithm``
+#:   (DFLASH vs NEXTN/MTP are different forwards), ``--speculative-num-steps``,
+#:   ``--speculative-eagle-topk`` (they derive the draft token count when it is
+#:   not stated);
+#: * ``--max-running-requests`` (the order names it; it bounds the batch and,
+#:   unstated graph bs, the decode capture);
+#: * ``--enable-mixed-chunk`` (decode tokens ride a prefill forward) and
+#:   ``--disable-cuda-graph`` (no decode capture at all).
+#:
+#: DELIBERATELY OUT: everything the floor itself PRICES (``--rank-gpu-memory-mib``,
+#: ``--mem-fraction-static``, ``--max-total-tokens``) -- the floor feeds the
+#: budget, a budget term in the key would change the key with the floor; the
+#: per-boot SOLVED layout (``--pp-stage-ratio``/``--pp-attn-stage-ratio``,
+#: ``--rank-tp-ratio``), solved from records each boot, would never repeat; and
+#: ports, paths, seeds. The checkpoint (dtype, quantization) is the key's
+#: ``checkpoint`` term already.
+RECIPE_FLAGS: Tuple[str, ...] = (
+    "--chunked-prefill-size",
+    "--tp-size",
+    "--tensor-parallel-size",
+    "--pp-size",
+    "--pipeline-parallel-size",
+    "--kv-cache-dtype",
+    "--speculative-algorithm",
+    "--speculative-num-steps",
+    "--speculative-eagle-topk",
+    "--speculative-num-draft-tokens",
+    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
+    "--max-running-requests",
+)
+#: Store-true flags of the recipe (present = ``"1"``).
+RECIPE_BOOL_FLAGS: Tuple[str, ...] = ("--enable-mixed-chunk", "--disable-cuda-graph")
+#: Spellings folded onto one item, so ``--tensor-parallel-size 3`` and
+#: ``--tp-size 3`` are one recipe.
+_RECIPE_ALIASES = {
+    "--tensor-parallel-size": "--tp-size",
+    "--pipeline-parallel-size": "--pp-size",
+}
+
+#: #233 review MUSS 2 (second half): MINIMUM EVIDENCE OF A MEASURED FOOTPRINT.
+#: ``probe_activation.py`` takes ``allocated_bytes.all.peak`` minus the floor
+#: over ONE prefill; a prefill shorter than one chunk never ran a full-width
+#: forward, so its peak is not the recipe's transient (store evidence: digest
+#: 1a4c9a1cdba1, chunk 512, "prefill of 122 tokens", 39/20/20 MiB). The
+#: minimum is defined from quantities the footprint already records: the
+#: prefill token count its ``source`` states (``prefill of N tokens``, written
+#: by the ingest) must be at least the ``chunked_prefill_size`` of its own
+#: profile. Below that -- or "?" tokens, or a profile with no chunk -- the
+#: footprint is refused as a corridor floor BY NAME and the law holds; it is
+#: never MEASURED-* with actuates=yes. A footprint that states no prefill at all
+#: (hand-written, a desk fixture, the shipped reference bounds) is not judged
+#: here: there is no count to compare.
+RECORD_THIN_TAG = "#233 CORRIDOR-RECORD-THIN-EVIDENCE"
+
 #: The group this process is, when it knows. Set by the Weg-2 launcher for
 #: both groups; absent outside Weg-2, which is why ``group`` is an explicit
 #: argument everywhere and this is only the last resort.
@@ -586,19 +735,378 @@ def _floor_digest_path() -> str:
     return os.path.join(CACHE_DIR, FLOOR_DIGEST_FILE_DEFAULT)
 
 
-def publish_floor_profile(group: str, profile, hw_fingerprint: Optional[str]) -> Optional[str]:
+def record_identity_enabled() -> bool:
+    """#233: is the identity-keyed pointer read/write ON? Default ON."""
+    raw = os.environ.get(RECORD_IDENTITY_ENV)
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in ("0", "off", "false", "no")
+
+
+def boot_record_identity(environ=None) -> Optional[Dict[str, str]]:
+    """This boot's calibration identity for the corridor pointer, or ``None``.
+
+    #233. NOT A NEW IDENTITY: the terms are the ones
+    ``pdflip_form.calibration_identity`` already accepts measured sources by
+    -- the checkpoint (``model_key``, the directory name) and the form's
+    ``arch`` -- plus the profile row id for the reader's benefit. They come
+    from ``FLLIPER_PDFLIP_FORM``, the ONE variable the launcher publishes into
+    its own environment before any floor is read and that ``build_env`` and
+    the front hand to every rank, so the writer (a group rank) and every
+    reader (launcher, front, ranks) compute the SAME key. ``None`` = no form
+    published (a desk test, a non-pdflip process): the caller keeps the
+    pre-#233 group-keyed read and says that the identity is unverified.
+    """
+    try:
+        from flliper.srt.pdflip import form as pdflip_form
+
+        form = pdflip_form.current_form(environ)
+    except Exception as exc:  # pragma: no cover - import shape
+        logger.debug("pdflip form unreadable for the corridor identity: %s", exc)
+        return None
+    if form is None or not str(form.model or "").strip():
+        return None
+    return {
+        "checkpoint": str(form.model).strip(),
+        "arch": str(form.arch or ""),
+        "profile": str(form.profile or ""),
+    }
+
+
+def record_identity_prefix(identity: Mapping[str, object]) -> str:
+    """``"<checkpoint>|<arch>"`` -- the model part of a ``records`` key."""
+    return f"{identity.get('checkpoint', '')}|{identity.get('arch', '')}"
+
+
+def record_identity_key(identity: Mapping[str, object], recipe: str = "") -> str:
+    """``"<checkpoint>|<arch>|<recipe>"`` -- the ``records`` key of one identity.
+
+    #233 review MUSS 2: the recipe is IN the key. An empty recipe (a process
+    the launcher did not arm) yields a key no armed reader ever looks up.
+    """
+    return f"{record_identity_prefix(identity)}|{recipe or ''}"
+
+
+def recipe_relevant_tokens(tokens: Sequence[str]) -> List[str]:
+    """Only the :data:`RECIPE_FLAGS` / :data:`RECIPE_BOOL_FLAGS` of ``tokens``.
+
+    The launcher's recipe probe hands the operator's ``--extra-*`` through the
+    group argv builders with SENTINEL budgets; the budget-raising refusal (W100)
+    and every other ``extra`` rule must not see the operator's non-recipe flags
+    there, and the recipe items are the same either way (they are read off these
+    flags only).
+    """
+    out: List[str] = []
+    toks = [str(t) for t in tokens]
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        name = t.split("=", 1)[0]
+        if name in RECIPE_BOOL_FLAGS:
+            out.append(t)
+        elif name in RECIPE_FLAGS:
+            out.append(t)
+            if "=" not in t and i + 1 < len(toks):
+                out.append(toks[i + 1])
+                i += 1
+        i += 1
+    return out
+
+
+def recipe_from_argv(argv: Sequence[str]) -> Dict[str, object]:
+    """``{"hash": str, "items": {flag: value}}`` of a group argv's recipe.
+
+    argparse semantics: the LAST value of a flag wins, ``--flag v`` and
+    ``--flag=v`` alike; a store-true flag present is ``"1"``. Aliases fold onto
+    one item. The hash is over the sorted items only -- never the group (the
+    record names the group), never a path.
+    """
+    import hashlib
+    import json
+
+    items: Dict[str, str] = {}
+    toks = [str(t) for t in argv]
+    for i, t in enumerate(toks):
+        name, eq, val = t.partition("=")
+        if name in RECIPE_BOOL_FLAGS:
+            items[name] = "1"
+        elif name in RECIPE_FLAGS:
+            if not eq:
+                if i + 1 >= len(toks):
+                    continue
+                val = toks[i + 1]
+            items[_RECIPE_ALIASES.get(name, name)] = str(val)
+    blob = json.dumps(sorted(items.items()), separators=(",", ":"))
+    return {"hash": hashlib.sha1(blob.encode()).hexdigest()[:12], "items": items}
+
+
+def boot_recipes(environ=None) -> Dict[str, Dict[str, object]]:
+    """``{group: {"hash", "items"}}`` the launcher published (:data:`RECIPE_ENV`).
+
+    ``{}`` when absent or unreadable -- an unarmed process has no recipe, and
+    without one no own record can be found (the safe direction).
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(RECIPE_ENV)
+    if not raw:
+        return {}
+    try:
+        import json
+
+        got = json.loads(raw)
+    except ValueError:
+        logger.warning("%s %s=%r is unreadable; no recipe for this boot", RECIPE_TAG, RECIPE_ENV, raw)
+        return {}
+    out: Dict[str, Dict[str, object]] = {}
+    for g, v in (got or {}).items():
+        if isinstance(v, dict) and v.get("hash"):
+            out[normalise_group(g)] = {
+                "hash": str(v["hash"]),
+                "items": dict(v.get("items") or {}),
+            }
+    return out
+
+
+def arm_group_recipe_env(group: str, argv: Sequence[str], env) -> List[str]:
+    """``launch_group``'s half of MUSS 1 + 2: arm one group's environment.
+
+    * :data:`RECIPE_SELF_ENV` = the recipe of the group's REAL argv -- the key
+      the group's ranks publish under, for the NEXT boot;
+    * :data:`POINTER_FROZEN_ENV` / :data:`RECIPE_ENV` copied from the
+      launcher's own environment (launcher OUTPUT, the R19 discipline: an
+      ``--env-*`` value or a shell leftover never describes this boot;
+      ``build_env`` pops both, so this is the ONE place a group gets them);
+    * the launcher's pre-budget recipe probe is compared with the real argv. A
+      difference is :data:`RECIPE_DRIFT_TAG`, named per flag: the probe missed
+      a footprint-relevant input, so the record this boot writes (under the
+      REAL recipe) is one the probe of the same command never finds -> the next
+      boot reads the law, the safe direction, and this line says why.
+
+    Returns the log lines; never raises.
+    """
+    lines: List[str] = []
+    tag = normalise_group(group)
+    try:
+        real = recipe_from_argv(argv)
+    except Exception as exc:  # pragma: no cover - argv shape
+        env.pop(RECIPE_SELF_ENV, None)
+        return [f"{RECIPE_DRIFT_TAG} group={tag}: real argv recipe unreadable ({exc}); this group publishes no record"]
+    env[RECIPE_SELF_ENV] = str(real["hash"])
+    for k in (POINTER_FROZEN_ENV, RECIPE_ENV):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+        else:
+            env.pop(k, None)
+    probe = boot_recipes().get(tag)
+    if probe is None:
+        lines.append(
+            f"{RECIPE_DRIFT_TAG} group={tag} recipe={real['hash']}: the launcher published "
+            f"no pre-budget recipe for this group, so no reader of this boot found an "
+            f"own record; the group publishes under its real recipe for the next boot"
+        )
+    elif probe["hash"] != real["hash"]:
+        pi, ri = dict(probe.get("items") or {}), dict(real["items"])
+        diff = {
+            k: (pi.get(k), ri.get(k))
+            for k in sorted(set(pi) | set(ri))
+            if pi.get(k) != ri.get(k)
+        }
+        lines.append(
+            f"{RECIPE_DRIFT_TAG} group={tag} probe={probe['hash']} argv={real['hash']} "
+            f"differs (probe, argv): {diff} -- the pre-budget recipe probe missed a "
+            f"footprint-relevant input; this boot's record goes under the argv recipe, "
+            f"which the probe never finds, so the next boot of this command reads the law"
+        )
+    else:
+        lines.append(
+            f"{RECIPE_TAG} group={tag} recipe={real['hash']} items={real['items']} "
+            f"(the pre-budget probe and the real group argv agree)"
+        )
+    return lines
+
+
+#: ``{(profile, checkpoint): (architectures, source)}`` -- one config read per
+#: process; the checkpoint does not change under a boot, and the rank-local
+#: readers (``kv_vmm_backing`` and friends) ask per call.
+_ARCH_CACHE: Dict[Tuple[str, str], Tuple[Tuple[str, ...], str]] = {}
+
+
+def boot_architectures(
+    identity: Optional[Mapping[str, object]],
+) -> Tuple[Tuple[str, ...], str]:
+    """HF ``architectures`` of this boot's checkpoint, sorted; ``((), why)``.
+
+    ``identity["architectures"]`` when the caller states it (the writer, which
+    holds the real ``ActivationProfile``). Otherwise the registry's path of the
+    checkpoint's format (``pdflip_form.format_of``; a listed derivative maps to
+    its base, whose config.json is the derivative's by definition) -- "the rig
+    mounts every checkpoint under the registry's path". Unreadable is NOT a
+    mismatch: it is reported as such and the caller treats an unprovable
+    origin as not-own.
+    """
+    if not identity:
+        return (), "no model identity"
+    given = identity.get("architectures")
+    if given:
+        return tuple(sorted(str(a) for a in given)), "stated by the writer"
+    key = (str(identity.get("profile") or ""), str(identity.get("checkpoint") or ""))
+    if key in _ARCH_CACHE:
+        return _ARCH_CACHE[key]
+    out: Tuple[Tuple[str, ...], str]
+    try:
+        import json
+
+        from flliper.srt.pdflip import form as pdflip_form
+
+        fmt = pdflip_form.format_of(key[0], key[1])
+        row = pdflip_form.profile_row(key[0])
+        wf = row.formats.get(fmt) if (row is not None and fmt) else None
+        ck = str(getattr(wf, "checkpoint", "") or "")
+        if not ck:
+            out = ((), f"checkpoint {key[1]!r} is not a registry format of profile {key[0]!r}")
+        else:
+            cfg = os.path.join(ck, "config.json")
+            with open(cfg, "r", encoding="utf-8") as fh:
+                archs = (json.load(fh) or {}).get("architectures") or ()
+            out = (
+                (tuple(sorted(str(a) for a in archs)), cfg)
+                if archs
+                else ((), f"{cfg} names no architectures")
+            )
+    except (OSError, ValueError) as exc:
+        out = ((), f"checkpoint config unreadable ({exc})")
+    except Exception as exc:  # pragma: no cover - registry shape
+        out = ((), f"model registry unreadable ({exc})")
+    _ARCH_CACHE[key] = out
+    return out
+
+
+def _footprint_architectures(
+    hw_fingerprint: str, digest: str, cache_dir: Optional[str] = None
+) -> Tuple[Tuple[str, ...], str]:
+    """The ``architectures`` a footprint file states IN ITS OWN CONTENT.
+
+    #233 migration rule: a legacy pointer entry carries no identity, but the
+    footprint it names does (``profile[0]`` of the canonical profile). That is
+    the only identity a legacy record can prove.
+    """
+    try:
+        import json
+
+        from flliper.srt.mem_ledger import activation as _act
+
+        path = _act.footprint_cache_path(hw_fingerprint, digest, cache_dir)
+        with open(path, "r", encoding="utf-8") as fh:
+            prof = (json.load(fh) or {}).get("profile") or []
+        archs = prof[0] if prof and isinstance(prof[0], (list, tuple)) else ()
+        if not archs:
+            return (), f"{path} states no architectures"
+        return tuple(sorted(str(a) for a in archs)), path
+    except (OSError, ValueError) as exc:
+        return (), f"footprint content unreadable ({exc})"
+    except Exception as exc:  # pragma: no cover - import shape
+        return (), f"footprint content unreadable ({exc})"
+
+
+_RECORD_NOTED: set = set()
+
+
+def _note_record_once(line: str) -> None:
+    """Every #233 verdict line once per process, at WARNING (it moves a floor)."""
+    if line in _RECORD_NOTED:
+        return
+    _RECORD_NOTED.add(line)
+    logger.warning("%s", line)
+
+
+class _PointerLock:
+    """Advisory ``flock`` around the pointer's read-modify-write.
+
+    #233 (a) makes every group rank publish (P and D boot side by side), so two
+    writers can now meet; without the lock one group's entry is lost to the
+    other's ``os.replace``. Best effort: no ``fcntl`` = no lock, same as before.
+    """
+
+    def __init__(self, path: str):
+        self._path = path + ".lock"
+        self._fh = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+
+            self._fh = open(self._path, "a")
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:  # pragma: no cover - platform
+            self._fh = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except Exception:  # pragma: no cover
+                pass
+            self._fh.close()
+        return False
+
+
+#: Sentinel: "take this boot's identity from the published form".
+_IDENTITY_FROM_FORM = object()
+
+#: SOLL 1 (review #233): the self-correction hangs on the publish now, so a
+#: silent write failure (read-only mount, rights) would renew the #232 class
+#: "pointer stands forever" invisibly. One WARNING per process and reason.
+_PUBLISH_FAILED_NOTED: set = set()
+
+
+def _warn_publish_failed_once(group: str, why: str) -> None:
+    key = (group, why.split(":", 1)[0])
+    if key in _PUBLISH_FAILED_NOTED:
+        return
+    _PUBLISH_FAILED_NOTED.add(key)
+    logger.warning(
+        "%s group=%s FAILED: %s -- the corridor pointer is NOT updated by this "
+        "process, so the next boot reads whatever stands there now (the #232 "
+        "class 'pointer stands forever' if nobody else writes it)",
+        RECORD_PUBLISH_TAG, group, why,
+    )
+
+
+def publish_floor_profile(
+    group: str,
+    profile,
+    hw_fingerprint: Optional[str],
+    identity=_IDENTITY_FROM_FORM,
+    recipe: Optional[str] = None,
+) -> Optional[str]:
     """Record WHICH activation profile the awake group booted with.
 
-    Called from the one place that already resolves a phase footprint with a
-    real profile (``ServerArgs.activation_reserve_mb``). Writes a digest and a
-    fingerprint; never a measurement. Returns the path, or ``None`` when there
-    was nothing to publish -- publication is best effort by construction,
-    because a rig that cannot write it simply reads UNMEASURED-FALLBACK, which
-    is verdict-only and therefore safe.
+    Writes a digest and a fingerprint; never a measurement. Returns the path,
+    or ``None`` when there was nothing to publish -- publication is best effort
+    by construction, because a rig that cannot write it simply reads
+    UNMEASURED-FALLBACK, which is verdict-only and therefore safe. A failure
+    is a named WARNING once per process (SOLL 1).
+
+    #233: with a model identity (``FLLIPER_PDFLIP_FORM`` published, or
+    ``identity`` passed) the digest goes under
+    ``records["<checkpoint>|<arch>|<recipe>"]`` (review MUSS 2: the recipe of
+    this group's real argv, :data:`RECIPE_SELF_ENV` unless ``recipe`` is
+    passed), beside the identity terms and the profile's HF architectures; the
+    legacy ``groups`` map is left exactly as it was. Without an identity the
+    pre-#233 shape is written, because there is nothing to key by. The write is
+    for the NEXT boot: this boot's readers hold the launcher's frozen state
+    (MUSS 1).
     """
     tag = normalise_group(group)
     if tag == GROUP_UNKNOWN or not hw_fingerprint:
         return None
+    ident = boot_record_identity() if identity is _IDENTITY_FROM_FORM else identity
+    if not record_identity_enabled():
+        ident = None
+    rcp = os.environ.get(RECIPE_SELF_ENV, "") if recipe is None else str(recipe)
     try:
         import json
 
@@ -607,47 +1115,216 @@ def publish_floor_profile(group: str, profile, hw_fingerprint: Optional[str]) ->
         digest = profile_key(profile)
         path = _floor_digest_path()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        cur = {}
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    cur = json.load(fh) or {}
-            except (OSError, ValueError):
-                cur = {}
-        if cur.get("hw_fingerprint") != hw_fingerprint:
-            cur = {"hw_fingerprint": hw_fingerprint, "groups": {}}
-        groups = dict(cur.get("groups") or {})
-        groups[tag] = digest
-        cur["groups"] = groups
-        cur["hw_fingerprint"] = hw_fingerprint
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(cur, fh, indent=1)
-        os.replace(tmp, path)
+        with _PointerLock(path):
+            cur = {}
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        cur = json.load(fh) or {}
+                except (OSError, ValueError):
+                    cur = {}
+            if cur.get("hw_fingerprint") != hw_fingerprint:
+                cur = {"hw_fingerprint": hw_fingerprint, "groups": {}}
+            if ident is None:
+                groups = dict(cur.get("groups") or {})
+                groups[tag] = digest
+                cur["groups"] = groups
+                key = "(no identity: legacy groups)"
+            else:
+                key = record_identity_key(ident, rcp)
+                records = dict(cur.get("records") or {})
+                rec = dict(records.get(key) or {})
+                rec["identity"] = {
+                    "checkpoint": str(ident.get("checkpoint") or ""),
+                    "arch": str(ident.get("arch") or ""),
+                    "profile": str(ident.get("profile") or ""),
+                    "recipe": rcp,
+                    "architectures": sorted(
+                        str(a) for a in (getattr(profile, "architectures", ()) or ())
+                    ),
+                }
+                rec_groups = dict(rec.get("groups") or {})
+                rec_groups[tag] = digest
+                rec["groups"] = rec_groups
+                records[key] = rec
+                cur["records"] = records
+            cur["hw_fingerprint"] = hw_fingerprint
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(cur, fh, indent=1)
+            os.replace(tmp, path)
+        logger.info(
+            "%s group=%s identity=%s digest=%s hw_fingerprint=%s path=%s",
+            RECORD_PUBLISH_TAG, tag, key, digest, hw_fingerprint, path,
+        )
         return path
-    except Exception as exc:  # pragma: no cover - best effort by design
-        logger.debug("corridor floor digest not published: %s", exc)
+    except Exception as exc:  # best effort by design, but never silent (SOLL 1)
+        _warn_publish_failed_once(tag, f"write: {exc}")
         return None
 
 
-def _published_groups() -> Tuple[Optional[str], Dict[str, str]]:
-    """``(hw_fingerprint, {group: digest})`` from the pointer file."""
+#: ``{group: digest}`` this process already published (SOLL 5: ONE write per
+#: group and process; a second, different digest of the same group is refused
+#: by name instead of overwriting the first).
+_BOOT_PUBLISHED: Dict[str, str] = {}
+
+
+def publish_boot_floor_profile(
+    server_args, *, profile=None, footprint_hit: Optional[bool] = None
+) -> Optional[str]:
+    """#233 (a): PUBLISH THIS GROUP'S PROFILE DIGEST, HIT OR MISS.
+
+    The pre-#233 comment promised "every boot republishes its own digest, so
+    the pointer self-corrects from the second boot". It never did: the only
+    writer sat behind ``if footprint is not None`` in
+    ``ServerArgs.activation_reserve_mb`` -- a boot WITHOUT a record of its own
+    (NF: architecture ``Qwen4Exp...`` has no footprint) never wrote, so the
+    27B pointer copied into the NF cache stood forever. Measured 24.10.: that
+    method is not even reached on either line's group ranks (0 heuristic lines
+    in the NF and the 27B D.log), so the pointer on both rigs was the 09.09.
+    hand seed. This is the writer every group rank passes
+    (``ModelRunner.alloc_memory_pool``), and it publishes on a miss too: the
+    boot's own digest then resolves to "no phase footprint" -> the named law,
+    never to another model's record.
+
+    The fingerprint is the RIG's (``rig_hardware_fingerprint``, NVML, CVD-
+    blind), the same one the readers compare against; the CVD-masked
+    ``live_fingerprint`` of a pinned rank would be refused by every reader.
+
+    The record is filed under this group's REAL argv recipe
+    (:data:`RECIPE_SELF_ENV`, armed by ``launch_group``) and read by the NEXT
+    boot; this boot's readers hold the launcher's frozen state (MUSS 1).
+    """
+    group = os.environ.get(GROUP_ENV, "")
+    tag = normalise_group(group)
+    if tag == GROUP_UNKNOWN:
+        return None
+    try:
+        if profile is None:
+            from flliper.srt.mem_ledger.activation import profile_from_server_args
+            from flliper.srt.mem_ledger.engine import _model_architectures
+
+            profile = profile_from_server_args(
+                server_args, _model_architectures(server_args)
+            )
+        from flliper.srt.mem_ledger.activation import profile_key
+
+        digest = profile_key(profile)
+    except Exception as exc:  # config availability -- named, once (SOLL 1)
+        _warn_publish_failed_once(tag, f"profile not derivable: {exc}")
+        return None
+    prior = _BOOT_PUBLISHED.get(tag)
+    if prior == digest:
+        return None
+    if prior is not None:
+        logger.warning(
+            "%s group=%s SECOND DIGEST %s REFUSED: this process already published "
+            "%s for group %s (one write per group and process; a second profile "
+            "in one process would overwrite the first record)",
+            RECORD_PUBLISH_TAG, tag, digest, prior, tag,
+        )
+        return None
+    fp, why = rig_hardware_fingerprint()
+    if not fp:
+        logger.info("%s group=%s SKIPPED: %s", RECORD_PUBLISH_TAG, tag, why)
+        return None
+    path = publish_floor_profile(group, profile, fp)
+    if path:
+        _BOOT_PUBLISHED[tag] = digest
+        logger.info(
+            "%s group=%s digest=%s recipe=%s footprint=%s (published on %s, for "
+            "the next boot; this boot reads the launcher's frozen pointer)",
+            RECORD_PUBLISH_TAG, tag, digest, os.environ.get(RECIPE_SELF_ENV) or "(none)",
+            {True: "hit", False: "miss", None: "not-resolved-here"}[footprint_hit],
+            "a hit" if footprint_hit else "a miss too (#233 a)",
+        )
+    return path
+
+
+def _read_pointer() -> dict:
+    """The pointer file as a dict, ``{}`` when absent or unreadable."""
     try:
         import json
 
         path = _floor_digest_path()
         if not os.path.exists(path):
-            return None, {}
+            return {}
         with open(path, "r", encoding="utf-8") as fh:
             raw = json.load(fh) or {}
-        fp = raw.get("hw_fingerprint")
-        groups = {
-            str(k): str(v) for k, v in (raw.get("groups") or {}).items() if v
-        }
-        return (str(fp) if fp else None), groups
+        return raw if isinstance(raw, dict) else {}
     except Exception as exc:  # pragma: no cover
         logger.debug("corridor floor digest unreadable: %s", exc)
-        return None, {}
+        return {}
+
+
+def _published_groups() -> Tuple[Optional[str], Dict[str, str]]:
+    """``(hw_fingerprint, {group: digest})`` from the LEGACY pointer map."""
+    raw = _read_pointer()
+    fp = raw.get("hw_fingerprint")
+    groups = {str(k): str(v) for k, v in (raw.get("groups") or {}).items() if v}
+    return (str(fp) if fp else None), groups
+
+
+def _frozen_snapshot() -> Optional[dict]:
+    """The launcher's frozen pointer resolution (MUSS 1), or ``None``.
+
+    ``None`` = no frozen state: this process was not started by a launcher of
+    this tree (desk, planner CLI) and reads the file live, saying so. A value
+    that is present but unreadable is NOT a reason to read live -- a live read
+    is exactly the second floor MUSS 1 removes -- so it resolves every group to
+    the law, named (``{"broken": why}``).
+    """
+    raw = os.environ.get(POINTER_FROZEN_ENV)
+    if not raw:
+        return None
+    try:
+        import json
+
+        snap = json.loads(raw)
+        if not isinstance(snap, dict) or snap.get("v") != 1:
+            raise ValueError(f"unknown snapshot shape {type(snap).__name__} v={getattr(snap, 'get', lambda k: None)('v')!r}")
+    except ValueError as exc:
+        return {"v": 1, "broken": f"{POINTER_FROZEN_ENV} unreadable ({exc})"}
+    if str(snap.get("pointer") or "") != _floor_digest_path():
+        # Frozen for ANOTHER pointer file (a leftover of an earlier main() in
+        # this process, e.g. a desk test that ran the launcher): it does not
+        # describe this pointer, so it is not this process's boot state. A
+        # real boot never moves its pointer path between freeze and read.
+        return None
+    return snap
+
+
+def _group_digest_pairs(raw: dict, ident, recipes) -> List[Tuple[str, str]]:
+    """Every ``(group, digest)`` a boot of ``ident`` with ``recipes`` can reach.
+
+    The legacy map plus -- #233 -- the records under this boot's own keys (one
+    per group recipe). Another identity's or another recipe's record is not in
+    it: its digests are never read by this boot, so they cannot be ambiguous
+    for it.
+    """
+    pairs = [(str(k), str(v)) for k, v in (raw.get("groups") or {}).items() if v]
+    if ident is not None:
+        records = raw.get("records") if isinstance(raw.get("records"), dict) else {}
+        for key in sorted({record_identity_key(ident, r["hash"]) for r in (recipes or {}).values() if r.get("hash")}):
+            rec = records.get(key) or {}
+            if isinstance(rec, dict):
+                pairs.extend(
+                    (str(k), str(v)) for k, v in (rec.get("groups") or {}).items() if v
+                )
+    return sorted(set(pairs))
+
+
+def _published_group_digests() -> List[Tuple[str, str]]:
+    """Every ``(group, digest)`` this boot's reads can reach -- FROZEN when the
+    launcher froze the pointer (MUSS 1: the collision is judged on the same
+    state the floors were), live otherwise."""
+    snap = _frozen_snapshot()
+    if snap is not None:
+        if snap.get("broken"):
+            return []
+        return [(str(g), str(d)) for g, d in (snap.get("pairs") or [])]
+    ident = boot_record_identity() if record_identity_enabled() else None
+    return _group_digest_pairs(_read_pointer(), ident, boot_recipes())
 
 
 def digest_group_collision(digest: str, tag: str) -> Optional[str]:
@@ -672,23 +1349,404 @@ def digest_group_collision(digest: str, tag: str) -> Optional[str]:
     """
     if not digest:
         return None
-    _fp, groups = _published_groups()
     others = sorted(
-        g
-        for g, d in groups.items()
-        if d == digest and normalise_group(g) != normalise_group(tag)
+        {
+            normalise_group(g)
+            for g, d in _published_group_digests()
+            if d == digest and normalise_group(g) != normalise_group(tag)
+        }
     )
     return ",".join(others) if others else None
 
 
 def _published_digest(group: str) -> Tuple[Optional[str], Optional[str]]:
-    """``(hw_fingerprint, profile_digest)`` for ``group``, or ``(None, None)``."""
+    """``(hw_fingerprint, profile_digest)`` for ``group`` from the LEGACY map.
+
+    Pre-#233 accessor, kept for callers that want the raw group-keyed entry;
+    the floor derivation reads :func:`_published_digest_for_boot`.
+    """
     fp, groups = _published_groups()
     tag = normalise_group(group)
     digest = groups.get(tag)
     if not digest or not fp:
         return None, None
     return str(fp), str(digest)
+
+
+def _legacy_recipe_verdict(
+    hw_fingerprint: str,
+    digest: str,
+    cache_dir: Optional[str],
+    items: Optional[Mapping[str, object]],
+) -> Tuple[str, str]:
+    """``("match"|"mismatch"|"undeterminable", detail)`` for a legacy entry.
+
+    #233 review MUSS 2, the Altbestand half: a legacy pointer entry has no
+    recipe, but the footprint it names records its PROFILE in its own content
+    (``[architectures, chunk, tp, pp, kv_dtype, spec_draft_tokens,
+    decode_max_bs]``). Those terms are compared with the flags this boot's
+    recipe states. ``decode_max_bs`` is NOT compared, by reason: it prices the
+    decode graph capture (``capture_mib``), the corridor floor reads only the
+    prefill transient (``activation_mib``), and the group argv does not state it
+    (server_args derives it). A term the argv does not state is undeterminable,
+    never assumed equal.
+    """
+    if items is None:
+        return "undeterminable", "this boot published no recipe (no launcher armed it)"
+    try:
+        import json
+
+        from flliper.srt.mem_ledger import activation as _act
+
+        path = _act.footprint_cache_path(hw_fingerprint, digest, cache_dir)
+        with open(path, "r", encoding="utf-8") as fh:
+            prof = (json.load(fh) or {}).get("profile") or []
+    except Exception as exc:
+        return "undeterminable", f"legacy footprint unreadable ({exc})"
+    if not isinstance(prof, (list, tuple)) or len(prof) < 6:
+        return "undeterminable", "the legacy footprint states no full profile"
+    want = {
+        "--chunked-prefill-size": prof[1],
+        "--tp-size": prof[2],
+        "--pp-size": prof[3],
+        "--kv-cache-dtype": prof[4],
+    }
+    missing = [k for k in want if k not in items]
+    if missing:
+        return "undeterminable", f"this boot's group argv states no {missing}"
+    diffs = {
+        k: (want[k], items[k]) for k in want if str(items[k]) != str(want[k])
+    }
+    if "--speculative-num-draft-tokens" in items:
+        spec_boot = items["--speculative-num-draft-tokens"]
+    elif "--speculative-algorithm" not in items:
+        spec_boot = 0
+    else:
+        return "undeterminable", (
+            f"this boot runs --speculative-algorithm {items['--speculative-algorithm']} "
+            f"without stating --speculative-num-draft-tokens"
+        )
+    if str(spec_boot) != str(prof[5]):
+        diffs["--speculative-num-draft-tokens"] = (prof[5], spec_boot)
+    if diffs:
+        return "mismatch", f"(legacy footprint, this boot): {diffs}"
+    return "match", (
+        f"chunk {prof[1]}, tp {prof[2]}, pp {prof[3]}, kv {prof[4]}, spec {prof[5]} "
+        f"equal to this boot's argv; decode_max_bs {prof[6] if len(prof) > 6 else '?'} "
+        f"not compared (decode capture, not the prefill transient; unstated by the argv)"
+    )
+
+
+#: SOLL 2 (review #233): the identity does NOT reach the footprint store.
+#: ``ActivationProfile`` has no checkpoint or quant field and the file is named
+#: ``phase_footprint-<hw>-<digest>.json``, so INT8, NVFP4, FP8 and bf16 of one
+#: architecture and recipe share ONE file even with records of their own. The
+#: record says WHICH digest this model+recipe booted; the bytes behind it are
+#: per architecture+recipe. Named in every OWN/LEGACY provenance.
+_STORE_SHARED_NOTE = (
+    "footprint store keyed by activation profile only (no checkpoint/quant term): "
+    "every checkpoint of these architectures and this recipe reads the same file"
+)
+
+
+def _resolve_pointer(
+    raw: dict,
+    group: str,
+    ident,
+    recipe: Optional[Mapping[str, object]],
+    cache_dir: Optional[str],
+    path: str,
+    enabled: bool,
+) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
+    """``(hw_fingerprint, digest, note, refusal)`` for ``group`` from ``raw``.
+
+    PURE: one pointer state in, one resolution out -- the launcher calls it
+    once per group to FREEZE the boot's state (MUSS 1), a process without a
+    frozen state calls it on a live read. Precedence, strictly:
+
+    1. no model identity (no form published, or the user switched the check
+       off): the pre-#233 group-keyed read (the switch-off is named);
+    2. this boot's own ``records["<checkpoint>|<arch>|<recipe>"]`` entry ->
+       OWN (refused as FOREIGN if the record's stated architectures contradict
+       this boot's);
+    3. a legacy ``groups`` entry -> adopted only when the footprint it names
+       states THIS boot's architectures AND this boot's recipe terms in its own
+       content (the migration rule); a different architecture -> FOREIGN, a
+       different recipe -> OTHER RECIPE, unprovable -> UNKNOWN ORIGIN;
+    4. records of this model under other recipes only -> OTHER RECIPE;
+    5. only other identities' records -> FOREIGN, named;
+    6. nothing -> ``(None, None, "", None)``, the caller's "first boot" fallback.
+    """
+    tag = normalise_group(group)
+    fp = str(raw.get("hw_fingerprint") or "") or None
+    legacy = {str(k): str(v) for k, v in (raw.get("groups") or {}).items() if v}
+    records = raw.get("records") if isinstance(raw.get("records"), dict) else {}
+    if ident is None:
+        d = legacy.get(tag)
+        if not d or not fp:
+            return None, None, "", None
+        # No form published (a desk test, a non-pdflip process): the pre-#233
+        # read, byte-identical -- such a process has no identity to compare.
+        # Switched off by the user: the same read, but it SAYS so, because
+        # off is the direction #232 measured as OOM.
+        note = (
+            ""
+            if enabled
+            else f"; #233 record identity check switched off ({RECORD_IDENTITY_ENV}=0)"
+        )
+        return fp, d, note, None
+    rcp = str((recipe or {}).get("hash") or "")
+    items = dict((recipe or {}).get("items") or {}) if rcp else None
+    prefix = record_identity_prefix(ident)
+    key = record_identity_key(ident, rcp)
+    own = records.get(key) if (rcp and isinstance(records.get(key), dict)) else {}
+    d = str((own.get("groups") or {}).get(tag) or "")
+    if d and fp:
+        rec_archs = tuple(
+            sorted(
+                str(a)
+                for a in ((own.get("identity") or {}).get("architectures") or ())
+            )
+        )
+        boot_archs, why = boot_architectures(ident)
+        if rec_archs and boot_archs and rec_archs != boot_archs:
+            line = (
+                f"{RECORD_FOREIGN_TAG} group={tag} identity={key} digest={d} "
+                f"pointer={path!r}: the record under this boot's key names "
+                f"architectures {list(rec_archs)} and this boot's checkpoint "
+                f"config names {list(boot_archs)} ({why}) -- another model's "
+                f"corridor floor is never used"
+            )
+            return fp, None, "", line
+        return fp, d, f"; {RECORD_OWN_TAG} identity={key} ({_STORE_SHARED_NOTE})", None
+
+    def _holds(r) -> bool:
+        return isinstance(r, dict) and bool((r.get("groups") or {}).get(tag))
+
+    same_model = sorted(
+        k for k, r in records.items()
+        if k != key and (k == prefix or k.startswith(prefix + "|")) and _holds(r)
+    )
+    others = sorted(
+        k for k, r in records.items()
+        if k != key and k not in same_model and _holds(r)
+    )
+    ld = legacy.get(tag)
+    if ld and fp:
+        rec_archs, rec_why = _footprint_architectures(fp, ld, cache_dir)
+        boot_archs, boot_why = boot_architectures(ident)
+        if rec_archs and boot_archs and rec_archs == boot_archs:
+            verdict, detail = _legacy_recipe_verdict(fp, ld, cache_dir, items)
+            if verdict == "match":
+                line = (
+                    f"{RECORD_LEGACY_TAG} group={tag} identity={key} digest={ld}: "
+                    f"legacy pointer entry (no identity) adopted -- the footprint "
+                    f"it names states architectures {list(rec_archs)} in its own "
+                    f"content ({rec_why}), the same as this boot's ({boot_why}), "
+                    f"and its recipe: {detail}; {_STORE_SHARED_NOTE}; this boot "
+                    f"republishes its own digest under its identity"
+                )
+                return fp, ld, f"; {line}", None
+            if verdict == "mismatch":
+                line = (
+                    f"{RECORD_OTHER_RECIPE_TAG} group={tag} identity={key} digest={ld} "
+                    f"pointer={path!r}: the legacy pointer entry names a footprint of "
+                    f"this boot's architectures {list(rec_archs)} measured under "
+                    f"another recipe {detail} -- another recipe's transient is never "
+                    f"this boot's floor"
+                )
+            else:
+                line = (
+                    f"{RECORD_UNKNOWN_TAG} group={tag} identity={key} digest={ld} "
+                    f"pointer={path!r}: the legacy pointer entry names a footprint of "
+                    f"this boot's architectures {list(rec_archs)}, but its recipe "
+                    f"cannot be matched ({detail}) -- an unknown recipe is not this "
+                    f"boot's own record"
+                )
+            return fp, None, "", line
+        if rec_archs and boot_archs:
+            line = (
+                f"{RECORD_FOREIGN_TAG} group={tag} identity={key} digest={ld} "
+                f"pointer={path!r}: the legacy pointer entry (no identity) names "
+                f"a footprint of architectures {list(rec_archs)} ({rec_why}) and "
+                f"this boot is {list(boot_archs)} ({boot_why}) -- another "
+                f"model's corridor floor is never used"
+            )
+        else:
+            line = (
+                f"{RECORD_UNKNOWN_TAG} group={tag} identity={key} digest={ld} "
+                f"pointer={path!r}: the legacy pointer entry carries no model "
+                f"identity and its origin cannot be proven (record: "
+                f"{list(rec_archs) if rec_archs else rec_why}; this boot: "
+                f"{list(boot_archs) if boot_archs else boot_why}) -- an "
+                f"unknown origin is not this boot's own record"
+            )
+        return fp, None, "", line
+    if same_model:
+        line = (
+            f"{RECORD_OTHER_RECIPE_TAG} group={tag} identity={key} pointer={path!r}: "
+            f"the pointer holds group {tag} records of this model only under "
+            f"{same_model}, none for this boot's recipe "
+            f"{rcp or '(none published)'} -- another recipe's footprint is never "
+            f"this boot's floor"
+        )
+        return fp, None, "", line
+    if others:
+        line = (
+            f"{RECORD_FOREIGN_TAG} group={tag} identity={key} pointer={path!r}: "
+            f"the pointer holds group {tag} records only for {others}, none "
+            f"for this boot -- another model's corridor floor is never used"
+        )
+        return fp, None, "", line
+    return None, None, "", None
+
+
+def _pointer_source(digest: Optional[str], refusal: Optional[str]) -> str:
+    if refusal:
+        return POINTER_SOURCE_FOREIGN
+    return POINTER_SOURCE_FROZEN if digest else POINTER_SOURCE_LAW
+
+
+def clear_boot_pointer_env() -> None:
+    """Drop a frozen state / recipe this process inherited (a shell, an earlier
+    ``main()`` in the same process): launcher OUTPUT never describes a boot it
+    did not resolve (R19)."""
+    for k in (POINTER_FROZEN_ENV, RECIPE_ENV, RECIPE_SELF_ENV):
+        os.environ.pop(k, None)
+    _POINTER_READ_NOTED.clear()
+
+
+def freeze_boot_pointer(
+    groups: Sequence[str] = CANONICAL_GROUPS, cache_dir: Optional[str] = None
+) -> List[str]:
+    """MUSS 1: read the pointer ONCE, resolve it for ``groups``, freeze it.
+
+    Called by the launcher before the first floor of the boot is read (the
+    budget pass), after the form and the recipe are published. The resolution
+    goes into :data:`POINTER_FROZEN_ENV` of THIS process, so the launcher's own
+    budget and lend floor, the front (``dict(os.environ)``) and every rank
+    (``launch_group`` -> :func:`arm_group_recipe_env`) read the SAME state. The ranks keep writing the file -- for the next boot.
+    Returns the log lines (one per group, tag :data:`POINTER_FROZEN_TAG`).
+    """
+    import json
+    import time
+
+    raw = _read_pointer()
+    path = _floor_digest_path()
+    enabled = record_identity_enabled()
+    ident = boot_record_identity() if enabled else None
+    recipes = boot_recipes()
+    snap = {
+        "v": 1,
+        "pointer": path,
+        "hw_fingerprint": str(raw.get("hw_fingerprint") or ""),
+        "frozen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pid": os.getpid(),
+        "groups": {},
+        "pairs": [list(p) for p in _group_digest_pairs(raw, ident, recipes)],
+    }
+    lines: List[str] = []
+    for g in groups:
+        tag = normalise_group(g)
+        fp, d, note, refusal = _resolve_pointer(
+            raw, tag, ident, recipes.get(tag), cache_dir, path, enabled
+        )
+        rcp = str((recipes.get(tag) or {}).get("hash") or "")
+        snap["groups"][tag] = {
+            "fp": fp, "digest": d, "note": note, "refusal": refusal, "recipe": rcp,
+        }
+        what = refusal or note.lstrip("; ") or (
+            "no record for this boot's identity and recipe (first boot of it: the law)"
+        )
+        lines.append(
+            f"{POINTER_FROZEN_TAG} group={tag} source={_pointer_source(d, refusal)} "
+            f"digest={d or '-'} recipe={rcp or '(none)'} identity="
+            f"{record_identity_key(ident, rcp) if ident else '(none)'} pointer={path!r}: "
+            f"{what} -- every reader of this boot (launcher budget and lend floor, "
+            f"front, ranks) reads THIS state; the ranks' publish is for the next boot"
+        )
+    os.environ[POINTER_FROZEN_ENV] = json.dumps(snap, sort_keys=True)
+    _POINTER_READ_NOTED.clear()
+    return lines
+
+
+_POINTER_READ_NOTED: set = set()
+
+
+def _note_pointer_read_once(tag: str, source: str, digest: Optional[str], detail: str) -> None:
+    """``#233 CORRIDOR-POINTER-READ group= source=FROZEN|LAW|FOREIGN|LIVE`` --
+    once per process and (group, source, digest): the named line MUSS 1 asks
+    for, so a rank log shows WHICH pointer state its floors came from."""
+    k = (tag, source, digest or "")
+    if k in _POINTER_READ_NOTED:
+        return
+    _POINTER_READ_NOTED.add(k)
+    logger.info(
+        "%s group=%s source=%s digest=%s pid=%d: %s",
+        POINTER_READ_TAG, tag, source, digest or "-", os.getpid(), detail,
+    )
+
+
+def _published_digest_for_boot(
+    group: str, cache_dir: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
+    """``(hw_fingerprint, digest, note, refusal)`` for ``group`` and THIS boot.
+
+    MUSS 1: the launcher's FROZEN resolution when it froze one -- the same
+    state its budget and lend floor were priced from, no matter what the ranks
+    have published since. Without a frozen state (a process the launcher did
+    not start) the file is read live and resolved by the same pure function
+    (:func:`_resolve_pointer`, precedence there); the read line says LIVE.
+
+    A ``refusal`` is a full provenance sentence with a stable tag; the caller
+    falls back to the stated law with it. It is never a measurement. With a
+    refusal the pointer's fingerprint is still returned, so the caller's
+    REFUTER FIX 4 hardware check runs FIRST: "another rig" stays the verdict
+    where it already was, and the refusal is logged only where it decides.
+    """
+    tag = normalise_group(group)
+    snap = _frozen_snapshot()
+    if snap is not None:
+        if snap.get("broken"):
+            line = (
+                f"{RECORD_UNKNOWN_TAG} group={tag}: {snap['broken']} -- a live read "
+                f"would be a second floor in this boot (MUSS 1), so the law holds"
+            )
+            _note_pointer_read_once(tag, POINTER_SOURCE_LAW, None, line)
+            return None, None, "", line
+        ent = (snap.get("groups") or {}).get(tag)
+        if not isinstance(ent, dict):
+            _note_pointer_read_once(
+                tag, POINTER_SOURCE_LAW, None,
+                f"group {tag} is not in the launcher's frozen pointer state (frozen: "
+                f"{sorted((snap.get('groups') or {}))}) -- the law",
+            )
+            return None, None, "", None
+        fp = ent.get("fp") or None
+        d = ent.get("digest") or None
+        note = str(ent.get("note") or "")
+        refusal = ent.get("refusal") or None
+        _note_pointer_read_once(
+            tag, _pointer_source(d, refusal), d,
+            f"launcher's frozen state ({snap.get('frozen_at')}, pid {snap.get('pid')}, "
+            f"recipe {ent.get('recipe') or '(none)'}): "
+            f"{refusal or note.lstrip('; ') or 'no record (the law)'}",
+        )
+        return fp, d, note, refusal
+    raw = _read_pointer()
+    enabled = record_identity_enabled()
+    ident = boot_record_identity() if enabled else None
+    recipe = boot_recipes().get(tag)
+    out = _resolve_pointer(
+        raw, tag, ident, recipe, cache_dir, _floor_digest_path(), enabled
+    )
+    _note_pointer_read_once(
+        tag, POINTER_SOURCE_LIVE, out[1],
+        f"no frozen pointer state in this process ({POINTER_FROZEN_ENV} unset: not "
+        f"started by a launcher of this tree); read live -> "
+        f"{_pointer_source(out[1], out[3])}",
+    )
+    return out
 
 
 #: Cached ``(fingerprint, why_not)`` of the WHOLE rig. One NVML inventory per
@@ -820,6 +1878,62 @@ class CorridorFloor:
         )
 
 
+def footprint_prefill_tokens(source: str) -> Optional[str]:
+    """The ``prefill of N tokens`` the ingest wrote into a footprint's
+    ``source`` (``N`` as written, possibly ``"?"``), or ``None`` if the source
+    states no prefill at all."""
+    import re
+
+    m = re.search(r"prefill of (\S+) tokens", str(source or ""))
+    return m.group(1) if m else None
+
+
+def _thin_evidence_refusal(hit, path: str, card_uuid: str) -> Optional[str]:
+    """:data:`RECORD_THIN_TAG` sentence when ``hit`` lacks the minimum evidence.
+
+    Minimum (defined from what the footprint already records): a MEASURED
+    footprint's stated prefill token count >= the ``chunked_prefill_size`` of
+    the profile in the same file. Bounds and footprints that state no prefill
+    are not judged (no count to compare).
+    """
+    prov = getattr(getattr(hit, "provenance", None), "value", getattr(hit, "provenance", ""))
+    if str(prov) != "measured_peak":
+        return None
+    stated = footprint_prefill_tokens(getattr(hit, "source", ""))
+    if stated is None:
+        return None
+    chunk = 0
+    try:
+        import json
+
+        with open(path, "r", encoding="utf-8") as fh:
+            prof = (json.load(fh) or {}).get("profile") or []
+        chunk = int(prof[1]) if isinstance(prof, (list, tuple)) and len(prof) > 1 else 0
+    except Exception:  # noqa: BLE001 - an unreadable profile has no minimum
+        chunk = 0
+    try:
+        tokens = int(stated)
+    except ValueError:
+        tokens = -1
+    if chunk > 0 and tokens >= chunk:
+        return None
+    why = (
+        f"its profile states no chunk, so the minimum is unknown"
+        if chunk <= 0
+        else (
+            f"it states 'prefill of {stated} tokens', no count"
+            if tokens < 0
+            else f"prefill of {tokens} tokens < one chunk ({chunk})"
+        )
+    )
+    return (
+        f"{RECORD_THIN_TAG} card={card_uuid} footprint={path}: activation "
+        f"{int(getattr(hit, 'activation_mib', 0))} MiB was measured over too little "
+        f"load ({why}) -- a peak that never ran a full-width forward is not this "
+        f"recipe's transient and is never a MEASURED floor"
+    )
+
+
 def _resolve_transient_mib(
     card_uuid: str,
     group: str,
@@ -842,8 +1956,14 @@ def _resolve_transient_mib(
     fp = hw_fingerprint
     digest = profile_digest
     unverified_fp = ""
+    ident_note = ""
     if profile is None and digest is None:
-        fp2, digest = _published_digest(group)
+        # #233: the pointer entry of THIS BOOT'S MODEL IDENTITY, never another
+        # model's. A refusal (foreign record, legacy entry of unknown origin)
+        # is a fallback to the stated law with the refusal as provenance.
+        fp2, digest, ident_note, refusal = _published_digest_for_boot(
+            group, cache_dir
+        )
         # REFUTER FIX 4 (serve-next4, 2026-09-09). THE POINTER SUPPLIED BOTH
         # TERMS AND NOTHING CHECKED THE FIRST ONE. On this path the caller
         # passes no profile and no digest, so a pointer file written on OTHER
@@ -876,6 +1996,11 @@ def _resolve_transient_mib(
                     f"another rig's measurement (a mismatched pointer is a "
                     f"fallback, not a measurement)"
                 )
+        if refusal:
+            _note_record_once(refusal)
+            return None, refusal
+        if RECORD_LEGACY_TAG in ident_note:
+            _note_record_once(ident_note.lstrip("; "))
         fp = fp or fp2
         if digest is None:
             # THE FIRST BOOT IS ALWAYS UNMEASURED, and an operator reading this
@@ -904,6 +2029,14 @@ def _resolve_transient_mib(
             # P or D profile differs from the tuple above would read another
             # recipe's transient stamped MEASURED-*. Every boot republishes its
             # own digest, so the pointer self-corrects from the second boot.
+            #
+            # #233 (24.10.): THAT LAST SENTENCE WAS FALSE UNTIL #233. The only
+            # writer published on a footprint HIT, and the NF (no record of its
+            # own) never hit, so the 27B pointer copied into its cache stood
+            # forever and priced the NF corridor at 767/701/700. Since #233 the
+            # pointer is keyed by model identity (:func:`_published_digest_for_boot`)
+            # and every group rank publishes hit or miss
+            # (:func:`publish_boot_floor_profile`).
             return None, (
                 f"no activation profile published for group {group!r} at "
                 f"{_floor_digest_path()!r} (only a boot of that group writes "
@@ -951,14 +2084,21 @@ def _resolve_transient_mib(
     if hit is None:
         return None, (
             f"no phase footprint for card {card_uuid} at fingerprint {fp} "
-            f"digest {digest or '(from profile)'}"
+            f"digest {digest or '(from profile)'}{ident_note}"
         )
     path = _act.footprint_cache_path(
         fp, digest or _act.profile_key(profile), cache_dir
     )
+    # #233 review MUSS 2: a footprint measured over less than one chunk of
+    # prefill is not the recipe's transient -- never MEASURED, never actuating.
+    thin = _thin_evidence_refusal(hit, path, card_uuid)
+    if thin:
+        _note_record_once(thin)
+        return None, thin
     return int(hit.activation_mib), (
         f"{path}#cards.{card_uuid}.activation_mib={int(hit.activation_mib)}MiB "
         f"({getattr(hit.provenance, 'value', hit.provenance)}){unverified_fp}"
+        f"{ident_note}"
     )
 
 
