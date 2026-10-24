@@ -14636,7 +14636,165 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
         res = _budget_rest.resolve(vals, _pconst_boots(name, profile), len(cards), group, name)
     except ValueError as exc:
         raise PdFlipLaunchRefused(f"{_budget_rest.MARKER}: {exc}") from None
-    return {"booked_rest_mib": list(res.values), "booked_rest_provenance": res.provenance}
+    rests = list(res.values)
+    prov = res.provenance
+    deltas = booked_rest_vote_line_deltas(cards, rests, name, profile, group, log)
+    if any(deltas):
+        rests = [None if v is None else int(v) + int(d) for v, d in zip(rests, deltas)]
+        prov = (f"{prov} + vote-line delta {','.join(str(d) for d in deltas)} "
+                f"{_budget_rest.VOTE_LINE_BASIS} ({_budget_rest.VOTE_LINE_MARKER})")
+    return {"booked_rest_mib": rests, "booked_rest_provenance": prov}
+
+
+def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int]], name: str,
+                                 profile: Optional[str] = None, group: str = "D",
+                                 log: Optional[Log] = None) -> List[int]:
+    """PDFLIP-VOTE-LINE-BOOK (desk/27b-int8-tp1corridor-1024, pdflip/budget_rest.py):
+    per card the MiB the extend width vote now keeps free beyond the line the booked
+    rest ``name`` was measured under -- ``ceil8(max(0, line_for_floor_mib(floor) -
+    record_line))`` where the card's corridor floor is MEASURED and its footprint is of
+    this form (reserve 0, as the booked path charges none; an unmeasured, hand-set or
+    foreign-form floor books nothing), 0 elsewhere. DERIVED, not measured: the record
+    under-books the current line, the caller books the delta beside it, so the vote's
+    line comes out of the KV pool, not out of the chunk."""
+    n = len(cards)
+    if not _budget_rest.vote_line_switch_on():
+        if log is not None:
+            log(f"{_budget_rest.VOTE_LINE_MARKER} group={group}: {_budget_rest.VOTE_LINE_ENV}=0 -- no delta "
+                f"booked (the KV pool keeps the vote's room, the vote narrows the chunk)")
+        return [0] * n
+    prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
+    row = pdflip_form.profile_row(prof)
+    rec = row.constants.get(name) if row is not None else None
+    boots = tuple(getattr(rec, "boots", ()) or ()) if rec is not None else ()
+    rec_line = _budget_rest.record_vote_line(name, boots)
+    if rec_line is None:
+        if log is not None:
+            log(f"{_budget_rest.VOTE_LINE_MARKER} group={group}: the vote line {name} was measured "
+                f"under is unknown (boots {','.join(boots) or '-'}) -- no delta booked (named, not "
+                f"guessed); re-measured under the current line the rest already contains it")
+        return [0] * n
+    from flliper.srt.pdflip.extend_trim import line_for_floor_mib, near_oom_mib
+
+    # reserve 0 BY DESIGN: the booked path charges no user reserve, and a reserve here
+    # would book a forbidden corridor reserve as "line" (keine-korridor-reserve-nie)
+    floors = corridor_budget.floors_for_cards(cards, group, 0)
+    act = [bool(floors[c.uuid].measured) for c in cards]
+    # VOTE-LINE-SINGLE: on a measured floor the line is near-OOM + the measured fixed part (the same record the
+    # ranks vote with, d_extend_vote_fixed_env) -- the floor is the activation rate x rows already prices
+    fixed, fixed_src = d_extend_vote_fixed_record(profile, n, cards)
+    if fixed is None and log is not None and (fixed_src.startswith("F unmeasured") or "name no form" in fixed_src):
+        log(f"{_budget_rest.VOTE_LINE_MARKER} group={group}: {_budget_rest.VOTE_FIXED_MARKER} off -- {fixed_src}; "
+            f"the delta books the floor line (review M1 form gate)")
+    lines = [line_for_floor_mib(floors[c.uuid].mib, fixed[i] if (fixed is not None and act[i]) else None)
+             for i, c in enumerate(cards)]
+    form_why: List[Optional[str]] = [None] * n
+    uuids = [c.uuid for c in cards]
+    _stores: Dict[str, object] = {}
+    for i, c in enumerate(cards):
+        if not act[i]:
+            continue
+        path = str(floors[c.uuid].provenance or "").split("#", 1)[0].strip()
+        if path not in _stores:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    _stores[path] = json.load(fh) or {}
+            except Exception as exc:  # noqa: BLE001 -- an unreadable store books nothing
+                _stores[path] = f"footprint store {path or '-'} unreadable ({type(exc).__name__})"
+        st = _stores[path]
+        why = st if isinstance(st, str) else _budget_rest.footprint_form_mismatch(st, uuids)
+        if why is not None:
+            act[i] = False
+            form_why[i] = why
+    deltas = _budget_rest.vote_line_deltas(rests, lines, act, rec_line)
+    if log is not None:
+        for i, c in enumerate(cards):
+            cf = floors[c.uuid]
+            reason = ""
+            if rests[i] is None:
+                reason = " -> 0: no booked rest on this card"
+            elif form_why[i] is not None:
+                reason = f" -> 0: the floor is not of this form ({form_why[i]})"
+            elif not act[i]:
+                reason = " -> 0: the floor is not measured (an unmeasured or hand-set law cuts no KV for the vote line)"
+            if fixed is not None and act[i]:
+                what = (f"{_budget_rest.VOTE_FIXED_MARKER}: near-OOM {near_oom_mib():.0f} + fixed "
+                        f"{fixed[i]:.0f} ({_budget_rest.VOTE_FIXED_RECORD}, {fixed_src}); floor {cf.mib} "
+                        f"source={cf.source} is the activation rate x rows prices, not held twice")
+            else:
+                what = f"max(300, floor {cf.mib} source={cf.source})"
+            log(f"{_budget_rest.VOTE_LINE_MARKER} group={group} ordinal={i} nvml{c.nvml_index}: "
+                f"delta {deltas[i]} MiB {_budget_rest.VOTE_LINE_BASIS} = ceil8(vote line {lines[i]:.0f} "
+                f"({what}) - record line {rec_line} ({name}, rc12g halt line of its boots))" + reason)
+    return deltas
+
+
+def d_extend_vote_fixed_record(profile: Optional[str] = None, n: Optional[int] = None,
+                               cards: Optional[Sequence[Card]] = None,
+                               model: Optional[str] = None) -> Tuple[Optional[List[float]], str]:
+    """VOTE-LINE-SINGLE: the profile's ``D_EXTEND_VOTE_FIXED_MIB`` per card (one value covers every card) and its
+    boots, or ``(None, why)`` -- no record (other profiles, Next Flash), the switch off
+    (``FLLIPER_PDFLIP_VOTE_LINE_SINGLE=0``), a vector that does not fit ``n`` cards, or (review M1) a FORM the record
+    was not measured on: the checkpoint (``model``, else the published form's) and the D cards' inventory must be a
+    form of the record's boots (``budget_rest.VOTE_FIXED_FORMS``); unknown checkpoint or no cards = not this form
+    (fail closed: the floor line). The ranks' env (:func:`_d_extend_vote_fixed_env`) and the budget's delta read this
+    ONE reader."""
+    if not _budget_rest.vote_line_single_on():
+        return None, f"{_budget_rest.VOTE_LINE_SINGLE_ENV}=0"
+    try:
+        vals = list(_pconst(_budget_rest.VOTE_FIXED_RECORD, profile))
+    except (KeyError, TypeError):
+        return None, f"no {_budget_rest.VOTE_FIXED_RECORD} record"
+    if not vals or any(v is None for v in vals):
+        return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} has an unmeasured card"
+    prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
+    row = pdflip_form.profile_row(prof)
+    rec = row.constants.get(_budget_rest.VOTE_FIXED_RECORD) if row is not None else None
+    boots = tuple(getattr(rec, "boots", ()) or ()) if rec is not None else ()
+    if model is None:
+        form = pdflip_form.current_form()
+        model = form.model if form is not None else ""
+    try:
+        inventory = card_identity.inventory_signature(list(cards)) if cards else ()
+    except Exception:  # noqa: BLE001 -- an unreadable inventory is not this form (fail closed)
+        inventory = ()
+    why = _budget_rest.vote_fixed_form_mismatch(boots, pdflip_form.model_key(model or ""), inventory)
+    if why is not None:
+        return None, why
+    if n is not None and len(vals) not in (1, int(n)):
+        return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} does not fit {n} cards"
+    out = [float(v) for v in vals]
+    if n is not None and len(out) == 1:
+        out = out * int(n)
+    return out, _pconst_boots(_budget_rest.VOTE_FIXED_RECORD, profile)
+
+
+def _d_extend_vote_fixed_env(ns, log, label: str, cards: Optional[Sequence[Card]] = None) -> Optional[str]:
+    """VOTE-LINE-SINGLE: wherever the launcher armed the D width vote, hand the ranks the measured fixed part
+    (``FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB`` from ``D_EXTEND_VOTE_FIXED_MIB``): a rank whose corridor floor is
+    MEASURED then votes with ``near-OOM 400 + fixed`` and trims before the forward under ``line + rate x rows``
+    (extend_trim.corridor_line_mib / need_trim_threshold) -- the line the budget books
+    (:func:`booked_rest_vote_line_deltas`). A value named in --env-d wins; no record / switch off = nothing written."""
+    vals, src = d_extend_vote_fixed_record(getattr(ns, "profile", None), None if cards is None else len(cards),
+                                           cards, getattr(ns, "model", None))
+    if vals is None:
+        if src.startswith("F unmeasured") or "name no form" in src:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {_budget_rest.VOTE_FIXED_MARKER} off: {src} -- no "
+                f"{_budget_rest.VOTE_FIXED_ENV}, the ranks keep the floor line (review M1 form gate)")
+        return None
+    text = ",".join(f"{v:g}" for v in vals)
+    _env_d = getattr(ns, "env_d", "") or ""
+    _have = parse_group_env(_env_d)
+    _given = _budget_rest.VOTE_FIXED_ENV in _have and str(_have.get(_budget_rest.VOTE_FIXED_ENV, "")).strip() != text
+    if not _given:
+        ns.env_d = set_group_env(_env_d, _budget_rest.VOTE_FIXED_ENV, text)
+    _now = str(parse_group_env(getattr(ns, "env_d", "") or "").get(_budget_rest.VOTE_FIXED_ENV, "")).strip()
+    log(f"{D_RANK_SOLVE_MARKER} {label} {_budget_rest.VOTE_FIXED_MARKER} {_budget_rest.VOTE_FIXED_ENV}={_now}"
+        f"{' (aus --env-d, Vorrang)' if _given else ''} ({_budget_rest.VOTE_FIXED_RECORD} {vals}, {src}; "
+        f"{_budget_rest.VOTE_FIXED_BASIS}): ein Rang mit GEMESSENEM Boden stimmt mit der Linie near-OOM + fixed statt "
+        f"mit dem Boden ab (der Boden ist die Aktivierung, die Rate x Zeilen schon bepreist) und trimmt vor dem "
+        f"Forward unter Linie + Rate x Zeilen")
+    return _now
 
 
 def torch_cache_cap_armed(ns) -> bool:
@@ -20349,7 +20507,7 @@ def _d_extend_derived_rate_env(ns, log, label: str, *, capped: bool) -> Optional
 EXTEND_CAP_FLIP_MARKER = "Q694 EXTEND-CAP-FLIP"
 
 
-def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
+def _d_extend_flip_rate_env(ns, log, label: str, cards: Optional[Sequence[Card]] = None) -> Optional[str]:
     """Q-694 (INT8 y8va, 03.10. 18:39:37Z, D-TP0 OOM): the D extend chunk follows the card on
     the FLIP line too, not only under the P0 torch cache cap.
 
@@ -20378,6 +20536,7 @@ def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
     if _rtext:
         _d_extend_cap_floor_env(ns, log, label)
         _d_extend_flip_trim_env(ns, log, label, _rtext)
+        _d_extend_vote_fixed_env(ns, log, label, cards)
     return _rtext
 
 
@@ -20582,7 +20741,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                 f"({_budget_rest.OVERHANG_MARKER}: physische Linie je Rang = Budget + gebuchter "
                 f"Rest - {_budget_rest.other_record_name('D')} = total - carve - dormant_other - "
                 f"nicht-torch; das Verdikt bucht hier kein fremd/nicht-torch)")
-            _d_extend_cap_rate_env(ns, log, label)
+            if _d_extend_cap_rate_env(ns, log, label):
+                _d_extend_vote_fixed_env(ns, log, label, cards)
         else:
             _caps = _tcc.launcher_caps(rank_verdicts, _floor)
             ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
@@ -20592,7 +20752,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     else:
         # Q-694: without the torch cap the flip line's D extend chunk follows
         # card_free_post (the rc12g vote); the dual layout writes nothing.
-        _d_extend_flip_rate_env(ns, log, label)
+        _d_extend_flip_rate_env(ns, log, label, cards)
     log(
         "%s VERDIKT %s: %s%s"
         % (

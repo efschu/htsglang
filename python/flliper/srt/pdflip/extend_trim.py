@@ -51,7 +51,10 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           # Q-710 EXTEND-CAP-FLOOR: the arming switch, the last logged floor line
           "cap_floor": _UNSET, "logged_floor": None,
           # NACHT2 (port of NF rc33 bc9dcc7520): this card's corridor line, read once per process
-          "line": _UNSET}
+          "line": _UNSET,
+          # VOTE-LINE-SINGLE (24.10.): the measured non-row part per rank (env, read once), and whether
+          # this rank's line is the single line (near-OOM + that part) -- set with "line"
+          "vote_fixed": _UNSET, "single": False}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -104,6 +107,8 @@ def reset_for_tests() -> None:
     _CACHE["cap_floor"] = _UNSET
     _CACHE["logged_floor"] = None
     _CACHE["line"] = _UNSET
+    _CACHE["vote_fixed"] = _UNSET
+    _CACHE["single"] = False
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -166,9 +171,23 @@ def before_extend(worker, batch) -> Optional[str]:
     return line
 
 
+def _batch_rows(batch) -> int:
+    """The new rows of an extend batch (``extend_num_tokens``, else the input ids); 0 when unknown."""
+    n = getattr(batch, "extend_num_tokens", None)
+    if n is not None:
+        return int(n or 0)
+    ids = getattr(batch, "input_ids", None)
+    try:
+        return int(ids.shape[0]) if ids is not None else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _before_extend_trim(worker, batch) -> Optional[str]:
     values = thresholds()
-    if batch is None or (values is None and not _CACHE["cap_trimmed"]):
+    # VOTE-LINE-SINGLE: a rank voting with the single line trims under its forward's need even without a static
+    # threshold (the line prices only what the trim cannot return); vote_fixed() unset = the old early exit
+    if batch is None or (values is None and not _CACHE["cap_trimmed"] and vote_fixed() is None):
         return None
     if getattr(worker, "is_draft_worker", False) and not getattr(worker, "is_phase_flip_tp_stack", False):
         return None
@@ -178,14 +197,18 @@ def _before_extend_trim(worker, batch) -> Optional[str]:
             return None
         # PDFLIP-EXTEND-CAP (29.09.): the vote's cap trim is spent by this extend too
         _CACHE["cap_trimmed"] = False
-        if values is None:
+        rank = int(getattr(worker, "tp_rank", 0) or 0)
+        thr = threshold_for(rank, values)
+        need = need_trim_threshold(rank, _batch_rows(batch)) if vote_fixed() is not None else None
+        if values is None and need is None:
             return None
+        if need is not None:
+            thr = need if thr is None else max(float(thr), float(need))
         import torch
 
         # rc12g: an extend is running -- the scheduler may trim again for the next one
         _CACHE["armed"] = False
-        rank = int(getattr(worker, "tp_rank", 0) or 0)
-        return maybe_trim(torch.cuda, rank, threshold_for(rank, values))
+        return maybe_trim(torch.cuda, rank, thr)
     except Exception as exc:  # noqa: BLE001 -- a guard never kills a forward
         logger.debug("%s skipped: %s", MARKER, exc)
         return None
@@ -282,7 +305,8 @@ LINE_MARKER = "EXTEND-CORRIDOR-LINE"
 def _read_corridor_line() -> "tuple[float, str]":
     """(line MiB, source) -- the guard's derived floor for THIS card: its TARGET (``CorridorFloor.mib``, the same
     number ``corridor_trace`` measures its margin to). On a MEASURED card that is the measured transient peak of the
-    awake group and equals the verdict floor the trace grades a breach against (no band under a measured peak); else
+    awake group and equals the verdict floor the trace grades a breach against (with VOTE-LINE-SINGLE the vote holds
+    near-OOM + the measured fixed part instead, the trace keeps grading this floor) (no band under a measured peak); else
     the stated law. Port of NF rc33 bc9dcc7520 / review 91e56eeec1 (``_read_corridor_line``).
 
     NACHT2 review 22.10.: the TARGET, not the verdict floor. For an UNMEASURED-FALLBACK / ENV-OVERRIDE / stated card
@@ -306,32 +330,159 @@ def _read_corridor_line() -> "tuple[float, str]":
         return float(CHUNKING_FLOOR_MIB), "halt-line"
 
 
-def corridor_line_mib(rank: Optional[int] = None) -> float:
-    """The card line the chunk's growth must leave free: THIS card's corridor law (``max(300, floor target)``), read
-    once per process and named once (``EXTEND-CORRIDOR-LINE``) -- never the old 300 MiB halt line under it, and no
-    reserve on top (the law is the corridor).
+# --------------------------------------------------------------------------
+# VOTE-LINE-SINGLE (24.10., desk/27b-vote-line-single-1024, root ticket S4 of the VOTE-LINE-BOOK review): ONE honest
+# line for the width vote -- the near-OOM edge plus only the posts that rate x rows does NOT already pay.
+#
+# THE DOUBLE COUNT. On a MEASURED card the NACHT2 line is the corridor floor, and that floor is
+# ``phase_footprint-a191a0712717-cc0ac5caf91e.json``: ``allocated peak - post-capture floor`` of a 4096-token PREFILL
+# (767 / 701 / 700 MiB on the 27B D) -- the extend activation. ``rate x rows`` prices exactly that activation already
+# (D_EXTEND_CAP_PER_ROW_MIB 0.3091 = the deep-prefix maximum of the ALLOCATED transient per row, 1266 MiB at 4096 rows
+# >= 701). Kept as line AND priced per row, it was counted twice; with PDFLIP-VOTE-LINE-BOOK (b130e9dab4) the KV pool
+# paid for the second copy (delta 472 / 408 / 400 MiB).
+#
+# WHAT AN EXTEND REALLY NEEDS ABOVE rate x rows, measured (every logged vote paired with its chunk --
+# budget_rest.extend_passes; six INT8-drei boots whose vote logged driver free as post, 618 passes with a forward
+# trim; report deskq/done/vote-line-single-1024.md):
+#
+#   post            the vote's driver free (PDFLIP-EXTEND-STUECKELUNG post=, after the vote's trim)
+#   admission peak  A = post - card_free_before of the FORWARD trim: the admission/load-back of the pass (Mamba
+#                   restore, KV load-back staging of a post-wake handback) -- up to ~510 MiB, in post-wake passes.
+#                   Released by the forward trim BEFORE the forward; it does not stack onto the rows and no width
+#                   removes it (one 1-row handback carries it): NOT a line post. Its condition post - A >= 400 is NOT
+#                   structurally secured (the admission runs before the forward-need trim; only the vote's STATIC trim
+#                   precedes it: TP2 800 - 468 = 332 structurally). Measured: INT8 drei min 542 (six boots); int4ar
+#                   376 / 390 -- violated, pre-existing, own ticket.
+#   forward phase   post - (card free at the chunk's end): torch reserved is monotone between trims, so the chunk's
+#                   end is the forward phase's driver-free reading (a boundary read, not a continuous minimum; the
+#                   draft extend of the same pass falls into the next window -- A1 checks both on the 100 ms trace).
+#                   Above rate x rows it is the admission REST the trim could not return (fragmented segments; it grows
+#                   with the handback's request count, bs <= 6) plus the forward's own fixed part: max 238 MiB (boot
+#                   _1022_003738 TP1 00:42:45, 6-request handback, 61 rows) -> D_EXTEND_VOTE_FIXED_MIB = 238.
+#                   IN-SAMPLE (the max over the very passes the truth test checks): a regression lock, not a bound.
+#   the edge        corridor_guard.NEAR_OOM_MIB = 400 (one allocation from OOM): the fixed rest.
+#
+#   line = NEAR_OOM_MIB + D_EXTEND_VOTE_FIXED_MIB = 400 + 238 = 638 MiB      (was the floor 767 / 701 / 700)
+#
+# The split holds only while the admission is released before the forward. :func:`need_trim_threshold` makes that
+# true by construction: before the forward the rank trims when the card is under ``line + rate x rows`` (the forward's
+# own need), not only under the hand-set static threshold (27b.env 1200 / 1100 / 800 -- TP2's 800 let a post-wake
+# handback's admission sit in the cache over the forward; the SAME passes trimmed on TP0 / TP1 stay under the record).
+# Over the need nothing changes (the card holds the forward anyway).
+#
+# Named limit (review MX3): under ``line + rate x floor_rows`` driver free the Q-710 cap floor raises the width above
+# the card's funding (EXTEND-CAP-FLOOR, pre-existing): there the forward can end under the edge whatever the line.
+#
+# Only on a MEASURED floor (the double-count case) AND a form of the record's boots (launcher form gate, review M1:
+# int4ar / NVFP4 duo measured 223-252 -- the floor line stays there); an unmeasured card keeps its stated law (NACHT2
+# rule: never a wider vote on a number nobody measured), and without the env (other profiles, NF forms, other forms)
+# the floor line holds, byte for byte. Nothing counted twice, no reserve (keine-korridor-reserve-nie): the edge is the
+# law's own near-OOM number, the fixed part a measurement, the rows the rate.
+# --------------------------------------------------------------------------
 
+SINGLE_LINE_MARKER = "VOTE-LINE-SINGLE"
+
+
+def near_oom_mib() -> float:
+    """The fixed rest of the single line: ``corridor_guard.NEAR_OOM_MIB`` (one source, never a copy)."""
+    from flliper.srt.managers.corridor_guard import NEAR_OOM_MIB
+
+    return float(NEAR_OOM_MIB)
+
+
+def line_for_floor_mib(floor_mib: float, fixed_mib: Optional[float] = None) -> float:
+    """THE vote line, one formula for the rank (:func:`corridor_line_mib`) and the launcher's budget
+    (PDFLIP-VOTE-LINE-BOOK, ``launcher.booked_rest_vote_line_deltas``), so the line the budget books and the line
+    the vote keeps cannot drift apart.
+
+    ``fixed_mib`` given (VOTE-LINE-SINGLE: a MEASURED floor and the profile's ``D_EXTEND_VOTE_FIXED_MIB``):
+    ``max(300, near-OOM 400 + fixed)`` -- the floor is NOT in it (it is the extend activation rate x rows prices).
+    Else the NACHT2 line ``max(300, floor)``."""
+    if fixed_mib is not None:
+        return max(float(CHUNKING_FLOOR_MIB), near_oom_mib() + max(0.0, float(fixed_mib)))
+    return max(float(CHUNKING_FLOOR_MIB), float(floor_mib))
+
+
+def vote_fixed() -> Optional[List[float]]:
+    """VOTE-LINE-SINGLE: the per-rank measured non-row part (``FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB``), read once."""
+    if _CACHE["vote_fixed"] is _UNSET:
+        try:
+            from flliper.srt.environ import envs
+
+            _CACHE["vote_fixed"] = parse_thresholds(envs.FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB.get())
+        except Exception:  # noqa: BLE001 -- unreadable: the floor line (the old vote)
+            _CACHE["vote_fixed"] = None
+    return _CACHE["vote_fixed"]  # type: ignore[return-value]
+
+
+def _source_measured(src: str) -> bool:
+    """``corridor_guard.CorridorFloor.measured`` on the line reader's source text (``MEASURED-D:701``)."""
+    return str(src or "").startswith("MEASURED-")
+
+
+def corridor_line_mib(rank: Optional[int] = None) -> float:
+    """The card line the chunk's growth must leave free, read once per process and named once
+    (``EXTEND-CORRIDOR-LINE``); no reserve on top.
+
+    VOTE-LINE-SINGLE (24.10.): on a MEASURED card with the record ``D_EXTEND_VOTE_FIXED_MIB`` (env
+    ``FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB``) the line is ``near-OOM 400 + fixed`` (:func:`line_for_floor_mib`); the
+    measured floor -- the 4096-row activation ``rate x rows`` prices -- is no longer held a second time.
+
+    NACHT2 22.10. (port of NF rc33 bc9dcc7520) otherwise: THIS card's corridor law (``max(300, floor target)``).
     27B INT8 rc29b metal 21.10. (786fe038dc): D TP1 (3080) breached the law 17x (minimum 3-7 MiB) when the vote funded
-    a 4096-row chunk down to 300 MiB; the line became the stated law ``corridor_law_mib()`` (1024 by default).
-    NACHT2 22.10. (port of NF rc33 bc9dcc7520, abgestimmt with this line's own funding fix a4f4b8fec1): the line is the
-    card's DERIVED corridor floor through the guard's one rank-local door, the number the rank's own breach instrument
-    grades against. 27B INT8 round 3c (boot 1022_015348, a4f4b8fec1): the ranks graded 700 (TP1) / 701 (TP2)
-    ("CORRIDOR LAW BREACHED ... the 700 MiB law"; the dual D TP0 5090: 767), while the vote kept 1024 -- 24 of 56
-    logged TP2 votes ``cap=1``, TP1 ``cap=1`` at post 864 MiB, so the group mostly ran the 256-row floor chunk (617 TP0
-    prefill batches ``#new-token: 256``; D prefill ~900 tok/s, night item 5). With the card's own law (page 1):
-    TP1 at post 864 funds floor((864 - 700) / 0.3091) = 530 rows, TP2 at post 1044 (cap 63 under 1024) about 1108 --
-    each still ending at or above the law at the priced rate. Funding stays the DRIVER alone
-    (a4f4b8fec1), the rate stays the measured one; only the line is the card's."""
+    a 4096-row chunk down to 300 MiB; the line became the stated law ``corridor_law_mib()`` (1024 by default), then
+    (NACHT2) the card's DERIVED corridor floor through the guard's one rank-local door (round 3c, boot 1022_015348,
+    a4f4b8fec1: 700 / 701 / 767 against a vote at 1024 that mostly ran the 256-row floor chunk). Funding stays the
+    DRIVER alone (a4f4b8fec1), the rate stays the measured one."""
     line = _CACHE["line"]
     if line is _UNSET:
         try:
             mib, src = _read_corridor_line()
         except Exception:  # noqa: BLE001
             mib, src = float(CHUNKING_FLOOR_MIB), "halt-line"
-        line = _CACHE["line"] = max(float(CHUNKING_FLOOR_MIB), float(mib))
-        logger.info(f"{LINE_MARKER} rank={'?' if rank is None else int(rank)} line_mib={line:.0f} source={src} "
-                    f"(the width vote keeps this card's corridor law; funds = driver free; no reserve)")
+        fixed = None
+        try:
+            fx = threshold_for(int(rank or 0), vote_fixed())
+            if fx is not None and fx >= 0 and _source_measured(src):
+                fixed = float(fx)
+        except Exception:  # noqa: BLE001 -- unpriced: the floor line
+            fixed = None
+        line = _CACHE["line"] = line_for_floor_mib(mib, fixed)
+        _CACHE["single"] = fixed is not None
+        if fixed is not None:
+            logger.info(f"{LINE_MARKER} rank={'?' if rank is None else int(rank)} line_mib={line:.0f} "
+                        f"source={SINGLE_LINE_MARKER}:near-oom {near_oom_mib():.0f} + fixed {fixed:.0f} "
+                        f"(D_EXTEND_VOTE_FIXED_MIB: admission rest + forward fixed part above rate x rows, measured) "
+                        f"replaces floor {float(mib):.0f} ({src}: the 4096-row activation rate x rows already prices); "
+                        f"the forward trims under line + rate x rows; funds = driver free; no reserve")
+        else:
+            logger.info(f"{LINE_MARKER} rank={'?' if rank is None else int(rank)} line_mib={line:.0f} source={src} "
+                        f"(the width vote keeps this card's corridor law; funds = driver free; no reserve)")
     return float(line)  # type: ignore[arg-type]
+
+
+def single_line_active(rank: Optional[int] = None) -> bool:
+    """VOTE-LINE-SINGLE: this rank's vote line is ``near-OOM + measured fixed part`` (reads the line once)."""
+    corridor_line_mib(rank)
+    return bool(_CACHE["single"])
+
+
+def need_trim_threshold(rank: int, rows: int) -> Optional[float]:
+    """VOTE-LINE-SINGLE: the driver free the coming forward needs -- ``line + vote rate x rows`` -- under which the
+    rank trims before it, so the admission's released cache never sits under the forward (the single line prices
+    only what the trim cannot return). ``None`` = not the single line on this rank, no rate, or no rows (the static
+    threshold alone, byte for byte)."""
+    try:
+        if int(rows) <= 0:
+            return None
+        start = threshold_for(int(rank), rates())
+        if start is None or start <= 0:
+            return None
+        if not single_line_active(int(rank)):
+            return None
+        return corridor_line_mib(int(rank)) + float(effective_rate(float(start), int(rank))) * int(rows)
+    except Exception:  # noqa: BLE001 -- unpriced need: the static threshold
+        return None
 
 
 def rows_cap(post_mib: float, rate: float, page_size: int, line_mib: Optional[float] = None) -> int:

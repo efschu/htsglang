@@ -177,6 +177,27 @@
    "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
   },
   {
+   "name": "D_EXTEND_VOTE_FIXED_MIB",
+   "value": [
+    238,
+    238,
+    238
+   ],
+   "provenance": "VOTE-LINE-SINGLE 24.10. (desk/27b-vote-line-single-1024, root ticket S4 of the VOTE-LINE-BOOK review; review M1-M4): what a D extend needs ABOVE rate x rows (D_EXTEND_CAP_PER_ROW_MIB) in its forward phase -- the admission rest the forward trim cannot return plus the forward's own fixed part. Measured with budget_rest.extend_passes / vote_fixed_from_passes on the six INT8-drei boots whose vote logged DRIVER free as post (041a871f4b _1021_001910, 0798c91fcd _1021_004350, a4f4b8fec1 _1022_003738 / _1022_010424 / _1022_015348, b9cddabda1 _1024_080355; the 121e4bf3f2..a4f4b8fec1 boots logged driver + cache and are left out by name): every logged width vote (PDFLIP-EXTEND-STUECKELUNG post=) paired with its chunk (PDFLIP-VRAM-PEAK phase=chunk card_free_mib at the window's end -- a boundary read; reserved is monotone between trims), excess = post - end - rate x rows over the 618 passes whose forward ran after a trim: per boot 0 / 191 / 238 / 197 / 153 / 155, max 238 MiB (_1022_003738 TP1 00:42:45, a 6-request post-wake handback, 61 rows, post 1084, admission 508, trim back 278, end 828; the rest grows with the handback's request count, bs <= 6). IN-SAMPLE: a regression lock, not a bound; the A1 boot is the first out-of-sample check (--vote-fixed <= this value, else raise it before the next boot). EXCLUDED by name: the admission PEAK before the forward trim (released before the forward, no width removes it; its condition post - peak >= 400 is NOT structurally secured -- measured INT8 drei min 542, int4ar 376 / 390 violated, pre-existing) and each rank's first extend of a boot (resident first-touch growth). Untrimmed passes (static trim TP1/TP2 0 on 21.10., TP2 800 later) are what the forward-need trim (extend_trim.need_trim_threshold) releases; the same passes trimmed on another rank stay <= 238. One value for every rank (TP-symmetric shards, the max). FORM GATE (budget_rest.VOTE_FIXED_FORMS): holds only for Qwen3.8-27B-INT8-gdncov-vocabembed on RTX5090,RTX3080,RTX3080 -- int4ar and NVFP4 duo measured 223-252 with the same tool, they keep the floor line. The line: near-OOM 400 + 238 = 638 MiB.",
+   "boots": [
+    "dkr27bbar1drei10210018",
+    "dkr27bbar1drei10210043",
+    "dkr27bbar1drei10220037",
+    "dkr27bbar1drei10220104",
+    "dkr27bbar1drei10220153",
+    "dkr27bbar1drei10240803"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded per record; the boots ran 5090 400 W / 3080 230 W (bytes, not a timing)",
+   "n": 618
+  },
+  {
    "name": "P_DRAFT_RESIDENT_BUDGET_MIB",
    "value": 1618.2,
    "provenance": "27B NEXTN head: mtp 405.2 + embed 1213.0 MiB (#1233 fix 3, L2 resident_mib)",

@@ -1157,6 +1157,12 @@ def launcher_d_budgets(totals: Sequence[float], dc: Sequence[float], *, profile:
             booked, booked_src = record(name, int)
             booked_src = ("%s %s" % (name, booked_src)) if booked is not None else ""
         gaps.append("Launcher environment FLLIPER_PDFLIP_BUDGET_REST_RECORD (=0 switches the booked rest off; the launcher environment is not visible in the profile)")
+        if booked is not None:
+            gaps.append("Vote-line delta beside the booked rest (PDFLIP-VOTE-LINE-BOOK, launcher.booked_rest_vote_line_deltas): booked only where the "
+                        "card's corridor floor is MEASURED -- ceil8(line - 300) with line = near-OOM 400 + D_EXTEND_VOTE_FIXED_MIB "
+                        "(VOTE-LINE-SINGLE, only for the record's forms: Qwen3.8-27B-INT8-gdncov-vocabembed on RTX5090,RTX3080,RTX3080 -> "
+                        "line 638, delta 344 per card), else max(300, floor) - 300; here the stated law, which is not measured: 0 "
+                        "(on the rig with a measured floor the launcher's D budget is lower by that delta)")
     carve_on = row is not None and bool(getattr(row, "budget_charges_driver_carve", False))
     if carve_on or booked is not None:
         min_total = int(getattr(row, "driver_carve_min_total_mib", 0) or 0) if row is not None else 0

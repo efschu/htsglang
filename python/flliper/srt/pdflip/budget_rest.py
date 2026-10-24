@@ -52,6 +52,7 @@ the MAXIMUM over the boots given (the newest N of the form, like
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -210,6 +211,362 @@ def resolve(values: Optional[Sequence[Optional[int]]], boots: str, n_cards: int,
                          f"cards; re-measure with python -m flliper.srt.pdflip.budget_rest")
     return Resolved(values=tuple(None if v is None else int(v) for v in vals),
                     provenance=f"{name or record_name(group)} {boots}".strip())
+
+
+# --------------------------------------------------------------------------
+# PDFLIP-VOTE-LINE-BOOK (desk/27b-int8-tp1corridor-1024): the rest is
+# measured UNDER A VOTE LINE, and that line has moved since.
+#
+# The rest above is ``card_total - min card_free - budget - dormant_other`` at
+# the tightest instant of its boots. That instant is the extend chunk the
+# width vote (extend_trim.width_vote) funded down to ITS line: the eight
+# boots of 28./29.09. ran rc12g, whose line was the 300 MiB halt line
+# (extend_trim.CHUNKING_FLOOR_MIB) -- the 3080s ended at 4 / 14 MiB free. On
+# 21.10. (786fe038dc) the vote's line became the corridor law and on 22.10.
+# (NACHT2 port) the card's MEASURED floor (767 / 701 / 700 on the 27B D): the
+# vote now keeps ``line - 300`` MiB more free at exactly that instant. The
+# record does not contain that room (it was measured without it): the booked
+# rest UNDER-books the current regime, the budget gave the room to the KV pool,
+# and the vote takes it out of the chunk. (Review 24.10.: no double booking in
+# the budget is resolved here -- the overlap of the line with rate x rows inside
+# the vote is the root, ticket S4.) The delta is DERIVED, not measured.
+#
+# METAL (boot boot_weg2_dkr27bbar1drei10240803_b9cddabda1_1024_080355, rc39a,
+# D.log 08:16:36): TP1 (3080, budget 17384 = 20480 - 425 - 592 - 2079) post
+# 790 / 734 MiB after the trim, line 701, rate 0.3091 -> cap 287 / 105 rows
+# (#794 GROUP-NARROWED 4096 -> 287 / 256); 741 GROUP-NARROWED lines, mode
+# 256. The card rested at the record's served-transient room (~750 MiB) and
+# the vote kept 701 of it as line.
+#
+# THE FIX books the moved line beside the rest, per card,
+#
+#     delta = ceil8(max(0, line_now - record_line))   line_now = extend_trim.line_for_floor_mib(floor)
+#
+# (ceil8: up to the budget's 8-MiB grain, so budget + rest -- the torch cap -- stays
+# byte-identical, review A2). Only where the floor is MEASURED
+# (corridor_guard.CorridorFloor.measured) AND its footprint is of THIS form (the
+# store's card set and TP equal this pass's cards, review S3): an unmeasured
+# card's vote line is the stated law 1024 and UNMEASURED-FALLBACK is verdict-only
+# -- it never spends KV pool (corridor_guard #1257c); a hand-set law
+# (ENV-OVERRIDE) is a moved TARGET with its +-20 % band, not a measured
+# requirement; a footprint of another form (the launcher reads the LAST
+# published D digest) is not the line this boot's ranks keep. The floor is read
+# with reserve 0 (the booked path charges no user reserve; a reserve passed here
+# would be a forbidden corridor reserve, keine-korridor-reserve-nie).
+#
+# No reserve: the delta is the vote's own line, which the vote enforces anyway;
+# it moves those bytes from the chunk to the KV pool's account. The PREDICTED
+# end state at the tightest instant is unchanged -- the vote still ends at its
+# line: rows_cap(post + delta, rate, page, line_now) == rows_cap(post, rate,
+# page, record_line) -- the metal check is A1. The delta is DERIVED (code state
+# of the record's boots vs today's measured floor), never a measurement; a
+# record re-measured with budget_rest under the current line switches it off
+# (its boots differ).
+#
+# A record re-measured under another line (its boots differ from the ones
+# named here) books no delta and says so: the regime of an unknown boot set
+# is not guessed.
+# --------------------------------------------------------------------------
+
+VOTE_LINE_MARKER = "PDFLIP-VOTE-LINE-BOOK"
+#: the D budget's rounding grain (launcher.budgets_from_dc: ``// 8 * 8``)
+BUDGET_GRAIN_MIB = 8
+#: review A3 (HOCHRECHNUNG != MESSUNG): the delta is DERIVED -- the code state of the record's
+#: boots (line 300) against today's measured floor -- never a measurement of VRAM.
+VOTE_LINE_BASIS = "DERIVED (record boots' code line vs measured floor; not a measurement)"
+#: the KV-vs-width choice (user law 30.08.: a KV<->performance trade is selectable). Default ON
+#: (user order 14.10.: new features on); =0 = the pre-fix budgets: the KV pool keeps the vote's
+#: room and the vote narrows the chunk (rc39a: 4096 -> 256..691 rows on the 27B D).
+VOTE_LINE_ENV = "FLLIPER_PDFLIP_VOTE_LINE_BOOK"
+
+
+def vote_line_switch_on(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """:data:`VOTE_LINE_ENV` unless it says off (0/false/no/off); default on."""
+    env = os.environ if environ is None else environ
+    return str(env.get(VOTE_LINE_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+#: the eight row-authority boots of D_AWAKE_REST_BOOKED_MIB / D_AWAKE_REST_CAPPED_MIB (28./29.09.)
+BOOTS_0929: Tuple[str, ...] = (
+    "dkr27browauthoritybar1fs09291152",
+    "dkr27browauthoritybar1fs09290956",
+    "dkr27browauthoritybar1w109290020",
+    "dkr27browauthoritybar1w109290002",
+    "dkr27browauthoritybar1w109281851",
+    "dkr27browauthoritybar1w109281715",
+    "dkr27browauthoritybar1w109281556",
+    "dkr27browauthoritybar1w109281300",
+)
+
+#: record name -> (the boots it was measured on, the extend width vote's line in force on them).
+#: Not a VRAM measurement: the code state of those boots (rc12g ``CHUNKING_FLOOR_MIB``; the
+#: line moved in 786fe038dc 21.10. and the NACHT2 port 22.10.).
+RECORD_VOTE_LINE_MIB: Dict[str, Tuple[Tuple[str, ...], int]] = {
+    "D_AWAKE_REST_BOOKED_MIB": (BOOTS_0929, 300),
+    "D_AWAKE_REST_CAPPED_MIB": (BOOTS_0929, 300),
+}
+
+
+def record_vote_line(name: str, boots: Sequence[str]) -> Optional[int]:
+    """The vote line the record ``name`` was measured under, or ``None`` when its
+    boots are not the ones named in :data:`RECORD_VOTE_LINE_MIB` (unknown regime)."""
+    ent = RECORD_VOTE_LINE_MIB.get(str(name))
+    if ent is None or tuple(boots or ()) != tuple(ent[0]):
+        return None
+    return int(ent[1])
+
+
+def footprint_form_mismatch(store: Mapping, uuids: Sequence[str]) -> Optional[str]:
+    """Review S3: ``None`` when the phase-footprint store behind a measured floor is of THIS
+    form -- its card set equals ``uuids`` and its profile's TP x PP (fields 2, 3 of
+    ``profile``) equals the card count -- else the reason. The launcher reads the LAST
+    published D digest; a footprint of another form (a duo boot after a drei boot) is not
+    the line this boot's ranks will keep. Pure."""
+    cards = sorted(str(k) for k in (store.get("cards") or {}))
+    want = sorted(str(u) for u in uuids)
+    if cards != want:
+        return f"footprint cards {cards} != this pass's cards {want}"
+    prof = list(store.get("profile") or [])
+    if len(prof) >= 4:
+        try:
+            tp_pp = int(prof[2]) * int(prof[3])
+        except (TypeError, ValueError):
+            return f"footprint profile {prof!r} unreadable"
+        if tp_pp != len(want):
+            return f"footprint profile tp x pp {tp_pp} != {len(want)} cards"
+    return None
+
+
+def vote_line_deltas(rests: Sequence[Optional[int]], lines_now: Sequence[float],
+                     measured: Sequence[bool], record_line: Optional[int]) -> List[int]:
+    """Per card ``max(0, ceil(line_now) - record_line)`` rounded UP to :data:`BUDGET_GRAIN_MIB`
+    -- 0 where the card has no booked rest, where its floor is not measured (or not of
+    this form), or where the record's line is unknown. Pure. DERIVED, not measured."""
+    if not (len(rests) == len(lines_now) == len(measured)):
+        raise ValueError(f"{VOTE_LINE_MARKER}: {len(rests)} rests, {len(lines_now)} lines, "
+                         f"{len(measured)} floors -- a partial vector never prices a card it never saw")
+    out: List[int] = []
+    for r, ln, act in zip(rests, lines_now, measured):
+        if r is None or record_line is None or not bool(act):
+            out.append(0)
+            continue
+        raw = max(0, int(-(-float(ln) // 1)) - int(record_line))
+        # review A2: UP to the budget's 8-MiB grain -- the budget is ``(... - rest) // 8 * 8``, so
+        # with a multiple of 8 the budget falls by exactly the delta and budget + rest (the torch
+        # cap, budget + rest - OTHER) stays byte-identical; an unrounded delta could raise it by
+        # up to 7 MiB (the OOM direction).
+        out.append(-(-raw // BUDGET_GRAIN_MIB) * BUDGET_GRAIN_MIB)
+    return out
+
+
+# --------------------------------------------------------------------------
+# VOTE-LINE-SINGLE (desk/27b-vote-line-single-1024, root ticket S4 of the VOTE-LINE-BOOK review 24.10.): the line
+# the delta above books is no longer the measured floor but ONE honest line,
+#
+#     line = corridor_guard.NEAR_OOM_MIB (400) + D_EXTEND_VOTE_FIXED_MIB (measured)      extend_trim.line_for_floor_mib
+#
+# The floor (767 / 701 / 700 on the 27B D) is the 4096-row activation peak, which ``rate x rows`` prices already --
+# held as line too, it was counted twice and VOTE-LINE-BOOK made the KV pool pay for the second copy. What rate x rows
+# does NOT pay is measured here from a boot's own D log (:func:`extend_passes`, :func:`vote_fixed_from_passes`):
+# per extend, the forward phase from the vote's post down to the chunk's end free (reserved is monotone between
+# trims; the end is a boundary read, not a continuous minimum, and the draft extend of the same pass falls into the
+# next window -- named, A1 checks it on the 100 ms trace), minus rate x rows = the admission rest the forward trim
+# could not return plus the forward's own fixed part.
+#
+# MEASURED on the six INT8-drei boots whose vote logged DRIVER free as post (041a871f4b, 0798c91fcd, a4f4b8fec1 x3,
+# b9cddabda1; the 121e4bf3f2..a4f4b8fec1 boots logged driver + cache and are left out by name): 618 passes with a
+# forward trim, max 238 MiB (boot _1022_003738 TP1 00:42:45, a 6-request post-wake handback, 61 rows, admission 508,
+# trim back 278, end 828). The rest grows with the number of handback requests (bs <= 6, the capture set), _080355
+# alone said 155. -> line 638, delta ceil8(638 - 300) = 344 per card (was 472 / 408 / 400): KV back 128 / 64 / 56 MiB.
+# IN-SAMPLE: the record is the max over exactly these passes, a regression lock, not a bound -- the A1 boot is the
+# first out-of-sample check (``--vote-fixed`` <= record, else the record is raised before the next boot).
+#
+# The admission PEAK before the forward trim is not a line post (it is released before the forward and no width
+# removes it). Its condition ``post - card_free_before >= 400`` is NOT structurally secured: the admission runs before
+# the forward-need trim, and before it only the vote's STATIC trim acts (TP2 800 -> structurally 800 - 468 = 332).
+# Measured on INT8 drei min 542 (six boots); on int4ar already violated (376 / 390, pre-existing, own ticket).
+#
+# FORM GATE (review M1 24.10.): the record holds only for the forms of its boots (:data:`VOTE_FIXED_FORMS`: checkpoint
+# and D card inventory). Other forms of the same profile measured 223-252 (int4ar, NVFP4 duo) -- there the floor line
+# stays, byte for byte, and the launcher names it.
+#
+# The value travels as the profile record ``D_EXTEND_VOTE_FIXED_MIB`` (launcher -> rank env
+# ``FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB``), the budget reads the same record: rank line and booked line are one
+# formula. ``FLLIPER_PDFLIP_VOTE_LINE_SINGLE=0`` = the floor line again (both sides; default ON, user order 14.10.).
+# --------------------------------------------------------------------------
+
+#: the record's boots (D logs with driver-free post, INT8 drei) and the forms they ran -- (checkpoint key, D card
+#: inventory). A record re-measured on other boots books nothing until its forms are named here (never guessed).
+BOOTS_VOTE_FIXED: Tuple[str, ...] = (
+    "dkr27bbar1drei10210018",
+    "dkr27bbar1drei10210043",
+    "dkr27bbar1drei10220037",
+    "dkr27bbar1drei10220104",
+    "dkr27bbar1drei10220153",
+    "dkr27bbar1drei10240803",
+)
+VOTE_FIXED_FORMS: Dict[Tuple[str, ...], Tuple[Tuple[str, Tuple[str, ...]], ...]] = {
+    BOOTS_VOTE_FIXED: (("Qwen3.8-27B-INT8-gdncov-vocabembed", ("RTX5090", "RTX3080", "RTX3080")),),
+}
+
+
+def vote_fixed_form_mismatch(boots: Sequence[str], model_key: str, inventory: Sequence[str]) -> Optional[str]:
+    """Review M1: ``None`` when (``model_key``, ``inventory``) is a form the record's ``boots`` ran, else why the
+    measured fixed part does not hold here (the floor line then stays). Pure."""
+    forms = VOTE_FIXED_FORMS.get(tuple(boots or ()))
+    if forms is None:
+        return f"the record's boots {','.join(boots or ()) or '-'} name no form"
+    want = (str(model_key or ""), tuple(inventory or ()))
+    if want in forms:
+        return None
+    return (f"F unmeasured for form {want[0] or '?'} on {','.join(want[1]) or '?'} (measured on "
+            + "; ".join(f"{m} on {','.join(i)}" for m, i in forms) + ")")
+
+
+VOTE_FIXED_RECORD = "D_EXTEND_VOTE_FIXED_MIB"
+VOTE_FIXED_MARKER = "VOTE-LINE-SINGLE"
+#: rank env the launcher writes from :data:`VOTE_FIXED_RECORD` (extend_trim.vote_fixed reads it)
+VOTE_FIXED_ENV = "FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB"
+#: the switch (launcher process): =0 writes no rank env and books the floor line (b130e9dab4 behaviour)
+VOTE_LINE_SINGLE_ENV = "FLLIPER_PDFLIP_VOTE_LINE_SINGLE"
+#: the measurement's denominator: passes whose forward ran after a trim (the regime the forward-need trim forces)
+VOTE_FIXED_BASIS = ("MEASURED (forward phase: vote post - chunk-end free - rate x rows over the extends whose forward "
+                    "ran after a trim; admission peak and the boot's first extend excluded by name)")
+
+
+def vote_line_single_on(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """:data:`VOTE_LINE_SINGLE_ENV` unless it says off (0/false/no/off); default on."""
+    env = os.environ if environ is None else environ
+    return str(env.get(VOTE_LINE_SINGLE_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+@dataclass(frozen=True)
+class ExtendPass:
+    """One width vote paired with the chunk it funded (one D rank).
+
+    ``post`` the vote's driver free (``PDFLIP-EXTEND-STUECKELUNG post=``), ``rate`` its priced rate, ``line`` its line
+    (``floor=``), ``cap`` its cap; ``rows`` the chunk's new rows and ``end`` its card free at the window's end
+    (``PDFLIP-VRAM-PEAK phase=chunk``); ``fwd_before`` / ``released`` the LAST trim between them (the forward trim:
+    driver free after the admission, bytes it returned), ``None`` / 0 when the forward ran without a trim."""
+
+    rank: int
+    vote_ts: str
+    chunk_ts: str
+    post: float
+    rate: float
+    line: float
+    cap: int
+    rows: int
+    end: float
+    fwd_before: Optional[float]
+    released: float
+
+    @property
+    def trimmed(self) -> bool:
+        return self.fwd_before is not None
+
+    @property
+    def admission(self) -> Optional[float]:
+        """The admission peak ``post - card_free_before`` of the forward trim (``None`` without one)."""
+        return None if self.fwd_before is None else self.post - float(self.fwd_before)
+
+    @property
+    def excess(self) -> float:
+        """Forward phase above the priced rows: ``post - end - rate x rows`` (MiB)."""
+        return self.post - self.end - self.rate * self.rows
+
+
+_RX_RANK = re.compile(r"^\[(\S+ \S+) TP(\d+)\] ")
+_RX_KV = re.compile(r"(\w+)=([-\w.]+)")
+
+
+def extend_passes(group_text: str) -> Dict[int, List[ExtendPass]]:
+    """Every logged width vote of a D log paired with the next chunk window of the same rank, in log order. A
+    ``phase=round`` / ``phase=flip`` window between them unpairs the vote (another pass ran in between); a vote
+    that returned no cap logs nothing and is never paired. Pure (text in, passes out)."""
+    out: Dict[int, List[ExtendPass]] = {}
+    pend: Dict[int, Tuple[str, Dict[str, str]]] = {}
+    trims: Dict[int, List[Dict[str, str]]] = {}
+    for ln in group_text.splitlines():
+        if "PDFLIP-EXTEND-STUECKELUNG" in ln:
+            kind = "vote"
+        elif "PDFLIP-EXTEND-CACHE-TRIM" in ln:
+            kind = "trim"
+        elif "PDFLIP-VRAM-PEAK" in ln:
+            kind = "chunk" if "phase=chunk" in ln else ("other" if ("phase=round" in ln or "phase=flip" in ln)
+                                                       else "")
+            if not kind:
+                continue
+        else:
+            continue
+        m = _RX_RANK.match(ln)
+        if not m:
+            continue
+        ts, r = m.group(1), int(m.group(2))
+        d = dict(_RX_KV.findall(ln))
+        if kind == "vote":
+            pend[r] = (ts, d)
+            trims[r] = []
+        elif kind == "trim":
+            if r in pend:
+                trims.setdefault(r, []).append(d)
+        elif kind == "other":
+            pend.pop(r, None)
+            trims.pop(r, None)
+        else:
+            v = pend.pop(r, None)
+            tr = trims.pop(r, [])
+            if v is None:
+                continue
+            vts, vd = v
+            try:
+                last = tr[-1] if tr else None
+                out.setdefault(r, []).append(ExtendPass(
+                    rank=r, vote_ts=vts, chunk_ts=ts, post=float(vd["post"]), rate=float(vd["rate"]),
+                    line=float(vd["floor"]), cap=int(vd["cap"]), rows=int(d["rows"]), end=float(d["card_free_mib"]),
+                    fwd_before=None if last is None else float(last["card_free_before"]),
+                    released=0.0 if last is None else float(last["released"])))
+            except (KeyError, ValueError):
+                continue
+    return out
+
+
+def vote_fixed_from_passes(passes: Mapping[int, Sequence[ExtendPass]]) -> Tuple[Optional[int], List[str]]:
+    """``D_EXTEND_VOTE_FIXED_MIB`` from paired passes: ``ceil(max excess)`` over every pass whose forward ran after
+    a trim, the boot's FIRST pass per rank excluded (its growth is resident -- first-touch workspaces, the next vote's
+    post is lower by it -- and the booked rest carries it). One value for every rank (TP-symmetric shards; the max).
+    ``None`` without a trimmed pass. Lines name the worst pass, the admission peak and the untrimmed passes."""
+    lines: List[str] = []
+    worst: Optional[ExtendPass] = None
+    for r in sorted(passes):
+        ps = list(passes[r])
+        if not ps:
+            continue
+        first = ps[0]
+        lines.append(f"{VOTE_FIXED_MARKER} rank={r} first pass {first.vote_ts} excluded: excess {first.excess:.0f} "
+                     f"MiB, resident growth {first.post - (ps[1].post if len(ps) > 1 else first.post):.0f} MiB "
+                     f"(next vote's post lower by it)")
+        tr = [p for p in ps[1:] if p.trimmed]
+        nt = [p for p in ps[1:] if not p.trimmed]
+        if tr:
+            w = max(tr, key=lambda p: p.excess)
+            adm = min(p.fwd_before for p in tr)  # type: ignore[type-var]
+            lines.append(f"{VOTE_FIXED_MARKER} rank={r} trimmed={len(tr)} max excess {w.excess:.1f} MiB at "
+                         f"{w.vote_ts} rows={w.rows} post={w.post:.0f} end={w.end:.0f}; admission peak max "
+                         f"{max(p.admission for p in tr):.0f} MiB, min post - admission {adm:.0f} MiB "  # type: ignore
+                         f"(should be >= 400; not structurally secured)")
+            if worst is None or w.excess > worst.excess:
+                worst = w
+        if nt:
+            wn = max(nt, key=lambda p: p.excess)
+            lines.append(f"{VOTE_FIXED_MARKER} rank={r} untrimmed={len(nt)} max excess {wn.excess:.1f} MiB at "
+                         f"{wn.vote_ts} rows={wn.rows} (admission held in the cache over the forward: the "
+                         f"forward-need trim releases it under line + rate x rows; not the line's post)")
+    if worst is None:
+        return None, lines
+    val = int(math.ceil(max(0.0, worst.excess) - 1e-9))
+    lines.append(f"{VOTE_FIXED_MARKER} {VOTE_FIXED_RECORD} = {val} MiB (rank {worst.rank} {worst.vote_ts}, "
+                 f"{VOTE_FIXED_BASIS})")
+    return val, lines
 
 
 # --------------------------------------------------------------------------
@@ -517,6 +874,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--dual-d-log", action="append", default=[], metavar="D_LOG",
                     help="PDFLIP-ALLOC-CACHE-BOOK: a D log of the dual form (newest first, repeat); prints "
                          "<G>_DUAL_ALLOC_CACHE_BOOK_MIB (see PDFLIP-ALLOC-CACHE-BOOK)")
+    ap.add_argument("--vote-fixed", action="store_true",
+                    help="VOTE-LINE-SINGLE: also print D_EXTEND_VOTE_FIXED_MIB measured from the D logs "
+                         "(vote post - chunk-end free - rate x rows, trimmed forwards, first pass excluded)")
     ap.add_argument("front_logs", nargs="+", help="front logs, newest first; the group log "
                     "is the same path with .front.log -> .<group>.log")
     a = ap.parse_args(argv)
@@ -531,6 +891,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 grp = "\n".join(ln for ln in fh
                                 if "PDFLIP-VRAM-PEAK" in ln or "PDFLIP-GRAPH-POOL" in ln)
         boots.append((_boot_tag(p), front, grp))
+    if a.vote_fixed:
+        merged: Dict[int, List[ExtendPass]] = {}
+        for p in a.front_logs:
+            gp = re.sub(r"\.front\.log$", ".D.log", p)
+            if not os.path.exists(gp):
+                continue
+            with open(gp, errors="replace") as fh:
+                text = "".join(ln for ln in fh if "PDFLIP-EXTEND-STUECKELUNG" in ln or "PDFLIP-EXTEND-CACHE-TRIM" in ln
+                               or "PDFLIP-VRAM-PEAK" in ln)
+            for r, ps in extend_passes(text).items():
+                # each boot's own first pass is resident growth: the first boot's is excluded by
+                # vote_fixed_from_passes (it skips ps[0]), every later boot's is dropped here
+                merged.setdefault(r, [])
+                merged[r].extend(ps if not merged[r] else ps[1:])
+        val, vlines = vote_fixed_from_passes(merged)
+        for ln in vlines:
+            print(ln)
+        print(json.dumps({"name": VOTE_FIXED_RECORD, "value": None if val is None else [val] * int(a.cards),
+                          "boots": [b[0] for b in boots],
+                          "kind": "memory"}))
     vals, lines = record_from_boots(boots, a.group, a.cards)
     for ln in lines:
         print(ln)

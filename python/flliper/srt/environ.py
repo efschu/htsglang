@@ -1788,6 +1788,13 @@ class Envs:
     # CSV, "0" = no rate). Set by the pdflip launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # VOTE-LINE-SINGLE (24.10., desk/27b-vote-line-single-1024): per-rank MEASURED non-row part
+    # of a D extend above rate x rows (MiB, CSV, one value = every rank) -- the admission rest the
+    # forward trim cannot return plus the forward's own fixed part (profile record
+    # D_EXTEND_VOTE_FIXED_MIB). Set by the pdflip launcher; with it a rank whose corridor floor is
+    # MEASURED votes with the line near-OOM 400 + this value instead of the floor (the floor is the
+    # 4096-row activation the rate already prices). Unset = the floor line, byte for byte.
+    FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB = EnvStr(None)
     # Q-694b EXTEND-RATE (NF port 1003): the rank MEASURES its own extend
     # transient per row (allocator peak / reserved growth of every target
     # extend of >= 2048 rows) and votes with max(start rate, measured x 1.15),
