@@ -485,7 +485,9 @@ def test_vram_refusal_sites_of_the_launcher_are_untouched():
     # 27B port 20.10. (NF rc28 merged): + the NF AP4 HW-BORROWED site (refusals register carries the code now)
     assert counts == {'D-BUDGET': 1, 'P-CARD': 2, 'WAKE-CREDIT': 2, 'HW-COUNT': 2, 'HW-UNCALIBRATED': 1, 'HW-BORROWED': 1}, counts
     # 97 `raise PdFlipLaunchRefused` on 524a880606; HOSTWARN2 adds exactly one (the preflight script without a verdict)
-    assert src.count("raise PdFlipLaunchRefused") == 98
+    # rc42b: +1 = #236 USER-RESERVE-RANKS (python/flliper/srt/pdflip/launcher.py:11731, effective_reserve_by_card:
+    # `raise PdFlipLaunchRefused` on a booked-rest vector whose length differs from the card count, commit 8f80d33101)
+    assert src.count("raise PdFlipLaunchRefused") == 99
 
 
 def test_a_foreign_process_on_a_card_still_refuses(monkeypatch):
