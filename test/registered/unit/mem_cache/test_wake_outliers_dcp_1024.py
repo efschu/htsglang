@@ -144,6 +144,7 @@ def test_t_source_instrument_names_the_path(root):
     t0 = _rank(root, 0)
     assert t0.set("d1", _page(1))
     assert t0.get("d1", torch.zeros(PAGE_BYTES, dtype=torch.uint8)) is not None
-    assert t0.set("d1", _page(1))                   # already on disk -> _touch_present<set
+    assert t0.set("d2", _page(1))
+    assert t0.set("d2", _page(1))                   # already on disk -> _touch_present<set (other key: 30 s dedupe)
     src = t0._evictor._t_source
     assert src.get("read:get") == 1 and sum(v for k, v in src.items() if k.startswith("_touch_present<")) == 1, src
