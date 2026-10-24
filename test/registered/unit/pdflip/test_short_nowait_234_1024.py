@@ -11,7 +11,11 @@ figure not kurz -- is no R2 case; it keeps waiting behind its anchor (a kurz SHO
 
 Danger directions and their mutants (each must turn at least one test here red):
   (1) "the kurz SHORT waits again" -> R2 broken (repro);
-  (2) "the rider is released at once too" -> its own figure goes to D uncounted behind an anchor not computed (R1/R7)."""
+  (2) "the rider is released at once too" -> its own figure goes to D uncounted behind an anchor not computed (R1/R7);
+  (3) review MUSS-1 "the D verdict releases a kurz SHORT without the kurz treatment" -> R6k class halb, no D_NOW (R6k/R2;
+      test_review_short_nowait_234_1024 P1/P2);
+  (4) review MUSS-2 "``_r2_flip_held`` counts queue entries only" -> a SHORT-only R3 flip under the R2 hold reads "not decided"
+      and the kurz SHORT is granted on D instead of riding it (R1a; the real R2-hold test here, P3)."""
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +33,7 @@ from flliper.srt.pdflip import front as front_mod  # noqa: E402
 from flliper.srt.pdflip import phase_policy as pp  # noqa: E402
 
 H, K = "pdflip-234-h", "pdflip-234-k"
+H2 = "pdflip-234-h2"
 X6 = 6185   # halbX 3092 at F_halb 0.5
 
 
@@ -169,14 +174,55 @@ def test_r8_r1a_no_decode_big_flips_and_the_kurz_short_rides_it(monkeypatch, cap
 
 
 def test_r1a_a_collect_that_holds_a_decided_flip_is_ridden_not_left(monkeypatch, caplog):
-    """R4OVER-1024 + R1a: a COLLECT that is the R2 hold of a DECIDED flip is no collecting set -- the kurz SHORT rides that flip,
-    it is not released to D (a fresh kurz arrival yields to it the same way, ``_set_flip_foreseeable``)."""
+    """R4OVER-1024 + R1a on the REAL R2 hold (#234 review MUSS-2; replaces the earlier patch of ``_r2_flip_held``): H (halb 4000)
+    and H2 (halb 3200) are SHORT members, S=7200 >= X -> R3 FLIP_P (SOLL section 5, example 3); a kurz D grant k1 opened before
+    it -> the R2 hold turns the verdict into COLLECT. That COLLECT holds a DECIDED flip of SHORT members: the kurz SHORT K rides
+    it (no release to D, no second tick release), a fresh kurz arrival yields to it the same way (``_set_flip_foreseeable``).
+    Once k1's D prefill is over the flip stands and K goes with it to P."""
     t0 = time.time()
-    f, st = _halb_and_kurz(monkeypatch, t0)
-    monkeypatch.setattr(front_mod.Front, "_r2_flip_held", lambda self: True)
+    f, st = _halb_and_kurz(monkeypatch, t0, running=("dec", "k1"))
+    st["shorts"][H2] = (t0 + 0.05, 3200, X6)
+    book = f._d_pf_book()
+    book.grant(rid="k1", tokens=181, now=t0 - 0.2)          # a kurz D grant opened BEFORE the flip verdict (R2 hold)
+    book.enter_leg2(rid="k1")
+    f.groups["D"].outstanding["k1"] = t0 - 0.2
+    f._r6k_mark_kurz("k1")
+    f._d_ext_reading = lambda: {}
+    _reprobe_stub(monkeypatch)
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         assert f._decode_collect(t0 + 0.3) == "hold"
-    assert K in st["shorts"] and K not in st["released"] and not _kurz_now(caplog)
+        assert f.counters["r2_kurz_grant_hold"] == 1, dict(f.counters)          # the R3 FLIP_P stands, held by R2
+        assert f._r2_flip_held()                                                 # decided although no queue member
+        assert K in st["shorts"] and K not in st["released"] and not _kurz_now(caplog)
+        assert f._set_flip_foreseeable(t0 + 0.35)                                # a fresh kurz arrival rides it too (R1a)
+        assert f._decode_collect(t0 + 0.4) == "hold"
+        assert K in st["shorts"] and K not in st["released"] and not _kurz_now(caplog)
+        book.done(rid="k1")                                                      # k1's D prefill is over: the flip goes
+        assert f._decode_collect(t0 + 0.6) == "P"
+    assert st["released"].get(K) == "P" and st["released"].get(H) == "P" and st["released"].get(H2) == "P", st["released"]
+    assert {H, H2} <= st["go_p"] and f.counters.get("set_short_kurz_now", 0) == 0
+
+
+def test_r1a_r2_hold_a_member_reprobed_kurz_holds_no_flip(monkeypatch, caplog):
+    """#234 review MUSS-2 with review A1 of R4OVER-1024: a SHORT member counts as a P member of the held flip only while its OWN
+    (re-probed) figure is not kurz -- once the re-probe moved both SHORT members under halbX, none holds the flip: it is no
+    longer decided (a kurz arrival is not made to ride a flip nobody triggers, R2)."""
+    t0 = time.time()
+    f, st = _halb_and_kurz(monkeypatch, t0, running=("dec", "k1"))
+    st["shorts"][H2] = (t0 + 0.05, 3200, X6)
+    book = f._d_pf_book()
+    book.grant(rid="k1", tokens=181, now=t0 - 0.2)
+    book.enter_leg2(rid="k1")
+    f.groups["D"].outstanding["k1"] = t0 - 0.2
+    f._r6k_mark_kurz("k1")
+    f._d_ext_reading = lambda: {}
+    _reprobe_stub(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(t0 + 0.3) == "hold"
+    assert f._r2_flip_held()
+    st["shorts"][H2] = (t0 + 0.05, 1200, X6)        # what _set_reprobe_apply writes: H2 kurz on its own figure now
+    st["shorts"][H] = (t0, 1100, X6)                # and H too
+    assert not f._r2_flip_held()                    # no SHORT trigger stands: no decided flip
 
 
 def test_r2_a_flip_waiting_for_its_reprobe_is_not_decided_the_kurz_short_goes(monkeypatch, caplog):
