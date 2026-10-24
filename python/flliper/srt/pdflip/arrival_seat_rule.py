@@ -343,7 +343,7 @@ def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
     Only a younger one is ever a victim (an older running request has the
     right of way; then the head is blocked by its elders and KV backfill
     applies). Only when the younger ones' KV can cover the deficit at all --
-    ``tokens_of`` is the front's LOWER bound (the prompt it priced), so a
+    ``tokens_of`` is the guaranteed release (:func:`victim_release`, KVD-1024), so a
     park that cannot make the head fit is never taken (no churn). A rid with
     no arrival stamp counts as old.  PRIO-AS-AGE 1014: younger/youngest by the order key (``lane_of`` /
     ``head_lane``) -- the victim is the youngest of the lowest priority, never a higher one than the head."""
@@ -355,6 +355,33 @@ def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
     if sum(max(0, int(tokens_of.get(r, 0) or 0)) for _, r in younger) < int(deficit):
         return None
     return max(younger)[1]
+
+
+def victim_release(seat_tokens: Mapping[str, int], basis: Optional[Mapping]) -> Dict[str, int]:
+    """KVD-1024 (front KV class D, SOLL R7/R11): what displacing each running decode is GUARANTEED to give back, in
+    the unit of the lifetime room the deficit is formed against -- the ONE victim price of the AGE PLAN and of the
+    front's own KV park (#246).
+
+    * rows: D's ``leaving_rows_by_rid`` (pdflip/d_leaving_rows.py: the seat minus the path rows other running decodes
+      keep locked -- 27B ``_1024_003732`` 01:02:43: 18-189 seat 54133, its displacement freed 36043, the 18137-token
+      shared system prompt stayed), never above the front's seat count; a rid D's map does not name: 0 (D does not
+      run it, nothing of it is guaranteed). An old D without the map: the seat, as before.
+    * under D's backup wall (S94): 0 rows -- the retained span goes back to the tree unpayable.
+    * plus its share of D's decode reserve (``decode_reserve_by_rid``, KVOFFSET-1024): D gives it back on leaving.
+    """
+    b = basis or {}
+    rb = b.get("reserve_by_rid") or {}
+    lv = b.get("leaving_by_rid")
+    wall = bool(b.get("wall"))
+    out: Dict[str, int] = {}
+    for r, v in seat_tokens.items():
+        rows = max(0, int(v or 0))
+        if isinstance(lv, Mapping):
+            rows = min(rows, max(0, int(lv.get(r, 0) or 0)))
+        if wall:
+            rows = 0
+        out[r] = rows + max(0, int(rb.get(r, 0) or 0))
+    return out
 
 
 def age_plan_enabled(env=None) -> bool:
@@ -383,8 +410,8 @@ def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: in
     it; nobody is displaced and younger ones that fit are backfilled. Else the
     FEWEST running decodes, youngest arrival first, all younger than the head,
     whose parking gives it a seat (one, when none is free) and covers the KV
-    ``deficit``. ``tokens_of`` is the front's lower bound of a decode's KV (the
-    prompt it priced). The front only ADMITS by it (a non-empty plan hands the
+    ``deficit``. ``tokens_of`` is what displacing a decode is guaranteed to give
+    back (:func:`victim_release`, KVD-1024 -- not its seat length). The front only ADMITS by it (a non-empty plan hands the
     head to D); the displacement itself is D's alone
     (``d_park_runtime.displace_for_age`` / ``victims_needed`` on D's real KV).
     A rid without an arrival stamp counts as old.  PRIO-AS-AGE 1014: "arrived after the head" and "youngest

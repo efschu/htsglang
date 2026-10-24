@@ -17015,6 +17015,7 @@ class Front:
         _ad = reading.get("admitted_rids") if reading else None
         _lr = reading.get("ledger_rids") if reading else None
         _rb = reading.get("decode_reserve_by_rid") if reading else None
+        _lv = reading.get("leaving_rows_by_rid") if reading else None
         basis = {
             "unread": not reading,
             "wall": _asr.backup_wall(reading),
@@ -17028,6 +17029,9 @@ class Front:
             "ledger": set(str(r) for r in _lr) if isinstance(_lr, (list, tuple)) else set(),
             # KVOFFSET-1024: each running decode's share of D's reserve (given back when it is displaced)
             "reserve_by_rid": ({str(k): int(v) for k, v in _rb.items()} if isinstance(_rb, dict) else {}),
+            # KVD-1024 (front KV class D): the rows each running decode is GUARANTEED to give back when displaced --
+            # the victim price of the AGE PLAN and the KV park (``_asr.victim_release``); None = an old D (the seat)
+            "leaving_by_rid": ({str(k): int(v) for k, v in _lv.items()} if isinstance(_lv, dict) else None),
         }
         _d_has = (None if basis["running"] is None else basis["running"] | basis["admitted"])
         shared = self._asr_shared_credit(rid, est_prompt, uncached, _d_has)
@@ -17107,7 +17111,8 @@ class Front:
             self.counters["arrival_seat_kv_decode_clipped"] += 1
 
     async def _arrival_seat_kv_displace(self, head_rid: str, head_arrival: Optional[float],
-                                        deficit: int, now: float) -> Optional[str]:
+                                        deficit: int, now: float,
+                                        basis: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """NF-STAU-KV (user rule #246 "Ältester rückt nach und verdrängt
         Jüngere"): the head has a free seat but its KV does not fit -- the
         youngest running decode that arrived AFTER it parks at its round
@@ -17124,7 +17129,10 @@ class Front:
             t = self._asr_arrival_of(r)
             if t is not None:
                 arrivals[r] = t
-        tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        # KVD-1024 (front KV class D): the guaranteed release, the same victim price as the AGE PLAN -- read from the
+        # basis of the KV test that just returned (the caller awaits nothing between that test and this call)
+        tokens = _asr.victim_release({s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())},
+                                     basis if basis is not None else Front._asr_kv_basis(self))
         # PRIO-AS-AGE 1014: younger / youngest by the order key (the victim: youngest of the lowest priority)
         victim = _asr.kv_displace_victim(head_arrival, running, arrivals, tokens, deficit,
                                          lane_of={r: Front._prio_lane(self, r) for r in running},
@@ -17224,20 +17232,14 @@ class Front:
             t = self._asr_arrival_of(r)
             if t is not None:
                 arrivals[r] = t
-        tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
-        _rb = basis.get("reserve_by_rid") or {}
-        if _rb:
-            # KVOFFSET-1024: the deficit is formed against D's lifetime room (decode reserve subtracted); a displaced
-            # decode gives its reserve share back besides its rows (``PrefillAdder.released_by_leaving``, the size D's
-            # own ``kv_displace_would_fit`` gives a victim) -- the front's victim price carries the same share
-            tokens = {r: v + int(_rb.get(r, 0) or 0) for r, v in tokens.items()}
-        if basis.get("wall"):
-            # S94 (R5): under D's backup wall a displaced decode frees no KV row -- D sizes every victim 0
-            # (``d_park_runtime.kv_displace_would_fit``: "a victim's retained KV goes back to the tree and is as
-            # unpayable as the rest"). The front plans with D's numbers: a KV deficit is not coverable by victims, only
-            # a missing SEAT is (the head then still has to fit D's payable room).
-            tokens = {r: int(_rb.get(r, 0) or 0) for r in tokens}   # KVOFFSET review NIT: D still gives the reserve
-            #                                                                 share back under the wall (0 + reserve)
+        seat_tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        # KVD-1024 (front KV class D, SOLL R7/R11): the victim price is what its displacement is GUARANTEED to give
+        # back (``_asr.victim_release``): D's ``leaving_rows_by_rid`` -- the seat minus the shared prefix other running
+        # decodes keep locked (27B 01:02:43: 18-189 seat 54133 planned against deficit 38313, its displacement freed
+        # 36043 rows, 18-188 was refused 181 times) -- plus its share of D's decode reserve (KVOFFSET-1024,
+        # ``PrefillAdder.released_by_leaving``); 0 rows under D's backup wall (S94: the retained span is unpayable,
+        # only a missing SEAT is coverable). Not enough: plan None -- the head waits for room (R5), no flip (R7).
+        tokens = _asr.victim_release(seat_tokens, basis)
         plan = _asr.displace_plan(head_arrival, seat_is_free, deficit, running, arrivals, tokens,
                                   lane_of={r: Front._prio_lane(self, r) for r in running},  # PRIO-AS-AGE 1014
                                   head_lane=Front._prio_lane(self, head_rid))
@@ -17247,13 +17249,17 @@ class Front:
             plans[head_rid] = key
             if plan is None:
                 self.counters["arrival_seat_age_blocked_by_elders"] += 1
-            logger.info("%s head=%s plan=%s seat_free=%s deficit=%d younger_victims_by_front_price=%s -- %s",
+            logger.info("%s head=%s plan=%s seat_free=%s deficit=%d younger_victims_by_front_price=%s "
+                        "release=%s -- %s",
                         _asr.AGE_MARKER, head_rid, key, bool(seat_is_free), int(deficit), plan or [],
+                        # KVD-1024: the guaranteed release per candidate (rows + reserve share), the plan's prices
+                        ",".join("%s:%d" % (r, tokens.get(r, 0)) for r in sorted(arrivals)[:8]) or "-",
                         ("S94 backup wall on D: displacing frees no KV row and the head does not fit D's payable "
                          "room -- it waits for room (R5), younger ones that fit are backfilled"
                          if basis.get("wall") and int(deficit) > 0 else
-                         "older running requests block it: it waits here, younger ones that fit are "
-                         "backfilled") if plan is None else
+                         "older running requests block it, or the younger decodes' GUARANTEED release (KVD-1024: "
+                         "shared prefix rows stay) does not cover it: it waits here for room (R5, no flip: R7), "
+                         "younger ones that fit are backfilled") if plan is None else
                         ("it fits" if not plan else
                          "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
         return plan

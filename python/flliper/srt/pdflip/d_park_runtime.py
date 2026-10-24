@@ -1732,6 +1732,17 @@ def _req_kv_tokens(r) -> int:
     return _n(getattr(r, "origin_input_ids", None)) + _n(getattr(r, "output_ids", None))
 
 
+def _leaving_rows(sched, reqs) -> dict:
+    """KVD-1024 (front KV class D, SOLL R7): the rows each of ``reqs`` is GUARANTEED to give back when it is
+    displaced (``d_leaving_rows.leaving_rows``: the seat minus the path rows other holders keep locked, the rows
+    already evictable and the rows an aux lock keeps unpeelable) -- not its seat length. 27B ``_1024_003732``
+    01:02:45: 18-189 was sized 54190, its displacement freed 36043 (the 18137-token shared system prompt stayed locked
+    by three other decodes), and the older 18-188 was refused 181 times behind it."""
+    from flliper.srt.pdflip.d_leaving_rows import leaving_rows_by_rid
+
+    return leaving_rows_by_rid(getattr(sched, "tree_cache", None), reqs)
+
+
 #: Q-702: the scheduler attribute that carries the adder's own refusal numbers
 #: next to ``_pdflip_sa_no_token`` (set in the same branch, consumed in the same pass).
 NO_TOKEN_VIEW_ATTR = "_pdflip_sa_no_token_view"
@@ -1883,7 +1894,11 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     of this rid, a desk double) the legacy reading stands: ``basis=legacy`` -- raw
     extend against available + evictable, which omits max_new, the page, the
     running decode reserves, the group floor and the commitment ledger (the
-    "fits free, nobody leaves" of an older request the adder kept refusing)."""
+    "fits free, nobody leaves" of an older request the adder kept refusing).
+
+    KVD-1024 (front KV class D, SOLL R7): a victim's KV rows are the rows its leaving is GUARANTEED to free
+    (:func:`_leaving_rows`), not its seat length -- shared prefix rows other running decodes keep locked stay on the
+    device. Not enough after all younger seats: nobody leaves (the older one waits for room; no flip for it)."""
     from flliper.srt.pdflip import seat_age as _sa
 
     older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
@@ -1906,7 +1921,8 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
         if now is not None and then is not None:
             avail += now - int(then)
         reserve = view.get("reserve") or {}
-        sizes = [(0 if wall else _req_kv_tokens(r)) + int(reserve.get(str(r.rid), 0)) for r in young]
+        rows = _leaving_rows(sched, young)
+        sizes = [(0 if wall else rows[str(r.rid)]) + int(reserve.get(str(r.rid), 0)) for r in young]
         basis = "adder"
     else:
         need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
@@ -1918,7 +1934,8 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
             avail += _evictable_reading(sched.tree_cache)
         except Exception:  # noqa: BLE001
             pass
-        sizes = [0 if wall else _req_kv_tokens(r) for r in young]
+        rows = _leaving_rows(sched, young)
+        sizes = [0 if wall else rows[str(r.rid)] for r in young]
     if wall:
         basis += "+wall"
     k = victims_needed(need, avail, sizes)
@@ -1932,11 +1949,16 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     # Q-702 (Auftrag 1522): the adder basis names k == 1 too (the displacement itself) -- the
     # metal probe reads ``basis=adder`` per RANK on exactly that line (review 1110/1140).
     if (k != 1 or basis.startswith("adder")) and (n <= 8 or (n & (n - 1)) == 0):
-        logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d basis=%s -> %s (n=%d)",
+        # KVD-1024: where a victim's guaranteed rows are below its seat, the line names them (rid:rows/seat, youngest
+        # first); otherwise it stays the base's line byte for byte
+        short = [r for r in young if rows[str(r.rid)] != _req_kv_tokens(r)]
+        logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d basis=%s -> %s (n=%d)%s",
                     "SEAT" if seat else "KV", str(older_rid), need, avail, len(young), basis,
                     "fits free, nobody leaves" if k == 0 else
                     "not even with all younger seats: nobody leaves, backfill stays" if k is None else
-                    "%d youngest must leave (one per pass)" % k, n)
+                    "%d youngest must leave (one per pass)" % k, n,
+                    (" leaving=" + ",".join("%s:%d/%d" % (str(r.rid), rows[str(r.rid)], _req_kv_tokens(r))
+                                            for r in young[:6])) if short else "")
     return bool(k)
 
 
