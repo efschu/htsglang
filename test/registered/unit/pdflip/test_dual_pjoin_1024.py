@@ -334,3 +334,30 @@ def test_s6_switch_off_is_the_prefix_rule(monkeypatch):
         assert abort_match.rid_hit("pdflip-0-20", "pdflip-0-2")
     finally:
         abort_match._reset_for_tests()
+
+
+# ------------------------------------------------- S2. K14 stamp in every layout
+
+
+def test_s2_k14_stamp_is_not_gated_on_dual_green():
+    """RED on 1ecda02a58: the F0-H port 8de7f55b3b nested the K14 stamp under
+    ``if _dgreen is not None`` -- off dual-green PP0 stamped no abort. The NF line has it under
+    the PP0 flush-verdict block. Structure check on the real method (the event-loop body is not
+    drivable on a stand-in)."""
+    import ast
+    import inspect
+    import textwrap
+
+    from flliper.srt.managers import scheduler_pp_mixin as ppm
+
+    src = textwrap.dedent(inspect.getsource(
+        ppm.SchedulerPPMixin._pp_forward_and_process_input_requests))
+    tree = ast.parse(src)
+
+    def _calls_stamp(node) -> bool:
+        return any(isinstance(n, ast.Attribute) and n.attr == "pp0_stamp_aborts" for n in ast.walk(node))
+
+    assert _calls_stamp(tree), "the K14 stamp must stay on PP0's forward path"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and "_dgreen" in ast.unparse(node.test):
+            assert not any(_calls_stamp(b) for b in node.body), "K14 stamp gated on dual-green"
