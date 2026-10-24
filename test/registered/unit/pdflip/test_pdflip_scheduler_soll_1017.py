@@ -509,8 +509,6 @@ def test_r2_kurz_reserve_reads_ds_extent_the_measure_barrier_and_nothing_unprice
 def test_r2_kurz_reserve_is_bounded_group_d_only_and_restores_the_groups_charge():
     """MAX_TRIES caps a reservation another gate keeps refusing; group P (no riegel) and a forwarded schedule never
     reserve; the charge restored is what the continuation REALLY took (CHUNKGEOM group MIN cut it further)."""
-    from types import SimpleNamespace
-
     from flliper.srt.pdflip import r2_kurz_chunk as k
 
     kurz = _k_req("pdflip-30-275", 188, priced=188, xgate=(188, 4097))
@@ -526,8 +524,15 @@ def test_r2_kurz_reserve_is_bounded_group_d_only_and_restores_the_groups_charge(
     told = _k_adder()
     told.scheduled_extents = {"pdflip-2-21": 1}
     assert k.plan_for_pass(told, _k_sched([fresh]), _k_cont()) is None                         # executes a schedule
+    class _Agree:  # a two-rank group whose other rank funds only 40 continuation tokens (CHUNKGEOM MIN)
+        def __call__(self, req, gate, total_tokens, rem_total):
+            return "ADMIT" if gate is None else gate  # both ranks admit what this rank admits
+
+        def chunk_min(self, rid, v):
+            return min(int(v), 40)
+
     adder = _k_adder()
-    adder.tp_admission_agree = SimpleNamespace(chunk_min=lambda rid, v: min(int(v), 40))
+    adder.tp_admission_agree = _Agree()
     cont = _k_cont()
     _k_pass(adder, _k_sched([fresh]), cont)
     assert cont.extend_range.end - cont.extend_range.start == 40
