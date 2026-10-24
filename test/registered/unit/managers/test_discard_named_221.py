@@ -12,6 +12,13 @@ it -- without a line and without a census exit, so the #915 identity
                               cleared the mark with no census exit.
   site 3  sleep_reset         flush_cache -> tree_cache.reset() ran no clearer over the
                               held population.
+  site 4  wake_rearm          (27B) park_l3.rearm_early_reads set prefetch_deferred=None
+                              with no census exit (review MUSS-3).
+
+Review MUSS-1/MUSS-2 (rule R7, danger direction W31/W50): site 3 closes a mark ONLY
+where the re-read does not hang on it -- every cleared rid is read again through the
+intake (#248 DEFER_ATTR wake read); the #1471 settle and FROM_SETTLE parks keep their
+mark (the X gate votes pending) and are named on a DISCARD-KEPT line.
 
 What is asserted, per site: a discarded mark gives ONE ``#221 DISCARD-NAMED site=..
 rid=.. marks=.. tokens=..`` line AND exactly one census exit. THE DANGER DIRECTION
@@ -51,6 +58,7 @@ from flliper.srt.managers.cache_controller import (  # noqa: E402
     StorageStopResult,
 )
 from flliper.srt.mem_cache import match_refusal_census as census  # noqa: E402
+from flliper.srt.pdflip.d_park_runtime import FROM_SETTLE_ATTR  # noqa: E402
 
 LOG = logging.getLogger("test_discard_named_221")
 
@@ -83,6 +91,38 @@ def _lines(logs, site):
 
 def _totals(logs, site):
     return [m for m in logs.output if dn.TOTAL_TAG + " site=" + site + " " in m]
+
+
+def _kept(logs):
+    return [m for m in logs.output if dn.KEPT_TAG + " site=" in m]
+
+
+def _intake_sched(reads):
+    """The real Scheduler intake bound to a stand-in (test_pdflip_park_l3_248 harness shape)."""
+    import functools
+
+    from flliper.srt.disaggregation.utils import DisaggregationMode
+
+    s = SimpleNamespace()
+    s._set_or_validate_priority = lambda req: True
+    s._kv_arrival_ct = 0
+    s.disaggregation_mode = DisaggregationMode.NULL
+    s._abort_on_queued_limit = lambda req: False
+    s._host_pool_available_size = lambda: 0
+    s._prefetch_kvcache = lambda req, **kw: reads.append(req.rid) or "issued"
+    s._apply_prefetch_deferral = lambda req, verdict, site: None
+    s._ple_admit_on_intake = lambda req: None
+    s._clear_prefetch_deferral_fields = _real_clear(s)
+    s.pdflip_dormant = True
+    s.pdflip_dormant_hold = []
+    s.tree_cache = SimpleNamespace(cache_controller=SimpleNamespace(), ongoing_prefetch={},
+                                   prefetch_loaded_tokens_by_reqid={})
+    s.forward_ct = 0
+    s.ps = SimpleNamespace(pp_rank=0, tp_size=1)
+    s._pdflip_park_l3_defer_hold_read = functools.partial(sch.Scheduler._pdflip_park_l3_defer_hold_read, s)
+    s._pdflip_d_park_hold_late = lambda req: False
+    s._add_request_to_queue = functools.partial(sch.Scheduler._add_request_to_queue, s)
+    return s
 
 
 # ------------------------------------------------------------------ the module
@@ -234,7 +274,7 @@ class TestSite3SleepReset(unittest.TestCase):
 
     def test_the_held_population_is_named_and_closed_each_with_one_exit(self):
         a, b, c = _marked("pdflip-12-168", span=100), _marked("pdflip-12-170", span=200), _marked("pdflip-8-51", span=50)
-        s = self._sched(parked=[a], hold=[b], settle=[c, a])  # `a` twice: counted once
+        s = self._sched(parked=[a, c], hold=[b, a])  # `a` twice: counted once
         before = census.gate_snapshot()
         with self.assertLogs(sch.logger, level="INFO") as logs:
             rids, marks, tokens = sch._discard_named_sleep_reset(s)
@@ -245,6 +285,75 @@ class TestSite3SleepReset(unittest.TestCase):
             self.assertIsNone(r.prefetch_deferred)
         (total,) = _totals(logs, "sleep_reset")
         self.assertIn("n=3 marks=3 tokens=350", total)
+        self.assertEqual(_kept(logs), [])  # nothing kept, no KEPT line
+
+    def test_DANGER_settle_and_from_settle_keep_their_mark_named_kept(self):
+        # MUSS-1: their re-read hangs on the mark (settle reads an absent record as "complete")
+        settle_m = _marked("pdflip-settle", span=300)
+        folded = _marked("pdflip-folded", span=400)
+        setattr(folded, FROM_SETTLE_ATTR, True)
+        held = _marked("pdflip-held", span=50)
+        s = self._sched(parked=[folded, held], hold=[settle_m], settle=[settle_m])  # in settle AND hold: kept
+        before = census.gate_snapshot()
+        with self.assertLogs(sch.logger, level="INFO") as logs:
+            rids, marks, tokens = sch._discard_named_sleep_reset(s)
+        self.assertEqual((rids, marks, tokens), (["pdflip-held"], 1, 50))
+        self.assertEqual(settle_m.prefetch_deferred, "store_prefix_short")
+        self.assertEqual(folded.prefetch_deferred, "store_prefix_short")
+        self.assertEqual(_delta(before), {"defer_lost_at_reset": 1})
+        self.assertEqual([m for m in _lines(logs, "sleep_reset") if "pdflip-settle" in m or "pdflip-folded" in m], [])
+        (kept,) = _kept(logs)
+        self.assertIn("site=sleep_reset n=2 rids=pdflip-settle,pdflip-folded", kept)
+
+    def test_DANGER_a_kept_settle_member_still_votes_pending_at_the_x_gate(self):
+        # MUSS-2 (second case): settle member, mark, _1471_short=False, NO record after the reset ->
+        # after site 3 the X gate still holds it out of the pricing (the mark is its re-read)
+        req = _marked("pdflip-12-168")
+        req._1471_short = False
+        s = self._sched(settle=[req])
+        s.tree_cache = SimpleNamespace(ongoing_prefetch={}, prefetch_loaded_tokens_by_reqid={})
+        with self.assertLogs(sch.logger, level="INFO"):
+            sch._discard_named_sleep_reset(s)
+        self.assertEqual(req.prefetch_deferred, "store_prefix_short")
+        self.assertTrue(sch.Scheduler._pdflip_store_read_is_pending(s, req))
+
+    def test_DANGER_every_cleared_rid_is_read_again_by_the_wake(self):
+        # MUSS-2: held marked requests -> site 3 -> the sleep leg's hold_parked (dormant, hold armed)
+        # -> the real #248 intake sets DEFER_ATTR -> park_l3.issue_deferred_reads reads each ONCE
+        from flliper.srt.pdflip import d_park_runtime, park_l3
+
+        reads = []
+        a, b = _marked("pdflip-0-7", span=120), _marked("pdflip-1-14", span=80)
+        for r in (a, b):
+            r.origin_input_ids, r.output_ids, r.kv_arrival_seq, r.extra_key = list(range(12)), [], None, None
+            r.time_stats = SimpleNamespace(set_wait_queue_entry_time=lambda: None)
+        s = _intake_sched(reads)
+        s.pdflip_d_parked = [a, b]
+        s.pdflip_post_wake_settle = []
+        s.waiting_queue = []
+        env = {"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_DORMANT_ADMIT": "1",
+               "FLLIPER_PDFLIP_ENABLE_PARK_L3": "1"}
+        with mock.patch.dict(os.environ, env), self.assertLogs(sch.logger, level="INFO"):
+            rids, marks, _ = sch._discard_named_sleep_reset(s)
+            self.assertEqual((sorted(rids), marks), (["pdflip-0-7", "pdflip-1-14"], 2))
+            d_park_runtime.hold_parked(s, hold_armed=True)
+            for r in (a, b):
+                self.assertTrue(park_l3.deferred(r), r.rid)  # the wake owes this read
+            self.assertEqual(reads, [])  # nothing read in the sleep
+            park_l3.issue_deferred_reads(s, s.pdflip_dormant_hold)
+        for rid in rids:
+            self.assertEqual(reads.count(rid), 1, rid)
+
+    def test_the_sleep_flush_precedes_the_hold_in_the_sleep_leg(self):
+        # the cleared parks are read through hold_parked's intake: site 3 (inside the flush) must come first
+        from flliper.srt.managers.scheduler_components import weight_updater as wu
+
+        src = open(wu.__file__).read()
+        i = src.index("            self._pdflip_sleep_flush()\n")
+        j = src.index("scheduler.pdflip_dormant = True", i)
+        k = src.index("_hold_parked()", j)
+        self.assertLess(i, j)
+        self.assertLess(j, k)
 
     def test_DANGER_a_queued_request_keeps_its_live_mark(self):
         queued = _marked("pdflip-queued")
@@ -368,16 +477,19 @@ class TestSite1ResetJoin(unittest.TestCase):
         self.assertIn("marks=1 tokens=1337 observed=0", _lines(logs, "reset_join")[0])
         self.assertEqual(_delta(before), {"discard_reset_join": 1, "discard_reset_join_tokens": 1337})
 
-    def test_reset_full_hands_the_records_over_before_it_clears_them(self):
+    def test_reset_full_snapshots_before_the_clear_and_hands_over_right_before_reset(self):
+        # SOLL-2: snapshot before the clear, the hand-over is the statement right before reset()
         from flliper.srt.mem_cache import unified_radix_cache as urc
 
         src = open(urc.__file__).read()
-        i = src.index("self.cache_controller._discard_named_records = _discard_named.snapshot_records(")
-        j = src.index("self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}")
-        k = src.index("self.cache_controller.reset()", j)
-        self.assertLess(src.index("def _reset_full"), i)
+        d = src.index("def _reset_full")
+        i = src.index("_dn_records = _discard_named.snapshot_records(", d)
+        j = src.index("self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}", d)
+        m = re.search(r"self\.cache_controller\._discard_named_records = _dn_records[^\n]*\n"
+                      r"\s+self\.cache_controller\.reset\(\)", src[j:])
         self.assertLess(i, j)
-        self.assertLess(j, k)
+        self.assertIsNotNone(m, "the records are handed over immediately before cache_controller.reset()")
+        self.assertEqual(src.count("_discard_named_records ="), 1)
 
     def test_snapshot_records_keys_by_operation_so_op_and_record_are_one_unit(self):
         op = _op("r", 10)
@@ -386,6 +498,60 @@ class TestSite1ResetJoin(unittest.TestCase):
         self.assertEqual(dn.snapshot_records({}), {})
         with mock.patch.dict(os.environ, {dn.ENV: "off"}):
             self.assertEqual(dn.snapshot_records({"r": _record(op)}), {})
+
+
+# ------------------------------------------------------------------ site 4 (27B)
+
+
+class TestSite4WakeRearm(unittest.TestCase):
+    def _issued(self, rid, marked=True, span=2048):
+        from flliper.srt.pdflip import park_l3
+
+        req = _marked(rid, span=span) if marked else SimpleNamespace(
+            rid=rid, prefetch_deferred=None, _prefetch_span_tokens=span)
+        setattr(req, park_l3.ISSUED_ATTR, True)
+        req._1471_short = True
+        req._pdflip_store_delivered = 7
+        return req
+
+    def test_the_rearm_names_the_mark_with_its_span_and_counts_the_exit(self):
+        from flliper.srt.pdflip import park_l3
+
+        req, plain = self._issued("pdflip-9-90"), self._issued("pdflip-9-91", marked=False)
+        s = SimpleNamespace(pdflip_dormant_hold=[req, plain])
+        before = census.gate_snapshot()
+        with self.assertLogs(park_l3.logger, level="INFO") as logs:
+            self.assertEqual(park_l3.rearm_early_reads(s, "fallback"), 2)
+        self.assertIsNone(req.prefetch_deferred)
+        self.assertTrue(park_l3.deferred(req))  # the release re-reads it: the mark is safe to close
+        self.assertIsNone(req._prefetch_span_tokens)  # nulled AFTER the line took it
+        (line,) = _lines(logs, "wake_rearm")
+        self.assertIn("rid=pdflip-9-90 marks=1 tokens=2048", line)  # tokens from before the null
+        self.assertIn("via=l15_rearm:fallback", line)
+        self.assertEqual(_delta(before), {"defer_lost_at_reset": 1})  # the unmarked one counts nothing
+
+    def test_switch_off_is_the_old_silent_clear(self):
+        from flliper.srt.pdflip import park_l3
+
+        req = self._issued("pdflip-9-92")
+        s = SimpleNamespace(pdflip_dormant_hold=[req])
+        before = census.gate_snapshot()
+        with mock.patch.dict(os.environ, {dn.ENV: "0"}), self.assertLogs(park_l3.logger, level="INFO") as logs:
+            park_l3.rearm_early_reads(s, "no-hold-drop")
+        self.assertIsNone(req.prefetch_deferred)
+        self.assertEqual(_lines(logs, "wake_rearm"), [])
+        self.assertEqual(_delta(before), {})
+
+    def test_the_rearm_goes_through_the_named_clearer_before_the_span_is_nulled(self):
+        from flliper.srt.pdflip import park_l3
+
+        src = open(park_l3.__file__).read()
+        i = src.index("def rearm_early_reads")
+        j = src.index("def after_release", i)
+        body = src[i:j]
+        self.assertNotIn("req.prefetch_deferred = None", body)
+        k = body.index("_discard_named.SITE_WAKE_REARM")
+        self.assertLess(k, body.index('"_prefetch_span_tokens"'))
 
 
 if __name__ == "__main__":

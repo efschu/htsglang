@@ -2042,23 +2042,54 @@ def _pdflip_parked_owned_prefetch_of(sched) -> frozenset:
 
 def _discard_named_sleep_reset(sched) -> tuple:
     """#221 Fix A (site sleep_reset): the D sleep flush's ``tree_cache.reset()`` killed the
-    operation that guarded the #1068 marks of the HELD population -- the requests the sleep holds
-    on purpose (flip / lane / RESUME-VIA-P parks, the #1443 dormant hold, the #1471 post-wake
-    settle: the same three lists ``_pdflip_liveness_hold_publish`` publishes). Their marks are
-    cleared BY NAME with a census exit (``defer_lost_at_reset``), the counterpart of the cutover's
-    ``_clear_prefetch_deferral_for_reissue``; the wake's own read decides anew. NO re-issue here.
+    operation that guarded the #1068 marks of the HELD population. A mark is cleared BY NAME with
+    a census exit (``defer_lost_at_reset``) -- the counterpart of the cutover's
+    ``_clear_prefetch_deferral_for_reissue`` -- ONLY where the request's re-read does not hang on
+    the mark (review #221 MUSS-1; rule R7 "kein stiller Verlust", danger direction W31/W50: no
+    request reaches the pricing without host KV):
 
-    The queue is NOT in the population: a request waiting in ``waiting_queue`` keeps its mark, the
-    next pass's ``_retry_deferred_prefetches`` re-issues it (a live mark is never closed). The
-    lists are replicated on every rank (``park_running`` is a broadcast), so the cleared set is
-    rank-identical and nothing here is a collective. Never raises into the flush."""
+    * CLEARED: the ``pdflip_dormant_hold`` and the ``pdflip_d_parked`` members NOT folded from the
+      settle. Both re-enter through ``_add_request_to_queue``: dormant (the sleep leg's
+      ``hold_parked`` runs after this flush, weight_updater ``_pdflip_sleep_flush()`` before
+      ``_hold_parked()``) the #248 intake sets DEFER_ATTR and the wake's
+      ``park_l3.issue_deferred_reads`` reads it; awake (``park_tick``, lane re-queue) the intake
+      calls ``_prefetch_kvcache`` -- neither reads ``prefetch_deferred``. In the sleep leg the
+      queue is IN ``pdflip_d_parked`` (``park_running`` folds it), protected by that same path.
+    * KEPT (mark left standing, one ``#221 DISCARD-KEPT`` line, no census move): the #1471
+      ``pdflip_post_wake_settle`` and the parked members with ``FROM_SETTLE_ATTR``. They go back
+      to the settle (``park_tick``: awake re-queue, a sleep whose hold is not armed under
+      ``FLLIPER_PDFLIP_DORMANT_ADMIT=0``, a plain flush with no sleep after it -- which of these
+      follows is not known at this point), and the settle answers "complete" for an absent record
+      when ``_1471_short`` is unset (``_pdflip_refetch_one``) and releases on its bound lapse or an
+      exception. Their only re-read on every exit is the standing mark: the X gate votes pending
+      (``_pdflip_store_read_is_pending``) and ``_retry_deferred_prefetches`` re-reads it.
+    * A request in ``waiting_queue`` outside a park is not held: it keeps its mark (retried in-pass).
+
+    The lists are replicated on every rank (``park_running`` is a broadcast, the settle is built by
+    group-MIN verdicts), so the cleared set is rank-identical and nothing here is a collective.
+    NO re-issue here. Never raises into the flush."""
     try:
-        held = []
-        for attr in ("pdflip_d_parked", "pdflip_dormant_hold", "pdflip_post_wake_settle"):
-            held.extend(getattr(sched, attr, None) or ())
-        return _discard_named.discard_marks(
+        from flliper.srt.pdflip.d_park_runtime import FROM_SETTLE_ATTR as _from_settle
+
+        settle = list(getattr(sched, "pdflip_post_wake_settle", None) or ())
+        parked = list(getattr(sched, "pdflip_d_parked", None) or ())
+        hold = list(getattr(sched, "pdflip_dormant_hold", None) or ())
+        kept = settle + [r for r in parked if getattr(r, _from_settle, False)]
+        kept_ids = {id(r) for r in kept}
+        held = [r for r in parked + hold if id(r) not in kept_ids]
+        out = _discard_named.discard_marks(
             held, _discard_named.SITE_SLEEP_RESET, logger,
             getattr(sched, "_clear_prefetch_deferral_fields", None))
+        if _discard_named.enabled():
+            seen, kept_rids = set(), []
+            for r in kept:
+                if id(r) not in seen and _discard_named.mark_standing(r):
+                    seen.add(id(r))
+                    kept_rids.append(str(getattr(r, "rid", "?")))
+            if kept_rids:
+                logger.info(_discard_named.format_kept(
+                    _discard_named.SITE_SLEEP_RESET, kept_rids, "settle-reread-hangs-on-the-mark"))
+        return out
     except Exception as exc:  # noqa: BLE001 -- the flush never breaks on its own bookkeeping
         logger.warning("#221 DISCARD-NAMED site=sleep_reset failed (%s: %s)", type(exc).__name__, exc)
         return [], 0, 0
@@ -9821,20 +9852,22 @@ class Scheduler(
     # each rank's own tree -- match_refusal_census.py `prefetch_gate_due`,
     # called from unified_radix_cache.py:1868):
     # deferred, landed, undeferrable, defer_expired, defer_released,
-    # defer_dropped, defer_cleared_cutover, defer_refused. Every MARK has
+    # defer_dropped, defer_cleared_reissue, defer_refused. Every MARK has
     # exactly one exit, so the identity the acceptance reads, per rank, is
     #   deferred == landed + defer_expired + defer_released + defer_dropped
-    #               + defer_cleared_cutover
+    #               + defer_cleared_reissue
     # #221 Fix A adds two exits (managers/discard_named.py, each with a
     # '#221 DISCARD-NAMED site=... rid=... marks=... tokens=...' line):
     # defer_cleared_refetch (clearer (d): the HOLD-REFETCH of
     # `_pdflip_refetch_one` / `_pdflip_refetch_budget`) and defer_lost_at_reset
-    # (clearer (e): the D sleep flush's tree reset, over the HELD population
-    # only; `_discard_named_sleep_reset`), so on a build with the switch on
+    # (clearer (e): the D sleep flush's tree reset, over the cleared held
+    # population only -- dormant hold + non-settle parks, the settle and
+    # FROM_SETTLE keep their mark, `_discard_named_sleep_reset`; clearer (f):
+    # the wake's L15 early-read re-arm `park_l3.rearm_early_reads`, site
+    # wake_rearm), so on a build with the switch on
     #   deferred == landed + defer_expired + defer_released + defer_dropped
     #               + defer_cleared_reissue + defer_cleared_refetch
     #               + defer_lost_at_reset
-    # (the key the cutover clearer counts is `defer_cleared_reissue`.)
     # UNDEFERRABLE and DEFER REFUSED are taken BEFORE a mark exists (the
     # request's own span exceeds the limit / the deferral is refused on this
     # rank-phase) and sit OUTSIDE the partition: counted, never members.

@@ -17,9 +17,25 @@ the 24.10. boots (0803: 2, 1106: 2, duo0126: 1):
    -- the HOLD-REFETCH (#1456/#1471) cleared the mark ("the shortfall mark is ours
    to re-issue") with no census exit.
 3. ``sleep_reset``        the D sleep flush (``flush_cache`` -> ``tree_cache.reset()``)
-   killed the operation that guarded the marks of the held population (parked /
-   dormant hold / post-wake settle) and ran no clearer, unlike the cutover's
-   ``_clear_prefetch_deferral_for_reissue``.
+   killed the operation that guarded the marks of the held population and ran no
+   clearer, unlike the cutover's ``_clear_prefetch_deferral_for_reissue``.
+4. ``wake_rearm``         (27B) ``park_l3.rearm_early_reads``: the wake's fallback
+   reset killed the early hold read and the re-arm set ``prefetch_deferred = None``
+   with no census exit (review #221 MUSS-3; the re-armed read is issued by the
+   release, so the mark is safe to close -- only its exit was missing).
+
+THE POPULATION OF SITE 3 (review #221 MUSS-1, rule R7 "kein stiller Verlust" and
+its danger direction W31/W50 "never a request without host KV into the pricing"):
+a mark is closed there ONLY for a request whose re-read is independent of the
+mark -- the non-settle members of ``pdflip_d_parked`` and the ``pdflip_dormant_hold``
+(both re-enter through the intake: the dormant ``#248`` DEFER_ATTR wake read, or
+``_prefetch_kvcache`` directly). The ``#1471`` post-wake settle and the parked
+members folded from it (``FROM_SETTLE_ATTR``) are KEPT: ``_pdflip_refetch_one``
+answers "complete" for an absent record when ``_1471_short`` is unset, and the
+settle also releases on its bound lapse and on an exception -- their only re-read
+on every exit is the standing mark (X gate pending + ``_retry_deferred_prefetches``).
+They are named on one ``#221 DISCARD-KEPT`` line (no census exit: a live mark is
+no loss and exits through its own lifecycle).
 
 WHAT THIS MODULE DOES (Variant A, nothing else): every discard is named with ONE
 line carrying the stable tag ``#221 DISCARD-NAMED`` and ``site= rid= marks= tokens=``,
@@ -29,7 +45,7 @@ and the census gets exactly one exit per discarded mark. NO re-issue is added
 CENSUS KEYS (the #915 ``prefetch-gate`` dict, same line as ``deferred`` / ``landed``):
 
 * ``defer_cleared_refetch`` (site hold_refetch_clear) and ``defer_lost_at_reset``
-  (site sleep_reset) are MARK exits and extend the identity::
+  (sites sleep_reset and wake_rearm) are MARK exits and extend the identity::
 
       deferred == landed + defer_expired + defer_released + defer_dropped
                   + defer_cleared_reissue + defer_cleared_refetch + defer_lost_at_reset
@@ -43,8 +59,8 @@ THE DANGER DIRECTION (tested): a census exit never closes a LIVE mark. An exit i
 counted only when a mark stood before the clear AND is gone after it
 (``discard_mark``); a clear that did not take (a partial scheduler without the
 clearer), a request that only carried a landed-hold, or a request outside the
-held population (a queued request is retried in-pass and stays marked) count
-nothing.
+cleared population (the queue outside a park, the settle, FROM_SETTLE) count
+nothing and keep their mark.
 
 Switch ``FLLIPER_DISCARD_NAMED`` (default ON; ``0``/``false``/``no``/``off`` =
 the pre-#221 behaviour byte for byte: no line, no census, site 3 clears nothing).
@@ -57,17 +73,25 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 TAG = "#221 DISCARD-NAMED"
 TOTAL_TAG = "#221 DISCARD-NAMED-TOTAL"
+#: marks a site deliberately does NOT close (their re-read is the mark itself)
+KEPT_TAG = "#221 DISCARD-KEPT"
+#: #221 Fix A "benannt verwerfen" (rule R7, kein stiller Verlust), DEFAULT ON: every discarded #1068
+#: deferral mark and every read unit a reset drops is named on one "#221 DISCARD-NAMED site=... rid=..." line
+#: with one census exit (defer_cleared_refetch / defer_lost_at_reset; read units discard_reset_join).
+#: 0/false/no/off = the pre-#221 behaviour: no line, no census, site 3 clears nothing, sites 2/4 clear silently.
 ENV = "FLLIPER_DISCARD_NAMED"
 
 SITE_RESET_JOIN = "reset_join"
 SITE_HOLD_REFETCH_CLEAR = "hold_refetch_clear"
 SITE_SLEEP_RESET = "sleep_reset"
-SITES = (SITE_RESET_JOIN, SITE_HOLD_REFETCH_CLEAR, SITE_SLEEP_RESET)
+SITE_WAKE_REARM = "wake_rearm"
+SITES = (SITE_RESET_JOIN, SITE_HOLD_REFETCH_CLEAR, SITE_SLEEP_RESET, SITE_WAKE_REARM)
 
 #: mark exits (terms of the #915 identity), per site
 EXIT_KEY = {
     SITE_HOLD_REFETCH_CLEAR: "defer_cleared_refetch",
     SITE_SLEEP_RESET: "defer_lost_at_reset",
+    SITE_WAKE_REARM: "defer_lost_at_reset",
 }
 #: read-unit census key of site 1 (NOT an identity term, see the module doc)
 UNIT_KEY = "discard_reset_join"
@@ -75,7 +99,7 @@ UNIT_KEY = "discard_reset_join"
 
 def enabled(env=None) -> bool:
     env = os.environ if env is None else env
-    return str(env.get(ENV, "") or "1").strip().lower() not in ("0", "false", "no", "off")
+    return str(env.get(ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _census(key: str, tokens: int = 0) -> None:
@@ -100,7 +124,13 @@ def format_total(site: str, rids: List[str], marks: int, tokens: int) -> str:
         TOTAL_TAG, site, len(rids), int(marks), int(tokens), ",".join(rids) or "-")
 
 
-# ---------------------------------------------------------------- marks (sites 2, 3)
+def format_kept(site: str, rids: List[str], why: str) -> str:
+    """The marks a site leaves standing ON PURPOSE, one line, no census move
+    (a different tag: neither ``DISCARD-NAMED site=`` nor the TOTAL grep sees it)."""
+    return "%s site=%s n=%d rids=%s why=%s" % (KEPT_TAG, site, len(rids), ",".join(rids) or "-", why)
+
+
+# ---------------------------------------------------------------- marks (sites 2, 3, 4)
 
 
 def mark_standing(req) -> bool:

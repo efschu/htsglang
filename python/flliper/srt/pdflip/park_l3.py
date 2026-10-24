@@ -782,8 +782,17 @@ def rearm_early_reads(sched, reason: str) -> int:
             setattr(req, CAPWAIT_ATTR, False)
             setattr(req, PAGES_ATTR, 0)
             setattr(req, WAKE_ATTR, None)
-            if getattr(req, "prefetch_deferred", None) is not None:
-                req.prefetch_deferred = None
+            # #221 Fix A (site wake_rearm, review MUSS-3): the reset killed the read that guarded
+            # the mark; the release re-reads it (DEFER_ATTR above), so the mark is closed -- BY NAME
+            # with its census exit (defer_lost_at_reset), and BEFORE `_prefetch_span_tokens` is
+            # nulled below (the line carries the span). The clearer is the pre-#221 one byte for
+            # byte (only `prefetch_deferred`); switch off = the old silent clear.
+            from flliper.srt.managers import discard_named as _discard_named
+
+            _discard_named.discard_mark(
+                req, _discard_named.SITE_WAKE_REARM, logger,
+                lambda r: setattr(r, "prefetch_deferred", None),
+                clear_unmarked=False, via="l15_rearm:" + str(reason))
             req._1471_short = False
             for attr in ("_pdflip_store_delivered", "_prefetch_span_tokens"):
                 if hasattr(req, attr):
