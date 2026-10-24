@@ -411,19 +411,41 @@ def _orphan_run(f, rids):
     return asyncio.run(run())
 
 
-def test_s60r_a1_an_orphan_whose_rid_prefixes_a_live_rid_is_not_aborted():
-    """D aborts by PREFIX (``park_abort`` / ``_abort_request_now``: ``rid.startswith(abort.rid)``). Boot 1018_153151
-    holds ``pdflip-2-6`` and ``pdflip-2-60`` .. ``-69`` in one epoch: the orphan's abort would drop the live one."""
+def _abort_rule(monkeypatch, exact: bool):
+    from flliper.srt.pdflip import abort_match
+
+    monkeypatch.setenv(abort_match.ENV, "1" if exact else "0")
+    abort_match._reset_for_tests()
+    monkeypatch.setattr(abort_match, "_ARMED", None)  # restored -> re-read after the test
+
+
+def test_s60r_a1_an_orphan_whose_rid_prefixes_a_live_rid_is_not_aborted(monkeypatch):
+    """Under the PREFIX abort rule (``FLLIPER_PDFLIP_ABORT_EXACT_RID=0``: ``rid.startswith(abort.rid)``) D's abort of
+    the orphan ``pdflip-2-6`` would drop the live ``pdflip-2-60`` (boot 1018_153151 holds both in one epoch)."""
+    _abort_rule(monkeypatch, exact=False)
     f = _front(running=["pdflip-2-60"], n=6)
     assert _orphan_run(f, ["pdflip-2-6", "pdflip-2-60"]) == 0
     assert f.rpc_calls == []
     assert f.counters["d_orphan_abort_prefix_skip"] == 1
 
 
-def test_s60r_a1_a_prefix_inside_the_park_list_is_skipped_the_other_orphan_still_goes():
+def test_s60r_a1_a_prefix_inside_the_park_list_is_skipped_the_other_orphan_still_goes(monkeypatch):
+    _abort_rule(monkeypatch, exact=False)
     f = _front(running=[], n=6)
     assert _orphan_run(f, ["pdflip-2-6", "pdflip-2-61"]) == 1
     assert f.rpc_calls == [("/abort_request", {"rid": "pdflip-2-61"})]
+
+
+def test_s60r_a1_exact_rule_aborts_the_orphan_and_spares_the_live_rid(monkeypatch):
+    """#1580 ABORT-EXACT-RID (default on): D's abort of ``pdflip-2-6`` hits only ``pdflip-2-6`` (and its non-digit
+    children), so the orphan IS aborted -- no shadow skip, the live ``pdflip-2-60`` is not touched."""
+    _abort_rule(monkeypatch, exact=True)
+    f = _front(running=["pdflip-2-60"], n=6)
+    assert _orphan_run(f, ["pdflip-2-6", "pdflip-2-60"]) == 1
+    assert f.rpc_calls == [("/abort_request", {"rid": "pdflip-2-6"})]
+    assert f.counters.get("d_orphan_abort_prefix_skip", 0) == 0
+    f2 = _front(running=[], n=6)
+    assert _orphan_run(f2, ["pdflip-2-6", "pdflip-2-61"]) == 2
 
 
 def test_s60r_a2_a_rid_the_front_still_holds_on_p_or_queued_is_no_orphan():

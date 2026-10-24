@@ -43,6 +43,7 @@ from flliper.srt.pdflip import front as F  # noqa: E402
 from flliper.srt.pdflip import p_intake  # noqa: E402
 from flliper.srt.pdflip import p_row_authority  # noqa: E402
 from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.pdflip.abort_match import rid_hit as _abort_rid_hit  # noqa: E402  (#1580: the doubles follow the real rule)
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -207,7 +208,7 @@ class _Follower:
         if SC.Scheduler._pdflip_defer_waiting_abort(self, recv_req):
             return
         self.aborted.append(recv_req.rid)
-        self.waiting_queue = [r for r in self.waiting_queue if not r.rid.startswith(recv_req.rid)]
+        self.waiting_queue = [r for r in self.waiting_queue if not _abort_rid_hit(r.rid, recv_req.rid)]
 
 
 def _req(rid=RID, **kw):

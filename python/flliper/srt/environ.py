@@ -5413,6 +5413,10 @@ class Envs:
     # D decoded it to 09:13:55, ~13.8k tokens, ~133k KV tokens and a D running slot for nobody). The front aborts
     # it on D at the park (R11: the front decides). 0 = it is only named in the PARK-RUNNING line, as before.
     FLLIPER_PDFLIP_D_ORPHAN_ABORT = EnvBool(True)
+    # #1580 ABORT-EXACT-RID (pdflip/abort_match.py, 24.10.): an abort of a front rid ``pdflip-<e>-<n>`` hits that rid or a
+    # non-digit continuation (n>1 child ``{rid}_{i}``), not ``pdflip-<e>-<n>x``. DEFAULT ON (user order 14.10.); =0 = the
+    # upstream prefix rule. Boot constant, read once per process by abort_match.exact_armed (rank-uniform, R11).
+    FLLIPER_PDFLIP_ABORT_EXACT_RID = EnvBool(True)
     # S46 F2-F4 (NF 18.10., SA #244 / PRIO=ALTER 14.10.): the seat ORDER of requests that rode a flip to P. F2: the D
     # line re-picks by age when an older hand-off joined it during the seat wait; F3: a BATCH fall-through is queued
     # at its age position (not behind younger ones); F4: while P is awake a younger hand-off does not take a seat
