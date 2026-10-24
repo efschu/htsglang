@@ -133,7 +133,10 @@ class Wiring(CustomTestCase):
         from flliper.srt.pdflip import front
         lsrc = inspect.getsource(launcher)
         fsrc = inspect.getsource(front)
-        self.assertIn("dc_residue_from_record(\n        _dc_rec_d, cards, ns.pdflip_weight_source)", lsrc)
+        # #227: main reads through dc_residue_for (measured max over D sleeps first), whose pre-#227 form is
+        # still this reader
+        self.assertIn("dc_residue_for(\n        measured_record_path(), _dc_accept, cards, ns.pdflip_weight_source)", lsrc)
+        self.assertIn("vals, prov = dc_residue_from_record(rec, cards, weight_source)", lsrc)
         self.assertIn('"--weight-form", str(ns.pdflip_weight_source)', lsrc)
         self.assertIn("self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc,", fsrc)
         self.assertIn("vram_residue_form=self.weight_form", fsrc)
