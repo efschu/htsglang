@@ -14747,8 +14747,6 @@ def d_extend_vote_fixed_record(profile: Optional[str] = None, n: Optional[int] =
         return None, f"no {_budget_rest.VOTE_FIXED_RECORD} record"
     if not vals or any(v is None for v in vals):
         return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} has an unmeasured card"
-    if n is not None and len(vals) not in (1, int(n)):
-        return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} does not fit {n} cards"
     prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
     row = pdflip_form.profile_row(prof)
     rec = row.constants.get(_budget_rest.VOTE_FIXED_RECORD) if row is not None else None
@@ -14763,6 +14761,8 @@ def d_extend_vote_fixed_record(profile: Optional[str] = None, n: Optional[int] =
     why = _budget_rest.vote_fixed_form_mismatch(boots, pdflip_form.model_key(model or ""), inventory)
     if why is not None:
         return None, why
+    if n is not None and len(vals) not in (1, int(n)):
+        return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} does not fit {n} cards"
     out = [float(v) for v in vals]
     if n is not None and len(out) == 1:
         out = out * int(n)
