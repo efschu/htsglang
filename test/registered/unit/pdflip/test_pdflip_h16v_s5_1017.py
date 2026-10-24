@@ -52,9 +52,10 @@ def test_f1_pure_shared_prefix_counts_once():
 
 
 def test_f1_the_log_case_of_15_36_s_is_counted_once_at_the_front_edge(monkeypatch, caplog):
-    """pdflip-80-912 (5396) + pdflip-80-913 (5534), both credit 20032, common prefix 24064: P brings 5396 + 1502 = 6898
-    (S_P). H16V review A5: the DECISION S is the D-side sum of the own figures (10930), D's in-batch dedupe is not
-    guaranteed; the deduplicated figure is reported as S_P only."""
+    """pdflip-80-912 (5396) + pdflip-80-913 (5534), both credit 20032, common prefix 24064: P brings 5396 + 1502 = 6898.
+    R1u (user 20.10.) made the deciding S the union figure; SIBLING-U-1024 (planner 24.10.) takes the rider 913's kurz rest
+    out of S (S = 5396) -- and the review MUSS-1 (planner variant (a)) holds 913 behind its anchor when the set goes to D at
+    T_halb: D never gets 913's own figure next to 912 uncounted (the test runs past T_halb so the end is not hidden)."""
     _on(monkeypatch)
     f = _fx()
     f.tp_prefill_max_tokens = 6185
@@ -77,6 +78,14 @@ def test_f1_the_log_case_of_15_36_s_is_counted_once_at_the_front_edge(monkeypatc
     # SIBLING-U-1024 (SOLL section 2 "u = was wirklich prefillt werden muss", R2/R4): 913 stands behind its anchor 912 in the
     # set and is classed on its rest 1502 < halbX 3092 -- kurz (a rider), no longer halb on its own 5534
     assert "classes=halb,kurz" in line and "prefix-shared=4032" in line and "S_own=10930" in line, line
+    # SIBLING-U-1024 review MUSS-1 (planner 24.10. variant (a), SOLL R1/R2/R7): past T_halb the set goes to D (S=5396 < X, R3);
+    # 912 is released, 913 is NOT -- it waits behind 912 on D (its D figure before 912 is computed is its own 5534)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._decode_collect(t0 + 4.7) == "D"
+    end = _verdicts(caplog)[-1]
+    assert "verdict=D_AFTER_TIMER" in end and "S=5396 " in end, end
+    assert st["released"].get("pdflip-80-912") == "D" and "pdflip-80-913" not in st["released"], st["released"]
+    assert st["rider_hold"]["pdflip-80-913"]["anchor"] == "pdflip-80-912"
 
 
 def test_f1_a_shared_prefix_is_counted_once_in_the_deciding_s_r1u(monkeypatch, caplog):
@@ -362,6 +371,15 @@ def test_user_case_15_36z_is_reroute_p_by_the_soll_not_by_a_moved_threshold(monk
     assert int(m.group(1)) < x1 and "verdict=COLLECT" in line and "S_own=11107" in line, line
     assert "classes=halb,kurz" in line and "sibling-rider=pdflip-80-913:1502" in line, line
     assert re.search(r"xk=7[56]\d\d", line), line   # X(k=2) ~7620 is reported, never decided on
+    # review MUSS-1 (planner 24.10. variant (a), SOLL R1/R2/R7): run past T_halb -- the set may go to D only WITHOUT the rider:
+    # 913 is never released to D next to its anchor 912 (5396 + 177 + 913's own 5534 would be on D against S=5573)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        r_end = f._decode_collect(t0 + 4.7)
+    end = _verdicts(caplog)[-1]
+    assert r_end == "D", (r_end, end)
+    assert "verdict=D_AFTER_TIMER" in end and "S=5573 " in end and st["released"].get("pdflip-80-912") == "D", end
+    assert st["released"].get("pdflip-80-913") != "D", (st["released"], end)
+    assert st["rider_hold"]["pdflip-80-913"]["anchor"] == "pdflip-80-912"
     # F1 alone: with only the deduplicated S_P = 7075 against the same real X the SOLL gives REROUTE_P as well
     assert pp.set_verdict([M("a", 5396, 0.0), M("b", 1502, 1.5)], x_tokens=x1, half_frac=0.5, t_half_s=4.5, now=1.6,
                           t_open=0.0, d_decoding=True, seats_free=6, d_prefill_running_uncached=177).verdict == "REROUTE_P"
