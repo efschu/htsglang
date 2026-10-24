@@ -7761,8 +7761,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            _park_rearm.MARKER, rank, type(exc).__name__, exc)
             return {}
         stats["ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
-        if stats.get("targets") or stats.get("busy"):
-            # review S3: every pass with a target names itself and its cost
+        if stats.get("targets") or stats.get("busy") or stats.get("agreed") or stats.get("incomplete"):
+            # review S3: every pass with a target names itself and its cost; END-ANCHOR-GUARD Nachpruefung SOLL-C:
+            # also a pass that marked (agreed=) or could not mark (incomplete=) -- the rate the metal reads
             logger.info("%s PASS rank=%d class1=%d %s", _park_rearm.MARKER, rank, int(bool(allow_class1)),
                         " ".join("%s=%s" % kv for kv in sorted(stats.items())))
         return stats
@@ -9670,7 +9671,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return   # (a refused copy is undone through the arena claim: arena-bound trees only)
             rid = str(getattr(req, "rid", "?"))
             clock = _te.IssueClock()
+            self._pdflip_chain_lookup_exc = None
             chain = self._pdflip_chain_nodes(radix_key) if radix_key is not None else []
+            _cexc = self.__dict__.get("_pdflip_chain_lookup_exc")
+            if _cexc is not None:
+                # END-ANCHOR-GUARD Nachpruefung SOLL-B: the lookup raised on THIS rank (swallowed as before: the turn
+                # end goes on without a chain) -- its turn-end registry is short of the node the others file: counted
+                # and named, never silent
+                _end_anchor_guard.note_register_failed(self, "chain_lookup", _cexc)
             # END-ANCHOR-GUARD-1024 (#231 review MUSS-1, SOLL R11): the turn end's END node enters the guard's
             # turn-end registry on EVERY rank, BEFORE any claim of this turn end answers (the chain is the tree's
             # structure, the device residency a replica) -- the shared-slot hold reads this, never the claim result
@@ -9787,7 +9795,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = node.parent
             chain.reverse()
             return chain
-        except Exception:  # noqa: BLE001 - an accelerator, never a wall
+        except Exception as exc:  # noqa: BLE001 - an accelerator, never a wall
+            self._pdflip_chain_lookup_exc = exc   # END-ANCHOR-GUARD SOLL-B: the turn end names it (REGISTER-FAILED)
             return []
 
     def _pdflip_publish_at_chunk(self, req, radix_key) -> None:

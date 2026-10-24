@@ -1165,6 +1165,14 @@ class MambaComponent(TreeComponent):
                 # hold.  Bounded by the number of finished prompts awaiting the
                 # flip, never the whole backlog (the #1470b hazard).
                 x_next = lru.get_prev_no_lock(x)
+                # END-ANCHOR-GUARD Nachpruefung SOLL-A (SOLL R11): on a shared-slot TP group the guard decides FIRST.
+                # The #1481 hold below reads the rank-local host copy: a rank without one held the node there --
+                # outside the guard's HOLD list -- while a rank with one held it through the guard, so the lists (the
+                # MAX_HELD cap, pass 2) parted. A registry node the guard holds is in the list on every rank alike.
+                _shared = _eag.tp_slot_shared(self.cache)
+                if _shared and _eag.interior_hold(self.cache, x, x.component_data[ct]):
+                    x = x_next
+                    continue
                 if (
                     getattr(x, "_pdflip_end_anchor", False)
                     and not getattr(x, "backuped", False)
@@ -1175,7 +1183,7 @@ class MambaComponent(TreeComponent):
                     continue
                 # END-ANCHOR-GUARD-1024: a BACKED (KV-only) turn-end anchor without a mamba copy -- the case the
                 # #1481 hold above let through -- is held in pass 1 (pass 2 below the walk evicts it if it must)
-                if _eag.interior_hold(self.cache, x, x.component_data[ct]):
+                if not _shared and _eag.interior_hold(self.cache, x, x.component_data[ct]):
                     x = x_next
                     continue
                 if not lru.in_list(x) or x.component_data[ct].value is None:

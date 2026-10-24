@@ -30,10 +30,11 @@ THE RULE. A PROTECTED node whose device mamba state has no copy is not given up 
   One rank / Form A host (no shared slot -- the rank's own claim is the group's): additionally the #1481 mark of a
   node filed outside the registry and a node whose anchor the S108 turn end deferred BY NAME
   (``_s108_anchor_deferred``, stamped with the registry generation at the deferral; same age bound) -- rank-local
-  inputs are the group's inputs there. On a pure TP group sharing the mamba blob slot (W65 class,
-  :func:`tp_slot_shared`) these two are NOT read: ``_s108_anchor_deferred`` is filled by each rank's own free-claim on
-  the shared arena (a slot frees at the LAST releaser, so the ranks answer differently -- metal: 18 of 307 turn ends
-  rank-uneven in boot ..._93eae72472_1024_012625), and a hold read from it parted the trees' device residency.
+  inputs are the group's inputs there (on Form A they decide only whether TP0 tries the save, never a hold). On a
+  pure TP group sharing the mamba blob slot (W65 class, :func:`tp_slot_shared`) these two are NOT read:
+  ``_s108_anchor_deferred`` is filled by each rank's own free-claim on the shared arena (a slot frees at the LAST
+  releaser, so the ranks answer differently -- metal: 18 of 307 turn ends rank-uneven in boot
+  ..._93eae72472_1024_012625), and a hold read from it parted the trees' device residency.
 * UNSECURED: on a shared-slot TP group = protected and not agreed-secured; the rank-local copy state
   (``host_value``, ``_pdflip_direct_mamba_rows``, ``pdflip_anchor_secured``) is NOT read -- a rank with a local copy
   holds with the others (harmless: pass 2 pays it). One rank / Form A host: a device value, no host value, no anchor
@@ -41,9 +42,16 @@ THE RULE. A PROTECTED node whose device mamba state has no copy is not given up 
 
 * Pass 1 (the full component's peel and the mamba component's drive each open one): before the node would lose its
   state (leaf demotion or interior tombstone), the guard
-    - one rank / Form A host: runs the K15 save (``pdflip_save_anchor_before_tombstone``: anchor-only copy, the K15
-      spill of an L3-secured foreign intermediate when the arena is full -- the other, SECURED state goes, never an
-      unsecured one); saved = the demotion goes ahead WITH a copy;
+    - Form A group (TP0 = host, the workers follow; Nachpruefung MUSS-4, SOLL R11): NO hold on any rank. TP0 runs the
+      K15 save first (TP0-local, as K15 does for an interior node since 16.10.), then EVERY rank demotes the leaf
+      alike -- the residency never hangs on a TP0-local result (K21: "ALL ranks keep the node on the device (a
+      rank-local skip on TP0 alone parted the trees)"; a worker can follow neither a hold after a failed save nor a
+      skip after a save). A failed save is NAMED on TP0 (``END-ANCHOR-GUARD FORM-A-DEMOTE``, counter
+      ``form_a_demote``): the copy is lost on purpose, every rank alike. The interior branch: no hold either, the
+      existing K15 save + tombstone runs;
+    - one rank (TP 1, its claim is the group's): runs the K15 save (``pdflip_save_anchor_before_tombstone``:
+      anchor-only copy, the K15 spill of an L3-secured foreign intermediate when the arena is full -- the other,
+      SECURED state goes, never an unsecured one); saved = the demotion goes ahead WITH a copy;
     - shared-slot TP group: no rank-local claim at all (a claim landing on some ranks only, or a #904 pin it leaves
       behind, would decide the residency per rank); the group-agreed PARK-REARM pass of the next group-verdict flush
       secures it (its candidate list carries the registry nodes as their own class after the park END anchors,
@@ -71,7 +79,10 @@ line, everything in :func:`counters`.
 DANGER DIRECTIONS (tests in test_end_anchor_guard_1024.py, mutants in the report):
 (a) hold too broad -> device/mamba pool cannot be paid, admission hangs: pass 2 + MAX_HELD + the age bound.
 (b) R11: on a shared-slot TP group the hold reads only the registry (rank-uniform events), the agreed mark (reduced
-    values) and the device residency; no rank-local claim, no rank-local copy state.
+    values) and the device residency; no rank-local claim, no rank-local copy state. The agreed mark itself comes
+    only off a rank-uniform candidate set (Nachpruefung MUSS-3: :func:`rearm_candidates` lists only nodes with a
+    DEVICE mamba state -- a replica -- never one a rank-local host copy alone keeps a candidate). On a Form A group
+    nothing is held (MUSS-4): TP0's save never decides the residency.
 (c) host memory: the guard claims nothing new -- a held node lives on the DEVICE; copies go only through the existing
     fixed-size mamba arena claims (K15 / re-arm), at most one K15 claim per node and pass.
 
@@ -124,7 +135,7 @@ PROTECT_NEWEST = REARM_SCAN
 
 _LOG_FIRST = 16
 _N: Dict[str, int] = {"held": 0, "demote_after": 0, "cap": 0, "unguarded": 0, "saved": 0, "save_calls": 0,
-                      "agreed": 0}
+                      "agreed": 0, "form_a_demote": 0, "form_a_split": 0, "register_failed": 0}
 #: MUSS-2: per occasion [n, ok, ms_sum, ms_max]
 SAVE_WHY = ("pass1", "pass2", "cap", "no_pass")
 _SAVE: Dict[str, List[float]] = {w: [0, 0, 0.0, 0.0] for w in SAVE_WHY}
@@ -249,8 +260,20 @@ def register_turn_end(tree: Any, chain: List[Any]) -> Optional[Any]:
                 _register(tree, n)
                 return n
     except Exception as exc:  # noqa: BLE001 - the registry never takes the turn end down
-        logger.warning("%s register_turn_end raised %s: %s", MARKER, type(exc).__name__, exc)
+        note_register_failed(tree, "register_turn_end", exc)
     return None
+
+
+def note_register_failed(tree: Any, where: str, exc: BaseException) -> None:
+    """Nachpruefung SOLL-B: a turn-end registration that failed on THIS rank (the chain lookup or the filing raised)
+    -- the other ranks filed the node, this one did not: the registry is rank-uneven from here (R11 risk). Counted
+    and named, never silent."""
+    _N["register_failed"] += 1
+    k = _N["register_failed"]
+    if _sampled(k):
+        logger.warning("%s REGISTER-FAILED n=%d where=%s rank=%s %s: %s -- this rank's turn-end registry lacks the "
+                       "node the other ranks filed (R11: the shared-slot hold may part; PARK-REARM PASS agreed= "
+                       "TP0/TP1 tells)", MARKER, k, where, getattr(tree, "tp_rank", "?"), type(exc).__name__, exc)
 
 
 def note_s108_deferred(tree: Any, node: Any) -> None:
@@ -284,12 +307,11 @@ def registry_age(tree: Any, node: Any) -> Optional[int]:
 def mark_agreed(tree: Any, node: Any) -> None:
     """The PARK-REARM pass found ``node``'s copy on every rank (``done`` / ``ISSUED`` / ``HEALED``, or no rank needs it
     off a complete gather) -- REDUCED values, the same on every rank: the hold is lifted on every rank alike."""
-    try:
-        if not getattr(node, AGREED_ATTR, False):
-            _N["agreed"] += 1
-        setattr(node, AGREED_ATTR, True)
-    except Exception:  # noqa: BLE001
-        pass
+    # (no swallow -- Nachpruefung SOLL-B: a mark that fails on one rank parts the marks; the PARK-REARM pass turns
+    # the raise into W203 ParkRearmDivergence)
+    if not getattr(node, AGREED_ATTR, False):
+        _N["agreed"] += 1
+    setattr(node, AGREED_ATTR, True)
 
 
 # ---------------------------------------------------------------------------------------------------- predicates
@@ -353,6 +375,11 @@ def _role() -> Optional[str]:
         return _r12.role()
     except Exception:  # noqa: BLE001 - no Form A readable: off
         return None
+
+
+def form_a() -> bool:
+    """A Form A group (TP0 = host, the workers follow; group-uniform): nothing is held there (MUSS-4)."""
+    return _role() in ("host", "worker")
 
 
 def tp_slot_shared(tree: Any) -> bool:
@@ -432,12 +459,17 @@ def _hold(tree: Any, node: Any, kind: str) -> bool:
 
 
 def _note_loss(tree: Any, node: Any, kind: str, site: str, why: str) -> None:
-    key = "demote_after" if why == "pass2" else "unguarded"
+    key = {"pass2": "demote_after", "form_a": "form_a_demote"}.get(why, "unguarded")
     _N[key] += 1
     k = _N[key]
     if not _sampled(k):
         return
-    if why == "pass2":
+    if why == "form_a":
+        logger.warning("%s FORM-A-DEMOTE n=%d node=%s kind=%s depth=%d rid=%s site=%s: Form A holds nothing -- TP0's "
+                       "K15 save found no copy, EVERY rank demotes the turn-end anchor alike (K21, SOLL R11) and its "
+                       "device mamba state leaves without a copy", MARKER, k, getattr(node, "id", "?"), kind,
+                       _depth(tree, node), getattr(node, "pdflip_anchor_rid", None), site)
+    elif why == "pass2":
         logger.warning("%s DEMOTE-AFTER n=%d node=%s kind=%s depth=%d rid=%s site=%s: the eviction could not be paid "
                        "without the held turn-end anchor -- its device mamba state leaves without a copy (old order, "
                        "only as many as needed)", MARKER, k, getattr(node, "id", "?"), kind, _depth(tree, node),
@@ -450,6 +482,20 @@ def _note_loss(tree: Any, node: Any, kind: str, site: str, why: str) -> None:
 
 def _occasion(tree: Any, node: Any, pass1: bool) -> str:
     return "pass2" if in_pass2(tree, node) else ("cap" if pass1 else "no_pass")
+
+
+def _decide_form_a(tree: Any, node: Any, cd: Any, site: str, just_tried: bool, kind: str) -> bool:
+    """Nachpruefung MUSS-4 (SOLL R11), Form A host (TP0): never a hold -- a worker cannot follow one (it holds no
+    recurrent state and sees neither TP0's save nor its outcome). The K15 save first (TP0-local, residency-neutral,
+    as K15 for an interior node), then the demotion goes ahead on TP0 exactly as on every worker; a failed save is
+    named (``FORM-A-DEMOTE``)."""
+    pass1 = getattr(tree, HOLD_ATTR, None) is not None
+    if not just_tried:
+        _try_save(tree, node, "pass1" if pass1 and not in_pass2(tree, node) else _occasion(tree, node, pass1), site,
+                  kind)
+    if unsecured(tree, node, cd):
+        _note_loss(tree, node, kind, site, "form_a")
+    return False
 
 
 def _decide_shared(tree: Any, node: Any, cd: Any, site: str) -> bool:
@@ -469,7 +515,8 @@ def _decide(tree: Any, node: Any, cd: Any, site: str, just_tried: bool) -> bool:
     """Common rule. True = HOLD (the caller frees nothing now). False = go ahead (a copy may have been made)."""
     if not on() or cd is None or getattr(cd, "value", None) is None:
         return False
-    if _role() == "worker":
+    role = _role()
+    if role == "worker":
         return False   # a Form A worker holds no recurrent state (bookkeeping rows, R12 reconciles): never a hold
     if tp_slot_shared(tree):
         return _decide_shared(tree, node, cd, site)
@@ -478,6 +525,8 @@ def _decide(tree: Any, node: Any, cd: Any, site: str, just_tried: bool) -> bool:
     kind = protected(tree, node)
     if kind is None:
         return False                           # SOLL-1: an unprotected leaf keeps the old demotion (no save)
+    if role == "host":
+        return _decide_form_a(tree, node, cd, site, just_tried, kind)   # MUSS-4: Form A holds nothing
     pass1 = getattr(tree, HOLD_ATTR, None) is not None
     if pass1 and not in_pass2(tree, node):
         if not just_tried and _try_save(tree, node, "pass1", site, kind):
@@ -507,15 +556,25 @@ def before_demote(tree: Any, node: Any, just_tried: bool = False) -> bool:
         return False                           # no save ran in this call: the node is exactly as the caller saw it
     # (one rank / Form A host only -- no save runs on a shared slot) the save may have pinned the node or taken it
     # off the device (#904): free nothing now
-    if getattr(node, "evicted", False) or not getattr(node, "backuped", True):
-        return True
-    is_leaf = getattr(tree, "_is_device_leaf", None)
-    try:
-        if callable(is_leaf) and not is_leaf(node):
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    return False
+    if getattr(node, "evicted", False):
+        return True                            # already off the device (on Form A: what a worker's demote gives)
+    gone = not getattr(node, "backuped", True)
+    if not gone:
+        is_leaf = getattr(tree, "_is_device_leaf", None)
+        try:
+            gone = bool(callable(is_leaf) and not is_leaf(node))
+        except Exception:  # noqa: BLE001
+            gone = False
+    if gone and form_a():
+        # MUSS-4: an anchor-only save of a backed leaf neither clears ``backuped`` nor hangs a device child under it;
+        # if it pinned the node anyway, demoting it now would free rows a write still reads -- TP0 keeps it and the
+        # workers demote it: a K21-class split, NAMED (never silent), the residency check (#639b) stops the group
+        _N["form_a_split"] += 1
+        logger.warning("%s FORM-A-SPLIT n=%d node=%s depth=%d backuped=%s: TP0's K15 save left the leaf pinned / not "
+                       "demotable while the workers demote it -- the trees' device residency parts (K21 class)",
+                       MARKER, _N["form_a_split"], getattr(node, "id", "?"), _depth(tree, node),
+                       getattr(node, "backuped", None))
+    return gone
 
 
 def interior_hold(tree: Any, node: Any, cd: Any) -> bool:
@@ -524,8 +583,8 @@ def interior_hold(tree: Any, node: Any, cd: Any) -> bool:
     the tombstone in pass 2 / capped / without a pass is named by :func:`note_interior_loss`)."""
     if not on() or cd is None or getattr(cd, "value", None) is None:
         return False
-    if _role() == "worker" or getattr(tree, HOLD_ATTR, None) is None or in_pass2(tree, node):
-        return False
+    if form_a() or getattr(tree, HOLD_ATTR, None) is None or in_pass2(tree, node):
+        return False   # MUSS-4: Form A holds nothing (the existing K15 save + tombstone runs on every rank alike)
     kind = protected(tree, node)
     if kind is None:
         return False
@@ -542,11 +601,15 @@ def interior_hold(tree: Any, node: Any, cd: Any) -> bool:
 
 def note_interior_loss(tree: Any, node: Any, cd: Any) -> None:
     """Right before an interior tombstone: a protected node still unsecured is named."""
-    if not on() or _role() == "worker":
+    if not on():
+        return
+    role = _role()
+    if role == "worker":
         return
     kind = protected(tree, node)
     if kind is not None and unsecured(tree, node, cd):
-        _note_loss(tree, node, kind, "interior", _occasion(tree, node, getattr(tree, HOLD_ATTR, None) is not None))
+        _note_loss(tree, node, kind, "interior",
+                   "form_a" if role == "host" else _occasion(tree, node, getattr(tree, HOLD_ATTR, None) is not None))
 
 
 def note_pass(tree: Any, held: List[Any], got_pass1: int, request: int, got_after: int, site: str) -> None:
@@ -594,7 +657,15 @@ def rearm_candidates(tree: Any) -> List[Any]:
     """Turn-end anchors for the PARK-REARM pass: the turn-end registry's newest ``REARM_SCAN`` generations (MUSS-1:
     the registry ONLY -- structural, the same on every rank; never ``_s108_anchor_deferred``, which one rank has and
     another lacks and which then filled the pass's 8-key window with candidates every LOCATE vote dropped), still hung
-    into the tree, not evicted, not agreed-secured. Newest first."""
+    into the tree, not evicted, not agreed-secured, WITH a device mamba state. Newest first.
+
+    Nachpruefung MUSS-3 (SOLL R11): the device mamba state is a replica, a host copy is not. A registry node whose
+    device state is gone on every rank but whose host copy one rank alone kept was a candidate on that rank only
+    (``TreeOps._has_anchor`` reads ``host_value``) -- the complete-gather rule then marked it secured there and nowhere
+    else, and once the device state came back ``protected`` / ``interior_hold`` answered per rank (probe P2:
+    marks [True, False]). Only device-resident nodes are candidates: the candidate set -- and so every mark the pass
+    sets off it -- is the same on every rank. A node without device state is held nowhere anyway (``_decide`` /
+    ``interior_hold`` need a device value)."""
     if not on():
         return []
     d = getattr(tree, "__dict__", None) or {}
@@ -606,6 +677,8 @@ def rearm_candidates(tree: Any) -> List[Any]:
             break                              # the registry is ordered by generation: everything older is stale
         if getattr(n, AGREED_ATTR, False) or getattr(n, "evicted", False) or not getattr(n, "hash_value", None):
             continue
+        if getattr(_mamba_cd(tree, n), "value", None) is None:
+            continue                           # MUSS-3: device-resident only (a replica; never a rank-local copy)
         if _in_tree(tree, n):
             out.append(n)
     return out
