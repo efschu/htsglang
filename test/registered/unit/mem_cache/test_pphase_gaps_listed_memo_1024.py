@@ -371,3 +371,19 @@ def test_r4_per_slot_form_with_memo_on_equals_memo_off(tmp_path, monkeypatch):
     l3s.invalidate_stems(a, [a.slot_stem(7)])
     on, off = _both(a, be, monkeypatch)
     assert np.array_equal(on, off) and on.shape[0] == 4
+
+
+def test_in_process_void_then_republish_without_a_census_in_between(tmp_path, monkeypatch):
+    """This process's own LRU took the file (invalidate_stems here) and the write-behind re-published the same
+    generation before any census ran (index lag): ``invalidate_stems`` itself must have forgotten the memo entry --
+    the census-side forget (SOLL 2) never saw the negative record."""
+    n = 64
+    a, be, idx = _arena(tmp_path, n)
+    _REAL_UNSEC(a, be)
+    st = a.slot_stem(17)
+    idx.remove([st])
+    l3s.invalidate_stems(a, [st])
+    l3s.publish(a, np.array([17]), np.array([_gen(a, 17)]))
+    on, off = _both(a, be, monkeypatch)
+    assert _key_lo(a, 17) in set(off.tolist())
+    assert np.array_equal(on, off)
