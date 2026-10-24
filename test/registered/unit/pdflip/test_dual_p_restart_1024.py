@@ -545,6 +545,17 @@ class RespawnRecord(unittest.TestCase):
             self.assertIsNone(S.read_spec(path))
             self.assertIsNone(S.read_spec(os.path.join(d, "missing.json")))
 
+    def test_the_launcher_plans_p_with_its_overhead(self):
+        from flliper.srt.pdflip import launcher as L
+
+        cards = [types.SimpleNamespace(uuid="GPU-%d" % i, nvml_index=i) for i in range(3)]
+        ns = types.SimpleNamespace(dual_layout=True, extra_p="--rank-gpu-memory-mib 6610,5050,5200",
+                                   dual_p_overhead_mib=2500)
+        # specimen 10240650: "D sized from P's PLAN (budget + overhead, MiB): nvml0 9110, nvml1 7550, nvml2 7700"
+        self.assertEqual(L.p_planned_need(cards, [26256, 16128, 15384], ns, lambda m: None), {0: 9110, 1: 7550, 2: 7700})
+        self.assertIsNone(L.p_planned_need(cards, [1, 2, 3], types.SimpleNamespace(dual_layout=False), lambda m: None))
+        self.assertIn("p_planned_need(cards, state.budgets.get(\"P\"), ns, log)", inspect.getsource(L.main))
+
     def test_the_launcher_writes_it_for_the_dual_layout_only(self):
         from flliper.srt.pdflip import launcher as L
 

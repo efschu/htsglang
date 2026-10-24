@@ -13754,6 +13754,21 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
             "form": group_form_block(spec.env)}})
 
 
+def p_planned_need(cards, budgets_p, ns, log: Log) -> Optional[Dict[int, int]]:
+    """S7b review MUSS 1: P's PLANNED peak per NVML card -- budget + overhead, exactly the number
+    ``dual_share_planned_dc`` sizes D against (specimen 10240650: 9110/7550/7700 MiB, the argv budget alone
+    6610/5050/5200). None = not derivable (the front's restart then refuses to spawn, by name)."""
+    if not getattr(ns, "dual_layout", False):
+        return None
+    try:
+        plan = dual_share_planned_dc(cards, list(budgets_p or []), getattr(ns, "extra_p", ""),
+                                     int(getattr(ns, "dual_p_overhead_mib", 1500)))
+        return {int(c.nvml_index): int(plan[c.uuid]) for c in cards}
+    except Exception as e:  # noqa: BLE001 -- named; no plan = no spawn
+        log(f"S7B P-RESPAWN-SPEC: P's planned peak not derivable ({type(e).__name__}: {e})")
+        return None
+
+
 def write_p_respawn_spec(spec: GroupSpec, ns, log: Log, dry: bool,
                          card_need_mib: Optional[Dict[int, int]] = None) -> str:
     """S7b P-RESTART (Auftrag #214): the exec record of group P -- the argv/env/cwd launch_group actually
@@ -28357,14 +28372,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec_p.env.update(dual_share_env(ns, "P"))
     spec_p.env.update(dual_priority_env(ns, "P", log))  # DUAL-SHARE: {} unless a switch is on
     launch_group(spec_p, tree, log, dry)
-    try:  # S7b review MUSS 1: P's PLANNED peak per card (budget + overhead) -- the number D is sized against
-        _s7b_plan = dual_share_planned_dc(cards, state.budgets["P"], getattr(ns, "extra_p", ""),
-                                          int(getattr(ns, "dual_p_overhead_mib", 1500)))
-        _s7b_need = {int(c.nvml_index): int(_s7b_plan[c.uuid]) for c in cards}
-    except Exception as _e7:  # noqa: BLE001 -- no plan = the restart refuses to spawn, named in its line
-        log(f"S7B P-RESPAWN-SPEC: P's planned peak not derivable ({type(_e7).__name__}: {_e7})")
-        _s7b_need = None
-    ns._s7b_spec_path = write_p_respawn_spec(spec_p, ns, log, dry, _s7b_need)  # S7b P-RESTART: dual only, else ''
+    ns._s7b_spec_path = write_p_respawn_spec(spec_p, ns, log, dry, p_planned_need(cards, state.budgets.get("P"), ns, log))
     ns._dual_spec_d = None
     if getattr(ns, "dual_share", False):
         # DUAL-TP3PP3 1b: D boots NOW as the union owner; P holds before its
