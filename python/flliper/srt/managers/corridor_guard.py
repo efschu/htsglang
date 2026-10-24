@@ -544,10 +544,46 @@ FLOOR_DIGEST_FILE_DEFAULT = "corridor_floor_digest.json"
 GROUP_ENV = "FLLIPER_PDFLIP_GROUP"
 
 #: ``{card_uuid: MiB}`` as JSON -- the operator's external headroom, handed to
-#: a child process that has no argv for it (the Weg-2 front). DECLARED HERE,
-#: with the rest of the floor, so the producer (the launcher) and the consumer
-#: (the front) cannot drift apart through two copies of a string.
+#: a child process that has no argv for it (the Weg-2 front, and since #236
+#: every rank of group P and group D through the group env). DECLARED HERE,
+#: with the rest of the floor, so the producer (the launcher) and the consumers
+#: (front, ranks) cannot drift apart through two copies of a string.
 USER_RESERVE_ENV = "FLLIPER_PDFLIP_USER_RESERVE_MIB_BY_CARD"
+
+
+#: #236: raw values of :data:`USER_RESERVE_ENV` already reported by this process
+#: (``None`` = the variable was absent). One line per distinct value, not one
+#: per call -- the floor readers run on every credit wait and every dial.
+_RESERVE_READ_NOTED: set = set()
+
+
+def _note_reserve_read(raw: Optional[str], parsed: Dict[str, int]) -> None:
+    """#236: name, once per process, WHERE this process's reserve came from.
+
+    The rank logs ``source=env:<NAME>`` with the per-card mapping it read, or
+    ``source=none`` when the launcher published nothing -- so a boot log shows
+    at a glance whether a rank priced its floor with the operator's reserve
+    (the front and the launcher print the same mapping on their lines). Never
+    a number the reader invented: ``value`` is the parsed operator input.
+    """
+    if raw in _RESERVE_READ_NOTED:
+        return
+    _RESERVE_READ_NOTED.add(raw)
+    if raw is None:
+        logger.info(
+            "PDFLIP-USER-RESERVE-READ source=none (%s unset: this process prices "
+            "its floor with the --rank-user-reserve-mib scalar fallback or 0) "
+            "value={} pid=%d",
+            USER_RESERVE_ENV,
+            os.getpid(),
+        )
+        return
+    logger.info(
+        "PDFLIP-USER-RESERVE-READ source=env:%s value=%s pid=%d",
+        USER_RESERVE_ENV,
+        dict(sorted(parsed.items())),
+        os.getpid(),
+    )
 
 
 def user_reserve_by_card() -> Dict[str, int]:
@@ -561,11 +597,14 @@ def user_reserve_by_card() -> Dict[str, int]:
     """
     raw = os.environ.get(USER_RESERVE_ENV)
     if not raw:
+        _note_reserve_read(None, {})
         return {}
     try:
         import json
 
-        return {str(k): max(0, int(v)) for k, v in json.loads(raw).items()}
+        parsed = {str(k): max(0, int(v)) for k, v in json.loads(raw).items()}
+        _note_reserve_read(raw, parsed)
+        return parsed
     except Exception:  # noqa: BLE001 - a malformed hint is no reserve, loudly
         logger.warning(
             "PDFLIP-CORRIDOR %s=%r is unreadable; reserve read as 0",
@@ -1104,8 +1143,24 @@ def corridor_floor_for_current_device(
     # is still rank-uniform: it is one CLI value shared by every rank.
     by_card = user_reserve_by_card()
     reserve = by_card.get(uuid)
+    reserve_source = "env-by-card"
     if reserve is None:
         reserve = max(0, int(fallback_reserve_mib or 0))
+        reserve_source = "fallback-scalar" if reserve else "none"
+    # #236: the card this rank resolved and the reserve it will add, once per
+    # (card, value, source) -- the rank-side half of the launcher's
+    # PDFLIP-USER-RESERVE PROVENANCE line.
+    _note_key = ("card", uuid, int(reserve), reserve_source)
+    if _note_key not in _RESERVE_READ_NOTED:
+        _RESERVE_READ_NOTED.add(_note_key)
+        logger.info(
+            "PDFLIP-USER-RESERVE-READ card=%s reserve_mib=%d source=%s group=%s pid=%d",
+            uuid or "?",
+            int(reserve),
+            reserve_source,
+            group,
+            os.getpid(),
+        )
     return corridor_floor_mib(uuid, group=group, user_reserve_mib=reserve)
 
 

@@ -11474,6 +11474,31 @@ def parse_group_env(spec: str) -> Dict[str, str]:
     return canonical_env(out)
 
 
+def user_reserve_env_value(user_reserve_by_card: Dict[str, int]) -> str:
+    """``{card_uuid: MiB}`` -> the value of ``corridor_guard.USER_RESERVE_ENV``.
+
+    #236: ONE serialiser for the front's ``fenv`` and every group's env, so the
+    three consumers (front, P ranks, D ranks) cannot be handed different text
+    for the same mapping.
+    """
+    return json.dumps({u: int(v) for u, v in user_reserve_by_card.items()})
+
+
+def user_reserve_group_env(user_reserve_by_card: Optional[Dict[str, int]]) -> Dict[str, str]:
+    """The group-env entry that carries the operator's reserve to the ranks.
+
+    Empty unless the operator stated a reserve on at least one card:
+    ``parse_user_reserve`` returns ``{uuid: 0}`` for every card when the flag is
+    absent, and publishing that would turn "no reserve stated" into "reserve 0
+    stated" on a rank, which silently beats the rank's own
+    ``--rank-user-reserve-mib`` scalar fallback
+    (``corridor_floor_for_current_device``).
+    """
+    if not user_reserve_by_card or not any(int(v) > 0 for v in user_reserve_by_card.values()):
+        return {}
+    return {corridor_guard.USER_RESERVE_ENV: user_reserve_env_value(user_reserve_by_card)}
+
+
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
               transport: str = "bar1", ring: Optional["HostRingPlan"] = None,
@@ -11522,7 +11547,12 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # pre-form behaviour and FLLIPER_PDFLIP_FORM is popped.
               boot_form: Optional["pdflip_form.PdFlipForm"] = None,
               # 27B FP8 (--fp8-uniform-marlin): one byte layout on every rank.
-              fp8_uniform_marlin: bool = False) -> Dict[str, str]:
+              fp8_uniform_marlin: bool = False,
+              # #236: the operator's per-card external headroom
+              # (``--user-reserve-mib``, ``{card_uuid: MiB}``), handed to EVERY
+              # rank of the group through the group env -- see the block at the
+              # end of this function. None = a desk caller / no reserve stated.
+              user_reserve_by_card: Optional[Dict[str, int]] = None) -> Dict[str, str]:
     # Rename 1b: ONE spelling per variable from here on -- the one this tree
     # reads (name_compat.canonical_env). Every pop, the PHASE_FLIP prefix strip
     # and the per-group overrides below act on that name; an operator's
@@ -11971,6 +12001,27 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # every other boot's environment stays exactly what it was.
     if fp8_uniform_marlin:
         env.update(FP8_UNIFORM_MARLIN_ENV)
+    # #236 (Auftrag, fund of the #233 second review): THE USER RESERVE REACHES
+    # THE RANKS. ``corridor_guard.USER_RESERVE_ENV`` had exactly one setter, the
+    # front's ``fenv`` (main(), below); every rank-side reader of the floor
+    # (``vram_dial``, ``weight_updater._pdflip_corridor_floor_bytes``,
+    # ``corridor_floor_for_current_device`` -> kv_vmm_backing / seam reserve /
+    # extend_trim / phase_flip_runtime) reads the reserve ONLY from this env, so
+    # with ``--user-reserve-mib`` the launcher priced floor = transient + reserve
+    # while every rank priced floor = transient + 0 (the OOM direction).
+    # Group env, so P and D, host and worker of every form inherit it through
+    # ``Popen(env=spec.env)`` -> ``mp.Process`` exactly as FLLIPER_PDFLIP_GROUP
+    # does; the mapping is keyed by card UUID and each rank picks its own card
+    # by ``registry.nvml.current_device_uuid()`` -- never by index.
+    # Launcher OUTPUT (R19 discipline): published only when the operator stated
+    # a reserve (any card > 0), POPPED otherwise, so a value inherited from a
+    # shell never describes a boot it did not resolve and a boot without
+    # ``--user-reserve-mib`` keeps today's env byte for byte (a rank booted with
+    # only a ``--rank-user-reserve-mib`` argv keeps its scalar fallback).
+    # NO NEW MARGIN: the value is the operator's, serialised by the same
+    # function the front uses.
+    env.pop(corridor_guard.USER_RESERVE_ENV, None)
+    env.update(user_reserve_group_env(user_reserve_by_card))
     return env
 
 
@@ -27951,7 +28002,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        "store_dir": expert_store_dir_of(ns),
                        "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
     _estore_id = publish_store_identity(ns.model, _emap, log)
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), user_reserve_by_card=user_reserve_by_card, expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--pdflip-vision-source ram`, named where the
     # P env is built (the line is empty, and nothing is logged, for `disk`).
     # VISION-GGUF: only a transient boot resolves the tower's directory (a GGUF reads it from --tokenizer-path)
@@ -28377,7 +28428,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
-        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), user_reserve_by_card=user_reserve_by_card, expert_map_path=_emap, expert_store_identity=_estore_id)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("FLLIPER_"))
         log(f"PDFLIP-GROUP-ENV D: {_sg or '(leer)'}")
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_only_bind_argv(ns.front_host), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.pdflip_vision, window_mib=ns.d_barlink_bar1_window_mib), ns.transport), state.logs["D"], env_d)
@@ -28434,7 +28485,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_tokvec.line)
         refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "pdflip_boot_form", None), log)
         refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
-        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), user_reserve_by_card=user_reserve_by_card, expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
@@ -28539,7 +28590,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_tokvec.line)
         refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "pdflip_boot_form", None), log)
         refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), user_reserve_by_card=user_reserve_by_card, expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
@@ -29120,9 +29171,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # LINE -- which is the shared surface, in one direction only, so the two
     # cannot disagree.
     if user_reserve_by_card:
-        fenv[corridor_guard.USER_RESERVE_ENV] = json.dumps(
-            {u: int(v) for u, v in user_reserve_by_card.items()}
-        )
+        fenv[corridor_guard.USER_RESERVE_ENV] = user_reserve_env_value(user_reserve_by_card)
     log("front argv: " + " ".join(shlex.quote(a) for a in front_argv))
     ffh = open(front_log, "ab")
     _front_cwd = core_cwd_for(front_log, tree, log)
