@@ -206,3 +206,62 @@ def test_pf_ring_one_plan_at_told_on_every_rank(monkeypatch, attaches):
     else:
         assert plans[0][0][2] == 0, plans          # told 0 on every rank: the old named fallback
         assert getattr(ring.stages[0], "_pf_fallback_n", 0) == 1
+
+
+# ---------------------------------------------------------------------------
+# REVIEW 1024 (Prüffrage 2, SOLL R11): the attach succeeds on ONE follower only -- PP0 stays the one verdict
+
+
+@pytest.mark.parametrize("pp2", ["store_miss", "attach_unconfirmed"])
+def test_review_pf_ring_asymmetric_attach_keeps_one_plan_on_every_rank(monkeypatch, pp2):
+    """PP1 reads and attaches the anchor (acks told), PP2 cannot (store miss) or attaches without the probe
+    confirming it. PP0 must not admit told: one plan, the SAME depth on every stage, below told (0 here: no
+    common anchor), and PP2's ack never names told."""
+    import _told_ring_pf as R
+
+    m = st
+    RID, RTOLD = "aaaa-told", 100_000
+    monkeypatch.delenv("FLLIPER_PDFLIP_TOLD_FIDELITY", raising=False)
+    for k in list(os.environ):
+        if k.startswith("FLLIPER_PDFLIP_TOLD") or k in ("FLLIPER_PDFLIP_P_TWIN_DEFER", m.ENV_FOLLOWER_EARLY_READ):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv(fb.ENV_FALLBACK, "1")
+    monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_SHARE", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_LAYOUT", raising=False)
+    ring = R.Ring(m, monkeypatch, {RID: RTOLD}, {r: {RID: (0.4, 0.6, 0.6)[r]} for r in range(3)})
+    attached = {1: set(), 2: set()}
+    asked = {1: [], 2: []}
+    for r in (1, 2):
+        stage = ring.stages[r]
+
+        def _attach(req, told, _r=r):
+            asked[_r].append(int(told))
+            if _r == 2 and pp2 == "store_miss":
+                return 0
+            attached[_r].add(int(told))
+            return int(told)
+
+        stage.tree_cache.pdflip_follower_state_at_told = _attach
+
+    def probe(scheduler, req, depth):
+        r = scheduler.ps.pp_rank
+        if r == 0:
+            return None
+        if r == 2 and pp2 == "attach_unconfirmed":
+            return 0
+        return int(depth) if int(depth) in attached[r] else 0
+
+    monkeypatch.setattr(m._tf, "rank_resumable", probe)
+    import flliper.srt.managers.pdflip_told_fidelity as tfmod
+
+    monkeypatch.setattr(tfmod, "rank_resumable", probe)
+    monkeypatch.setattr(tfmod, "enabled", lambda: True)
+    ring.arrive(RID)
+    ring.run(120)
+    plans = ring.plans(RID)
+    assert plans[0] == plans[1] == plans[2] and len(plans[0]) == 1, plans
+    assert plans[0][0][2] == 0, plans                    # never told: PP2 cannot resume there
+    assert asked == {1: [RTOLD], 2: [RTOLD]}             # each follower read once, at its acked depth
+    assert getattr(ring.stages[0], "_pf_fallback_n", 0) == 1
+    assert getattr(ring.stages[1], "_pf_ack_state_at_own_n", 0) == 1
+    assert getattr(ring.stages[2], "_pf_ack_state_at_own_n", 0) == 0
