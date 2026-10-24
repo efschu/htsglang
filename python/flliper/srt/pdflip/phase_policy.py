@@ -605,6 +605,15 @@ class SetMember:
     #: that know no per-member X: byte-identical verdicts). The class of a member follows ITS X, S is checked against the
     #: smallest of them.
     x_own: int = 0
+    #: SIBLING-U-1024 (SOLL section 2 "u = uncached Tokens eines Requests (was wirklich prefillt werden muss)", R2, R4,
+    #: R1u): the rid of the EARLIER set member whose prompt brings this member's shared uncached prefix (the member
+    #: ``shared_prefix_discount`` took the overlap from); "" = none. While that member is IN the set, this member's u is
+    #: its REST ``uncached`` (what is really prefilled behind it), so it is classed on the rest (:func:`member_class`); a
+    #: rest under halbX makes it a RIDER (:func:`sibling_riders`): kurz, no trigger, no R4 company, never big, its rest
+    #: NOT in S (R2/R3: a kurz request is no S-counting member; planner decision 24.10.), and it rides the set's verdict
+    #: (R1a). The SAME class decision keeps it out of S (one truth). Without the anchor in the set (left, aborted, sent to D) the member is classed on
+    #: its own figure again (danger direction: a rest priced too small).
+    anchor: str = ""
 
 
 @dataclass(frozen=True)
@@ -632,6 +641,46 @@ def classify_arrival(uncached: int, x_tokens: int, half_frac: float, p_only: boo
     if u >= half_x_of(x_tokens, half_frac):
         return CLASS_HALB
     return CLASS_KURZ
+
+
+def _anchored(m: SetMember, present: "Iterable[str]") -> bool:
+    """SIBLING-U-1024: ``m`` was discounted against an earlier member (``anchor``) that is still in ``present``."""
+    a = str(getattr(m, "anchor", "") or "")
+    return bool(a) and a != m.rid and a in present and int(m.own_uncached or 0) > 0
+
+
+def member_class(m: SetMember, x_class: int, half_frac: float, present: "Iterable[str]" = ()) -> str:
+    """The class of a set member (R2/R3/R4/R9, R2a its own X). SOLL section 2: u = what really must be prefilled. A member
+    whose shared prefix an earlier member IN THE SET (``present``, its ``anchor``) brings is classed on its REST
+    (``uncached``, the R1u union figure: SIBLING-U-1024, duo rc42 14:00:15 pdflip-16-112 own 4677 / rest 163 at X 4096 was
+    classed gross on 4677 and flipped its anchor's R4 wait after 1.5 s); every other member on its own arrival figure as
+    before (``own_uncached or uncached``)."""
+    xm = int(m.x_own) or int(x_class)
+    if m.p_only:
+        return CLASS_P_ONLY
+    if _anchored(m, set(present)):
+        return classify_arrival(int(m.uncached), xm, half_frac, False)
+    return classify_arrival(m.own_uncached or m.uncached, xm, half_frac, False)
+
+
+def sibling_riders(members: Sequence[SetMember], x_class: int, half_frac: float) -> frozenset:
+    """SIBLING-U-1024 (SOLL R2 "nie ein Flip fuer einen kurzen Request", R4 "Flip erst, wenn ein weiterer Halb-/Gross-
+    Request dazukommt", R1a, R1u): the rids of the members that are KURZ on their rest behind an anchor in the set while
+    their own figure is not kurz. Such a member is no trigger (no R4 company, not big) and its rest is NOT in S (R2 "nie
+    ein Flip fuer einen kurzen Request", R3 "halbX <= u < X kommt ins Set": a kurz request is no S-counting member --
+    planner decision 24.10.; R1u's dedupe stays for halb/big members), but it stays in the set and rides its verdict: it cannot go to D at once (R2) because on D, before its anchor is computed, its u is the
+    own figure (4677 > X in the metal case) -- its rest exists only behind the anchor. Anchors must be members of
+    ``members`` (a running D prefill is no anchor here: its overlap stays in the rest as before)."""
+    present = {m.rid for m in members}
+    out = set()
+    for m in members:
+        if m.p_only or not _anchored(m, present):
+            continue
+        xm = int(m.x_own) or int(x_class)
+        if (classify_arrival(int(m.uncached), xm, half_frac, False) == CLASS_KURZ
+                and classify_arrival(int(m.own_uncached), xm, half_frac, False) != CLASS_KURZ):
+            out.add(m.rid)
+    return frozenset(out)
 
 
 def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float, t_half_s: float,
@@ -670,9 +719,15 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     # R1u (user decision 20.10.): S = the tokens to compute NEW, a shared uncached piece once (``uncached`` already is the
     # members' union figure, ``own_uncached`` the figure at arrival: it classes the member, R2, and no longer sums); the
     # running D prefill's rest arrives with its overlap against the members already taken out (``running_overlap``)
-    s = sum(max(0, int(m.uncached)) for m in members) + running
-    classes = [classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or xc, half_frac, m.p_only) for m in members]
+    # SIBLING-U-1024 (SOLL section 2, R2, R4, R1a): a member classed kurz on its rest behind an anchor in the set is a
+    # RIDER -- no R4 company, never big, its rest NOT in S (R1/R2/R3: the same class decision that makes it kurz keeps it
+    # out of the sum; planner decision 24.10.); it rides whatever the set decides (R1a)
+    riders = sibling_riders(members, xc, half_frac)
+    present = {m.rid for m in members}
+    s = sum(max(0, int(m.uncached)) for m in members if m.rid not in riders) + running
+    classes = [member_class(m, xc, half_frac, present) for m in members]
     big = any(c in (CLASS_GROSS, CLASS_P_ONLY) for c in classes)
+    n_trig = len(members) - len(riders)
     t0 = float(t_open) if t_open is not None else min(float(m.t_arrive) for m in members)
     left = max(0.0, float(t_half_s) - (float(now) - t0))
     new = int(new_since_last)
@@ -700,8 +755,8 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
         # R8: decided NOW -- never the S49 hold (a grant D has not begun is not in S: R1, R6 user 18.10.; kurz: R2/R6k)
         return SetVerdict(V_D_AFTER_TIMER, "R8 no decode on D: decided now, S=%d < X=%d" % (s, x), 0.0, s, hx)
     if big:
-        if len(members) >= 2:
-            return _flip("R4 a big member and company (n=%d, S=%d, new=%d)" % (len(members), s, new))
+        if n_trig >= 2:
+            return _flip("R4 a big member and company (n=%d, S=%d, new=%d)" % (n_trig, s, new))
         if left <= 0.0:
             return _flip("R4 T_halb over, big member alone (S=%d)" % s)
         return SetVerdict(V_COLLECT, "R4 big member waits %.1f s for company" % left, left, s, hx)
@@ -734,14 +789,16 @@ def decide(kind: str, **kw) -> "SetDecision":
     members = list(kw.pop("members"))
     half_frac = kw["half_frac"]
     xc = int(kw.get("class_x_tokens") or kw["x_tokens"])
-    keep, out, classes = [], [], []
+    keep, out = [], []
     for m in members:
-        c = classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or xc, half_frac, m.p_only)
-        if c == CLASS_KURZ:
+        # a member kurz on its OWN figure is no member (R2); a sibling kurz only on its rest (SIBLING-U-1024) stays as a
+        # rider -- its anchor must stay in the set for that, so the own-figure filter comes first
+        if classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or xc, half_frac, m.p_only) == CLASS_KURZ:
             out.append(m.rid)
             continue
         keep.append(m)
-        classes.append(c)
+    present = {m.rid for m in keep}
+    classes = [member_class(m, xc, half_frac, present) for m in keep]
     sv = set_verdict(keep, **kw)
     return SetDecision(sv, _rule_tag(sv.why, sv.verdict), tuple(classes), tuple(m.rid for m in keep), tuple(out))
 
@@ -824,11 +881,19 @@ def shared_prefix_discount(entries: Sequence[Tuple[str, int, int, float, str]],
     assumed for D: D's in-batch prefix dedupe (``schedule_policy._compute_prefix_matches``) only runs for the
     cache-aware policies and a cached match <= 32 tokens, so a D set after T_halb is priced at the members' own
     figures (``set_verdict`` sums ``SetMember.own_uncached``); the discount rides the set to P only (``S_P``)."""
-    out: Dict[str, int] = {}
+    return {rid: u for rid, (u, _a) in shared_prefix_discount_anchored(entries, common).items()}
+
+
+def shared_prefix_discount_anchored(entries: Sequence[Tuple[str, int, int, float, str]],
+                                    common: Callable[[str, str], int]) -> Dict[str, Tuple[int, str]]:
+    """:func:`shared_prefix_discount` plus WHO brings the overlap: ``{rid: (uncached', anchor)}``, ``anchor`` = the earlier
+    member of the deepest single overlap (the one the discount is taken from), "" when nothing was discounted.
+    SIBLING-U-1024: the member is classed on its rest only while that anchor is in the set (``SetMember.anchor``)."""
+    out: Dict[str, Tuple[int, str]] = {}
     seen: List[Tuple[str, int, str]] = []
     for rid, u, depth, _t, sess in sorted(entries, key=lambda e: e[3]):
         u = max(0, int(u))
-        best = 0
+        best, anchor = 0, ""
         if sess:
             for arid, adepth, asess in seen:
                 if asess != sess:
@@ -837,8 +902,10 @@ def shared_prefix_discount(entries: Sequence[Tuple[str, int, int, float, str]],
                     c = int(common(arid, rid))
                 except Exception:  # noqa: BLE001 -- a missing prompt discounts nothing
                     c = 0
-                best = max(best, c - max(int(adepth), int(depth)))
-        out[rid] = max(0, u - max(0, best))
+                ov = c - max(int(adepth), int(depth))
+                if ov > best:
+                    best, anchor = ov, arid
+        out[rid] = (max(0, u - max(0, best)), anchor if best > 0 and u > 0 else "")
         seen.append((rid, int(depth), sess))
     return out
 

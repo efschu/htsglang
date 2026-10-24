@@ -15398,6 +15398,14 @@ class Front:
                    for r, u, t, q in items]
         return phase_policy.shared_prefix_discount(entries, lambda a, b: Front._set_common(self, a, b))
 
+    def _set_discount_anchored(self, items: Sequence[Tuple[str, int, float, Any]]) -> Dict[str, Tuple[int, str]]:
+        """:meth:`_set_discount` plus the earlier member each discount is taken from (SIBLING-U-1024, ``SetMember.anchor``:
+        a member is classed on its rest while that anchor is in the set, SOLL section 2 / R2 / R4)."""
+        sess_of = self.__dict__.get("_sess_by_rid") or {}
+        entries = [(r, int(u), Front._set_depth_of(self, r, q), float(t), str(sess_of.get(str(r)) or ""))
+                   for r, u, t, q in items]
+        return phase_policy.shared_prefix_discount_anchored(entries, lambda a, b: Front._set_common(self, a, b))
+
     def _set_x_for(self, rids_depths: Sequence[Tuple[str, int, int]]) -> int:
         """The X the set's S is decided against: SOLL R2a, the smallest own X of the members (each at its own depth),
         nothing else. ``(rid, depth, X at k=1)`` per member. H16V review A2: X(k) = X + (k-1) x P fixed cost is NOT a
@@ -15541,10 +15549,14 @@ class Front:
             xs[rid] = int(tup[2]) if len(tup) > 2 and tup[2] else int(self.tp_prefill_max_tokens)
             depth[rid] = Front._set_depth_of(self, rid)
             raw.append((rid, int(u), float(t), False, None))
-        eff = Front._set_discount(self, [(r, u, t, q) for r, u, t, _p, q in raw])
+        _effa = Front._set_discount_anchored(self, [(r, u, t, q) for r, u, t, _p, q in raw])
+        eff = {r: v[0] for r, v in _effa.items()}
         _xo = _fd.enabled()
+        # SIBLING-U-1024 (SOLL section 2, R2/R4): the member the discount came from rides along as ``anchor`` -- while it is
+        # in the set, the discounted member is classed on its rest (phase_policy.member_class / sibling_riders)
         out = [phase_policy.SetMember(r, eff.get(r, u), t, p, own_uncached=(u if eff.get(r, u) != u else 0),
-                                      x_own=(int(xs.get(r, 0)) if _xo else 0))
+                                      x_own=(int(xs.get(r, 0)) if _xo else 0),
+                                      anchor=(_effa[r][1] if r in _effa and eff.get(r, u) != u else ""))
                for r, u, t, p, _q in raw]
         st["xs"] = xs
         st["depths"] = depth
@@ -16084,12 +16096,22 @@ class Front:
                  verdict: str, why: str, x_tok: int, frac: float, t_half: float, decoding: bool, seats: int,
                  waited: float, x_cls: int = 0, xk: int = 0, unstarted: int = 0) -> None:
         """``PDFLIP SET-VERDICT`` (SOLL section 4), the exact format, once per decision."""
-        classes = [phase_policy.classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or x_cls or x_tok, frac, m.p_only)
-                   for m in members]
+        _present = {m.rid for m in members}
+        classes = [phase_policy.member_class(m, x_cls or x_tok, frac, _present) for m in members]
+        _riders = phase_policy.sibling_riders(members, x_cls or x_tok, frac)
         _shared = sum(m.own_uncached - m.uncached for m in members if m.own_uncached)
+        _rider_rest = sum(max(0, int(m.uncached)) for m in members if m.rid in _riders)
         if _shared > 0:
-            # R1u (20.10.): S is already the union figure (a shared piece once); the own figures only class the members
-            why = "%s [prefix-shared=%d counted once in S (R1u), S_own=%d]" % (why, _shared, int(sv.s_tokens) + _shared)
+            # R1u (20.10.): S is already the union figure (a shared piece once); SIBLING-U-1024: a member behind an anchor
+            # in the set is classed on that same rest, a rider's (kurz) rest is not in S (R2/R3, planner 24.10.)
+            why = "%s [prefix-shared=%d counted once in S (R1u), S_own=%d]" % (why, _shared,
+                                                                            int(sv.s_tokens) + _rider_rest + _shared)
+        if _riders:
+            self.counters["set_sibling_rider"] += 1
+            why = "%s [sibling-rider=%s kurz on its rest behind %s: no trigger, no R4 company, not in S, rides the verdict " \
+                  "(SOLL u = the rest)]" % (why, ",".join("%s:%d" % (m.rid, int(m.uncached)) for m in members
+                                                      if m.rid in _riders),
+                                         ",".join(sorted({m.anchor for m in members if m.rid in _riders})))
         if xk > 0:
             why = "%s xk=%d" % (why, xk)   # H16V review A2: X(k) is information only
         # EZ-S1: ONE record, SET-VERDICT (SOLL section 4, byte-identical to the H91 line) derived from the same data as the
