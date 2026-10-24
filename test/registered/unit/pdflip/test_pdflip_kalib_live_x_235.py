@@ -223,12 +223,33 @@ def test_route_needs_the_boot_admin_key_and_reloads(tmp_path):
     assert _call(f, _Req(body=ValueError("no json"), auth=f"Bearer {f.admin_key}")).status == 400
 
 
-def test_route_without_a_key_serves_loopback_only(tmp_path):
+def test_route_without_a_key_refuses_the_post_for_everyone_even_loopback(tmp_path, caplog):
+    """Review #235 SOLL-3: no admin key on the boot -> the POST is refused entirely (403, named), loopback included;
+    the read stays loopback-only. The refused POST changes nothing."""
+    caplog.set_level(logging.WARNING, logger="pdflip.front")
     f = _front()
     f.admin_key = None
     path = _write(tmp_path, _curves())
     assert _call(f, _Req(body={"path": path})).status == 403
-    assert _call(f, _Req(body={"path": path}, remote="127.0.0.1")).status == 200
+    assert _call(f, _Req(body={"path": path}, remote="127.0.0.1")).status == 403
+    assert _call(f, _Req(body={"path": path}, remote="::1")).status == 403
+    assert f.x_mode == xc.X_MODE_LIVE and f.counters.get("x_curves_reloads", 0) == 0
+    named = [m for m in caplog.messages if m.startswith("PDFLIP X-CURVES POST REFUSED 403")]
+    assert len(named) == 3 and "no admin key" in named[0] and "remote=127.0.0.1" in named[1]
+    assert _call(f, _Req(method="GET")).status == 403                       # read: not loopback
+    assert _call(f, _Req(method="GET", remote="127.0.0.1")).status == 200   # read: loopback
+
+
+def test_route_with_a_key_refuses_loopback_without_the_bearer(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="pdflip.front")
+    f = _front()
+    f.admin_key = "k" * 43
+    path = _write(tmp_path, _curves())
+    assert _call(f, _Req(body={"path": path}, remote="127.0.0.1")).status == 401
+    assert _call(f, _Req(body={"path": path}, remote="127.0.0.1", auth="Bearer nope")).status == 401
+    assert f.x_mode == xc.X_MODE_LIVE
+    named = [m for m in caplog.messages if m.startswith("PDFLIP X-CURVES POST REFUSED 401")]
+    assert len(named) == 2 and "bearer missing" in named[0] and "does not match" in named[1]
 
 
 def test_the_route_is_registered_on_every_boot():

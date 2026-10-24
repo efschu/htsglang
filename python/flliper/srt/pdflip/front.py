@@ -23120,16 +23120,27 @@ class Front:
                 "new": {"x_mode": setup.mode, "x_source": setup.source, "envelope": int(setup.envelope),
                         "cap": setup.cap, "x_by_depth": {str(d): x for d, x in xs.items()}}}
 
-    def _admin_refusal(self, request: web.Request) -> Optional[web.Response]:
-        """KALIB-LIVE-X #235: the admin gate of /pdflip/dual-priority, shared: with an admin key the bearer must match;
-        without one only loopback callers are served. None = admitted."""
+    def _admin_refusal(self, request: web.Request, *, write: bool = False) -> Optional[web.Response]:
+        """KALIB-LIVE-X #235 admin gate. With an admin key the bearer must match (401 otherwise, loopback too). Without
+        one: a WRITE (``write=True``, the POST) is refused outright (403, SOLL-3 of review #235: the protection must not
+        hang on network topology / docker's userland proxy); a read is served to loopback callers only. Every refusal is
+        named in a log line. None = admitted."""
         if self.admin_key:
             import hmac
 
             got = request.headers.get("Authorization", "")
             if not hmac.compare_digest(got.encode(), f"Bearer {self.admin_key}".encode()):
+                logger.warning("PDFLIP X-CURVES %s REFUSED 401: no valid admin key in the request (remote=%s, %s) -- X "
+                               "source unchanged", request.method, request.remote,
+                               "bearer missing" if not got else "bearer does not match this boot's admin key")
                 return web.json_response({"error": "unauthorized"}, status=401)
+        elif write:
+            logger.warning("PDFLIP X-CURVES %s REFUSED 403: this boot has no admin key, the route's write is refused for "
+                           "every caller incl. loopback (remote=%s) -- X source unchanged", request.method, request.remote)
+            return web.json_response({"error": "no admin key on this boot: x-curves write refused"}, status=403)
         elif (request.remote or "") not in ("127.0.0.1", "::1", "localhost"):
+            logger.warning("PDFLIP X-CURVES %s REFUSED 403: loopback-only read (no admin key on this boot, remote=%s)",
+                           request.method, request.remote)
             return web.json_response({"error": "loopback-only (no admin key on this boot)"}, status=403)
         return None
 
@@ -23137,7 +23148,7 @@ class Front:
         """KALIB-LIVE-X #235 admin route ``/pdflip/x-curves``: GET = the X source in force; POST {"path": <curve file
         as the front sees it>, "who"?: <caller>} = :meth:`reload_x_curves` (200 switched, 409 refused by name, the old
         X source kept). Called by the rotation's kalib_boot.py right after it activated this boot's curve."""
-        refused = Front._admin_refusal(self, request)
+        refused = Front._admin_refusal(self, request, write=request.method != "GET")
         if refused is not None:
             return refused
         if request.method == "GET":
