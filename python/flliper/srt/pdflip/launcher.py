@@ -14674,13 +14674,17 @@ def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int
                 f"under is unknown (boots {','.join(boots) or '-'}) -- no delta booked (named, not "
                 f"guessed); re-measured under the current line the rest already contains it")
         return [0] * n
-    from flliper.srt.pdflip.extend_trim import line_for_floor_mib
+    from flliper.srt.pdflip.extend_trim import line_for_floor_mib, near_oom_mib
 
     # reserve 0 BY DESIGN: the booked path charges no user reserve, and a reserve here
     # would book a forbidden corridor reserve as "line" (keine-korridor-reserve-nie)
     floors = corridor_budget.floors_for_cards(cards, group, 0)
-    lines = [line_for_floor_mib(floors[c.uuid].mib) for c in cards]
     act = [bool(floors[c.uuid].measured) for c in cards]
+    # VOTE-LINE-SINGLE: on a measured floor the line is near-OOM + the measured fixed part (the same record the
+    # ranks vote with, d_extend_vote_fixed_env) -- the floor is the activation rate x rows already prices
+    fixed, fixed_src = d_extend_vote_fixed_record(profile, n)
+    lines = [line_for_floor_mib(floors[c.uuid].mib, fixed[i] if (fixed is not None and act[i]) else None)
+             for i, c in enumerate(cards)]
     form_why: List[Optional[str]] = [None] * n
     uuids = [c.uuid for c in cards]
     _stores: Dict[str, object] = {}
@@ -14710,11 +14714,62 @@ def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int
                 reason = f" -> 0: the floor is not of this form ({form_why[i]})"
             elif not act[i]:
                 reason = " -> 0: the floor is not measured (an unmeasured or hand-set law cuts no KV for the vote line)"
+            if fixed is not None and act[i]:
+                what = (f"{_budget_rest.VOTE_FIXED_MARKER}: near-OOM {near_oom_mib():.0f} + fixed "
+                        f"{fixed[i]:.0f} ({_budget_rest.VOTE_FIXED_RECORD}, {fixed_src}); floor {cf.mib} "
+                        f"source={cf.source} is the activation rate x rows prices, not held twice")
+            else:
+                what = f"max(300, floor {cf.mib} source={cf.source})"
             log(f"{_budget_rest.VOTE_LINE_MARKER} group={group} ordinal={i} nvml{c.nvml_index}: "
                 f"delta {deltas[i]} MiB {_budget_rest.VOTE_LINE_BASIS} = ceil8(vote line {lines[i]:.0f} "
-                f"(max(300, floor {cf.mib} source={cf.source})) - record line {rec_line} ({name}, "
-                f"rc12g halt line of its boots))" + reason)
+                f"({what}) - record line {rec_line} ({name}, rc12g halt line of its boots))" + reason)
     return deltas
+
+
+def d_extend_vote_fixed_record(profile: Optional[str] = None,
+                               n: Optional[int] = None) -> Tuple[Optional[List[float]], str]:
+    """VOTE-LINE-SINGLE: the profile's ``D_EXTEND_VOTE_FIXED_MIB`` per card (one value covers every card) and its
+    boots, or ``(None, why)`` -- no record (other profiles, Next Flash), the switch off
+    (``FLLIPER_PDFLIP_VOTE_LINE_SINGLE=0``), or a vector that does not fit ``n`` cards. The ranks' env
+    (:func:`_d_extend_vote_fixed_env`) and the budget's delta read this ONE reader."""
+    if not _budget_rest.vote_line_single_on():
+        return None, f"{_budget_rest.VOTE_LINE_SINGLE_ENV}=0"
+    try:
+        vals = list(_pconst(_budget_rest.VOTE_FIXED_RECORD, profile))
+    except (KeyError, TypeError):
+        return None, f"no {_budget_rest.VOTE_FIXED_RECORD} record"
+    if not vals or any(v is None for v in vals):
+        return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} has an unmeasured card"
+    if n is not None and len(vals) not in (1, int(n)):
+        return None, f"{_budget_rest.VOTE_FIXED_RECORD} {vals!r} does not fit {n} cards"
+    out = [float(v) for v in vals]
+    if n is not None and len(out) == 1:
+        out = out * int(n)
+    return out, _pconst_boots(_budget_rest.VOTE_FIXED_RECORD, profile)
+
+
+def _d_extend_vote_fixed_env(ns, log, label: str) -> Optional[str]:
+    """VOTE-LINE-SINGLE: wherever the launcher armed the D width vote, hand the ranks the measured fixed part
+    (``FLLIPER_PDFLIP_EXTEND_VOTE_FIXED_MIB`` from ``D_EXTEND_VOTE_FIXED_MIB``): a rank whose corridor floor is
+    MEASURED then votes with ``near-OOM 400 + fixed`` and trims before the forward under ``line + rate x rows``
+    (extend_trim.corridor_line_mib / need_trim_threshold) -- the line the budget books
+    (:func:`booked_rest_vote_line_deltas`). A value named in --env-d wins; no record / switch off = nothing written."""
+    vals, src = d_extend_vote_fixed_record(getattr(ns, "profile", None))
+    if vals is None:
+        return None
+    text = ",".join(f"{v:g}" for v in vals)
+    _env_d = getattr(ns, "env_d", "") or ""
+    _have = parse_group_env(_env_d)
+    _given = _budget_rest.VOTE_FIXED_ENV in _have and str(_have.get(_budget_rest.VOTE_FIXED_ENV, "")).strip() != text
+    if not _given:
+        ns.env_d = set_group_env(_env_d, _budget_rest.VOTE_FIXED_ENV, text)
+    _now = str(parse_group_env(getattr(ns, "env_d", "") or "").get(_budget_rest.VOTE_FIXED_ENV, "")).strip()
+    log(f"{D_RANK_SOLVE_MARKER} {label} {_budget_rest.VOTE_FIXED_MARKER} {_budget_rest.VOTE_FIXED_ENV}={_now}"
+        f"{' (aus --env-d, Vorrang)' if _given else ''} ({_budget_rest.VOTE_FIXED_RECORD} {vals}, {src}; "
+        f"{_budget_rest.VOTE_FIXED_BASIS}): ein Rang mit GEMESSENEM Boden stimmt mit der Linie near-OOM + fixed statt "
+        f"mit dem Boden ab (der Boden ist die Aktivierung, die Rate x Zeilen schon bepreist) und trimmt vor dem "
+        f"Forward unter Linie + Rate x Zeilen")
+    return _now
 
 
 def torch_cache_cap_armed(ns) -> bool:
@@ -20456,6 +20511,7 @@ def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
     if _rtext:
         _d_extend_cap_floor_env(ns, log, label)
         _d_extend_flip_trim_env(ns, log, label, _rtext)
+        _d_extend_vote_fixed_env(ns, log, label)
     return _rtext
 
 
@@ -20660,7 +20716,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                 f"({_budget_rest.OVERHANG_MARKER}: physische Linie je Rang = Budget + gebuchter "
                 f"Rest - {_budget_rest.other_record_name('D')} = total - carve - dormant_other - "
                 f"nicht-torch; das Verdikt bucht hier kein fremd/nicht-torch)")
-            _d_extend_cap_rate_env(ns, log, label)
+            if _d_extend_cap_rate_env(ns, log, label):
+                _d_extend_vote_fixed_env(ns, log, label)
         else:
             _caps = _tcc.launcher_caps(rank_verdicts, _floor)
             ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
