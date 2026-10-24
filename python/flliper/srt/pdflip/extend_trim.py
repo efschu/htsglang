@@ -54,7 +54,9 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           "line": _UNSET,
           # VOTE-LINE-SINGLE (24.10.): the measured non-row part per rank (env, read once), and whether
           # this rank's line is the single line (near-OOM + that part) -- set with "line"
-          "vote_fixed": _UNSET, "single": False}
+          "vote_fixed": _UNSET, "single": False,
+          # TRIM-LAW (#201): the static threshold was checked against this rank's own line (once per process)
+          "law_lifted": False}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -109,6 +111,7 @@ def reset_for_tests() -> None:
     _CACHE["line"] = _UNSET
     _CACHE["vote_fixed"] = _UNSET
     _CACHE["single"] = False
+    _CACHE["law_lifted"] = False
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -532,8 +535,10 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         rate = effective_rate(rate, rank)
         if bool(cuda.is_current_stream_capturing()):
             return None
+        # TRIM-LAW (#201): the static threshold never under this card's own line + floor chunk (once per process)
+        thr = lift_threshold_to_law(rank, start_rate, int(configured), page_size)
         if not _CACHE["armed"]:
-            if maybe_trim(cuda, rank, threshold_for(rank, thresholds()), clock) is not None:
+            if maybe_trim(cuda, rank, thr, clock) is not None:
                 _CACHE["armed"] = True
         post, _total = cuda.mem_get_info()
         post_mib = post / MIB
@@ -672,12 +677,17 @@ def floor_rows(configured: int, page_size: int) -> int:
     return max(page, (int(configured) // CAP_FLOOR_DIV // page) * page)
 
 
-def flip_trim_thresholds(rates_text: str, configured: int, page_size: int, line_mib: float) -> str:
+def flip_trim_thresholds(rates_text: str, configured: int, page_size: int, line_mib) -> str:
     """27B int4ar 23.10. (D TP2 2x3080, boot ..._a45112428e_1023_140032): the trim threshold the flip arm writes
     when the profile names none -- per rank ``ceil(line + floor_rows(configured) x rate)``, i.e. the driver free a
     card needs for the vote to fund at least the floor chunk above the corridor line. Under it the trim hands the
     fully free segments of the allocator cache back to the driver before the extend (``maybe_trim``), so the vote
     reads what the card really has. A rank without a rate (``0``) gets ``0`` = never trims.
+
+    TRIM-LAW (#201, 24.10.): ``line_mib`` is a scalar (every rank) or one line PER RANK -- the line of that rank's
+    own card (launcher :func:`d_card_vote_lines`, the same line the rank's vote keeps). A per-rank vector whose length
+    does not match the rates is never zipped short: every rank then gets the HIGHEST of the lines (a threshold under a
+    card's line is the OOM direction, one over it only trims earlier).
 
     Why the flip arm needs it: the vote funds from DRIVER free alone (a4f4b8fec1), so without a trim the cache that
     decode and extend leave behind is never returned and the vote starves. Metal: the int4ar profile (derived from
@@ -687,15 +697,90 @@ def flip_trim_thresholds(rates_text: str, configured: int, page_size: int, line_
     vals = [x.strip() for x in str(rates_text or "").split(",") if x.strip()]
     if not vals:
         return ""
+    if isinstance(line_mib, (int, float)):
+        lines = [float(line_mib)] * len(vals)
+    else:
+        lv = [float(x) for x in line_mib]
+        if not lv:
+            raise ValueError("flip_trim_thresholds: an empty line vector prices no rank")
+        lines = lv if len(lv) == len(vals) else [max(lv)] * len(vals)
     rows = floor_rows(configured, page_size)
     out = []
-    for v in vals:
+    for v, ln in zip(vals, lines):
         try:
             r = float(v)
         except ValueError:
             r = 0.0
-        out.append("0" if r <= 0 else str(int(math.ceil(float(line_mib) + rows * r))))
+        out.append("0" if r <= 0 else str(int(math.ceil(ln + rows * r))))
     return ",".join(out)
+
+
+# --------------------------------------------------------------------------
+# TRIM-LAW (#201, Unify-RISK (c), 24.10.): the static trim threshold never sits under this rank's OWN line.
+#
+# The flip arm's threshold is ``ceil(line + floor_rows x rate)`` -- the driver free at which the vote funds at least
+# the floor chunk above the line the vote keeps (:func:`corridor_line_mib`). The launcher now prices it with each D
+# card's own line (``launcher.d_card_vote_lines``); before it priced every rank with the stated law 1024. The launcher
+# reads the published floor pointer BEFORE the D process exists, the rank reads it at its first vote -- after a D
+# process whose own footprint exists republished it -- so the two can still name different lines. Over the rank's
+# line a threshold only trims earlier; UNDER it the card sits between ``threshold`` and ``line + floor chunk`` with an
+# untrimmed cache, the vote funds less than the floor chunk above its line, the Q-710 floor raises it to what the
+# whole free card funds, and the forward ends under the card's law (the danger direction of the ticket).
+#
+# So the rank lifts its own entry once, at its first vote (where the configured width and page are known), to
+# ``ceil(corridor_line_mib(rank) + floor_rows(configured, page) x start rate)`` -- the launcher's formula on the
+# rank's own terms -- and says so (``TRIM-LAW-LIFT``). Never lowered (a higher hand value, e.g. the INT8 profile's
+# ``1200,1100,800``, stays byte for byte), never armed where there is none (no env value, ``0`` = never trims, no
+# rate): nothing in this process trims that did not trim before, it only trims no LATER than its own line requires.
+# The lift writes into the parsed threshold list itself, so every reader of :func:`thresholds` (the vote's trim, the
+# forward trim, an admission trim) reads one value. Rank-local memory care: no verdict, no width rule, no collective
+# (SOLL R11 untouched; the width stays the group's MIN). No reserve: line, floor chunk and rate are the vote's own.
+# --------------------------------------------------------------------------
+
+LAW_LIFT_MARKER = "TRIM-LAW-LIFT"
+
+
+def law_bound_threshold(rank: int, start_rate: float, configured: int, page_size: int) -> Optional[float]:
+    """The lowest static threshold this rank's own line allows: ``ceil(corridor_line_mib(rank) +
+    floor_rows(configured, page_size) x start_rate)``; ``None`` without a rate or a width. Pure in its inputs
+    but for the once-per-process line read."""
+    if start_rate is None or float(start_rate) <= 0 or int(configured) <= 0:
+        return None
+    return float(math.ceil(corridor_line_mib(int(rank)) + floor_rows(configured, page_size) * float(start_rate)))
+
+
+def lift_threshold_to_law(rank: int, start_rate: float, configured: int, page_size: int) -> Optional[float]:
+    """Once per process: raise this rank's entry of the parsed static threshold to :func:`law_bound_threshold` when
+    it is under it, log the lift; returns the threshold in force for the rank afterwards (``None`` = no static
+    threshold). Never raises (an unreadable line lifts nothing)."""
+    if _CACHE["law_lifted"]:
+        return threshold_for(int(rank), thresholds())
+    _CACHE["law_lifted"] = True
+    vals = thresholds()
+    thr = threshold_for(int(rank), vals)
+    if thr is None or thr <= 0:
+        return thr
+    try:
+        need = law_bound_threshold(int(rank), start_rate, configured, page_size)
+    except Exception as exc:  # noqa: BLE001 -- no line, no lift (the launcher's value stands)
+        logger.debug("%s skipped: %s", LAW_LIFT_MARKER, exc)
+        return thr
+    if need is None or thr >= need:
+        return thr
+    new = list(vals or [])
+    if len(new) == 1:
+        new = [float(need)]  # one process = one rank: a single value covers only this process
+    elif 0 <= int(rank) < len(new):
+        new[int(rank)] = float(need)
+    else:
+        return thr
+    _CACHE["thresholds"] = new
+    logger.info(f"{LAW_LIFT_MARKER} rank={int(rank)} threshold={thr:.0f} -> {need:.0f} (= ceil(line "
+                f"{corridor_line_mib(int(rank)):.0f} + floor chunk {floor_rows(configured, page_size)} x rate "
+                f"{float(start_rate):.4f}); the launcher priced a line under this card's own -- under it the vote "
+                f"could not fund the floor chunk above the card's law with the cache untrimmed; never lowered, no "
+                f"reserve")
+    return float(need)
 
 
 def floored_width(cap: int, post_mib: float, rate: float, configured: int, page_size: int) -> int:

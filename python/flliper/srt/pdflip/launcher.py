@@ -14646,6 +14646,46 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
     return {"booked_rest_mib": rests, "booked_rest_provenance": prov}
 
 
+def d_card_vote_lines(cards: Sequence[Card], group: str = "D", fixed: Optional[Sequence[float]] = None):
+    """THE LINE OF THE CARD, ONE READER for the launcher (PDFLIP-VOTE-LINE-BOOK and, #201 TRIM-LAW, the flip arm's
+    trim threshold): per D ordinal ``i`` (``cards[i]`` = the NVML-identified card of D rank ``i``, its ``uuid`` from
+    ``card_identity``, never torch order) the corridor floor (``corridor_budget.floors_for_cards``, reserve 0 -- the
+    rank's own read ``corridor_floor_for_current_device`` gets no user reserve either, and a reserve in a line is
+    forbidden: keine-korridor-reserve-nie), the vote line ``extend_trim.line_for_floor_mib(floor, fixed[i] if
+    measured)`` -- the formula :func:`extend_trim.corridor_line_mib` evaluates on the rank -- and whether that line is
+    USABLE: the floor is MEASURED and its footprint store is of THIS form (review S3,
+    ``budget_rest.footprint_form_mismatch``: the launcher reads the LAST published D digest). Returns
+    ``(floors by uuid, lines, usable, why-not-of-this-form)``."""
+    from flliper.srt.pdflip.extend_trim import line_for_floor_mib
+
+    n = len(cards)
+    # reserve 0 BY DESIGN: the booked path charges no user reserve, and a reserve here
+    # would book a forbidden corridor reserve as "line" (keine-korridor-reserve-nie)
+    floors = corridor_budget.floors_for_cards(cards, group, 0)
+    act = [bool(floors[c.uuid].measured) for c in cards]
+    lines = [line_for_floor_mib(floors[c.uuid].mib, fixed[i] if (fixed is not None and act[i]) else None)
+             for i, c in enumerate(cards)]
+    form_why: List[Optional[str]] = [None] * n
+    uuids = [c.uuid for c in cards]
+    _stores: Dict[str, object] = {}
+    for i, c in enumerate(cards):
+        if not act[i]:
+            continue
+        path = str(floors[c.uuid].provenance or "").split("#", 1)[0].strip()
+        if path not in _stores:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    _stores[path] = json.load(fh) or {}
+            except Exception as exc:  # noqa: BLE001 -- an unreadable store books nothing
+                _stores[path] = f"footprint store {path or '-'} unreadable ({type(exc).__name__})"
+        st = _stores[path]
+        why = st if isinstance(st, str) else _budget_rest.footprint_form_mismatch(st, uuids)
+        if why is not None:
+            act[i] = False
+            form_why[i] = why
+    return floors, lines, act, form_why
+
+
 def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int]], name: str,
                                  profile: Optional[str] = None, group: str = "D",
                                  log: Optional[Log] = None) -> List[int]:
@@ -14674,38 +14714,15 @@ def booked_rest_vote_line_deltas(cards: List[Card], rests: Sequence[Optional[int
                 f"under is unknown (boots {','.join(boots) or '-'}) -- no delta booked (named, not "
                 f"guessed); re-measured under the current line the rest already contains it")
         return [0] * n
-    from flliper.srt.pdflip.extend_trim import line_for_floor_mib, near_oom_mib
+    from flliper.srt.pdflip.extend_trim import near_oom_mib
 
-    # reserve 0 BY DESIGN: the booked path charges no user reserve, and a reserve here
-    # would book a forbidden corridor reserve as "line" (keine-korridor-reserve-nie)
-    floors = corridor_budget.floors_for_cards(cards, group, 0)
-    act = [bool(floors[c.uuid].measured) for c in cards]
     # VOTE-LINE-SINGLE: on a measured floor the line is near-OOM + the measured fixed part (the same record the
     # ranks vote with, d_extend_vote_fixed_env) -- the floor is the activation rate x rows already prices
     fixed, fixed_src = d_extend_vote_fixed_record(profile, n, cards)
     if fixed is None and log is not None and (fixed_src.startswith("F unmeasured") or "name no form" in fixed_src):
         log(f"{_budget_rest.VOTE_LINE_MARKER} group={group}: {_budget_rest.VOTE_FIXED_MARKER} off -- {fixed_src}; "
             f"the delta books the floor line (review M1 form gate)")
-    lines = [line_for_floor_mib(floors[c.uuid].mib, fixed[i] if (fixed is not None and act[i]) else None)
-             for i, c in enumerate(cards)]
-    form_why: List[Optional[str]] = [None] * n
-    uuids = [c.uuid for c in cards]
-    _stores: Dict[str, object] = {}
-    for i, c in enumerate(cards):
-        if not act[i]:
-            continue
-        path = str(floors[c.uuid].provenance or "").split("#", 1)[0].strip()
-        if path not in _stores:
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    _stores[path] = json.load(fh) or {}
-            except Exception as exc:  # noqa: BLE001 -- an unreadable store books nothing
-                _stores[path] = f"footprint store {path or '-'} unreadable ({type(exc).__name__})"
-        st = _stores[path]
-        why = st if isinstance(st, str) else _budget_rest.footprint_form_mismatch(st, uuids)
-        if why is not None:
-            act[i] = False
-            form_why[i] = why
+    floors, lines, act, form_why = d_card_vote_lines(cards, group, fixed)
     deltas = _budget_rest.vote_line_deltas(rests, lines, act, rec_line)
     if log is not None:
         for i, c in enumerate(cards):
@@ -20535,8 +20552,10 @@ def _d_extend_flip_rate_env(ns, log, label: str, cards: Optional[Sequence[Card]]
     _rtext = _d_extend_cap_rate_env(ns, log, label, capped=False)
     if _rtext:
         _d_extend_cap_floor_env(ns, log, label)
-        _d_extend_flip_trim_env(ns, log, label, _rtext)
+        # #201 TRIM-LAW: the fixed part first -- the trim threshold prices the line the ranks will keep, and under
+        # VOTE-LINE-SINGLE that line reads the fixed part from this same env
         _d_extend_vote_fixed_env(ns, log, label, cards)
+        _d_extend_flip_trim_env(ns, log, label, _rtext, cards)
     return _rtext
 
 
@@ -20545,7 +20564,53 @@ EXTEND_TRIM_FLIP_MARKER = "EXTEND-TRIM-FLIP"
 EXTEND_TRIM_ENV = "FLLIPER_PDFLIP_EXTEND_TRIM_MIB"
 
 
-def _d_extend_flip_trim_env(ns, log, label: str, rtext: str) -> Optional[str]:
+def d_flip_trim_lines(ns, cards: Optional[Sequence[Card]], n: int) -> Tuple[List[float], List[str]]:
+    """#201 TRIM-LAW (Unify-RISK (c)): the corridor line per D rank the flip arm's trim threshold is priced on, with
+    its source -- the line of the rank's OWN card (:func:`d_card_vote_lines`, the one launcher reader of the card law,
+    the same line PDFLIP-VOTE-LINE-BOOK books and the rank's vote keeps): ``cards[r]`` is D rank ``r``'s card by NVML
+    UUID. Under VOTE-LINE-SINGLE the fixed part is the one in ``ns.env_d`` (what the ranks read). Where no line of
+    this card is usable -- no D cards at this call, a rank count that does not match, an unmeasured / hand-set floor,
+    a footprint of another form -- the rank gets the STATED LAW ``corridor_law_mib()`` (the pre-#201 value), and the
+    source says why (``Rueckfall Korridor-Gesetz``). The rank lifts a threshold under its own line itself
+    (``extend_trim.lift_threshold_to_law``), so a launcher read that names another line than the rank's can only
+    trim earlier, never later."""
+    law = float(corridor_guard.corridor_law_mib())
+    if cards is None or len(list(cards)) != int(n):
+        why = ("keine D-Karten an dieser Stelle" if cards is None
+               else f"{len(list(cards))} D-Karten fuer {int(n)} Raten")
+        return [law] * int(n), [f"Rueckfall Korridor-Gesetz {law:.0f} ({why})"] * int(n)
+    cards = list(cards)
+    fixed = None
+    raw = str(parse_group_env(getattr(ns, "env_d", "") or "").get(_budget_rest.VOTE_FIXED_ENV, "") or "").strip()
+    if raw:
+        try:
+            fv = [float(x) for x in raw.split(",") if x.strip()]
+            fixed = (fv * int(n)) if len(fv) == 1 else (fv if len(fv) == int(n) else None)
+        except ValueError:
+            fixed = None
+    try:
+        floors, lines, usable, form_why = d_card_vote_lines(cards, "D", fixed)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable card law: the stated law, named
+        why = f"Kartengesetz unlesbar ({type(exc).__name__}: {exc})"
+        return [law] * int(n), [f"Rueckfall Korridor-Gesetz {law:.0f} ({why})"] * int(n)
+    out: List[float] = []
+    srcs: List[str] = []
+    for r, c in enumerate(cards):
+        cf = floors[c.uuid]
+        if usable[r]:
+            out.append(float(lines[r]))
+            single = fixed is not None  # usable implies measured, and a measured floor takes the fixed part
+            srcs.append(f"Kartengesetz {float(lines[r]):.0f} ({cf.source}:{cf.mib}"
+                        + (", VOTE-LINE-SINGLE near-OOM + fixed" if single else "") + ")")
+        else:
+            why = form_why[r] if form_why[r] is not None else f"Boden {cf.source}:{cf.mib} nicht gemessen"
+            out.append(law)
+            srcs.append(f"Rueckfall Korridor-Gesetz {law:.0f} ({why})")
+    return out, srcs
+
+
+def _d_extend_flip_trim_env(ns, log, label: str, rtext: str,
+                            cards: Optional[Sequence[Card]] = None) -> Optional[str]:
     """27B int4ar 23.10. (D TP2 2x3080, boot dkr27bint4arbar1int4ar10231400 a45112428e, D.log _1023_140032): wherever
     the flip arm armed the vote (Q-694 rate + Q-710 floor), arm the rc12e trim too -- a value named in --env-d wins.
 
@@ -20556,15 +20621,21 @@ def _d_extend_flip_trim_env(ns, log, label: str, rtext: str) -> Optional[str]:
     the corridor rule), reserved 18.4 GiB vs 17.2 GiB allocated, every vote 1 row, the Q-710 floor raised it to 256
     (128-135 at 40 MiB free) -- 21003 D tokens in 137 extends, ~426 tok/s wall.
 
-    Threshold per rank = ``ceil(stated corridor law + floor_rows(CHUNKED_PREFILL_TOKENS) x rate)``
+    Threshold per rank = ``ceil(line of the rank's card + floor_rows(CHUNKED_PREFILL_TOKENS) x rate)``
     (:func:`extend_trim.flip_trim_thresholds`): the driver free at which the vote funds at least the floor chunk
-    above the line; under it the extend first hands the fully free cache segments back. No reserve, no new term: the
-    law, the floor chunk and the rate are the ones the vote itself uses. Dual layout / P0 / Next Flash never reach
-    this (they never reach :func:`_d_extend_flip_rate_env`'s armed branch)."""
+    above the line; under it the extend first hands the fully free cache segments back. #201 TRIM-LAW (24.10.): the
+    line is the rank's OWN card's (:func:`d_flip_trim_lines`, D rank -> card UUID from ``cards``), not the stated law
+    for every rank: a MEASURED card whose line is under 1024 trims no earlier than its law needs, one over 1024 is no
+    longer priced under its line (the OOM direction). Unmeasured / foreign-form / no cards: the stated law, named.
+    No reserve, no new term: the line, the floor chunk and the rate are the ones the vote itself uses. Dual layout /
+    P0 / Next Flash never reach this (they never reach :func:`_d_extend_flip_rate_env`'s armed branch)."""
     from flliper.srt.pdflip import extend_trim as _et
 
-    line = float(corridor_guard.corridor_law_mib())
-    value = _et.flip_trim_thresholds(rtext, CHUNKED_PREFILL_TOKENS, 1, line)
+    n = len([x for x in str(rtext or "").split(",") if x.strip()])
+    if n <= 0:
+        return None
+    lines, srcs = d_flip_trim_lines(ns, cards, n)
+    value = _et.flip_trim_thresholds(rtext, CHUNKED_PREFILL_TOKENS, 1, lines)
     if not value:
         return None
     _env_d = getattr(ns, "env_d", "") or ""
@@ -20574,11 +20645,19 @@ def _d_extend_flip_trim_env(ns, log, label: str, rtext: str) -> Optional[str]:
     if not _given:
         ns.env_d = set_group_env(_env_d, EXTEND_TRIM_ENV, value)
     _now = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_TRIM_ENV, "")).strip()
+    _rows = _et.floor_rows(CHUNKED_PREFILL_TOKENS, 1)
+    _per = " | ".join(
+        f"rang{r}" + (f" nvml{cards[r].nvml_index}" if cards is not None and len(list(cards)) == n else "")
+        + f": {srcs[r]} -> {value.split(',')[r]}" for r in range(n))
     log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_TRIM_FLIP_MARKER} {EXTEND_TRIM_ENV}={_now}"
-        f"{' (aus --env-d gesetzt, unveraendert)' if _given else ''} (je Rang ceil(Korridor-Gesetz {line:.0f} + "
-        f"Bodenchunk {_et.floor_rows(CHUNKED_PREFILL_TOKENS, 1)} x Rate); darunter gibt D vor dem Extend die ganz "
-        f"freien Cache-Segmente an den Treiber zurueck, damit die Breitenabstimmung den echten Kartenstand liest)")
+        f"{' (aus --env-d gesetzt, unveraendert; berechnet ' + value + ')' if _given else ''} (je Rang ceil(Linie der "
+        f"eigenen Karte + Bodenchunk {_rows} x Rate); darunter gibt D vor dem Extend die ganz freien Cache-Segmente an "
+        f"den Treiber zurueck, damit die Breitenabstimmung den echten Kartenstand liest) [{TRIM_LAW_MARKER} {_per}]")
     return _now
+
+
+#: #201: the per-rank provenance of the flip arm's trim threshold (card law or the named stated-law fallback)
+TRIM_LAW_MARKER = "TRIM-LAW"
 
 
 #: Q-710: the arming variable of the chunk-cap floor (the vote never crawls)
