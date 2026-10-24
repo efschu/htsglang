@@ -816,7 +816,9 @@ def stage_fixed_checkpoint_delta(
 
     ONE-SIDED ON PURPOSE.  A larger non-layer payload than the reference's is
     ADDED (it is resident, header bytes are exact).  A SMALLER one (e.g. an
-    NVFP4 ``lm_head`` of 682 MiB against the reference's BF16 2425) is NOT
+    NVFP4 ``lm_head`` -- 606.2 MiB of ``lm_head.weight`` in the headers,
+    its scale tensors are not counted by ``checkpoint_weight_terms`` -- against
+    the reference's BF16 2425) is NOT
     credited: crediting it raises the priced pool, which is the direction a
     wrong post OOMs in, and no boot of such a form has yet measured the
     stage-fixed post the credit would rest on.  The uncredited MiB are named on
@@ -836,8 +838,9 @@ def stage_fixed_checkpoint_delta(
     add[-1] += max(0.0, d_head)
     out = tuple(v + a for v, a in zip(fixed, add))
     not_credited = [
-        "%s %+.1f MiB" % (name, d)
-        for name, d in (("embedding", d_emb), ("lm_head", d_head))
+        ("%s absent from the headers (tied to the embedding?) %+.1f MiB" % (name, d))
+        if float(got) <= 0.0 else ("%s %+.1f MiB" % (name, d))
+        for name, d, got in (("embedding", d_emb, embedding_mib), ("lm_head", d_head, lm_head_mib))
         if d < 0.0
     ]
     line = (

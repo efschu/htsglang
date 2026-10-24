@@ -59,7 +59,7 @@ REF_EMBED_MIB = 1212.97  # vocabembed: I8 1212.5 + scale 0.47
 REF_HEAD_MIB = 2425.0
 INT4AR_EMBED_MIB = 2425.0  # BF16 [248320, 5120]
 INT4AR_HEAD_MIB = 2425.0
-NVFP4_HEAD_MIB = 682.0  # U8 606.2 + F8 scale 75.8 (Qwen3.8-27B-NVFP4-RadixArk)
+NVFP4_HEAD_MIB = 606.2  # lm_head.weight U8 [248320, 2560] as checkpoint_weight_terms counts it (scales not)
 
 # Launcher-printed and runtime-realised numbers of the boot (verbatim).
 PRICED_36_28 = (301650, 148747)
@@ -139,7 +139,18 @@ class TheDeltaFunction(CustomTestCase):
         )
         self.assertEqual(out[1], 4960.6, "a smaller lm_head must never lower the post")
         self.assertIn("NOT credited", line)
-        self.assertIn("lm_head -1743.0 MiB", line)
+        self.assertIn("lm_head -1818.8 MiB", line)
+
+    def test_absent_head_is_named_as_absent(self):
+        _, line = stage_fixed_checkpoint_delta(
+            RECORD_STAGE_FIXED,
+            ref_label="vocabembed",
+            ref_embedding_mib=REF_EMBED_MIB,
+            ref_lm_head_mib=REF_HEAD_MIB,
+            embedding_mib=INT4AR_EMBED_MIB,
+            lm_head_mib=0.0,
+        )
+        self.assertIn("lm_head absent from the headers", line)
 
     def test_reference_checkpoint_is_a_no_op(self):
         out, line = stage_fixed_checkpoint_delta(

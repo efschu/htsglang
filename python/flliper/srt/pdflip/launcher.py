@@ -10362,6 +10362,91 @@ def _rope_cache_cols(cfg: dict) -> int:
         return 0
 
 
+GGUF_DENSE_VOCAB_ENV = "FLLIPER_GGUF_DENSE_VOCAB"
+
+
+def _p_gguf_dense_vocab(ns, model: Optional[str]) -> bool:
+    """True when group P loads a GGUF checkpoint with the legacy dense vocab
+    (``model_loader.gguf_qwen35.gguf_dense_vocab``: token_embd/output are
+    dequantized to BF16 at load) -- read where P reads it: the exported env,
+    overridden by an ``--env-p`` entry.  The name is restated here only so this
+    module does not import torch; the reader's spelling is pinned by a test."""
+    if not model or not os.path.isfile(str(model)):
+        return False
+    from flliper.srt.pdflip import gguf_census as _gguf_census
+
+    if not _gguf_census.is_gguf_checkpoint(str(model)):
+        return False
+    val = os.environ.get(GGUF_DENSE_VOCAB_ENV, "0")
+    try:
+        val = parse_group_env(str(getattr(ns, "env_p", "") or "")).get(GGUF_DENSE_VOCAB_ENV, val)
+    except ValueError:
+        pass
+    return str(val).strip() == "1"
+
+
+def p_stage_fixed_for_checkpoint(
+    ns, stage_fixed: Sequence[float], terms, *, text_cfg: Optional[Dict] = None,
+    model: Optional[str] = None,
+) -> Tuple[Tuple[float, ...], str]:
+    """PPCUT-INT4AR 24.10.: group P's per-stage fixed posts for THIS checkpoint.
+
+    Three branches, each with its own line:
+
+    * ``--pp-cut-stage-fixed-mib`` given on the command line
+      (``ns.pp_cut_stage_fixed_given``, set by :func:`apply_profile_arg_defaults`)
+      -> the operator's measurement of this checkpoint, unchanged;
+    * the profile registers no reference checkpoint in
+      :data:`P_PP_STAGE_FIXED_REF_NONLAYER_MIB` -> the record, unchanged;
+    * otherwise the record is moved onto this checkpoint's RESIDENT non-layer
+      bytes by ``pp_cut_launch.stage_fixed_checkpoint_delta`` (first stage +=
+      embedding delta, last stage += lm_head delta, one-sided).
+
+    RESIDENT, not header bytes, where the two differ: a GGUF checkpoint loaded
+    with ``FLLIPER_GGUF_DENSE_VOCAB=1`` dequantizes token_embd/output to BF16,
+    so the header's quant size would under-book the first stage by the
+    dequantization growth (review #222 SOLL-2).  There the dense BF16 size
+    ``vocab_size x hidden_size x 2`` from the config is used for both.
+    """
+    fixed = tuple(float(v) for v in stage_fixed)
+    if getattr(ns, "pp_cut_stage_fixed_given", False):
+        return fixed, ("PP-CUT STAGE-FIXED CHECKPOINT: --pp-cut-stage-fixed-mib given on the command "
+                       "line -> taken as this checkpoint's measurement, not moved")
+    profile = str(getattr(ns, "profile", None) or PROFILE_QWEN27B)
+    ref = P_PP_STAGE_FIXED_REF_NONLAYER_MIB.get(profile)
+    if ref is None:
+        return fixed, ("PP-CUT STAGE-FIXED CHECKPOINT: profile %r registers no reference checkpoint for "
+                       "its P_PP_STAGE_FIXED_MIB record (P_PP_STAGE_FIXED_REF_NONLAYER_MIB) -> record "
+                       "unchanged" % (profile,))
+    from flliper.srt.planner import pp_cut as _pp_cut
+    from flliper.srt.planner import pp_cut_launch as _cut
+
+    emb_mib = float(terms.embedding_weight_bytes) / _pp_cut.MIB
+    head_mib = float(terms.lm_head_weight_bytes) / _pp_cut.MIB
+    note = ""
+    if _p_gguf_dense_vocab(ns, model):
+        cfg = text_cfg or {}
+        vocab, hidden = int(cfg.get("vocab_size") or 0), int(cfg.get("hidden_size") or 0)
+        if vocab > 0 and hidden > 0:
+            dense = vocab * hidden * 2 / _pp_cut.MIB
+            note = ("; GGUF %s=1: token_embd/output dequantized to BF16 at load -> resident "
+                    "%.1f MiB each (header %.1f / %.1f)" % (GGUF_DENSE_VOCAB_ENV, dense, emb_mib, head_mib))
+            emb_mib, head_mib = max(emb_mib, dense), max(head_mib, dense)
+        else:
+            note = ("; GGUF %s=1 but the config states no vocab_size/hidden_size -- header bytes "
+                    "used, the first stage may be UNDER-booked by the dequantization growth"
+                    % (GGUF_DENSE_VOCAB_ENV,))
+    out, line = _cut.stage_fixed_checkpoint_delta(
+        fixed,
+        ref_label=ref[0],
+        ref_embedding_mib=float(ref[1]),
+        ref_lm_head_mib=float(ref[2]),
+        embedding_mib=emb_mib,
+        lm_head_mib=head_mib,
+    )
+    return out, line + note
+
+
 def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Optional[str]]:
     """YaRN x2 27B (29.09.): the per-stage VRAM the EAGER RoPE cos/sin cache
     grows by when group P boots a longer context than the one its per-stage
@@ -22762,28 +22847,10 @@ def solve_p_cut(
             _rope_delta = _ctx_delta
         _stage_fixed = tuple(float(v) + float(d) for v, d in zip(_stage_fixed, _rope_delta))
     # PPCUT-INT4AR 24.10.: the record's non-layer half is its reference
-    # checkpoint's embedding/lm_head; move it onto THIS checkpoint's header
-    # bytes (one-sided: only a larger payload is added).  An operator-given
-    # vector is left alone; a profile without a registered reference too.
-    _sf_ref = P_PP_STAGE_FIXED_REF_NONLAYER_MIB.get(
-        str(getattr(ns, "profile", None) or PROFILE_QWEN27B))
-    if getattr(ns, "pp_cut_stage_fixed_given", False):
-        log("PP-CUT STAGE-FIXED CHECKPOINT: --pp-cut-stage-fixed-mib given on the command line "
-            "-> taken as this checkpoint's measurement, not moved")
-    elif _sf_ref is None:
-        log("PP-CUT STAGE-FIXED CHECKPOINT: profile %r registers no reference checkpoint for its "
-            "P_PP_STAGE_FIXED_MIB record (P_PP_STAGE_FIXED_REF_NONLAYER_MIB) -> record unchanged"
-            % (getattr(ns, "profile", None),))
-    else:
-        _stage_fixed, _sf_line = _cut.stage_fixed_checkpoint_delta(
-            _stage_fixed,
-            ref_label=_sf_ref[0],
-            ref_embedding_mib=float(_sf_ref[1]),
-            ref_lm_head_mib=float(_sf_ref[2]),
-            embedding_mib=float(terms.embedding_weight_bytes) / _pp_cut.MIB,
-            lm_head_mib=float(terms.lm_head_weight_bytes) / _pp_cut.MIB,
-        )
-        log(_sf_line)
+    # checkpoint's embedding/lm_head; move it onto THIS checkpoint's bytes.
+    _stage_fixed, _sf_line = p_stage_fixed_for_checkpoint(
+        ns, _stage_fixed, terms, text_cfg=text_cfg, model=model)
+    log(_sf_line)
     _booked = p_pool_posts_as_booked(ns)
     # the draft cell rides the same per-model gate: a model whose row keeps the old posts keeps the old cell
     _p_draft_cell, _p_draft_cell_line = (p_draft_kv_cell_bytes_by_stage(ns, len(budgets_p), text_cfg)
