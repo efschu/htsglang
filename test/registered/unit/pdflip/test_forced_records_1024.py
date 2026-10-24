@@ -342,6 +342,52 @@ class DangerDirection(Base):
         self.assertEqual(rec["forced_past"], ["HW-COUNT/METAL-UNPROVEN", "HW-UNCALIBRATED/pp-crossing-width"])
 
 
+class CardSetPick(unittest.TestCase):
+    """duo (5090+3080) and dual (5090+3080+3080) share the NVFP4 identity; once forced boots write records, a duo
+    D sample must not push dual onto the constant, and duo prefers its own sample over dual's bigger card set."""
+
+    U5, UA, UB = "GPU-31d7ef41", "GPU-62dbbae1", "GPU-5c648f96"
+
+    def cards(self, *uuids):
+        names = {self.U5: ("NVIDIA GeForce RTX 5090", 32607, (12, 0)), self.UA: ("NVIDIA GeForce RTX 3080", 20480, (8, 6)),
+                 self.UB: ("NVIDIA GeForce RTX 3080", 20480, (8, 6))}
+        return [card(i, *names[u], uuid=u) for i, u in enumerate(uuids)]
+
+    def rows(self):
+        dual = dict(d_sample("dual1007", {self.U5: 1848, self.UA: 1364, self.UB: 1364}), at="2026-10-07T04:37:34Z")
+        duo = dict(d_sample("duo1025", {self.U5: 1682, self.UA: 1332}), at="2026-10-25T01:00:00Z")
+        return [dual, duo]
+
+    def test_dual_keeps_its_exact_three_card_sample_although_duo_wrote_later(self):
+        cards = self.cards(self.U5, self.UA, self.UB)
+        rec, how = L.pick_d_residue_record(self.rows(), cards)
+        self.assertEqual(rec["boot_tag"], "dual1007")
+        self.assertTrue(how.startswith("exact card set"), how)
+        got, _ = L.dc_residue_from_record(rec, cards, "exchange")
+        self.assertEqual(got, {self.U5: 1848 + 256, self.UA: 1364 + 256, self.UB: 1364 + 256})
+
+    def test_duo_prefers_its_own_sample_and_falls_back_to_the_covering_one(self):
+        cards = self.cards(self.U5, self.UA)
+        rec, how = L.pick_d_residue_record(self.rows(), cards)
+        self.assertEqual((rec["boot_tag"], how.split(":")[0]), ("duo1025", "exact card set"))
+        rec, how = L.pick_d_residue_record(self.rows()[:1], cards)
+        self.assertEqual((rec["boot_tag"], how.split(":")[0]), ("dual1007", "covering card set"))
+
+    def test_no_covering_sample_returns_the_newest_and_the_reader_refuses_it(self):
+        cards = self.cards(self.U5, self.UA, self.UB)
+        rec, how = L.pick_d_residue_record(self.rows()[1:], cards)
+        self.assertEqual(rec["boot_tag"], "duo1025")
+        self.assertIn("no sample covers", how)
+        got, why = L.dc_residue_from_record(rec, cards, "exchange")
+        self.assertIsNone(got)
+        self.assertIn(self.UB, why)
+        self.assertEqual(L.pick_d_residue_record([], cards), (None, "no sample"))
+
+    def test_the_launcher_reads_all_d_samples_through_the_pick(self):
+        src = open(LAUNCHER_SRC, encoding="utf-8").read()
+        self.assertIn('pick_d_residue_record(\n        host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept), cards)', src)
+
+
 class LauncherWiring(unittest.TestCase):
     def test_seal_flush_and_export_precede_the_front_spawn_after_every_refusal_site(self):
         src = open(LAUNCHER_SRC, encoding="utf-8").read()

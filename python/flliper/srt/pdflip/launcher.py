@@ -491,6 +491,30 @@ def dc_residue_from_record(
                  + ", ".join(parts) + " MiB")
 
 
+def pick_d_residue_record(rows: Sequence[Dict[str, object]], cards: Sequence[Card]
+                          ) -> Tuple[Optional[Dict[str, object]], str]:
+    """#227: which group-D dormant-image sample prices THIS boot's D residue (``rows`` oldest first, already
+    through the calibration identity). The newest whose ``vram_residue_mib`` names EXACTLY this boot's cards
+    (same card set = same D topology); else the newest that covers every card (the pre-#227 answer: a sample
+    of a bigger card set); else the newest at all, so :func:`dc_residue_from_record` names what is missing.
+    ``(None, why)`` without any sample."""
+    want = {c.uuid for c in cards}
+    if not rows:
+        return None, "no sample"
+
+    def _keys(r):
+        v = r.get("vram_residue_mib")
+        return set(v) if isinstance(v, dict) else set()
+
+    for how, ok in (("exact card set", lambda k: k == want), ("covering card set", lambda k: want <= k)):
+        hit = [r for r in rows if ok(_keys(r))]
+        if hit:
+            r = max(hit, key=lambda e: str(e.get("at", "")))
+            return r, f"{how}: boot {r.get('boot_tag', '?')}"
+    r = max(rows, key=lambda e: str(e.get("at", "")))
+    return r, f"newest, no sample covers this card set: boot {r.get('boot_tag', '?')}"
+
+
 P_DORMANT_EXPECT_ENV = "FLLIPER_PDFLIP_D_EXPECT_P_RECORD"
 #: How many of the newest group-P boots (same calibration identity, same weight
 #: form, every card measured) the expectation takes the per-card MAXIMUM over.
@@ -26659,8 +26683,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _dc_accept = (d_residue_record_accept(calib_identity, d_bs)
                   if calib_identity is not None and calib_identity.uses_d_capture_set
                   else calib_sample_accept)
-    _dc_rec_d = host_ledger.read_measured_record(
-        measured_record_path(), accept=_dc_accept).get("D")
+    # #227: with forced boots writing records again, forms of ONE checkpoint and form on DIFFERENT card sets
+    # write into the same identity (NVFP4: duo 5090+3080 writes D samples, dual 5090+3080+3080 reads them). The
+    # newest sample alone would hand dual a 2-card duo sample, which dc_residue_from_record refuses card by card
+    # (-> the constant, ~1 GiB per card off P). Prefer the newest sample of EXACTLY this boot's card set, then the
+    # newest that covers it (the pre-#227 answer), then the newest at all (for the refusal's wording).
+    _dc_rec_d, _dc_pick = pick_d_residue_record(
+        host_ledger.read_measured_records(measured_record_path(), "D", accept=_dc_accept), cards)
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.pdflip_weight_source)
     # D-EXPECT: group P's measured dormant residue, same calibration identity,
@@ -26673,6 +26702,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"in the sidecar -- samples of another checkpoint or form are not this "
             f"boot's residue (PDFLIP-FORM; xsn418 died W19 on fnFL2x144's) -> constant")
     elif calib_sample_accept is not None:
+        _dc_record_prov += f" [{_dc_pick}]"
         _dc_record_prov += (
             f" [PDFLIP-FORM calibration identity: {boot_form.model}, "
             f"{' '.join(a + '=' + getattr(boot_form, a) for a in pdflip_form.RESIDUE_AXES)}]")
