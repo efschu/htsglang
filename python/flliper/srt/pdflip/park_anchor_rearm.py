@@ -39,6 +39,13 @@ No reserve and no new budget: room comes from free slots, from a slot another re
 part 1: ``ARENA-DROP freed>0``, a release, an ack), or from one agreed spill of an anchor that already has its L3 copy
 (no anchor is traded for another, #257).
 
+END-ANCHOR-GUARD-1024 (#231, review MUSS-1/SOLL-3, SOLL R11): the turn-end registry's anchors (structural, the same
+on every rank) are targets too, in their OWN class between the park END anchors and the chain intermediates (key bit
+``TURN_END_BIT``: a park END always comes first, the 8-key window is never filled by turn-end anchors ahead of it). The
+pass tells the guard what it found SECURED on every rank -- only from reduced values: a target nobody needs
+(``done``), ``ISSUED``, ``HEALED``, and, when every rank's needing list fit its gather segment (the incomplete flag,
+one more slot of the same gather), every turn-end candidate key no rank posted.
+
 Switch ``FLLIPER_PDFLIP_PARK_ANCHOR_REARM`` (default on). Off = byte for byte the old W65 skip.
 """
 from __future__ import annotations
@@ -59,6 +66,9 @@ AGREE_ROUNDS = 6
 #: larger than every key (keys are < 2**61)
 INF = 1 << 62
 _DEPTH_SPAN = 1 << 31
+#: END-ANCHOR-GUARD-1024 (SOLL-3): a turn-end registry target -- class 0 (END anchors, ``allow_class1`` keeps it), but
+#: ordered AFTER every park END (bits 28..58 depth, 0..27 hash, 60 class)
+TURN_END_BIT = 1 << 59
 
 
 def armed() -> bool:
@@ -91,6 +101,21 @@ def victim_key(depth: int, last_hash: Any) -> int:
     return d << 28 | _crc(last_hash)
 
 
+def turn_end_key(depth: int, last_hash: Any) -> int:
+    """Order key of a turn-end registry target: after every park END, before every chain intermediate; deeper first."""
+    return target_key(0, depth, last_hash) | TURN_END_BIT
+
+
+def is_turn_end_key(key: int) -> bool:
+    return class_of_target_key(key) == 0 and bool(int(key) & TURN_END_BIT)
+
+
+def _cls_name(key: int) -> str:
+    if class_of_target_key(key) == 1:
+        return "chain"
+    return "turn_end" if is_turn_end_key(key) else "end"
+
+
 def depth_of_target_key(key: int) -> int:
     return _DEPTH_SPAN - 1 - ((int(key) >> 28) & (_DEPTH_SPAN - 1))
 
@@ -104,19 +129,30 @@ def _max(group_max: Callable[[List[int]], List[int]], values: Sequence[int]) -> 
     return [int(v) for v in (out.tolist() if hasattr(out, "tolist") else out)]
 
 
-def gather_union(local_keys: Iterable[int], rank: int, world: int, group_max, veto: bool = False,
-                 k: int = K_PER_RANK):
+def gather_union_full(local_keys: Iterable[int], rank: int, world: int, group_max, veto: bool = False,
+                      incomplete: bool = False, k: int = K_PER_RANK):
     """All-gather of each rank's ``k`` smallest keys through one group MAX (rank r fills its own segment, 0 = empty;
-    keys travel +1). Returns ``(union sorted ascending, any_veto)`` -- the same on every rank."""
-    mine = sorted({int(x) for x in local_keys})[:k]
-    vec = [0] * (world * k + 1)
+    keys travel +1), plus a busy veto and an INCOMPLETE flag (a rank had more than ``k`` keys, or could not list its
+    keys). Returns ``(union sorted ascending, any_veto, any_incomplete)`` -- the same on every rank. Not incomplete =
+    the union is EVERY key any rank asked for (END-ANCHOR-GUARD: "not in the union" = nobody needs it)."""
+    allk = sorted({int(x) for x in local_keys})
+    mine = allk[:k]
+    vec = [0] * (world * k + 2)
     base = int(rank) * k
     for i, x in enumerate(mine):
         vec[base + i] = x + 1
+    vec[-2] = 1 if (incomplete or len(allk) > k) else 0
     vec[-1] = 1 if veto else 0
     red = _max(group_max, vec)
-    union = sorted({v - 1 for v in red[:-1] if v > 0})
-    return union, bool(red[-1])
+    union = sorted({v - 1 for v in red[:-2] if v > 0})
+    return union, bool(red[-1]), bool(red[-2])
+
+
+def gather_union(local_keys: Iterable[int], rank: int, world: int, group_max, veto: bool = False,
+                 k: int = K_PER_RANK):
+    """``(union, any_veto)`` of :func:`gather_union_full` (the same collective)."""
+    union, any_veto, _inc = gather_union_full(local_keys, rank, world, group_max, veto=veto, k=k)
+    return union, any_veto
 
 
 def agree_min_common(local_keys: Iterable[int], group_max, rounds: int = AGREE_ROUNDS):
@@ -203,10 +239,28 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
             return default
 
     busy = bool(_safe(ops.busy, True))
-    local = _safe(ops.needing, {}) or {}
+    _fail = object()
+    local = _safe(ops.needing, _fail)
+    need_failed = local is _fail
+    local = {} if need_failed else (local or {})
     if not allow_class1:
         local = {k: v for k, v in local.items() if class_of_target_key(k) == 0}
-    union, any_busy = gather_union(local.keys(), rank, world, ph(PH_GATHER), veto=busy)
+    union, any_busy, any_incomplete = gather_union_full(local.keys(), rank, world, ph(PH_GATHER), veto=busy,
+                                                        incomplete=need_failed)
+    st["agreed"] = 0
+
+    def _agreed(node):
+        # END-ANCHOR-GUARD-1024 (MUSS-1, R11): called only on REDUCED outcomes -- the same targets on every rank
+        f = getattr(ops, "agreed_secured", None)
+        if callable(f):
+            _safe(lambda: f(node), None)
+            st["agreed"] += 1
+
+    if not any_incomplete:
+        # every key any rank asked for is in the union: a turn-end candidate outside it is secured on EVERY rank
+        f_un = getattr(ops, "agreed_unneeded", None)
+        if callable(f_un):
+            st["agreed"] += int(_safe(lambda: f_un(set(union)), 0) or 0)
     if any_busy or not union:
         if any_busy and union:
             st["busy"] = 1
@@ -225,9 +279,10 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
             inflight = kv_noroom = m_noroom = 0
         any_needs, any_inflight, any_kv, any_m = ph(PH_STATE)([needs, inflight, kv_noroom, m_noroom])
         depth = depth_of_target_key(key)
-        cls = "end" if class_of_target_key(key) == 0 else "chain"
+        cls = _cls_name(key)
         if not any_needs:
             st["done"] += 1
+            _agreed(node)
             continue
         if any_inflight or any_kv:
             st["skipped"] += 1
@@ -275,6 +330,7 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
             if not still:
                 st["healed"] += 1
                 st["issued"] += 1
+                _agreed(node)
                 log.warning("%s SPLIT HEALED depth=%d class=%s spill_victim_depth=%s (a rank could not write its copy at "
                             "the first try; its same-pass join made the anchor rank-equal)", MARKER, depth, cls, spill)
                 continue
@@ -295,6 +351,7 @@ def run_pass(ops: Any, group_max, rank: int, world: int, log: Optional[logging.L
                         "next flush poll asks again)", MARKER, depth, cls, spill)
             break
         st["issued"] += 1
+        _agreed(node)
         log.info("%s ISSUED depth=%d class=%s spill_victim_depth=%s (every rank holds or writes the anchor's copy; "
                  "PARK-END-ANCHOR BACKED names each rank's ack, slot=COMPLETE the last one)", MARKER, depth, cls, spill)
     return st
@@ -353,15 +410,18 @@ class TreeOps:
                 if not getattr(n, "pdflip_park_end", False) and not n.evicted and self._has_anchor(n):
                     _put(target_key(1, t.pdflip_node_depth(n), n.hash_value[-1]), n)
                 n = n.parent
-        # END-ANCHOR-GUARD-1024 (#231, SOLL R7): turn-end anchors (END registry, S108 anchor-deferred) are class 0
-        # targets too -- the eviction guard holds them on the device until a copy exists, and on a shared-slot TP
-        # group THIS pass is the one rank-agreed way to make that copy (agreed L3-secured victim, existing votes)
+        # END-ANCHOR-GUARD-1024 (#231, SOLL R7; review MUSS-1/SOLL-3, R11): the turn-end registry's anchors (filed at
+        # the turn-end events on every rank -- never the rank-local S108 deferral) are targets in their own class
+        # AFTER the park END anchors -- the eviction guard holds them on the device until a copy exists, and on a
+        # shared-slot TP group THIS pass is the one rank-agreed way to make that copy (agreed L3-secured victim,
+        # existing votes). A node already a park target keeps its park key (one key per node).
         try:
             from flliper.srt.pdflip import end_anchor_guard as _eag
 
+            placed = {id(x) for x in out.values()}
             for n in _eag.rearm_candidates(t):
-                if self._has_anchor(n):
-                    _put(target_key(0, t.pdflip_node_depth(n), n.hash_value[-1]), n)
+                if id(n) not in placed and self._has_anchor(n):
+                    _put(turn_end_key(t.pdflip_node_depth(n), n.hash_value[-1]), n)
         except Exception:  # noqa: BLE001 - no turn-end candidates readable: the park list alone (the old pass)
             pass
         for k in bad:
@@ -382,6 +442,22 @@ class TreeOps:
         KV-only (the drop flag, cleared only at the copy's ack). The union over the ranks is the candidate list."""
         return {k: n for k, n in self._candidates().items() if self._needs(n)
                 and (class_of_target_key(k) == 0 or getattr(n, "pdflip_park_anchor_dropped", False))}
+
+    def agreed_secured(self, n) -> None:
+        """END-ANCHOR-GUARD-1024: the pass found ``n``'s copy on every rank (``done`` / ``ISSUED`` / ``HEALED``)."""
+        from flliper.srt.pdflip import end_anchor_guard as _eag
+
+        _eag.mark_agreed(self.tree, n)
+
+    def agreed_unneeded(self, union) -> int:
+        """END-ANCHOR-GUARD-1024: the gather was complete -- every turn-end candidate whose key no rank posted is
+        secured on every rank (the candidate map is the tree's structure, the same keys on every rank)."""
+        from flliper.srt.pdflip import end_anchor_guard as _eag
+
+        nodes = [n for k, n in self._candidates().items() if is_turn_end_key(k) and k not in union]
+        for n in nodes:
+            _eag.mark_agreed(self.tree, n)
+        return len(nodes)
 
     def has_rows(self, n) -> bool:
         """Review A2: THIS rank holds mamba rows for ``n`` -- a committed host copy, a write of its anchor in flight

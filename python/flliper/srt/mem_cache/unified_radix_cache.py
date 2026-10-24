@@ -8254,6 +8254,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if ad is None:
                     ad = self._s108_anchor_deferred = {}
                 ad[node.id] = node
+                _end_anchor_guard.note_s108_deferred(self, node)   # END-ANCHOR-GUARD-1024 SOLL-5: its age
                 while len(ad) > 4096:
                     ad.pop(next(iter(ad)))
                 mxfer = None
@@ -9670,6 +9671,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             rid = str(getattr(req, "rid", "?"))
             clock = _te.IssueClock()
             chain = self._pdflip_chain_nodes(radix_key) if radix_key is not None else []
+            # END-ANCHOR-GUARD-1024 (#231 review MUSS-1, SOLL R11): the turn end's END node enters the guard's
+            # turn-end registry on EVERY rank, BEFORE any claim of this turn end answers (the chain is the tree's
+            # structure, the device residency a replica) -- the shared-slot hold reads this, never the claim result
+            _end_anchor_guard.register_turn_end(self, chain)
             old = [n for n in list((self.__dict__.get("_s108_deferred") or {}).values())[-_rp.max_issue():]
                    if n not in chain and not n.evicted and not n.backuped and not n.l3_present
                    and self._s108_in_tree(n)]   # the newest deferred, bounded
