@@ -23,6 +23,15 @@ waits here until the wake's first forwards are launched:
 * :func:`release` by the rescan's join at the next release leg (never a wait on the flip's critical path);
 * bounded by ``FLLIPER_PDFLIP_WAKE_DEFER_MAX_MS`` (4000) -- the deferral is never a gate.
 
+WAKE-OUTLIERS-1024 (27B int8 boot ``..._1024_080355``, D): 5 of 14 D wakes released by the bound, two of them with
+``extends=0`` (08:44:09, 08:48:21) -- the wake's first extend was STILL LAUNCHING when the 4 s ran out (its load took
+3.3 s, its eager launch is host-paced), so the journal apply (690 ms at 08:48:21 on TP0, the L3 owner) ran inside
+exactly the forward the deferral exists to protect: TP0 compute 2879 ms vs TP1 595 / TP2 264 ms for 244 tokens, the
+peers waiting 3.3-3.6 s in the collectives (``PDFLIP-FIRST-FWD-TIMING`` gap_sum 3386 ms, load_wait 84 ms -- not the
+H2D). Now a bound that expires while a launch is in flight (:func:`launch_begin` at the top of ``run_batch``,
+:func:`launch_end` in its ``finally``) waits for that launch to return, at most ``FLLIPER_PDFLIP_WAKE_DEFER_LAUNCH_MAX_MS``
+(8000) more -- still never a gate, and a join at the release leg still releases at once.
+
 ``FLLIPER_PDFLIP_WAKE_DEFER`` (default ON, "0" = the rescan starts at the wake as before).
 
 The L3 write-behind is NOT held here: S36 SOLL 2 ENDGUELTIG (user 18.10.) -- the L2 -> L3 write never holds still.
@@ -40,14 +49,19 @@ logger = logging.getLogger(__name__)
 ENV = "FLLIPER_PDFLIP_WAKE_DEFER"
 ENV_MAX_MS = "FLLIPER_PDFLIP_WAKE_DEFER_MAX_MS"
 ENV_EXTENDS = "FLLIPER_PDFLIP_WAKE_DEFER_EXTENDS"
+ENV_LAUNCH_MAX_MS = "FLLIPER_PDFLIP_WAKE_DEFER_LAUNCH_MAX_MS"
 MAX_MS_DEFAULT = 4000.0
 EXTENDS_DEFAULT = 2
+LAUNCH_MAX_MS_DEFAULT = 8000.0
 
 _clock = time.monotonic
 _ev = threading.Event()
 _ev.set()  # not armed = released
-_st = {"armed_at": None, "extends": 0, "deadline": 0.0, "why": "init", "wake": 0}
+_st = {"armed_at": None, "extends": 0, "deadline": 0.0, "why": "init", "wake": 0, "in_launch": False,
+       "launch_gen": 0, "launch_done_gen": 0}
 _lock = threading.Lock()
+_launch_idle = threading.Event()
+_launch_idle.set()  # no launch in flight
 
 #: scheduler-level ForwardMode names of a prefill launch (TARGET_VERIFY is the worker's decode form, not counted)
 _EXTEND_MODES = ("EXTEND", "MIXED", "SPLIT_PREFILL", "DLLM_EXTEND")
@@ -75,8 +89,41 @@ def _extends_n(env=None) -> int:
         return EXTENDS_DEFAULT
 
 
+def _launch_max_s(env=None) -> float:
+    env = os.environ if env is None else env
+    try:
+        v = float(env.get(ENV_LAUNCH_MAX_MS, "") or LAUNCH_MAX_MS_DEFAULT)
+    except ValueError:
+        v = LAUNCH_MAX_MS_DEFAULT
+    return max(0.0, v) / 1000.0
+
+
 def armed() -> bool:
     return not _ev.is_set()
+
+
+def hold_bound_s(env=None) -> float:
+    """The longest a released-by-bound deferral can hold: the bound plus the launch cap (s)."""
+    return _max_s(env) + _launch_max_s(env)
+
+
+def launch_begin() -> None:
+    """Top of ``run_batch``: a launch is in flight (one attribute read while not armed)."""
+    if _ev.is_set():
+        return
+    # review 1024 SOLL 2: a GENERATION, so a waiter that saw launch g wait for g's end, not for the next launch's
+    _st["launch_gen"] += 1
+    _st["in_launch"] = True
+    _launch_idle.clear()
+
+
+def launch_end() -> None:
+    """``run_batch``'s ``finally``: the launch returned (also when it raised)."""
+    if not _st["in_launch"]:
+        return
+    _st["launch_done_gen"] = _st["launch_gen"]
+    _st["in_launch"] = False
+    _launch_idle.set()
 
 
 def arm(has_work: bool = True) -> bool:
@@ -126,7 +173,20 @@ def wait(who: str = "") -> float:
     t0 = _clock()
     left = max(0.0, _st["deadline"] - t0)
     if not _ev.wait(left):
-        release("bound")
+        if _st["in_launch"]:
+            # WAKE-OUTLIERS-1024: the bound ran out inside a launch -- the deferred work starts when it returns
+            # (or at a release meanwhile, e.g. the release leg's join), capped: never a gate
+            gen = _st["launch_gen"]
+            cap = _clock() + _launch_max_s()
+
+            def _running() -> bool:
+                return _st["launch_done_gen"] < gen
+
+            while _running() and not _ev.is_set() and _clock() < cap:
+                _launch_idle.wait(min(0.01, max(0.0, cap - _clock())))
+            release("bound+launch_cap" if _running() else "bound+launch_end")
+        else:
+            release("bound")
     held = _clock() - t0
     if held >= 0.001:
         armed_at = _st.get("armed_at")
@@ -144,5 +204,7 @@ def state() -> dict:
 
 def _reset_for_tests() -> None:
     with _lock:
-        _st.update(armed_at=None, extends=0, deadline=0.0, why="init", wake=0)
+        _st.update(armed_at=None, extends=0, deadline=0.0, why="init", wake=0, in_launch=False, launch_gen=0,
+                   launch_done_gen=0)
         _ev.set()
+        _launch_idle.set()

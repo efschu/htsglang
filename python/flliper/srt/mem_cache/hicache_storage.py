@@ -1085,6 +1085,17 @@ def l3_rank_format(server_args: Any) -> dict:
     }
 
 
+
+def _dp_attention_on() -> bool:
+    """WAKE-OUTLIERS-1024: DP attention is active in this process (False when it cannot be asked)."""
+    try:
+        from flliper.srt.layers.dp_attention import is_dp_attention_enabled
+
+        return bool(is_dp_attention_enabled())
+    except Exception:  # noqa: BLE001 -- flags not initialised (unit tests, tools): no DP attention
+        return False
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -2333,6 +2344,13 @@ class HiCacheFile(HiCacheStorage):
             writer_count=writer_count,
             path_for_stem=self._existing_path,
             iter_existing=self._iter_existing_files,
+            # WAKE-OUTLIERS-1024 (review MUSS 1/2): the TP-peer T-line dedupe only for the group-wide KV page, and
+            # never under the dcp owner form, DP attention or a phase-changing rank identity (outside a Weg-2 group)
+            dcp_owner_mode=self.dcp_owner_mode,
+            dcp_owner_rows=self._kv_owner_rows is not None,
+            dp_attention=_dp_attention_on(),
+            rank_identity_stable=self._l3p_group() in ("P", "D"),
+            touch_dedupe_suffix=self._touch_dedupe_suffix,
             iter_staging=self._iter_staging_files,
             pins=self.pins,
             # #810: under `--hicache-host-role staging` this store IS the
@@ -2365,6 +2383,15 @@ class HiCacheFile(HiCacheStorage):
         """A persistent store the launcher proved (identity file present)."""
         return self._l3p_on() and os.path.isfile(
             os.path.join(self.file_path, "L3_IDENTITY.json"))
+
+    def _touch_dedupe_suffix(self) -> Optional[str]:
+        """WAKE-OUTLIERS-1024: the CURRENT KV suffix when every rank of the group names it (re-derived at
+        ``install_canonical_windows``), else None -- read by the evictor's T-line dedupe."""
+        # the #239 owner-row form: the host rank abstains from reads its peers do -- no key is the owner's duplicate
+        if (self.dcp_owner_mode and getattr(self, "_kv_owner_rows", None) is not None) or not getattr(
+                self, "_kv_config_suffix_is_group_wide", False):
+            return None
+        return self.kv_config_suffix or None
 
     @staticmethod
     def _l3p_group() -> str:
@@ -3079,7 +3106,7 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
             return None
-        self._evictor.touch(suffixed, tensor_path)
+        self._evictor.touch(suffixed, tensor_path, read=True)  # WAKE-OUTLIERS-1024: read path
         if self.metadata_cache is not None:
             self.metadata_cache.add(suffixed)
         return target_location
@@ -3357,7 +3384,7 @@ class HiCacheFile(HiCacheStorage):
                     raise IOError(
                         f"Short read for {suffixed}: {got} of {expected} bytes"
                     )
-            self._evictor.touch(suffixed, tensor_path)
+            self._evictor.touch(suffixed, tensor_path, read=True)  # WAKE-OUTLIERS-1024: read path
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return target_location
@@ -3459,7 +3486,7 @@ class HiCacheFile(HiCacheStorage):
                     self._arena_evict_to_disk(arena, 256)
         for (i, key, suffixed, path, window, target), status in zip(plan, statuses):
             if status == 0:
-                self._evictor.touch(suffixed, path, mtime=False)
+                self._evictor.touch(suffixed, path, mtime=False, read=True)  # WAKE-OUTLIERS-1024: read path
                 if self.metadata_cache is not None:
                     self.metadata_cache.add(suffixed)
                 results[i] = target

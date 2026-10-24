@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -136,6 +137,35 @@ def _kv_sidecar_twins(stem: str) -> Tuple[str, ...]:
     if u <= 0 or (0 <= d < u):
         return ()
     return tuple(stem[:u] + tag + stem[u:] for tag in _PAIR_SIDECAR_TAGS)
+
+
+
+
+
+#: WAKE-OUTLIERS-1024 instrument: journaled T lines by call path, one line per 2^17 lines and writer. The 27B int8 D
+#: phase 08:44-08:47 read 1.03 M pages per rank with l3fill_pages=0 (all from the L2 arena) -- the T-line mass is not
+#: the disk read path; this names which path it is (read / _touch_present caller / _l3_refresh_kept).
+_T_SOURCE_EVERY = 1 << 17
+
+
+def _t_source_note(ev, read: bool) -> None:
+    try:
+        import sys as _sys
+
+        f = _sys._getframe(3)            # _t_source_note <- _journal_touch <- touch <- caller
+        name = f.f_code.co_name
+        if name == "_touch_present" and f.f_back is not None:
+            name = "_touch_present<" + f.f_back.f_code.co_name
+        c = ev.__dict__.setdefault("_t_source", {})
+        key = ("read:" if read else "") + name
+        c[key] = c.get(key, 0) + 1
+        n = ev.__dict__.get("_t_source_n", 0) + 1
+        ev._t_source_n = n
+        if n % _T_SOURCE_EVERY == 0:
+            logger.info("L3-T-SOURCE n=%d by_path=%s (WAKE-OUTLIERS-1024: journaled T lines of this writer by call "
+                        "path, cumulative)", n, dict(sorted(c.items(), key=lambda kv: -kv[1])[:8]))
+    except Exception:  # noqa: BLE001 -- an instrument never fails a read
+        pass
 
 
 class PdFlipL3EvictorPauseRefused(RuntimeError):
@@ -271,6 +301,11 @@ class LRUFileEvictor:
         iter_staging: Optional[Callable[[], Iterable[os.stat_result]]] = None,
         pins: Optional[Any] = None,
         require_watermark: bool = False,
+        dcp_owner_mode: bool = False,
+        dcp_owner_rows: bool = False,
+        dp_attention: bool = False,
+        rank_identity_stable: bool = True,
+        touch_dedupe_suffix: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         # #410: the pin ledger, or None. None is the default and every code
         # path guards on it, so a store without checkpoints behaves exactly as
@@ -379,6 +414,28 @@ class LRUFileEvictor:
         self._is_storage_owner = (not self._writes_shared_keys) or (
             tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
         )
+        # WAKE-OUTLIERS-1024: a pure TP peer of the owner (same pp stage and cp position, tp_rank > 0) reads the
+        # SAME group-wide KV page files as the owner (identical PDFLIP-READ-STAGES page counts on every D TP rank), so
+        # its T lines for them duplicate the owner's -- see _journal_touch. PP stages read different page sets and keep
+        # theirs. Review 1024 MUSS 2: never where that premise is not shown -- the #239 owner-row dcp form (the host
+        # rank ABSTAINS from a read its peers do), DP attention (disjoint requests per attention rank) and a rank
+        # identity that changes with the phase (Weg 1 cutover: this flag is computed once, here).
+        # The page-1 dcp owner form (task #60, the 27B D groups) is split by PATH (test_wake_outliers_dcp_1024.py):
+        # every rank reads the group's key list from the same rank-shared file (PDFLIP-READ-STAGES 8776008 pages on
+        # each int8 D rank; a read reaped short on one rank is cut to the group MIN and re-issued, so the owner's
+        # reads cover every page a peer reads -- duo 07:03-07:05), but a page is WRITTEN only by its owner rank
+        # (cache_controller._page_backup kv_page_owner_mask), so a write-path T line (``_touch_present``) is that
+        # page's only one. There only READ-path lines are deduplicated.
+        self._journal_touch_tp_peer = bool(
+            self._writes_shared_keys and not self._is_storage_owner
+            and tp_rank > 0 and pp_rank == 0 and attn_cp_rank == 0
+            and not (dcp_owner_mode and dcp_owner_rows) and not dp_attention and rank_identity_stable
+        )
+        self._journal_touch_read_only = bool(dcp_owner_mode)
+        self._touch_tp_rank = int(tp_rank)
+        # the backend's CURRENT group-wide KV suffix (it is re-derived when the canonical page is installed after
+        # construction); None = no key qualifies. Without it: the static suffix pair of this constructor.
+        self._touch_dedupe_suffix_fn = touch_dedupe_suffix
         # 28.09. THE INDEX IS PERSISTED IN THE STORE (store_journal.py): every
         # writing rank of a shared-key store appends write-ahead lines to its own
         # journal; an attach loads snapshot + journals instead of walking, the
@@ -1232,14 +1289,14 @@ class LRUFileEvictor:
             if cur is not None:
                 self._total_bytes -= cur
 
-    def touch(self, suffixed_key: str, tensor_path: str, mtime: bool = True) -> None:
+    def touch(self, suffixed_key: str, tensor_path: str, mtime: bool = True, read: bool = False) -> None:
         """Mark key as MRU, adopting an untracked on-disk file if needed.
 
         ``mtime=False`` skips the utime: the batched reader (#1402) already
         bumped the inode through its open fd, and a second syscall here would
         be a second GIL hand-off per page for nothing.
         """
-        self._journal_touch(suffixed_key)
+        self._journal_touch(suffixed_key, read=read)
         if not self._eviction_enabled:
             return
         if mtime:
@@ -1262,7 +1319,7 @@ class LRUFileEvictor:
                 self._lru[suffixed_key] = size
                 self._total_bytes += size
 
-    def _journal_touch(self, suffixed_key: str) -> None:
+    def _journal_touch(self, suffixed_key: str, read: bool = False) -> None:
         """L3-READ-RECENCY-1014: a read hit as a ``T`` journal line, so the
         storage OWNER (it rebuilds its LRU from journal lines at wake and never
         walks st_mtime since the 28.09. journal index) sees the SIBLING's reads.
@@ -1277,6 +1334,14 @@ class LRUFileEvictor:
         try:
             if not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH.get():
                 return
+            if (getattr(self, "_journal_touch_tp_peer", False)
+                    and (read or not getattr(self, "_journal_touch_read_only", False))
+                    and self._is_group_wide_kv_key(suffixed_key)
+                    and not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH_TP_PEERS.get()):
+                # WAKE-OUTLIERS-1024: the owner journals this canonical KV page's read hit itself (TP peers read the
+                # identical page set); a peer's line is a duplicate the other group's owner parses at its wake
+                # (P PP0, boot ..._1024_080355: 3.2 M of 3.4 M lines were T, 6.8 s beside the first P forwards)
+                return
             now = time.time()
             seen = self.__dict__.get("_journal_touched")
             if seen is None:
@@ -1289,8 +1354,33 @@ class LRUFileEvictor:
             while len(seen) > 65536:
                 seen.popitem(last=False)
             jn.write("T", now, 0, suffixed_key)
+            _t_source_note(self, read)
         except Exception:  # noqa: BLE001 -- a recency line is never a reason to fail a read
             return
+
+    def _touch_dedupe_suffix(self) -> Optional[str]:
+        """WAKE-OUTLIERS-1024: the KV suffix every rank of the group names, or None."""
+        fn = getattr(self, "_touch_dedupe_suffix_fn", None)
+        if fn is not None:
+            try:
+                return fn() or None
+            except Exception:  # noqa: BLE001 -- no answer = no dedupe, the line is written
+                return None
+        suf = self.kv_config_suffix or self.config_suffix
+        # a suffix with this rank's tp term names a per-rank file (config_suffix ``..._{tp_rank}_{tp_size}``)
+        if not suf or re.search(r"_%d_\d+(?:_|$)" % int(getattr(self, "_touch_tp_rank", 0)), suf):
+            return None
+        return suf
+
+    def _is_group_wide_kv_key(self, suffixed_key: str) -> bool:
+        """Review 1024 MUSS 1 (whitelist): a plain KV page under the group-wide KV suffix -- the stem carries no
+        component tag (no '.'), and the suffix no rank term. Every other key (.swa/.indexer/.deepseek_v4_*/.mamba/
+        .draft/... and every per-rank suffix) is this rank's own file and keeps its T line."""
+        suf = self._touch_dedupe_suffix()
+        if not suf or not suffixed_key.endswith(suf):
+            return False
+        stem = suffixed_key[: -len(suf)]
+        return bool(stem) and "." not in stem
 
     def _touch_mtime(self, tensor_path: str) -> None:
         """Record the recency where the SIBLING owner can read it (N2).
