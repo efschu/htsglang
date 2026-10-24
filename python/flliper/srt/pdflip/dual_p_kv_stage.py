@@ -418,31 +418,70 @@ PHYS_CHECK_S = 10.0
 PHYS_BOOK_AFTER = 3
 
 
+def law_floor_bytes(group: str) -> int:
+    """DUAL-GRANT-1024: this card's MEASURED corridor transient in bytes (the
+    law the CORRIDOR LAW BREACHED line grades against), or a hand-set law
+    (``FLLIPER_CORRIDOR_LAW_FLOOR_MIB``). An unmeasured fallback 1024, no card,
+    or no guard answers 0: it grades and refuses elsewhere, it never spends KV
+    pool here (``CorridorFloor.actuates``, the guard's own rule).
+
+    The USER RESERVE is NOT part of it: house rule 19.09. ("Reserven NIE"),
+    and where an arm still passes ``--user-reserve-mib`` the launcher prices it
+    in the plan already. This prices a measured transient, it reserves
+    nothing: the ledger is the ONE place that hands the card's bytes to KV,
+    and a full commit of it must leave the card at its law, never at 0.
+
+    Metal 27B NVFP4 dual boot_..._1ecda02a58_1024_115913 (5090, PP0 law 1055 =
+    MEASURED-P transient, TP0 law 767 = MEASURED-D): LEDGER-PHYS gap
+    phys_free - ledger_free 9938 -> 3440 -> 618 -> 102 -> 14 -> 0 MiB while
+    P's and D's torch caches grew (P reserved 16190 -> 17726, D 28286 -> 29404
+    MiB), then held at 0 by OVER-PROMISE bookings (12:10:35 123600896 B, ...).
+    The 12:08:43 grant of pdflip-0-20 (2231369728 B on ledger free 2281701376)
+    left the card at 64/62 MiB; nothing booked it, because the ledger never
+    promised MORE than the card had -- it promised all of it."""
+    try:
+        from flliper.srt.managers import corridor_guard as _cg
+
+        fl = _cg.corridor_floor_for_current_device(group=group)
+    except Exception:  # noqa: BLE001 -- no guard, no floor term (the old check stands)
+        return 0
+    if not str(getattr(fl, "card_uuid", "") or ""):
+        return 0
+    if not (bool(getattr(fl, "measured", False))
+            or str(getattr(fl, "source", "")) == str(getattr(_cg, "FLOOR_SOURCE_ENV", "ENV-OVERRIDE"))):
+        return 0
+    return max(0, int(getattr(fl, "transient_mib", 0) or 0)) << 20
+
+
 def phys_check(actor, group: str) -> None:
     """Throttled instrument (operator order after dual14): the ledger's free
     bytes against the card's physical free bytes. OVER-PROMISE = the ledger
-    would grant bytes the card does not have (dual14: budget counted twice)."""
+    would grant bytes the card does not have (dual14: budget counted twice),
+    or bytes the card only has UNDER its actuating corridor law (DUAL-GRANT-1024:
+    ``phys`` is the free bytes ABOVE the law, ``law_floor_bytes``)."""
     t = _now()
     if t < getattr(actor, "_phys_next", 0.0):
         return
     actor._phys_next = t + PHYS_CHECK_S
     led = getattr(actor, "ledger", None)
     path = getattr(led, "path", None)
-    phys = phys_free_bytes()
-    if not path or phys is None:
+    phys_raw = phys_free_bytes()
+    if not path or phys_raw is None:
         return
     from flliper.srt.pdflip.card_kv_ledger import peek
 
     st = peek(path)
     if st is None:
         return
+    law = law_floor_bytes(group)
+    phys = max(0, int(phys_raw) - int(law))
     over = int(st.free) - int(phys)
     win = actor.__dict__.setdefault("_phys_over", [])
     if over > 0:
         win.append(over)
         logger.warning("%s LEDGER-PHYS OVER-PROMISE by %d B group=%s ledger_free=%d phys_free=%d budget=%d "
-                       "committed=%s", MARK, over, group, int(st.free), int(phys), int(st.budget),
-                       dict(st.committed))
+                       "committed=%s law=%d", MARK, over, group, int(st.free), int(phys_raw), int(st.budget),
+                       dict(st.committed), int(law))
         if len(win) >= PHYS_BOOK_AFTER:
             # metal dual15: 628359168 B of card use outside the KV pools stood
             # for minutes. Persistent = real.
@@ -459,8 +498,8 @@ def phys_check(actor, group: str) -> None:
                                PHYS_BOOK_AFTER * PHYS_CHECK_S)
     else:
         win.clear()
-        logger.info("%s LEDGER-PHYS ok group=%s ledger_free=%d phys_free=%d budget=%d committed=%s", MARK,
-                    group, int(st.free), int(phys), int(st.budget), dict(st.committed))
+        logger.info("%s LEDGER-PHYS ok group=%s ledger_free=%d phys_free=%d budget=%d committed=%s law=%d", MARK,
+                    group, int(st.free), int(phys_raw), int(st.budget), dict(st.committed), int(law))
 
 
 # -- wiring (P process, dual only) -------------------------------------------
