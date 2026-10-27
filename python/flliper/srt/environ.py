@@ -1831,6 +1831,14 @@ class Envs:
     # CSV of the TP ranks the measurement above applies to; unset/empty = every
     # rank. NF: "1,2" -- TP0 keeps its recorded rate unchanged.
     FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS = EnvStr(None)
+    # EXTEND-CAP-SOFT (27.10., user rule 24.10. "the line is a plan target, not a run-time gate"): the D width
+    # vote funds the chunk down to the HARD floor (near-OOM 400 + the measured fixed part, never under the user
+    # reserve the rank resolved) instead of the 1024 MiB corridor line, and prices the rows with this rank's
+    # measured per-row cost x 1.25 (never under half the start rate, never over the start rate) instead of the
+    # start rate for ever. Boot 1027_211839 TP2 (3080): free 1062-1184 MiB, cap 122-516 under the 1024 line, so
+    # a 16384-row chunk ran in 1024-row pieces (the CAP_FLOOR_DIV floor). 0 = the old line and rate, byte for
+    # byte (named off-switch only; default ON).
+    FLLIPER_PDFLIP_EXTEND_SOFT_LINE = EnvBool(True)
     # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
     # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
     # #1028c bounded-min window (5 s) of the #656 gate still holding the

@@ -41,6 +41,10 @@ def _vote_line_300_for_this_module(monkeypatch):
     pins the vote's arithmetic at the old 300 MiB halt line it was written for -- the law case is pinned in
     test_27b_metal_hang_1021."""
     monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
+    # EXTEND-CAP-SOFT (27.10.): this module pins the pre-soft vote (the FLLIPER_PDFLIP_EXTEND_SOFT_LINE=0 path); the
+    # soft rule is pinned in test_pdflip_extend_soft_line_1027
+    monkeypatch.setenv("FLLIPER_PDFLIP_EXTEND_SOFT_LINE", "0")
+    ET.reset_for_tests()
     yield
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")

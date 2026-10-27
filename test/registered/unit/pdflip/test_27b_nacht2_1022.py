@@ -242,7 +242,10 @@ def _vote(cuda, floor="1"):
 
 
 @pytest.fixture(autouse=True)
-def _reset_et():
+def _reset_et(monkeypatch):
+    # EXTEND-CAP-SOFT (27.10.): the vote tests below pin the pre-soft vote (the FLLIPER_PDFLIP_EXTEND_SOFT_LINE=0
+    # path); the soft rule is pinned in test_pdflip_extend_soft_line_1027
+    monkeypatch.setenv("FLLIPER_PDFLIP_EXTEND_SOFT_LINE", "0")
     ET.reset_for_tests()
     yield
     ET.reset_for_tests()

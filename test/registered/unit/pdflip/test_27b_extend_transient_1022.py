@@ -27,6 +27,17 @@ register_cpu_ci(est_time=5, suite="stage-a-pdflip-unit")
 
 from flliper.srt.pdflip import extend_trim as ET  # noqa: E402
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pre_soft_vote(monkeypatch):
+    """EXTEND-CAP-SOFT (27.10.): this module pins the pre-soft vote (plan line, start rate -- the
+    FLLIPER_PDFLIP_EXTEND_SOFT_LINE=0 path); the soft rule is pinned in test_pdflip_extend_soft_line_1027."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_EXTEND_SOFT_LINE", "0")
+    ET.reset_for_tests()
+
+
 MIB = 1 << 20
 RATE = 0.3091            # FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB of both boots (rate_src=start)
 MEASURED_DROP = 0.2533   # the largest driver drop per row of the 80 TP1 extends (round 1 + 2)

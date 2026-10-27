@@ -50,6 +50,9 @@ UUIDS = ("GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",  # D TP0, RTX 5090 (drei ri
 def _stated_law_default(monkeypatch):
     """No law override: the stated law is the shipped 1024 (the metal boots set none)."""
     monkeypatch.delenv(LAW_ENV, raising=False)
+    # EXTEND-CAP-SOFT (27.10.): this module pins the pre-soft vote (the FLLIPER_PDFLIP_EXTEND_SOFT_LINE=0 path); the
+    # soft rule is pinned in test_pdflip_extend_soft_line_1027
+    monkeypatch.setenv("FLLIPER_PDFLIP_EXTEND_SOFT_LINE", "0")
     ET.reset_for_tests()
     yield
     ET.reset_for_tests()

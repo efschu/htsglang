@@ -39,6 +39,8 @@ import os
 import time
 from typing import List, Optional, Sequence
 
+import msgspec
+
 logger = logging.getLogger(__name__)
 
 MARKER = "PDFLIP-EXTEND-CACHE-TRIM"
@@ -61,7 +63,12 @@ _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": N
           "law_lifted": False, "law_line": None,
           # ADMIT-TRIM (desk/27b-admit-trim-1024): the width-vote pass counter, the pass whose vote trimmed, the pass
           # whose admission trimmed
-          "vote_seq": 0, "vote_trim_seq": -1, "admit_seq": -1}
+          "vote_seq": 0, "vote_trim_seq": -1, "admit_seq": -1,
+          # EXTEND-CAP-SOFT (27.10.): the switch (env, read once), this rank's soft measurement (max cost per row over
+          # extends >= SOFT_MIN_ROWS, and the widest such extend), the card's effective user reserve (read once), the
+          # last logged soft width, whether the soft path already fell back once
+          "soft": _UNSET, "soft_measured": None, "soft_rows": 0, "reserve": _UNSET, "logged_soft": None,
+          "soft_failed": False}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -122,6 +129,12 @@ def reset_for_tests() -> None:
     _CACHE["vote_seq"] = 0
     _CACHE["vote_trim_seq"] = -1
     _CACHE["admit_seq"] = -1
+    _CACHE["soft"] = _UNSET
+    _CACHE["soft_measured"] = None
+    _CACHE["soft_rows"] = 0
+    _CACHE["reserve"] = _UNSET
+    _CACHE["logged_soft"] = None
+    _CACHE["soft_failed"] = False
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -180,7 +193,9 @@ def before_extend(worker, batch) -> Optional[str]:
     measurement opens its reading (only with ``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE``
     on this rank; off = byte-identical)."""
     line = _before_extend_trim(worker, batch)
-    if batch is not None and measure_armed(getattr(worker, "tp_rank", None)):
+    rank = getattr(worker, "tp_rank", None)
+    # EXTEND-CAP-SOFT: a rank with a start rate also reads its own cost per row (extends >= SOFT_MIN_ROWS rows)
+    if batch is not None and (measure_armed(rank) or soft_measure_on(rank)):
         measure_open(worker, batch)
     return line
 
@@ -796,6 +811,205 @@ def chunk_need_mib(rank: int, rows: int) -> Optional[float]:
         return None
 
 
+# --------------------------------------------------------------------------
+# EXTEND-CAP-SOFT (27.10., user rule 24.10.: the ~1 GB line is a PLAN target, not a run-time gate; only the physical
+# limit -- near-OOM 400 MiB, an allocation that does not fit -- and the user's reserve are hard).
+#
+# THE DEFECT (boot dkr27bbar1drei10272118_fdd27a84d4_1027_211839, D group TP3 INT8, configured 16384; the 1841 boot the
+# same with 8192 -> 512): the vote below was ``floor((post - line) / rate)`` with line = 1024 (UNMEASURED-FALLBACK, the
+# stated law) and rate = the START rate 0.3091 for ever (``rate_src=start``: the measurement only counts extends of
+# >= 2048 rows, which a 1024-row chunk never reaches). TP2 (3080): post 1062-1184 MiB -> cap 122-516, TP1 cap 853-1247;
+# the Q-710 floor (configured / CAP_FLOOR_DIV = 1024) raised it, ``GROUP-NARROWED 16384 -> 1024``. What those chunks
+# really cost (PDFLIP-VRAM-PEAK phase=chunk TP2, rows=1024): transient 138-139 MiB = 0.136 MiB/row, card free
+# 904 -> 846 (-58 MiB), i.e. less than half the start rate; the card ended every chunk at ~850 MiB, far above the
+# 400 MiB edge. The line, not the card, bound.
+#
+# THE RULE, per rank, off with ``FLLIPER_PDFLIP_EXTEND_SOFT_LINE=0`` (default ON):
+#
+#   line  = max(user reserve, min(old line, near-OOM 400 + F))       F = max(238, seed, live F, group F)
+#   rate  = max(soft base rate, 1.15 x the >= 2048-row maximum)      soft base = max(1.25 x own measured cost per
+#           row (rows >= 512), 0.5 x start), never over the start rate; no measurement yet = the start rate
+#   cap   = floor((post - line) / rate), page aligned; with a measured soft rate at most 2 x the widest extend this
+#           rank measured (an extrapolation guard) but never under what the OLD rule funded
+#
+# * near-OOM 400 is ``corridor_guard.NEAR_OOM_MIB``; F is the measured non-row part of an extend above rate x rows
+#   (admission rest the trim cannot return + the forward's fixed part: ``D_EXTEND_VOTE_FIXED_MIB`` = 238 over six
+#   INT8-drei boots, the same number the single line (VOTE-LINE-SINGLE) already books). With a launcher seed or the
+#   live meter the line follows them (raise only). Boot 1027_211839 TP2, 1024 rows: vote post 1108 -> chunk end 846 =
+#   262 MiB = admission 204 + forward 58; priced soft 0.17 x 1024 + 238 = 412. The meter's own F is priced at the START
+#   rate (vote_fixed_live), so it does not rise in the soft regime; the 238 default is the margin there (named).
+# * the user reserve is the rank's EFFECTIVE one (``corridor_guard.reserve_for_card``, the one door the floor reader
+#   uses): the launcher masks it to 0 on a card whose measured awake rest is booked (``launcher.effective_reserve_by_card``:
+#   "the reserve was never free VRAM - the awake D consumed it"; this boot: stated 1800/1400/1400, effective 0/0/0 on D,
+#   the booked rest in ``budgets_from_dc`` replaces floor + reserve). Where it is NOT masked the chunk may not take the
+#   card under it. Never added on top of the edge: the reserve is a free-column floor, as near-OOM is.
+# * the reserved-but-not-allocated cache is NOT credited as funds: the 22.10. metal (D TP1, 2162 rows: reserved +534 MiB
+#   for a 282 MiB transient with 860 MiB cache present) refuted it, and the vote already reads ``post`` after its trim.
+#   The measured cost per row is max(allocated transient, reserved growth) without netting the cache, so the cache that
+#   does serve a chunk (driver free fell 58 MiB for a 139 MiB transient) is the unlisted margin, not a counted one.
+# * the Q-710 floor (CAP_FLOOR_DIV) stays the crawl guard and only ever RAISES the soft width (:func:`floored_width`).
+#
+# One line per new width (rank-local, like GROUP-NARROWED):
+#
+#   EXTEND-CAP-SOFT rank=2 free=892 hard_floor=638 rate_used=0.1700 rate_src=measured-soft cap=1494 width=1494 ...
+# --------------------------------------------------------------------------
+
+SOFT_MARKER = "EXTEND-CAP-SOFT"
+#: the soft rate's margin over this rank's measured cost per row (the >= 2048-row path keeps its 1.15): the soft
+#: measurement starts at 512 rows, where the per-row figure carries a share of the forward's fixed part (conservative)
+#: but not yet the deep-prefix growth of a wide chunk
+SOFT_RATE_SAFETY = 1.25
+#: the soft base rate never goes under this fraction of the start rate (one boot's measurement is one boot's depth)
+SOFT_RATE_FLOOR_FRAC = 0.5
+#: only extends of at least this many rows enter the soft measurement (= GROWTH_MIN_ROWS, rc12f)
+SOFT_MIN_ROWS = GROWTH_MIN_ROWS
+#: a measured soft rate holds up to this multiple of the widest extend measured (linear extrapolation guard)
+SOFT_RAMP_FACTOR = 2
+#: F without a seed: ``D_EXTEND_VOTE_FIXED_MIB``, the measured max of admission rest + forward fixed part (INT8 drei)
+SOFT_FIXED_DEFAULT_MIB = 238.0
+
+
+class SoftTerms(msgspec.Struct, frozen=True):
+    """One rank's soft vote terms: the rate and line the cap is computed with, and what they came from."""
+
+    rate: float
+    rate_src: str
+    line: float
+    reserve: float
+    fixed: float
+    old_line: float
+    cap_old: int
+
+
+def soft_on() -> bool:
+    """``FLLIPER_PDFLIP_EXTEND_SOFT_LINE`` (default ON), read once per process."""
+    if _CACHE["soft"] is _UNSET:
+        from flliper.srt.environ import envs
+
+        _CACHE["soft"] = bool(envs.FLLIPER_PDFLIP_EXTEND_SOFT_LINE.get())
+    return bool(_CACHE["soft"])
+
+
+def soft_measure_on(rank: Optional[int]) -> bool:
+    """This rank measures its cost per row for the soft vote: the switch is on and the rank has a start rate."""
+    if rank is None or not soft_on():
+        return False
+    start = threshold_for(int(rank), rates())
+    return start is not None and start > 0
+
+
+def soft_base_rate(start: float, measured: Optional[float]) -> "tuple[float, str]":
+    """``(rate, source)``: ``max(1.25 x measured, 0.5 x start)`` capped at ``start`` once the rank measured a cost per
+    row (``measured-soft``), else the start rate (``start``). Pure."""
+    if measured is None:
+        return float(start), "start"
+    soft = max(_ceil4(float(measured) * SOFT_RATE_SAFETY), _ceil4(float(start) * SOFT_RATE_FLOOR_FRAC))
+    if soft >= float(start):
+        return float(start), "start"
+    return soft, "measured-soft"
+
+
+def soft_line_mib(old_line: float, reserve_mib: float, fixed_mib: float) -> float:
+    """The soft vote line: the user reserve, or the near-OOM edge plus the fixed part when that is lower than the old
+    line -- never the old line when it is higher (that is the plan target the rule softens). Pure."""
+    edge = near_oom_mib() + max(0.0, float(fixed_mib))
+    return max(float(reserve_mib), min(float(old_line), edge))
+
+
+def soft_ramp_bound(cap_old: int, widest_rows: int, page_size: int) -> int:
+    """The widest chunk a MEASURED soft rate may extrapolate to: ``SOFT_RAMP_FACTOR x`` the widest extend measured,
+    page aligned, never under what the old rule funded (the soft rule never narrows below it). Pure."""
+    page = max(1, int(page_size or 1))
+    return max(int(cap_old), (int(widest_rows) * SOFT_RAMP_FACTOR // page) * page)
+
+
+def _user_reserve_mib() -> float:
+    """This card's EFFECTIVE user reserve (launcher-masked to 0 on a booked-rest card), read once per process."""
+    if _CACHE["reserve"] is _UNSET:
+        from flliper.srt.managers.corridor_guard import reserve_for_card
+
+        try:
+            from flliper.srt.registry import nvml as registry_nvml
+
+            uuid = registry_nvml.current_device_uuid() or ""
+        except Exception as exc:  # noqa: BLE001 -- no NVML: the floor reader's own answer (no card, no mapped reserve)
+            logger.debug("%s: current device uuid unavailable for the reserve: %s", SOFT_MARKER, exc)
+            uuid = ""
+        # the one function every rank reader of the floor uses (#236 SOLL-2): the launcher's EFFECTIVE reserve
+        _CACHE["reserve"] = float(reserve_for_card(uuid, 0)[0])
+    return float(_CACHE["reserve"])  # type: ignore[arg-type]
+
+
+def soft_terms(rank: int, post_mib: float, start_rate: float, page_size: int, old_line: float) -> SoftTerms:
+    """The soft vote's rate and line for this rank (reads the once-per-process reserve, the live F and the soft and
+    >= 2048-row measurements)."""
+    seed = threshold_for(int(rank), vote_fixed())
+    fixed = fixed_effective(rank, max(SOFT_FIXED_DEFAULT_MIB, 0.0 if seed is None else float(seed)))
+    reserve = _user_reserve_mib()
+    base, src = soft_base_rate(start_rate, _CACHE["soft_measured"])
+    rate = effective_rate(base, rank)
+    if rate > base:
+        src = "measured"
+    return SoftTerms(rate=rate, rate_src=src, line=soft_line_mib(old_line, reserve, fixed), reserve=reserve,
+                     fixed=fixed, old_line=float(old_line),
+                     cap_old=rows_cap(post_mib, effective_rate(start_rate, rank), page_size, old_line))
+
+
+def soft_cap(post_mib: float, page_size: int, terms: SoftTerms) -> int:
+    """``rows_cap`` on the soft line and rate; a measured soft rate holds up to :func:`soft_ramp_bound`."""
+    cap = rows_cap(post_mib, terms.rate, page_size, terms.line)
+    if terms.rate_src != "measured-soft":
+        return cap
+    return min(cap, soft_ramp_bound(terms.cap_old, int(_CACHE["soft_rows"]), page_size))
+
+
+def _soft_terms_or_none(rank: int, post_mib: float, start_rate: float, page_size: int,
+                        old_line: float) -> Optional[SoftTerms]:
+    """The soft terms, or ``None`` = the old rule: switch off, or the soft path could not be priced (named once, at
+    WARNING -- an unpriced soft vote must fall back to the old line, not abstain from the vote)."""
+    if not soft_on():
+        return None
+    try:
+        return soft_terms(rank, post_mib, start_rate, page_size, old_line)
+    except Exception as exc:  # noqa: BLE001 -- fall back to the old, narrower rule
+        if not _CACHE["soft_failed"]:
+            _CACHE["soft_failed"] = True
+            logger.warning(f"{SOFT_MARKER} rank={rank} could not price the soft line ({type(exc).__name__}: {exc}); "
+                           f"this rank votes with the old line and rate")
+        return None
+
+
+def _log_soft(rank: int, terms: SoftTerms, post_mib: float, cap: int, width: int, configured: int) -> None:
+    """One line per new soft width of this rank (edge-triggered like GROUP-NARROWED)."""
+    if width == _CACHE["logged_soft"]:
+        return
+    _CACHE["logged_soft"] = width
+    measured = _CACHE["soft_measured"]
+    logger.info(
+        f"{SOFT_MARKER} rank={rank} free={post_mib:.0f} hard_floor={terms.line:.0f} rate_used={terms.rate:.4f} "
+        f"rate_src={terms.rate_src} cap={cap} width={width} configured={configured} reserve={terms.reserve:.0f} "
+        f"fixed={terms.fixed:.0f} old_line={terms.old_line:.0f} cap_old={terms.cap_old} "
+        f"soft_measured={'none' if measured is None else f'{float(measured):.4f}'} soft_rows={int(_CACHE['soft_rows'])}"
+    )
+
+
+def _note_soft_measure(rank: Optional[int], rows: int, rate: float, transient: int, growth: int) -> Optional[str]:
+    """One extend of >= SOFT_MIN_ROWS rows: the widest one bounds the ramp, the highest cost per row is this rank's
+    soft measurement (ratchet up). Returns the line it logged."""
+    prev = _CACHE["soft_measured"]
+    if rows > int(_CACHE["soft_rows"]):
+        _CACHE["soft_rows"] = rows
+    if prev is not None and rate <= float(prev):
+        return None
+    _CACHE["soft_measured"] = rate
+    line = (f"{RATE_MARKER} source=measured-soft rank={'?' if rank is None else int(rank)} rows={rows} "
+            f"transient_mib={transient / MIB:.0f} reserved_growth_mib={growth / MIB:.0f} rate={rate:.4f} "
+            f"prev={'none' if prev is None else f'{float(prev):.4f}'} soft_rows={int(_CACHE['soft_rows'])} "
+            f"safety={SOFT_RATE_SAFETY}")
+    logger.info(line)
+    return line
+
+
 def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                clock=time.perf_counter) -> Optional[int]:
     """This rank's vote for the group's chunk width, ``None`` = no vote.
@@ -867,10 +1081,17 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         # the driver free; a capped post would make the reading smaller by the gap)
         live_note_vote(rank, post_mib if cap_post is None else _live_driver_post, rate)
         line_mib = corridor_line_mib(rank)
-        cap = rows_cap(post_mib, rate, page_size, line_mib)
+        # EXTEND-CAP-SOFT: the hard floor and the measured rate instead of the plan line and the start rate
+        soft = _soft_terms_or_none(rank, post_mib, start_rate, page_size, line_mib)
+        if soft is None:
+            cap = rows_cap(post_mib, rate, page_size, line_mib)
+        else:
+            rate, line_mib = soft.rate, soft.line
+            cap = soft_cap(post_mib, page_size, soft)
         if cap >= int(configured):
             _CACHE["logged_cap"] = None
             _CACHE["logged_floor"] = None
+            _CACHE["logged_soft"] = None
             return None
         if cap != _CACHE["logged_cap"]:
             _CACHE["logged_cap"] = cap
@@ -878,12 +1099,14 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 f"{CHUNKING_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
                 f"post={post_mib:.0f} cache_free={cache_free_mib:.0f} funds=driver rate={rate:.4f} floor={line_mib:.0f}"
                 + ("" if cap_post is None else f" torch_cap={torch_cap:.0f} cap_post={cap_post:.0f}")
-                + ("" if not measure_armed(rank) else
+                + (f" rate_src={soft.rate_src} start_rate={start_rate:.4f}" if soft is not None else
+                   "" if not measure_armed(rank) else
                    f" rate_src={'measured' if rate > start_rate else 'start'} start_rate={start_rate:.4f}")
             )
-        if cap_floor_armed():
-            return _apply_cap_floor(rank, cap, post_mib, rate, int(configured), page_size)
-        return cap
+        width = _apply_cap_floor(rank, cap, post_mib, rate, int(configured), page_size) if cap_floor_armed() else cap
+        if soft is not None:
+            _log_soft(rank, soft, post_mib, cap, width, int(configured))
+        return width
     except Exception as exc:  # noqa: BLE001 -- a vote that cannot price abstains
         logger.debug("%s skipped: %s", CHUNKING_MARKER, exc)
         return None
@@ -1339,7 +1562,9 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
     if pending is None:
         return None
     try:
-        if not measure_armed(rank):
+        armed = measure_armed(rank)
+        soft = soft_measure_on(rank)
+        if not (armed or soft):
             _CACHE["pending"] = None
             return None
         if getattr(runner, "is_draft_worker", False) or getattr(runner, "is_draft_model_runner", False):
@@ -1354,7 +1579,7 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
         ids = getattr(forward_batch, "input_ids", None)
         rows = (int(ids.shape[0]) if ids is not None
                 else int(getattr(forward_batch, "extend_num_tokens", 0) or 0))
-        if rows < GROWTH_PER_ROW_MIN_ROWS:
+        if rows < (SOFT_MIN_ROWS if soft else GROWTH_PER_ROW_MIN_ROWS):
             return None
         pa1, _a1, r1 = _alloc_stats(cuda)
         # the peak counter is this extend's only if the extend raised it
@@ -1364,6 +1589,9 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
         if cost <= 0:
             return None
         rate = _ceil4(cost / MIB / rows)
+        soft_line = _note_soft_measure(rank, rows, rate, transient, growth) if soft else None
+        if not armed or rows < GROWTH_PER_ROW_MIN_ROWS:
+            return soft_line
         prev = _CACHE["measured"]
         if prev is not None and rate <= float(prev):
             return None
