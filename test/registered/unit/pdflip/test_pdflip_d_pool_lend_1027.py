@@ -225,6 +225,23 @@ class Pure(CustomTestCase):
         self.assertEqual(L.size_pool(mapped=2 * STEP, need=STEP, **kw).kind, "hold")     # never a second shrink
         self.assertEqual(L.size_pool(mapped=2 * STEP, need=TOP + 1, **kw).target, TOP)   # past the top = all back
 
+    def test_auto_step_keeps_the_int8_lattice_and_gives_the_small_int4ar_pool_room(self):
+        """Derived property: the fixed step 32768 left the int4ar pool (126178 rows per rank) without a release for a
+        live floor above 60642 rows (a release needs MIN_RELEASE_CELLS cells under the top); the auto step keeps the
+        INT8 drei pool (270000 rows, boot dkr27bbar1drei10272126) on 32768 and cuts the int4ar pool to ~11 cells."""
+        self.assertEqual(L.resolve_step(0, 270000), 32768)
+        self.assertEqual(L.resolve_step(0, 126178), 12288)
+        self.assertEqual(L.resolve_step(16384, 126178), 16384)          # a set value is taken as set
+        self.assertEqual(L.resolve_step(0, 20000), L.STEP_MIN)          # a tiny pool never goes under the floor
+        top = 126178
+        need32k = L.need_tokens(live=50000, incoming=12000, air=2048, step=32768)
+        self.assertEqual(L.size_pool(mapped=top, top=top, step=32768, need=need32k).kind, "hold")
+        step = L.resolve_step(0, top)
+        need = L.need_tokens(live=50000, incoming=12000, air=2048, step=step)
+        move = L.size_pool(mapped=top, top=top, step=step, need=need)
+        self.assertEqual((move.kind, move.target), ("release", need))
+        self.assertGreaterEqual(top - need, 2 * step)
+
     def test_intent_table(self):
         kw = dict(incoming=100000, busy=True, streak=0, settle=3, min_rows=4096)
         self.assertEqual(L.intent(lent=True, pend=2, **kw).kind, "back")

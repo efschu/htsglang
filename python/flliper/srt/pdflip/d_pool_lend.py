@@ -68,6 +68,12 @@ GROW_SHORT_BACKOFF_ROUNDS = 64
 COMPACT_BACKOFF_MAX = 64
 #: a release must give at least this many lattice cells back
 MIN_RELEASE_CELLS = 2
+#: the auto lattice step: an eighth of the pool on this row alignment, within these bounds (the INT8 drei pool of
+#: 270000 rows lands on 32768, the int4ar pool of 126178 rows on 12288: ~11 cells, ~330 extents per rank, the same
+#: map count per D wake as the INT8 lattice)
+STEP_ALIGN = 4096
+STEP_MIN = 8192
+STEP_MAX = 32768
 
 
 class Move(msgspec.Struct, frozen=True):
@@ -99,10 +105,26 @@ class Knobs(msgspec.Struct, frozen=True):
     low_first: int
 
 
+def auto_step(top: int) -> int:
+    """The lattice step when ``FLLIPER_PDFLIP_D_POOL_LEND_STEP_TOKENS`` is 0 (auto): about an eighth of the pool, on
+    ``STEP_ALIGN`` rows, within [``STEP_MIN``, ``STEP_MAX``]. A fixed 32768 leaves a small pool without a release:
+    a release needs ``MIN_RELEASE_CELLS`` cells under the top, so the int4ar pool (126178 rows per rank, TP2 3080)
+    could lend only while live + prefill + air stayed under 60642 rows, the INT8 drei pool (270000) under 204464.
+    Pure."""
+    eighth = (int(top) // 8 // STEP_ALIGN) * STEP_ALIGN
+    return max(STEP_MIN, min(STEP_MAX, eighth))
+
+
+def resolve_step(configured: int, top: int) -> int:
+    """The knob's value (> 0 = as set) or the auto step of this pool (0). Pure."""
+    return int(configured) if int(configured) > 0 else auto_step(top)
+
+
 def knobs_from_env() -> Knobs:
+    """``step`` 0 = auto: :func:`resolve_step` fixes it at the attach, where the pool size is known."""
     from flliper.srt.environ import envs
 
-    return Knobs(step=max(1, int(envs.FLLIPER_PDFLIP_D_POOL_LEND_STEP_TOKENS.get())),
+    return Knobs(step=max(0, int(envs.FLLIPER_PDFLIP_D_POOL_LEND_STEP_TOKENS.get())),
                  settle=max(1, int(envs.FLLIPER_PDFLIP_D_POOL_LEND_SETTLE_ROUNDS.get())),
                  min_rows=max(0, int(envs.FLLIPER_PDFLIP_D_POOL_LEND_MIN_ROWS.get())),
                  recheck=max(1, int(envs.FLLIPER_PDFLIP_D_POOL_LEND_RECHECK_ROUNDS.get())),
@@ -394,10 +416,11 @@ def attach(runner) -> Optional[PoolLend]:
     if not spans.available:
         logger.warning("%s NOT armed: the saver's span map (tms_set_spans) is not in the preloaded hook", MARK)
         return None
-    knobs = knobs_from_env()
     dev = torch.device("cuda", int(runner.gpu_id))
     granule, allocator = _sv.granule_for(dev), runner.token_to_kv_pool_allocator
     pools, top = _pk.stage_pools(runner.token_to_kv_pool), int(allocator.size)
+    knobs = knobs_from_env()
+    knobs = msgspec.structs.replace(knobs, step=resolve_step(knobs.step, top))
     born, extents, reason = _cut_pools(pools, top=top, spans=spans, granule=granule, step=knobs.step)
     if reason:
         logger.warning("%s NOT armed: %s", MARK, reason)

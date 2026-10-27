@@ -4793,8 +4793,10 @@ class Envs:
     #   (pdflip/d_pool_lend.py). The span lattice is cut at the KV attach, so the switch is read at the boot.
     FLLIPER_PDFLIP_D_POOL_LEND = EnvBool(True)
     #   The lattice step in GLOBAL tokens (one cell = one saver extent per K/V tensor; every cell costs one
-    #   map per D wake): a release or return moves whole cells.
-    FLLIPER_PDFLIP_D_POOL_LEND_STEP_TOKENS = EnvInt(32768)
+    #   map per D wake): a release or return moves whole cells. 0 (default) = auto: an eighth of the pool on
+    #   4096 rows within [8192, 32768] (d_pool_lend.auto_step: INT8 drei 270000 rows -> 32768, int4ar 126178 -> 12288);
+    #   a value > 0 is taken as set.
+    FLLIPER_PDFLIP_D_POOL_LEND_STEP_TOKENS = EnvInt(0)
     #   Decode rounds in a row with a running batch and no pending prefill before a lent tail goes back.
     FLLIPER_PDFLIP_D_POOL_LEND_SETTLE_ROUNDS = EnvInt(64)
     #   A sole prefill below this many rows (the request's whole token count) lends nothing.
