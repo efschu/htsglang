@@ -10719,7 +10719,8 @@ class Scheduler(
             return 0
         cap = int(self.chunked_prefill_size or 0)
         out = min(int(width), cap) if cap > 0 else int(width)
-        out = self._p_chunk_mem_guard(out)
+        # explicit class call: the unit tests drive this function with a bare stub as ``self``
+        out = Scheduler._p_chunk_mem_guard(self, out)
         # SF (b23 #1004): remember where this budget was planned, so a #988
         # prefix move to another start replans (pdflip/pp_slot_fidelity.py).
         from flliper.srt.pdflip import pp_slot_fidelity as _sf
