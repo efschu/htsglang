@@ -16151,12 +16151,13 @@ def resolve_dual_layout(ns) -> None:
         raise PdFlipLaunchRefused(l15_msg)
     if str(getattr(ns, "dual_mps", "off")) == "on" and os.environ.get(DUAL_MPS_OPT_IN_ENV, "").strip() != "1":
         raise PdFlipDualLayoutRefused(
-            "DUAL-TP3PP3: --dual-mps on is refused -- MEASURED to wedge both groups: repro v2 "
+            "DUAL-TP3PP3: --dual-mps on needs the opt-in -- on 30.09. MPS wedged both groups: repro v2 "
             "(gpuq scjhru 30.09., run_dualstress.sh arm S1: MPS + extend-sized barlink collectives of "
             "D and P, P rc=124, D 31 rounds in 45 s; without MPS, arm S3, clean) and metal boots "
-            "kw6pft/ndktv4 (both groups frozen in the same second). Run without MPS "
-            f"(--dual-mps off, latency guard --dual-p-duty), or set {DUAL_MPS_OPT_IN_ENV}=1 "
-            "to opt in for a measurement.")
+            "kw6pft/ndktv4 (both groups frozen in the same second); the root cause is fixed by b855aecfd3 "
+            "and the release profile 27b-nvfp4-dual sets the opt-in. Set "
+            f"{DUAL_MPS_OPT_IN_ENV}=1 to use MPS, or run --dual-mps off (time-slicing, latency guard "
+            "--dual-p-duty, no green ladder).")
     if _d_adopt_armed(ns):
         raise PdFlipDualLayoutRefused(
             "DUAL-TP3PP3: --dual-layout with --pdflip-d-adopt on -- D would hold placeholder "
@@ -24781,9 +24782,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
                          "under the boot's run dir) so P and D kernels run concurrently on a card instead "
-                         "of time-slicing. Only with --dual-layout. REFUSED unless FLLIPER_PDFLIP_DUAL_MPS_OPT_IN=1: "
-                         "measured to wedge both groups under extend-sized collectives (repro v2 scjhru S1, "
-                         "boots kw6pft/ndktv4); the dual layout runs without MPS, latency guard --dual-p-duty.")
+                         "of time-slicing. Only with --dual-layout. Needs FLLIPER_PDFLIP_DUAL_MPS_OPT_IN=1 (the "
+                         "release profile 27b-nvfp4-dual sets it): on 30.09. MPS wedged both groups under "
+                         "extend-sized collectives (repro v2 scjhru S1, boots kw6pft/ndktv4); root cause fixed by "
+                         "b855aecfd3 (barlink-BAR1 under MPS without the cooperative full-card grid). MPS is not "
+                         "needed to RUN the dual layout (without it: time-slicing, latency guard --dual-p-duty, "
+                         "no green ladder) but it is what gives concurrent P/D kernels and the dynamic GEMM share "
+                         "(--dual-green-ladder needs --dual-mps on). See docs/dev/dual-layout.md.")
     ap.add_argument("--flip-weights", choices=("family", "resident"), default="family",
                     help="Task #47 Scheibe 6a: 'family' (default) moves the weights family across the flip "
                          "(gathered legs, host ring / exchange); 'resident' keeps BOTH groups' weights mapped "
