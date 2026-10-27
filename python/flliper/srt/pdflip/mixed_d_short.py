@@ -118,7 +118,8 @@ def stamp_chunked(req) -> None:
         return
     try:
         er = getattr(req, "extend_range", None)
-        start = int(er.start) if er is not None else len(getattr(req, "prefix_indices", None) or ())
+        prefix_indices = getattr(req, "prefix_indices", None)  # a torch.Tensor: never ``or ()`` on it
+        start = int(er.start) if er is not None else (0 if prefix_indices is None else len(prefix_indices))
         seqlen = int(getattr(req, "seqlen"))
         total = max(0, seqlen - start)
     except Exception:  # noqa: BLE001 -- no total = big (chunked_big), never an invented bound

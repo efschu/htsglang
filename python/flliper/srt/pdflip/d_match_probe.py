@@ -374,7 +374,9 @@ def locked_agreed(locked, g_ok, g_min, g_max, rid, fp_min=None, fp_max=None):
 def match_numbers(match_result: Any) -> Tuple[int, int, int]:
     """(device tokens, host-tier tokens, key depth) of a ``MatchResult`` -- the admission's usable prefix is
     ``device + host`` (``Req.init_next_round_input``: prefix_indices + host_hit_length)."""
-    dev = len(getattr(match_result, "device_indices", ()) or ())
+    device_indices = getattr(match_result, "device_indices", None)
+    # a torch.Tensor: ``x or ()`` raises from two elements on, so only ``is None`` and ``len`` here
+    dev = 0 if device_indices is None else len(device_indices)
     host = int(getattr(match_result, "host_hit_length", 0) or 0)
     key = int(getattr(match_result, "key_match_depth", 0) or 0)
     return dev, host, key
