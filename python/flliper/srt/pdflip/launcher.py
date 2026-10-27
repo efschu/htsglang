@@ -16119,6 +16119,9 @@ DUAL_MPS_OPT_IN_ENV = "FLLIPER_PDFLIP_DUAL_MPS_OPT_IN"
 def resolve_dual_layout(ns) -> None:
     """DUAL-TP3PP3 (F26): the ONE place --dual-layout changes other flags.
 
+    See docs/dev/dual-layout.md (user explanation of the dual layout: weights in the D layout, P loads only
+    the byte difference, no all-reduce in prefill, GEMM share by load via MPS) before changing anything dual.
+
     Both groups stay awake, so their weights never sleep: --flip-weights is
     forced to 'resident' and --idle-layout pp (an idle flip rule) to 'tp'.
     Refused by name: --pdflip-d-adopt on (D would hold placeholders that only a
@@ -16582,7 +16585,10 @@ def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
     boot (pipe dir under /tmp/pdflip-dual-mps-<tag>, so nothing outside the boot
     can attach), started before the groups; returns the client env both
     groups get. The daemon lives until teardown() (or the early-exit paths of cli())
-    calls :func:`stop_dual_mps`. Off: {}."""
+    calls :func:`stop_dual_mps`. Off: {}.
+
+    Why MPS: P and D are two MPS clients per card (docs/dev/dual-layout.md); the static SM percentage is
+    dual_p_sm_env, the dynamic share is the green ladder (pdflip/dual_green.py), not this daemon."""
     if not getattr(ns, "dual_layout", False) or str(getattr(ns, "dual_mps", "off")) != "on":
         return {}
     root = dual_mps_root(ns.tag)
