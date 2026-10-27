@@ -19962,9 +19962,26 @@ class Front:
             self.exact_tokens.pop(next(iter(self.exact_tokens)))
         self.exact_tokens[hashlib.sha1(text.encode(errors="replace")).hexdigest()] = int(prompt_tokens)
 
+    def _fork_tail_allowance(self, text: Optional[str]) -> int:
+        """FORK-TAIL (Q-360 on D, W16 on the front, boot dkr27bnvfp4dualbar1drei10271342): the generation-prompt tail ``N - F`` that
+        group P's fork cut leaves to D's own extend, or 0. D's X gate admits it (``PDFLIP X-GATE FORK-TAIL``); the front's leg-2
+        price must not call it a double prefill against the dual layout's X=1. Same predicate as D's
+        (``fork_anchor.fork_cut`` over the prompt ids, switch and max_tail from the env): the front's own exact ids of this
+        text, ``FLLIPER_PDFLIP_FORK_ANCHOR_TOKEN`` in the front's env. 0 without the switch, without ids, without a fork token
+        in the final window -- then X stands alone."""
+        from flliper.srt.pdflip import fork_anchor as _fa
+
+        tok = _fa.fork_token()
+        ft = self.ftok
+        if tok is None or ft is None or not text:
+            return 0
+        ids = ft.ids_for(text)
+        f = _fa.fork_cut(ids, tok, _fa.max_tail())
+        return 0 if f is None else max(0, len(ids) - int(f))
+
     def _leg2_verdict(self, pt: int, ct: int, priced: bool, pending: Optional[Pending],
                       single_prefill: bool, stream: bool, rid: str,
-                      x_inband: bool = False) -> str:
+                      x_inband: bool = False, text: Optional[str] = None) -> str:
         """spec 3.6 verdict with the 1j holes closed (#1233 zero-remainder).
 
         * single_prefill (route CARRIER-EXCEEDS): no leg 1 ever ran, so there
@@ -19998,6 +20015,13 @@ class Front:
             self.counters["W28_PdFlipLeg2Unpriced_stream_served"] += 1
             logger.error("W28 PdFlipLeg2Unpriced rid=%s: STREAMED leg 2 ended without a usage/meta_info chunk; served, unpriced, counted", rid)
             return "unpriced"
+        # FORK-TAIL: P's fork cut leaves the generation prompt to D (D's gate admits it); a match SHORT of the fork leaves
+        # more than the tail and is still priced against X alone (the allowance is added, X is not raised for anything else).
+        _tail = Front._fork_tail_allowance(self, text)
+        if _tail and _x < uncached <= _x + _tail:
+            logger.info("PDFLIP LEG2 FORK-TAIL rid=%s uncached=%d tail=%d X=%d verdict=serve (the generation prompt after P's fork "
+                        "cut is D's own extend, not a double prefill)", rid, uncached, _tail, _x)
+            return "serve"
         v = double_prefill_verdict(pt, ct, pending.reroutes, _x)
         if stream and v != "serve":
             self.counters["W16_PdFlipDoublePrefillExceeded"] += 1
@@ -20617,7 +20641,7 @@ class Front:
                             rid,
                         )
                     verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, True, rid,
-                                                 x_inband=x_inband)
+                                                 x_inband=x_inband, text=text)
                     if pt:
                         # #1324: the PRESENCE witness is D's own cached share,
                         # not the prompt length. `pt` still feeds the
@@ -20684,7 +20708,7 @@ class Front:
                     logger.error("W28 PdFlipLeg2Unpriced rid=%s: D answered 200 without usage/meta_info (%d bytes); refusing by name "
                                  "rather than serving on a fail-open (0,0) price", rid, len(body))
                     return web.json_response({"error": f"W28 PdFlipLeg2Unpriced rid={rid}"}, status=503)
-                verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
+                verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid, text=text)
                 g.served += 1
                 self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_of(js), rid=rid)
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),

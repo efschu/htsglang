@@ -30175,6 +30175,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # chunk + one decode round of every seat with the draft's tokens)
     fenv.update(dual_p_sleep_front_env(ns, dual_d_air_tokens(d_bs)))
     fenv.update(dual_front_kv_tag_env(ns))
+    # FORK-TAIL on the front (W16, boot ...10271342): the leg-2 price needs the same fork token the groups cut at ({} when off).
+    fenv.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None), bool(getattr(ns, "p_trim_end_anchor", False))))
     # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
     # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
     #
