@@ -63,9 +63,9 @@ class _Victims(vv.HostImageVictims):
     def _named_storages(self):
         return [(n, vv.storage_view(t)) for n, t in self.tensors.items()]
 
-    def stash(self, views):
+    def stash(self, views, *, sums=None):
         self.stashed += 1
-        super().stash(views)
+        super().stash(views, sums=sums)
 
     def restore(self, views):
         if self.mode == "skip":

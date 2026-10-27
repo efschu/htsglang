@@ -520,9 +520,11 @@ class ExactPrice:
     device_locked: Optional[int] = None
 
 
-def exact_price(ans: ProbeAnswer, store_tokens: int) -> ExactPrice:
+def exact_price(ans: ProbeAnswer, store_tokens: int, *, d_encodes: bool = False) -> ExactPrice:
     """THE price of the arrival from the sources' numbers (no estimate): D's tree (device + host tier) and the
-    shared store, both asked with D's own ids. ``store_tokens`` is the store's page depth of ``ans.ids``."""
+    shared store, both asked with D's own ids. ``store_tokens`` is the store's page depth of ``ans.ids``.
+    ``d_encodes`` (user order 27.10., flip layouts): group D runs its own vision stage (``vision_d_runner``), so an
+    image ending past ``covered`` is no P-only tail -- D encodes it; the price is D's figure."""
     n = ans.n
     tree = ans.tree_tokens
     store = max(0, min(int(store_tokens), n))
@@ -532,7 +534,7 @@ def exact_price(ans: ProbeAnswer, store_tokens: int) -> ExactPrice:
     # rows -- it is no P-only tail (R9 is for an image D cannot compute); only the other images decide
     rows = set((int(a), int(b)) for a, b in getattr(ans, "mm_rows", ()) or ())
     past = [(int(a), int(b)) for a, b in ans.mm_spans if int(b) > covered]
-    tail = any(s not in rows for s in past)
+    tail = (not d_encodes) and any(s not in rows for s in past)
     src = "d_tree" if tree >= store and tree > 0 else ("store" if store > 0 else "none")
     locked = (locked_rows_continued(getattr(ans, "device_locked_spans", ()) or (), covered)
               if getattr(ans, "device_locked_known", False) else None)

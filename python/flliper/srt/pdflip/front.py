@@ -1164,6 +1164,18 @@ def vision_flip_urgent(env=None) -> bool:
     return _env_switch_on_or_profile(VISION_FLIP_URGENT_ENV, env)
 
 
+def vision_on_d(vision: str, dual_layout: bool, env=None) -> bool:
+    """User order 27.10. ("vision natürlich in D und in P, für die flip layouts, vision nur auf P
+    in dual layout"): under ``--pdflip-vision transient`` and the flip layouts D encodes images too
+    (``pdflip/vision_d_runner``), so an image request is no longer P-only: it is routed and priced by
+    its exact uncached length like text (R9, user 19.10.). Dual layout: P only, as before.
+    ``FLLIPER_PDFLIP_VISION_D=0`` switches it off -- the same switch the D group reads."""
+    src = os.environ if env is None else env
+    if str(vision) != VISION_MODE_TRANSIENT or dual_layout:
+        return False
+    return str(src.get("FLLIPER_PDFLIP_VISION_D", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 #: verdicts of :func:`vision_verdict`
 VERDICT_ROUTE = "route"
 VERDICT_STAGE = "stage"
@@ -5540,6 +5552,13 @@ class Front:
         #: D is `awake`), SHORT work is served on D as in every D phase.
         #: Default off: the front is byte-identical.
         self.dual_layout = bool(dual_layout)
+        self.vision_on_d = vision_on_d(self.vision, self.dual_layout)
+        if self.vision == VISION_MODE_TRANSIENT:
+            logger.info("PDFLIP VISION-ON-D %s (dual_layout=%s, FLLIPER_PDFLIP_VISION_D=%r): %s",
+                        "on" if self.vision_on_d else "off", self.dual_layout,
+                        os.environ.get("FLLIPER_PDFLIP_VISION_D"),
+                        "flip layouts encode images on D too; an image request is routed and priced "
+                        "like text" if self.vision_on_d else "an image request is prefilled on P only")
         self._dual_task: Optional[asyncio.Task] = None
         self._dual_backoff_until = 0.0
         #: DUAL-TP3PP3 unified KV (user order 30.09. 07:25Z): the card KV
@@ -6249,7 +6268,7 @@ class Front:
                 continue
             if p.fut.done() or not any(q is p for q in self.queue):
                 continue  # gone meanwhile: named at the loop head
-            xp = _dmp.exact_price(ans, int(store) if ns_known else 0)
+            xp = _dmp.exact_price(ans, int(store) if ns_known else 0, d_encodes=self.vision_on_d)
             u = int(_dmp.class_uncached(xp))
             old = int(p.est_uncached or 0)
             p.est_uncached = u
@@ -8108,7 +8127,7 @@ class Front:
                     # mix: no price, the entry stays on its store bound
                     raise ValueError("n_d=%d != n_front=%d: not booked" % (int(ans.n), int(n)))
                 # the exact D price of this rid, kept as an answered arrival probe keeps it (NF-VISION-CACHED)
-                _xp = _dmp.exact_price(ans, int(store) if ns_known else 0)
+                _xp = _dmp.exact_price(ans, int(store) if ns_known else 0, d_encodes=self.vision_on_d)
                 _pbook = self.__dict__.setdefault("_probe_price", collections.OrderedDict())
                 _pbook[str(rid)] = _xp
                 while len(_pbook) > 4096:
@@ -8373,7 +8392,7 @@ class Front:
         # ledger's figure above stays in the line as the comparison (it decides nothing any more)
         _xp = None
         if _probe is not None:
-            _xp = _dmp.exact_price(_probe, int(l3) if ns_known else 0)
+            _xp = _dmp.exact_price(_probe, int(l3) if ns_known else 0, d_encodes=self.vision_on_d)
             _ledger = (pending, credit, src)
             pending = _dmp.class_uncached(_xp)
             credit = max(0, int(c.n) - int(pending))
@@ -12708,7 +12727,8 @@ class Front:
                 "W102 PdFlipVisionStage rid=%s -- route %s stands UNPRICED: no exact number says the image is "
                 "uncached; D's admission measures it (W123 -> P-only requeue with D's extent), no rule-flip "
                 "on a missing number (S66, S56r A1)", rid, route)
-        elif _verdict == VERDICT_STAGE and not _mm_cached and route != "none" and route != "long":
+        elif (_verdict == VERDICT_STAGE and not _mm_cached and route != "none" and route != "long"
+                and not self.vision_on_d):
             _route_vision_p_only = True
             logger.info(
                 "W102 PdFlipVisionStage rid=%s -- route %s -> long (P): an image "
@@ -13024,8 +13044,8 @@ class Front:
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
                     # S66: an UNPRICED image request is D's admission's call (W123 -> P-only requeue), not P-only
-                    p_only=(_verdict == VERDICT_STAGE and not _mm_cached and not _w102_unpriced_d)
-                    or _probe_p_only,
+                    p_only=((_verdict == VERDICT_STAGE and not _mm_cached and not _w102_unpriced_d)
+                            or _probe_p_only) and not self.vision_on_d,
                     # S56: priced from D's exact numbers -- no ledger reprice overwrites them
                     # S56r A1: an UNPRICED entry is never repriced by the ledger either -- D's admission measures it
                     probe_priced=bool(_xx is not None and (getattr(_xx, "probe", None) is not None or _unpriced)),
@@ -16730,7 +16750,7 @@ class Front:
         uncached tail (R9). Returns True when the class number moved."""
         if Front._rvp_other_key(self, rid, e, "apply", site):
             return False
-        xp = _dmp.exact_price(ans, int(store) if e.ns_known else 0)
+        xp = _dmp.exact_price(ans, int(store) if e.ns_known else 0, d_encodes=self.vision_on_d)
         u = int(_dmp.class_uncached(xp))
         old_xp = e.price
         old_u = int(_dmp.class_uncached(old_xp)) if old_xp is not None else -1

@@ -81,7 +81,8 @@ def _tower_needed(it: Any) -> bool:
     tower on D -- its positions are computed like text from those rows. Only P-side items never carry them."""
     from flliper.srt.pdflip.vision_row_store import has_rows
 
-    return not has_rows(it)
+    # rows attached by D's own vision stage (user order 27.10., vision_d_runner) are rows too: D encodes nothing here
+    return not has_rows(it) and getattr(it, "precomputed_embeddings", None) is None
 
 
 def image_spans(req: Any) -> List[Tuple[int, int]]:
@@ -227,6 +228,21 @@ def reroute_message(req: Any, covered: Optional[int]) -> str:
         f"itself; this request's extent after prefix matching is {extent}. "
         f"Re-routed through the prefill group, which has the vision tower -- "
         f"{refusal_message(req, covered)}"
+    )
+
+
+def stage_reroute_message(req: Any, code: str, detail: str) -> str:
+    """The same W50 refusal for the D vision STAGE's own refusal (user order 27.10.): the stage on
+    D's TP0 refused this image (``code``: ``detail``, e.g. W105b air short), so the request goes
+    back through P with its original body -- P has the tower -- instead of ending as a 503 to the
+    client. Same marker and extent sentence as :func:`reroute_message`; the front's bound ends it."""
+    fill = getattr(req, "full_untruncated_fill_ids", None)
+    total = 0 if fill is None else len(fill)
+    return (
+        f"W50 PdFlipTpPrefillExceeded (vision reroute): group D cannot serve this request "
+        f"itself; this request's extent after prefix matching is {total}. "
+        f"Re-routed through the prefill group, which has the vision tower -- "
+        f"the D vision stage refused it: {code}: {detail}"
     )
 
 

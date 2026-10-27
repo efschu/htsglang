@@ -37,7 +37,7 @@ import logging
 import os
 import struct
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -648,21 +648,36 @@ def plan_checkpoint_into(views: Dict[str, torch.Tensor], tensors: Sequence[CkptT
 
 SOURCE_DISK = "disk"
 SOURCE_RAM = "ram"
-SOURCES = (SOURCE_DISK, SOURCE_RAM)
+#: user order 27.10.: the tower as a STANDING pinned host copy ("pinned
+#: Dauerkopie im Host RAM"): staged once at arming, every image is an H2D from
+#: it at link speed (Basalt's ``dynamic`` form). The default of place=weights.
+SOURCE_PINNED = "pinned"
+SOURCES = (SOURCE_DISK, SOURCE_RAM, SOURCE_PINNED)
 SOURCE_ENV = "FLLIPER_PDFLIP_VISION_SOURCE"
+#: rollback switch of the standing pinned copies (tower AND victim image);
+#: unset/1 = on, 0 = the per-stage disk read and the pageable per-stage image
+PINNED_ENV = "FLLIPER_PDFLIP_VISION_PINNED"
 RAM_DIR_ENV = "FLLIPER_PDFLIP_VISION_RAM_DIR"
 DEFAULT_RAM_DIR = "/dev/shm/pdflip-vision"
 #: staging read size (the shard is read once, sequentially)
 RAM_STAGE_CHUNK = 64 * MIB
 
 
-def vision_source(env: Optional[Dict[str, str]] = None) -> str:
-    """``FLLIPER_PDFLIP_VISION_SOURCE``: unset/empty = ``disk``. An unknown
-    value is REFUSED -- a typo must not silently pick a source."""
+def pinned_on(env: Optional[Dict[str, str]] = None) -> bool:
+    """``FLLIPER_PDFLIP_VISION_PINNED``: on unless it is exactly ``0``/off."""
+    e = os.environ if env is None else env
+    return (e.get(PINNED_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def vision_source(env: Optional[Dict[str, str]] = None, *, place: Optional[str] = None) -> str:
+    """``FLLIPER_PDFLIP_VISION_SOURCE``: unset/empty = ``pinned`` under
+    place=weights (user order 27.10., switch :data:`PINNED_ENV`), else
+    ``disk``. An unknown value is REFUSED -- a typo must not silently pick a
+    source."""
     e = os.environ if env is None else env
     raw = (e.get(SOURCE_ENV, "") or "").strip().lower()
     if not raw:
-        return SOURCE_DISK
+        return SOURCE_PINNED if place == PLACE_WEIGHTS and pinned_on(e) else SOURCE_DISK
     if raw not in SOURCES:
         raise VisionRankStageRefused(
             f"{SOURCE_ENV}={raw!r} is not one of {list(SOURCES)}")
@@ -688,6 +703,8 @@ class TowerSource:
     direct: bool
     host_bytes: int
     reused: bool = False
+    #: the standing pinned copy of the extent (``pinned`` source only)
+    pinned: Optional[torch.Tensor] = field(default=None, compare=False, repr=False)
 
 
 def disk_source(shard: str) -> TowerSource:
@@ -748,6 +765,80 @@ def stage_tower_to_ram(shard: str, tensors: Sequence[CkptTensor], directory: str
             os.unlink(tmp)
         raise
     return TowerSource(SOURCE_RAM, path, lo, False, hi - lo)
+
+
+def stage_tower_to_pinned(shard: str, tensors: Sequence[CkptTensor], *,
+                          alloc: Optional[Callable[[int], torch.Tensor]] = None) -> TowerSource:
+    """Read the byte extent ``[min offset, max end)`` of ``tensors`` from the
+    shard into ONE pinned host tensor, once (arming). The extent starts at the
+    last ``DIRECT_ALIGN`` boundary at or below its first byte, so the read is
+    O_DIRECT (no page cache, no ARC) into a page-aligned pinned buffer;
+    ``shift`` is that boundary. The buffer lives as long as the returned
+    source: its host price is ``host_bytes``."""
+    if not tensors:
+        raise VisionRankStageRefused(f"{shard}: no tower tensors to stage")
+    lo = min(t.file_offset for t in tensors) // DIRECT_ALIGN * DIRECT_ALIGN
+    hi = max(t.file_offset + t.nbytes for t in tensors)
+    size = os.path.getsize(shard)
+    span = (hi - lo + DIRECT_ALIGN - 1) // DIRECT_ALIGN * DIRECT_ALIGN
+    buf = alloc(span) if alloc is not None else _alloc_bounce(span, torch.cuda.is_available())
+    fd, is_direct = _open_direct(shard)
+    try:
+        pos = 0
+        while pos < hi - lo:
+            want = min(RAM_STAGE_CHUNK, span - pos)
+            if not is_direct:
+                want = min(want, hi - lo - pos)
+            else:
+                want = min(want, (size - lo - pos + DIRECT_ALIGN - 1) // DIRECT_ALIGN * DIRECT_ALIGN)
+            got = os.preadv(fd, [memoryview(buf.numpy())[pos:pos + want]], lo + pos)
+            if got <= 0:
+                raise VisionRankStageRefused(f"{shard}: short read at {lo + pos} while staging the pinned copy")
+            pos += got
+    finally:
+        os.close(fd)
+    return TowerSource(SOURCE_PINNED, shard, lo, is_direct, int(buf.numel()), pinned=buf)
+
+
+def copy_from_pinned(src: TowerSource, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
+                     stream: Optional[Any] = None) -> DirectReadReport:
+    """The H2D of every planned tensor straight from the standing pinned
+    copy (``plan`` is already shifted against the extent), queued on
+    ``stream`` and complete when this returns -- the contract of
+    :func:`read_into`."""
+    rep = DirectReadReport(direct=False, pinned=True)
+    if src.pinned is None:
+        raise VisionRankStageRefused("the pinned tower source holds no buffer")
+    cuda = any(d.is_cuda for _, d in plan)
+    ctx = torch.cuda.stream(stream) if (stream is not None and cuda) else contextlib.nullcontext()
+    with ctx:
+        for ck, dst in plan:
+            if dst.numel() * dst.element_size() != ck.nbytes:
+                raise VisionRankStageRefused(
+                    f"{ck.name}: checkpoint holds {ck.nbytes} bytes, destination "
+                    f"{tuple(dst.shape)}x{dst.dtype} holds {dst.numel() * dst.element_size()}")
+            if ck.file_offset < 0 or ck.file_offset + ck.nbytes > int(src.pinned.numel()):
+                raise VisionRankStageRefused(f"{ck.name}: outside the pinned extent")
+            dst.view(torch.uint8).reshape(-1).copy_(src.pinned[ck.file_offset:ck.file_offset + ck.nbytes],
+                                                    non_blocking=cuda)
+            rep.bytes_read += ck.nbytes
+            rep.chunks += 1
+        if cuda:
+            ev = torch.cuda.Event()
+            ev.record(stream if stream is not None else torch.cuda.current_stream())
+            ev.synchronize()
+    return rep
+
+
+def load_tower(src: TowerSource, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
+               stream: Optional[Any] = None, cached_first: bool = False) -> DirectReadReport:
+    """One call for every source: the plan (checkpoint offsets) is shifted
+    against the source's extent and read from disk, the RAM image or the
+    standing pinned copy."""
+    shifted = shift_plan(plan, src.shift)
+    if src.kind == SOURCE_PINNED:
+        return copy_from_pinned(src, shifted, stream=stream)
+    return read_into(src.path, shifted, stream=stream, direct=src.direct, cached_first=cached_first)
 
 
 def remove_ram_image(src: TowerSource) -> None:

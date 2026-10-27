@@ -8822,7 +8822,11 @@ VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
 #: variable names are the rank's (`pdflip.vision_rank_stage`), one spelling.
 VISION_SOURCE_DISK = "disk"
 VISION_SOURCE_RAM = "ram"
-VISION_SOURCES = (VISION_SOURCE_DISK, VISION_SOURCE_RAM)
+#: user order 27.10.: ONE standing pinned host copy of the tower, an H2D per image;
+#: the RANK's default under `--pdflip-vision-place weights` (FLLIPER_PDFLIP_VISION_PINNED=0
+#: = off), so the launcher default stays `disk` and publishes nothing
+VISION_SOURCE_PINNED = "pinned"
+VISION_SOURCES = (VISION_SOURCE_DISK, VISION_SOURCE_RAM, VISION_SOURCE_PINNED)
 VISION_PLACE_AUTO = "auto"
 #: VISION-WEIGHTS (09.10.): `weights` = the tower borrows victim weight memory
 #: of P's PP0 (pdflip.vision_victim); off until the metal proof
@@ -8850,7 +8854,7 @@ def vision_source_host_line(model: str, source: str) -> str:
     """The host-RAM price of `--pdflip-vision-source ram`, named at the launch:
     the tower extent (header read only) lives in a tmpfs image for the life
     of P's PP0 (shmem, charged to memory.current). Empty for `disk`."""
-    if source != VISION_SOURCE_RAM:
+    if source not in (VISION_SOURCE_RAM, VISION_SOURCE_PINNED):
         return ""
     try:
         from flliper.srt.planner.vision_stage_load import find_tower_shard, tower_extent
@@ -8859,6 +8863,12 @@ def vision_source_host_line(model: str, source: str) -> str:
         mib = f"{(ext.file_last_end - ext.file_first_offset) / (1 << 20):.1f} MiB"
     except Exception as exc:  # noqa: BLE001 -- unmeasured is said, never guessed
         mib = f"size unread ({type(exc).__name__}: {exc})"
+    if source == VISION_SOURCE_PINNED:
+        return (
+            f"W102 PdFlipVisionStage SOURCE=pinned: P's PP0 stages the tower extent into ONE pinned host "
+            f"copy once ({mib}), kept for the life of the boot (pinned, counted in memory.current); "
+            "every image then loads from it by H2D instead of the disk"
+        )
     return (
         f"W102 PdFlipVisionStage SOURCE=ram: P's PP0 stages the tower extent into a tmpfs "
         f"image once ({mib}), held in host RAM for the life of the boot (shmem, counted in "

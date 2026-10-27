@@ -321,7 +321,7 @@ class ExpertRowVictims:
                         f"differ from the device rows {z0}..{z0 + n - 1} they would be loaded back into; "
                         "nothing moved")
 
-    def stash(self, views: Sequence[torch.Tensor]) -> None:
+    def stash(self, views: Sequence[torch.Tensor], *, sums: Optional[Sequence[Tuple[int, ...]]] = None) -> None:
         """No-op: the bytes already live in the pinned store (plan R4)."""
         return None
 

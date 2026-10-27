@@ -606,8 +606,8 @@ def test_front_unpriced_image_request_is_not_p_only_by_rule():
     i_rule = src.index("request is prefilled on P by rule; its embeddings are")
     assert i_unpriced < i_rule, "the unpriced branch must be decided before the P-only rule"
     assert "_w102_unpriced_d = True" in src
-    assert ("p_only=(_verdict == VERDICT_STAGE and not _mm_cached and not _w102_unpriced_d)\n"
-            "                    or _probe_p_only,") in src
+    assert ("p_only=((_verdict == VERDICT_STAGE and not _mm_cached and not _w102_unpriced_d)\n"
+            "                            or _probe_p_only) and not self.vision_on_d,") in src
     # an image MEASURED in the uncached tail stays P-only (R9 unchanged)
     assert "_probe_p_only = bool(_xx is not None and getattr(_xx, \"image_in_tail\", False))" in src
     assert F.vision_unpriced_to_d_on({}) is True

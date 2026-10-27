@@ -49,6 +49,14 @@ class _Req:
         return self._payload
 
 
+@pytest.fixture(autouse=True)
+def _p_only_form(monkeypatch):
+    """These cases pin the P-only form of vision (every image is prefilled on P). Since 27.10. the
+    flip layouts encode images on D too by default; ``FLLIPER_PDFLIP_VISION_D=0`` is the form pinned
+    here, the D form is pinned in test_pdflip_vision_on_d_front_1027."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_VISION_D", "0")
+
+
 def _front(vision):
     return Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
                  tp_prefill_max_tokens=X, vision=vision)

@@ -150,7 +150,7 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
     if not refusal:
         try:
             place = vrs.vision_place(env)
-            source_kind = vrs.vision_source(env)
+            source_kind = vrs.vision_source(env, place=place)
         except vrs.VisionRankStageRefused as exc:
             refusal = str(exc)
     scheduler._pdflip_vision_place = place
@@ -167,6 +167,13 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
             refusal = str(exc)
         else:
             scheduler._pdflip_vision_source = arm_ram_source(ram_dir, env)
+    if not refusal and source_kind == vrs.SOURCE_PINNED:
+        try:
+            pin_dir = tower_dir(scheduler.server_args)
+        except VisionStageLoadRefused as exc:  # a GGUF without a tower dir: no disk either
+            refusal = str(exc)
+        else:
+            scheduler._pdflip_vision_source = arm_pinned_source(pin_dir)
     scheduler._pdflip_vision_arm_refusal = refusal
     scheduler._pdflip_vision_origin_aborts = []
     scheduler._pdflip_vision_refused = set()
@@ -187,7 +194,8 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
                     ", else in the card's free VRAM" if place == vrs.PLACE_AUTO else
                     " never; the card's free VRAM",
                     src.kind if src is not None else vrs.SOURCE_DISK,
-                    f"tmpfs image {src.path}, buffered" if src is not None
+                    "standing pinned host copy, H2D per image" if src is not None and src.kind == vrs.SOURCE_PINNED
+                    else f"tmpfs image {src.path}, buffered" if src is not None
                     else "checkpoint shard, O_DIRECT",
                     vrs.BOUNCE_COUNT, vrs.BOUNCE_BYTES // vrs.MIB)
     return True
@@ -218,11 +226,53 @@ def arm_victims(scheduler, env: Optional[Dict[str, str]] = None) -> Tuple[Option
     try:
         source = vv.resolve_source(scheduler)
         shard = find_tower_shard(tower_dir(scheduler.server_args))
-        line, why = vv.arming_line(source, vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name)
+        line, plan, why = vv.arming_plan(source, vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name)
     except Exception as exc:  # noqa: BLE001 -- a named arming refusal, never a dead boot
         return None, f"{vv.W_VICTIM_PLAN_REFUSED}: {type(exc).__name__}: {exc}"
     (logger.error if why else logger.info)("%s%s", line, f" -- {why}" if why else "")
+    if not why and plan is not None and vrs.pinned_on(e) and isinstance(source, vv.HostImageVictims):
+        _keep_victim_image_pinned(source, plan.victim_bytes)
     return (None if why else source), why
+
+
+def _keep_victim_image_pinned(source, victim_bytes: int, clock: Callable[[], float] = time.perf_counter) -> None:
+    """The standing pinned host image of the victims (user order 27.10.),
+    allocated here -- at arming, where its cudaHostAlloc is paid once -- so no
+    image waits for it. A failed allocation is named and the per-stage
+    pageable image stays (host RAM is a warning, never a refusal)."""
+    t0 = clock()
+    try:
+        source.keep_pinned(victim_bytes)
+    except Exception as exc:  # noqa: BLE001 -- named, the pageable form stays
+        logger.error("%s standing pinned victim image of %.1f MiB NOT allocated (%s: %s) -- the "
+                     "per-stage pageable image is used", W_ARM_REFUSED, victim_bytes / vrs.MIB,
+                     type(exc).__name__, exc)
+        return
+    logger.info("%s victim image standing pinned: host_mib=%.1f allocated in %.0f ms (kept for the life "
+                "of this rank; the D2H runs only when the victims' checksums changed)",
+                W_STAGE_OK, victim_bytes / vrs.MIB, (clock() - t0) * 1e3)
+
+
+def arm_pinned_source(model_dir: str, clock: Callable[[], float] = time.perf_counter) -> Optional[vrs.TowerSource]:
+    """Stage the tower's extent into ONE standing pinned host tensor, once per
+    boot (user order 27.10., the default of place=weights). Returns the
+    source, or None when the staging is refused -- then the stage reads from
+    DISK and says so by name (W111); an image request is never refused for its
+    source. The host price is printed where it is paid (pinned, charged to
+    this rank's memory cgroup for its life)."""
+    t0 = clock()
+    try:
+        shard = find_tower_shard(model_dir)
+        tensors = vrs.checkpoint_tensors(shard, is_vision_weight)
+        src = vrs.stage_tower_to_pinned(shard, tensors)
+    except Exception as exc:  # noqa: BLE001 -- named, then the disk reads
+        logger.error("%s pinned source for the transient tower REFUSED (%s: %s) -- the stage "
+                     "reads from DISK (O_DIRECT) instead", W_ARM_REFUSED, type(exc).__name__, exc)
+        return None
+    logger.info("%s SOURCE=pinned host_mib=%.1f (one pinned host copy of the tower extent, O_DIRECT "
+                "read once, kept for the life of this rank) staged in %.0f ms",
+                W_STAGE_OK, src.host_bytes / vrs.MIB, (clock() - t0) * 1e3)
+    return src
 
 
 def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
@@ -804,12 +854,15 @@ def attention_backend_scope(backend: Optional[str]):
     return _mm_attention_backend(backend)
 
 
-def build_tower_meta(hf_config: Any, device: torch.device) -> Tuple[torch.nn.Module, str]:
+def build_tower_meta(hf_config: Any, device: torch.device, *,
+                     use_data_parallel: bool = False) -> Tuple[torch.nn.Module, str]:
     """The Qwen3-VL-family tower (27B and Qwen4-Exp share the class), every
     parameter on meta in bf16 (the loader's dtype), buffers real on
     ``device``. Returns (module, attention backend); the backend comes from
     the card's shared-memory ceiling (xsn407) and is held again for the
-    encode, because the forward reads the global too."""
+    encode, because the forward reads the global too. ``use_data_parallel`` builds
+    the tower UNSHARDED whatever the group's TP size (the D group is TP3, user
+    order 27.10.; on P's tp-1 PP0 both forms are the same)."""
     from flliper.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
     from flliper.srt.runtime_context import get_server_args
     from flliper.srt.pdflip.vision_stage_boot import (
@@ -829,7 +882,7 @@ def build_tower_meta(hf_config: Any, device: torch.device) -> Tuple[torch.nn.Mod
             norm_eps=getattr(hf_config, "rms_norm_eps", 1e-6),
             quant_config=None,
             prefix="model.visual",
-            use_data_parallel=False,
+            use_data_parallel=use_data_parallel,
         )
     module.eval()
     return module, backend
@@ -1359,8 +1412,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             out.source = src.kind
             stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
             own_streams.append(_stream_id(stream))
-            rep = vrs.read_into(src.path, vrs.shift_plan(plan, src.shift), stream=stream,
-                                direct=src.direct, cached_first=load_warm_on())
+            rep = vrs.load_tower(src, plan, stream=stream, cached_first=load_warm_on())
             out.read_bytes, out.direct = rep.bytes_read, rep.direct
             out.cached_bytes = rep.cached_bytes
             out.legs_ms["load"] = (clock() - t0) * 1e3
@@ -1768,8 +1820,7 @@ def start_async_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_conf
         legs = {}
         with ctx:
             t = clock()
-            rep = vrs.read_into(src.path, vrs.shift_plan(plan, src.shift), stream=stream,
-                                direct=src.direct)
+            rep = vrs.load_tower(src, plan, stream=stream)
             legs["load"] = (clock() - t) * 1e3
             t = clock()
             with torch.inference_mode(), attention_backend_scope(backend):
