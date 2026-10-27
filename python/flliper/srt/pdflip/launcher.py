@@ -6028,6 +6028,10 @@ class BootState:
     #: H52: the mem time series supervisor (session leader, pgid == pid);
     #: also in ``helper_pids``. teardown() stops it by process group.
     memts_pid: int = 0
+    #: DUAL-TP3PP3 --dual-mps on: the private MPS daemon's root dir
+    #: (``/tmp/pdflip-dual-mps-<tag>``); empty when no daemon was started. teardown()
+    #: reads it from the state json (a fresh process) and stops the daemon there.
+    dual_mps_root: str = ""
     #: #1236: WHERE this boot's store directory is, on disk. Replaces
     #: ``store_mount`` + ``store_gib`` -- there is no mount and no RAM size.
     store_dir: str = ""
@@ -16577,10 +16581,11 @@ def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
     """DUAL-TP3PP3 --dual-mps on: one PRIVATE MPS control daemon for this
     boot (pipe dir under /tmp/pdflip-dual-mps-<tag>, so nothing outside the boot
     can attach), started before the groups; returns the client env both
-    groups get. The daemon lives as long as the container. Off: {}."""
+    groups get. The daemon lives until teardown() (or the early-exit paths of cli())
+    calls :func:`stop_dual_mps`. Off: {}."""
     if not getattr(ns, "dual_layout", False) or str(getattr(ns, "dual_mps", "off")) != "on":
         return {}
-    root = f"/tmp/pdflip-dual-mps-{ns.tag}"
+    root = dual_mps_root(ns.tag)
     env = {"CUDA_MPS_PIPE_DIRECTORY": root + "/pipe", "CUDA_MPS_LOG_DIRECTORY": root + "/log"}
     if not dry:
         os.makedirs(env["CUDA_MPS_PIPE_DIRECTORY"], exist_ok=True)
@@ -16594,6 +16599,137 @@ def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
     log(f"PDFLIP-DUAL MPS daemon {'(dry, not started)' if dry else 'started'}: pipe "
         f"{env['CUDA_MPS_PIPE_DIRECTORY']} -- P and D are MPS clients on every card")
     return env
+
+
+#: Root of one boot's private MPS daemon (pipe + log dir); only paths under this prefix are ever removed.
+DUAL_MPS_ROOT_PREFIX = "/tmp/pdflip-dual-mps-"
+DUAL_MPS_CONTROL = "nvidia-cuda-mps-control"
+#: How long the daemon's own ``quit`` may take to end the daemon and its server before TERM, then 2 s before KILL.
+DUAL_MPS_STOP_BOUND_S = 8.0
+
+
+def dual_mps_root(tag: str) -> str:
+    return f"{DUAL_MPS_ROOT_PREFIX}{tag}"
+
+
+def _alive_not_zombie(pid: int, proc_root: str = "/proc") -> bool:
+    """``_alive`` that does not count a zombie (a daemonized MPS control is reparented to PID 1 of the
+    container, which may never reap it)."""
+    if not _alive(pid):
+        return False
+    try:
+        with open(f"{proc_root}/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def _mps_pids_on_pipe(pipe_dir: str, proc_root: str = "/proc") -> Dict[str, List[int]]:
+    """The MPS control daemon and server processes of THIS boot: argv0 basename names the program, the
+    environment must carry this boot's ``CUDA_MPS_PIPE_DIRECTORY`` (another boot's daemon is never touched)."""
+    want = f"CUDA_MPS_PIPE_DIRECTORY={pipe_dir}".encode()
+    out: Dict[str, List[int]] = {"daemon": [], "server": []}
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        return out
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            with open(f"{proc_root}/{n}/cmdline", "rb") as f:
+                argv0 = os.path.basename(f.read().split(b"\0", 1)[0].decode(errors="replace"))
+            kind = {"nvidia-cuda-mps-control": "daemon", "nvidia-cuda-mps-server": "server"}.get(argv0)
+            if kind is None:
+                continue
+            with open(f"{proc_root}/{n}/environ", "rb") as f:
+                if want in f.read().split(b"\0"):
+                    out[kind].append(int(n))
+        except OSError:
+            continue
+    return out
+
+
+def stop_dual_mps(tag: str, root: str = "", *, armed: bool = False, run=subprocess.run, scan=_mps_pids_on_pipe,
+                  alive=_alive_not_zombie, kill=os.kill, sleep=time.sleep, clock=time.monotonic,
+                  bound_s: float = DUAL_MPS_STOP_BOUND_S, rmtree=shutil.rmtree) -> str:
+    """Stop this boot's private MPS daemon (``start_dual_mps``) and return the teardown line.
+
+    The MPS daemon and its server are not children of any group: no TERM of the group pids reaches them, and
+    a server that outlives the groups keeps a context on every card (boot dkr27bnvfp4dualbar1drei10271237:
+    ``cards_empty=False`` after a refusal, the teardown lines named no MPS process). Order: ``quit`` on the
+    daemon's own control pipe (with ``get_server_list`` first, to name the server pids), wait, TERM and then KILL
+    what is left (daemon and server found by argv0 + this boot's pipe dir in their environment), then remove the
+    pipe/log dir. Nothing to do and nothing armed -> ``""`` (a boot without --dual-mps prints nothing)."""
+    root = root or (dual_mps_root(tag) if tag else "")
+    if not root or not root.startswith(DUAL_MPS_ROOT_PREFIX):
+        return ""
+    pipe, logd = root + "/pipe", root + "/log"
+    if not os.path.isdir(root):
+        return (f"PDFLIP-TEARDOWN MPS daemon absent: {root} does not exist (nothing to stop)" if armed else "")
+    before = scan(pipe)
+    pids = set(before["daemon"]) | set(before["server"])
+    env = {**os.environ, "CUDA_MPS_PIPE_DIRECTORY": pipe, "CUDA_MPS_LOG_DIRECTORY": logd}
+    quit_rc = "not-run"
+    if pids or os.path.exists(pipe + "/control"):
+        # only against a daemon that is there: nvidia-cuda-mps-control without -d would START one in the foreground
+        try:
+            r = run([DUAL_MPS_CONTROL], input="get_server_list\nquit\n", env=env, capture_output=True, text=True,
+                    timeout=15)
+            quit_rc = str(r.returncode)
+            pids |= {int(x) for x in (r.stdout or "").split() if x.isdigit()}
+        except FileNotFoundError:
+            quit_rc = "no-control-binary"
+        except subprocess.TimeoutExpired:
+            quit_rc = "timeout"
+        except OSError as e:
+            quit_rc = f"oserror:{e.__class__.__name__}"
+    t0 = clock()
+    while clock() - t0 < bound_s and any(alive(p) for p in pids):
+        sleep(0.1)
+    termed = sorted(p for p in pids if alive(p))
+    for p in termed:
+        try:
+            kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    t1 = clock()
+    while termed and clock() - t1 < 2.0 and any(alive(p) for p in termed):
+        sleep(0.1)
+    killed = sorted(p for p in termed if alive(p))
+    for p in killed:
+        try:
+            kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+    rest = scan(pipe)  # a server the daemon spawned while it was quitting
+    for p in sorted(set(rest["daemon"]) | set(rest["server"])):
+        if alive(p) and p not in pids:
+            try:
+                kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+            killed.append(p)
+            pids.add(p)
+    still = sorted(p for p in pids if alive(p))
+    rmtree(root, ignore_errors=True)
+    verdict = "stopped" if not still else "NOT stopped (process(es) survive KILL)"
+    servers = sorted(pids - set(before["daemon"]))
+    return (f"PDFLIP-TEARDOWN MPS daemon {verdict} pipe={pipe} quit_rc={quit_rc} "
+            f"daemon_pids={sorted(before['daemon'])} server_pids={servers} term={termed} kill={killed} "
+            f"alive={still} dir_removed={not os.path.isdir(root)}")
+
+
+def stop_dual_mps_of_state(st, log=print) -> str:
+    """The early-exit paths of cli() (refusal or crash BEFORE any group spawned): teardown() does not run
+    there, so the daemon ``start_dual_mps`` started is stopped here. ``st``: the live BootState (or None)."""
+    if st is None:
+        return ""
+    root = getattr(st, "dual_mps_root", "") or ""
+    line = stop_dual_mps(getattr(st, "tag", ""), root, armed=bool(root))
+    if line:
+        log(line)
+    return line
 
 
 def _d_early_start_armed(ns) -> bool:
@@ -29415,6 +29551,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_dual_p_sleep(ns, spec_p, log)  # D PRIORITY stage 2 (dual unified KV only)
     spec_p.env.update(dual_alloc_cache_book_env(ns, cards, log))  # item 170: D's cache growth, booked at P's join
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
+    if ns._dual_mps_env and not dry:
+        # persisted AT ONCE: every exit path (cli() early exits, teardown() in a fresh process) reads it
+        state.dual_mps_root = dual_mps_root(ns.tag)
+        _write_state(state)
     spec_p.env.update(ns._dual_mps_env)
     spec_p.env.update(dual_p_sm_env(ns))
     spec_p.env.update(dual_duty_env(ns))
@@ -30557,6 +30697,12 @@ def teardown(path: str, report: dict | None = None) -> int:
         except OSError:
             pass
     print(f"KILL leftovers {left}")
+    # The MPS daemon + server of --dual-mps on are no group's child: stop them after their clients (the
+    # groups above), before the cards are read again below and by the refusal's cards_empty.
+    _mps_line = stop_dual_mps(st.get("tag", ""), st.get("dual_mps_root", "") or "",
+                              armed=bool(st.get("dual_mps_root")))
+    if _mps_line:
+        print(_mps_line, flush=True)
     # H135b: the groups are gone -- their registry entries go with them, so the
     # arm's owner guard finds nothing left to stop after this teardown.
     if st.get("tag"):
@@ -30774,6 +30920,7 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
             # which starts BEFORE group P (H52): stop it here, not teardown().
             if st is not None and st.memts_pid:
                 print(f"[{_now()}] {stop_memts(st.tag, st.memts_pid)}", flush=True)
+            stop_dual_mps_of_state(st, log=lambda line: print(f"[{_now()}] {line}", flush=True))
             return 2
         # #1248: at least one group is already running. Go through the SAME
         # teardown() the operator's `--teardown PATH` mode and the killer use
@@ -30798,6 +30945,11 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         # unchanged (traceback and exit code stay what they were).
         boot_state_write(_say, "dead", cause=state_file_mod.make_cause(
             f"LAUNCHER_EXCEPTION_{type(e).__name__}", "launcher", repr(e), exception_type=type(e).__name__))
+        _st = _ACTIVE_BOOT_STATE
+        if _st is not None and not any(_st.pids.values()):
+            # no group spawned: nobody is an MPS client yet, the daemon only holds the pipe dir. With a group
+            # running it stays up -- stopping it under live clients is undefined; teardown() ends both then.
+            stop_dual_mps_of_state(_st, log=lambda line: print(f"[{_now()}] {line}", flush=True))
         raise
     boot_state_write(_say, event=("launcher_done", {"rc": rc}))
     return rc
