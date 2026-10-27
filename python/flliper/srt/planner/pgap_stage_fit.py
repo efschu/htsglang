@@ -72,8 +72,12 @@ MIN_SPREAD_1K = 4.0
 #: 5-9 ms at launch 57 >= gpu_fwd 55 ms).
 HOST_BOUND_RATIO = 0.9
 HOST_PACED_GAP_MS = 1.0
-#: ``auto`` scans at most this many of the newest P logs.
+#: ``auto`` NAMES the skip reason of this many logs one by one (the rest is one count line).
 AUTO_SCAN_LOGS = 8
+#: ``auto`` reads the newest P logs until one qualifies, at most this many (a P log is 0.1-4 MB, read in < 0.1 s; the
+#: cap only bounds a pathological evidence dir). Counting only the logs LOOKED AT (the former cap of eight) made
+#: ``auto`` refuse on the 27.10. int8 day: nine barren measuring-boot logs stood in front of the qualifying one.
+AUTO_SCAN_MAX_LOGS = 256
 
 _PGAP_RE = re.compile(
     r"\b(?P<rank>PP\d+)\] #PGAP pp_rank=\S+ fwd=(?P<fwd>-?\d+) tokens=(?P<tok>\S+) "
@@ -530,11 +534,10 @@ def newest_pgap_log(
         key=lambda p: os.path.getmtime(p),
         reverse=True,
     )
-    for path in paths[: AUTO_SCAN_LOGS * 4]:
+    skipped = 0
+    for path in paths[:AUTO_SCAN_MAX_LOGS]:
         if accept is not None and not accept(path):
             continue
-        if len(seen) >= AUTO_SCAN_LOGS:
-            break
         try:
             log = read_pgap_log(path)
             if log.chunk_tokens != int(chunk_tokens):
@@ -543,11 +546,22 @@ def newest_pgap_log(
                 raise StageFitRefused("%d stages, this boot %d" % (len(log.counts), int(stages)))
             fit_rank_lines(log, min_samples=min_samples)
         except (StageFitRefused, OSError, ValueError, ZeroDivisionError) as exc:
-            seen.append("%s: skipped (%s)" % (os.path.basename(path), exc))
+            skipped += 1
+            if len(seen) < AUTO_SCAN_LOGS:
+                seen.append("%s: skipped (%s)" % (os.path.basename(path), exc))
             continue
+        _note_unnamed_skips(seen, skipped)
         seen.append("%s: taken" % os.path.basename(path))
         return path, seen
+    _note_unnamed_skips(seen, skipped)
     return None, seen
+
+
+def _note_unnamed_skips(seen: List[str], skipped: int) -> None:
+    """One count line for the skipped logs beyond the named first :data:`AUTO_SCAN_LOGS`."""
+    if skipped > AUTO_SCAN_LOGS:
+        seen.append("%d more skipped (same reasons: another chunk, other stage count, too few device-bound chunks)"
+                    % (skipped - AUTO_SCAN_LOGS))
 
 
 def depth_profile(

@@ -172,6 +172,52 @@ class TestPiecewise(CustomTestCase):
             os.unlink(path)
 
 
+class TestAutoScan(CustomTestCase):
+    """``--pp-cut-stage-fit auto`` picks the newest log that carries the fit, not the newest eight.
+
+    Bug (27.10., int8 xkurve day): the evidence dir held nine P logs of measuring boots (D-curve boots without a
+    P forward, a 16384-token sweep, ...) newer than the one 2048-chunk log with 446 #PGAP lines; the scan stopped
+    after the eighth log it had LOOKED AT, so ``auto`` refused (W40 "found no P log") although a qualifying log sat
+    one position behind -- the cap counted files examined, not files that qualified (the #1299 shape of resolve_x).
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for n in os.listdir(self.dir):
+            os.unlink(os.path.join(self.dir, n))
+        os.rmdir(self.dir)
+
+    def _put(self, name, text, age_s):
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        t = 1.8e9 - age_s
+        os.utime(path, (t, t))
+        return path
+
+    def test_a_qualifying_log_behind_many_barren_ones_is_found(self):
+        with open(_write_log(), "r") as fh:
+            good_text = fh.read()
+        good = self._put("old_good.P.log", good_text, age_s=10000)
+        for i in range(F.AUTO_SCAN_LOGS + 3):
+            self._put("new_barren_%02d.P.log" % i, _pass(0, 0, 512, "r", 50.0), age_s=100 + i)
+        path, seen = F.newest_pgap_log(self.dir, CHUNK, 3)
+        self.assertEqual(path, good)
+        self.assertTrue(seen[-1].endswith(": taken"))
+        # the skipped logs are named, but a long skip run is one count line, not one line per log
+        self.assertLessEqual(len(seen), F.AUTO_SCAN_LOGS + 2)
+        self.assertTrue(any("more skipped" in s for s in seen), seen)
+
+    def test_no_qualifying_log_is_none_and_counted(self):
+        for i in range(F.AUTO_SCAN_LOGS + 3):
+            self._put("barren_%02d.P.log" % i, _pass(0, 0, 512, "r", 50.0), age_s=100 + i)
+        path, seen = F.newest_pgap_log(self.dir, CHUNK, 3)
+        self.assertIsNone(path)
+        self.assertIn("%d more skipped" % 3, " ".join(seen))
+
+
 class TestDepthProfile(CustomTestCase):
     def test_ladder_weights_each_rung_equally(self):
         pts, prov = F.depth_profile("ladder:2048,8192,32768", CHUNK)
