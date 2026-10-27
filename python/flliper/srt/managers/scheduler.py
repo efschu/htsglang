@@ -272,6 +272,7 @@ from flliper.srt.managers import tp_admission_agree as _tp_admission_agree  # RA
 from flliper.srt.pdflip import extend_trim as _pdflip_extend_trim  # rc12g extend chunk cap
 from flliper.srt.pdflip import d_seat_vram as _pdflip_d_seat_vram  # D-MEM-SCHED stage between wakes
 from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D-TRANSIENT-LEND
+from flliper.srt.pdflip import d_pool_lend as _pdflip_d_pool_lend  # D-POOL-LEND (flip form)
 from flliper.srt.pdflip import d_seat_rewake as _pdflip_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed wake cohort
 from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
@@ -9616,6 +9617,9 @@ class Scheduler(
         # (UNIFY 1002: round_boundary runs _pdflip_d_seat_vram.runtime_tick itself)
         _t_gap = time.perf_counter()  # nf-decode-host-1020: D-DECODE-GAP spans (host ms, rank-local)
         _pdflip_d_transient_lend.round_start(self)
+        # D-POOL-LEND (flip form): ONE pending prefill -> the KV pool tail above its need is card free memory
+        # before the width vote below reads the card; a second prefill / outgrown need / settle -> back
+        _pdflip_d_pool_lend.round_start(self)
         _pdflip_d_decode_gap.span(self, "lend_start", _t_gap)
         _t_gap = time.perf_counter()
         _pdflip_d_seat_rewake.round_boundary(self)

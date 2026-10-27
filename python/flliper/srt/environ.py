@@ -4782,6 +4782,29 @@ class Envs:
     #   on 4-7 expert rows instead of > 20 (bs1 34.3 vs 22.9 gpu-ms). False = any waiting request is pending,
     #   as before.
     FLLIPER_PDFLIP_D_LEND_HOLD_AWARE = EnvBool(True)
+    # D-POOL-LEND (27.10., user order: "es gibt doch schon eine Funktion, die KV-VRAM freigibt vom Dual-Layout her,
+    #   warum nutzt du die nicht um die Chunkgroesse zuzulassen?"): FLIP FORM only (group D, not the dual layout,
+    #   not the seat/stage form). While exactly ONE prefill is pending (a chunked or a waiting request) the KV
+    #   pool's tail above T = live rows + the prefill's rows + air is unmapped through the saver's span plan
+    #   (tms_set_spans, the dual D-KV mechanism) and the allocator cap; the freed bytes stand as card free memory,
+    #   so the width vote (EXTEND-CAP-SOFT) funds a wider chunk. Back (map + cap lifted) when a second prefill is
+    #   pending, when the live need outgrows T, after SETTLE decode rounds without a pending prefill, and before
+    #   every D sleep. Default ON (user order 14.10.); False = nothing here runs, byte for byte
+    #   (pdflip/d_pool_lend.py). The span lattice is cut at the KV attach, so the switch is read at the boot.
+    FLLIPER_PDFLIP_D_POOL_LEND = EnvBool(True)
+    #   The lattice step in GLOBAL tokens (one cell = one saver extent per K/V tensor; every cell costs one
+    #   map per D wake): a release or return moves whole cells.
+    FLLIPER_PDFLIP_D_POOL_LEND_STEP_TOKENS = EnvInt(32768)
+    #   Decode rounds in a row with a running batch and no pending prefill before a lent tail goes back.
+    FLLIPER_PDFLIP_D_POOL_LEND_SETTLE_ROUNDS = EnvInt(64)
+    #   A sole prefill below this many rows (the request's whole token count) lends nothing.
+    FLLIPER_PDFLIP_D_POOL_LEND_MIN_ROWS = EnvInt(4096)
+    #   Rounds between two reads of the live floor (a pending shrink or a grow is re-read at this cadence; a
+    #   second pending prefill returns the tail at once). Lockstep across the D ranks.
+    FLLIPER_PDFLIP_D_POOL_LEND_RECHECK_ROUNDS = EnvInt(16)
+    #   D-LOW-FIRST every N allocation calls under the pool lend (new KV lands on the lowest ids, so the live
+    #   floor stays low and the tail is free to go); 0 = off. Same allocator hook as FLLIPER_PDFLIP_DUAL_D_LOW_FIRST.
+    FLLIPER_PDFLIP_D_POOL_LEND_LOW_FIRST = EnvInt(64)
     # S78 EM-FETCH (19.10.): per EAGER-DEVICE-EM forward and rank, the rows
     #   and bytes the pool steps copied host->device and the device time of
     #   those copies (CUDA events around copy_rows) beside the device time of

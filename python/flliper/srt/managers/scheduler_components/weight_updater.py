@@ -10495,6 +10495,12 @@ class SchedulerWeightUpdaterManager:
             if _ah_split.runtime() is not None:
                 _ah_split.runtime().on_kv_release()
             _kvsub.mark("ah")
+            # D-POOL-LEND (flip form): D never sleeps with its KV pool tail lent -- after the flush (it ran on the
+            # lent pool, cap and rows bound), right before the pause: the plan goes back to the full lattice
+            # (nothing mapped here; the pause drops the mapped cells, the wake maps every one)
+            from flliper.srt.pdflip import d_pool_lend as _dpl
+
+            _dpl.quiesce_for_sleep(self.scheduler)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             _kvsub.mark("kv_pause")
             if _pls is not None and _pls.modules:

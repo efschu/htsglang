@@ -34,9 +34,10 @@ device is synchronized first, exactly like the shrink's own unmap):
 
 Mamba/GDN state is slot-based (``req.mamba_pool_idx``), not row-based: untouched.
 
-Gate: ``dual_d_kv_stage.armed()`` (FLLIPER_PDFLIP_DUAL_LAYOUT=1, group D, D KV max tokens > 0) AND
-``FLLIPER_PDFLIP_DUAL_D_COMPACT`` (default ON there; 0/false/off turns it off). Flip, INT8, NF and
-group P never reach this module (the D tick returns before it without the dual D actor).
+Gate: ``dual_d_kv_stage.armed()`` (FLLIPER_PDFLIP_DUAL_LAYOUT=1, group D, D KV max tokens > 0) OR the flip
+form's ``d_pool_lend.armed()`` (group D, no dual layout, FLLIPER_PDFLIP_D_POOL_LEND, which calls ``run`` when
+the live floor blocks a pool release) AND ``FLLIPER_PDFLIP_DUAL_D_COMPACT`` (default ON; 0/false/off turns it
+off). NF and group P never reach this module.
 """
 
 from __future__ import annotations
@@ -80,9 +81,10 @@ class PdFlipDualCompactBreach(RuntimeError):
 
 def armed(env=None) -> bool:
     env = os.environ if env is None else env
+    from flliper.srt.pdflip import d_pool_lend as _dpl
     from flliper.srt.pdflip import dual_d_kv_stage as _ddk
 
-    if not _ddk.armed(env):
+    if not (_ddk.armed(env) or _dpl.armed(env)):          # the flip form's pool lend runs it too (d_pool_lend)
         return False
     return str(env.get(SWITCH_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 

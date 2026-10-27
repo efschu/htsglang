@@ -5251,6 +5251,10 @@ class ModelRunnerKVCacheMixin:
 
             _ddk.attach(self)
             _ddk._BOOT_TOKENS = None  # the draft's pool (built later) passes untouched
+            # D-POOL-LEND (flip form): the target pool re-cut into lattice cells, full mapping (boot = top)
+            from flliper.srt.pdflip import d_pool_lend as _dpl
+
+            _dpl.attach(self)
 
     def _hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
         """Physically reachable ceiling on max_total_num_tokens for hybrid

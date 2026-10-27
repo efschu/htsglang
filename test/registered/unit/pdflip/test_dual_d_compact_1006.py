@@ -255,13 +255,21 @@ def test_plan_pairs_lowest_free_of_the_same_owner_class():
     assert e.value.reason == "class_short"
 
 
-def test_gate_dual_d_only_default_on(monkeypatch):
-    for env in [{}, {C.SWITCH_ENV: "1"}, {"FLLIPER_PDFLIP_GROUP": "D"},
+def test_gate_dual_d_and_the_flip_forms_pool_lend_default_on(monkeypatch):
+    for env in [{}, {C.SWITCH_ENV: "1"}, {"FLLIPER_PDFLIP_GROUP": "P"},
                 {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "P", D.MAX_TOKENS_ENV: "256"},
-                {**DUAL_D, C.SWITCH_ENV: "0"}, {**DUAL_D, C.SWITCH_ENV: "off"}]:
+                {**DUAL_D, C.SWITCH_ENV: "0"}, {**DUAL_D, C.SWITCH_ENV: "off"},
+                {"FLLIPER_PDFLIP_GROUP": "D", C.SWITCH_ENV: "0"}]:
         assert C.armed(env) is False, env
     assert C.armed(dict(DUAL_D)) is True                  # default ON in the dual D
     assert C.armed({**DUAL_D, C.SWITCH_ENV: "1"}) is True
+    # 27.10.: the flip form's D-POOL-LEND (pdflip/d_pool_lend.py) calls the compaction when the live floor blocks
+    # a release -- group D without the dual layout is armed through it, and only through it
+    assert C.armed({"FLLIPER_PDFLIP_GROUP": "D"}) is True
+    from flliper.srt.environ import envs
+
+    with envs.FLLIPER_PDFLIP_D_POOL_LEND.override(False):
+        assert C.armed({"FLLIPER_PDFLIP_GROUP": "D"}) is False
 
 
 # ------------------------------------------------------------------------------------------- one rank

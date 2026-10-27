@@ -410,10 +410,11 @@ def low_first_every() -> int:
         return 0
 
 
-def _arm_low_first(allocator) -> int:
+def _arm_low_first(allocator, every: Optional[int] = None) -> int:
     """Arm the allocator's low-first placement when the switch is on and its class calls the hook
-    (token + paged allocator); says so in the log either way. Returns the N armed (0 = not armed)."""
-    n = low_first_every()
+    (token + paged allocator); says so in the log either way. Returns the N armed (0 = not armed).
+    ``every``: the flip form's pool lend names its own N (``d_pool_lend``); None = the dual switch."""
+    n = low_first_every() if every is None else max(0, int(every))
     if n <= 0:
         return 0
     if not callable(getattr(allocator, "set_low_first", None)):
