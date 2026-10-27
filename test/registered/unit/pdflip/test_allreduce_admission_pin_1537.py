@@ -66,7 +66,15 @@ _TREES: dict = {}
 def _tree(path: pathlib.Path) -> ast.Module:
     key = str(path)
     if key not in _TREES:
-        _TREES[key] = ast.parse(path.read_text(encoding="utf-8"))
+        if path == SCHED_PATH:  # scheduler.py + the files its methods moved to (27.10. refactor), one view
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("_scheduler_source", pathlib.Path(__file__).with_name("_scheduler_source.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _TREES[key] = mod.merged_tree()
+        else:
+            _TREES[key] = ast.parse(path.read_text(encoding="utf-8"))
     return _TREES[key]
 
 

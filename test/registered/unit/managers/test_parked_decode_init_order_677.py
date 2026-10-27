@@ -106,10 +106,21 @@ def _self_assign_lines(node, attr):
     return out
 
 
+def _sched_src():
+    """The merged scheduler source view (scheduler.py + the files its methods moved to, 27.10. refactor)."""
+    import importlib.util
+    import pathlib
+
+    p = pathlib.Path(__file__).resolve().parents[1] / "pdflip" / "_scheduler_source.py"
+    spec = importlib.util.spec_from_file_location("_scheduler_source", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TheParkSetIsBuiltAfterThePoolItReads(unittest.TestCase):
     def setUp(self):
-        src = inspect.getsource(scheduler_mod)
-        self.tree = ast.parse(src)
+        self.tree = _sched_src().merged_tree()
         self.sched = _class_node(self.tree, "Scheduler")
         self.init = _method(self.sched, "__init__")
 

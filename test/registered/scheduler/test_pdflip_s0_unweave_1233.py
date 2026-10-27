@@ -48,6 +48,18 @@ register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SRT = _REPO_ROOT / "python" / "flliper" / "srt"
 
+
+def _sched_src():
+    """The merged scheduler source view (scheduler.py + the files its methods moved to, 27.10. refactor)."""
+    import importlib.util
+    import pathlib
+
+    p = pathlib.Path(__file__).resolve().parents[1] / "unit" / "pdflip" / "_scheduler_source.py"
+    spec = importlib.util.spec_from_file_location("_scheduler_source", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 #: The three files S0 owns.  Paths, not module names: the assertion is about
 #: the source of record, and it must hold whether or not the module imports.
 _S0_FILES = (
@@ -2454,7 +2466,7 @@ class TestStockPpPathSurvives(unittest.TestCase):
         """
         from flliper.srt.managers.scheduler import Scheduler
 
-        sched = _SRT / "managers" / "scheduler.py"
+        sched = _sched_src().file_defining("init_parked_decode_set")
         found = _literal_assignments(
             sched, "init_parked_decode_set", "_parked_decode_verdict"
         )

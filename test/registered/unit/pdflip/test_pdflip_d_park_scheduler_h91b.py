@@ -243,13 +243,25 @@ def test_wiring_park_running_route_and_rpc():
     assert "self, recv_req, late_hold_armed=_pdflip_dormant_admit_armed()" in sch
 
 
+def _sched_src():
+    """The merged scheduler source view (scheduler.py + the files its methods moved to, 27.10. refactor)."""
+    import importlib.util
+    import pathlib
+
+    p = pathlib.Path(__file__).resolve().parents[1] / "pdflip" / "_scheduler_source.py"
+    spec = importlib.util.spec_from_file_location("_scheduler_source", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def test_wiring_sleep_retract_admission_abort_tick():
     wu = _read("managers", "scheduler_components", "weight_updater.py")
     # unified tree: the 27B side sets pdflip_dormant at a second, earlier site;
     # the park hook sits after the one of the sleep leg's dormant point.
     sites = [m.start() for m in re.finditer(re.escape("scheduler.pdflip_dormant = True"), wu)]
     assert any("pdflip_d_hold_parked" in wu[i:i + 1500] for i in sites)
-    sch = _read("managers", "scheduler.py")
+    sch = _sched_src().merged_text()
     assert ("self._add_request_to_queue(req, is_retracted=True)\n"
             "        self._pdflip_d_park_note_retracted(retracted_reqs)") in sch
     assert "_d_park_gate = self._pdflip_d_park_admission(running_batch)" in sch

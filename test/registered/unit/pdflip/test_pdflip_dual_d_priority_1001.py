@@ -70,10 +70,22 @@ def test_off_the_dual_d_the_retract_runs_as_before(monkeypatch, env):
         _retract(monkeypatch, env)
 
 
+def _sched_src():
+    """The merged scheduler source view (scheduler.py + the files its methods moved to, 27.10. refactor)."""
+    import importlib.util
+    import pathlib
+
+    p = pathlib.Path(__file__).resolve().parents[1] / "pdflip" / "_scheduler_source.py"
+    spec = importlib.util.spec_from_file_location("_scheduler_source", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def test_the_swallowing_callers_reraise_the_named_stop():
     for name in ("_pdflip_d_retract_guard_sites",):
         assert not hasattr(SC.Scheduler, name)  # no second implementation of the guard
-    src = inspect.getsource(SC.Scheduler)
+    src = _sched_src().class_source()
     for marker in ('logger.warning("#888b carrier yield failed: %s", e)',
                    'logger.warning("%s rung 3 (retract) failed: %s", self._LADDER_PREFIX, e)'):
         i = src.index(marker)

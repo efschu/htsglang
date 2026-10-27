@@ -387,14 +387,24 @@ class TestSite3SleepReset(unittest.TestCase):
         self.assertEqual(src[k:i].count("self.tree_cache.reset()"), 0)
 
     def test_the_hold_refetch_sites_go_through_the_named_clearer(self):
-        src = open(sch.__file__).read()
-        i = src.index("def _pdflip_refetch_one")
-        j = src.index("def _pdflip_group_min_ints")
-        self.assertEqual(src[i:j].count("_discard_named.discard_mark("), 2)
-        self.assertNotIn("clear(req)  # the shortfall mark", src[i:j])
+        src = _sched_src().method_source("_pdflip_refetch_one") + "\n" + _sched_src().method_source("_pdflip_refetch_budget")
+        self.assertEqual(src.count("_discard_named.discard_mark("), 2)
+        self.assertNotIn("clear(req)  # the shortfall mark", src)
 
 
 # ------------------------------------------------------------------ site 1
+
+def _sched_src():
+    """The merged scheduler source view (scheduler.py + the files its methods moved to, 27.10. refactor)."""
+    import importlib.util
+    import pathlib
+
+    p = pathlib.Path(__file__).resolve().parents[1] / "pdflip" / "_scheduler_source.py"
+    spec = importlib.util.spec_from_file_location("_scheduler_source", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 
 def _controller():
