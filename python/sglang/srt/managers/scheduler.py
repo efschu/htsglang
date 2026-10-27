@@ -4950,6 +4950,17 @@ class Scheduler(
                     "(W123) at the admission"
                 )
         _vision_origin_aborts = None
+        # WEG2 VISION (D side, flip layouts, user order 27.10.): the TP ranks of group D
+        # encode images in a pass before the admission (weg2/vision_d_runner.py); TP0
+        # leads. False on every other boot, rank and the dual layout.
+        self._weg2_vision_d_stage = False
+        if os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper() == "D":
+            from sglang.srt.weg2.vision_d_runner import arm_d_stage
+            from sglang.srt.weg2.vision_rank_runner import take_origin_aborts as _take_d_aborts
+
+            self._weg2_vision_d_stage = arm_d_stage(self)
+            if self._weg2_vision_d_stage:
+                _vision_origin_aborts = lambda: _take_d_aborts(self)  # noqa: E731
         if os.environ.get("SGLANG_WEG2_VISION", "").strip() == "transient":
             from sglang.srt.weg2.vision_rank_runner import (
                 arm_rank_stage,
@@ -14872,6 +14883,10 @@ class Scheduler(
             from sglang.srt.weg2.vision_rank_runner import vision_rank_pass
 
             _vision_parked = vision_rank_pass(self)
+        elif getattr(self, "_weg2_vision_d_stage", False):
+            from sglang.srt.weg2.vision_d_runner import d_pass
+
+            _vision_parked = d_pass(self)
         elif getattr(self, "_weg2_vision_follower_gate", False):
             from sglang.srt.weg2.vision_verdict import follower_pass
 

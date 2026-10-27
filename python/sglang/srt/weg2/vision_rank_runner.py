@@ -437,12 +437,15 @@ def attention_backend_scope(backend: Optional[str]):
     return _mm_attention_backend(backend)
 
 
-def build_tower_meta(hf_config: Any, device: torch.device) -> Tuple[torch.nn.Module, str]:
+def build_tower_meta(hf_config: Any, device: torch.device, *,
+                     use_data_parallel: bool = False) -> Tuple[torch.nn.Module, str]:
     """The Qwen3-VL-family tower (27B and Qwen4-Exp share the class), every
     parameter on meta in bf16 (the loader's dtype), buffers real on
     ``device``. Returns (module, attention backend); the backend comes from
     the card's shared-memory ceiling (xsn407) and is held again for the
-    encode, because the forward reads the global too."""
+    encode, because the forward reads the global too. ``use_data_parallel`` builds
+    the tower UNSHARDED whatever the group's TP size (the D group is TP3, user
+    order 27.10.; on P's tp-1 PP0 both forms are the same)."""
     from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
     from sglang.srt.runtime_context import get_server_args
     from sglang.srt.weg2.vision_stage_boot import (
@@ -462,7 +465,7 @@ def build_tower_meta(hf_config: Any, device: torch.device) -> Tuple[torch.nn.Mod
             norm_eps=getattr(hf_config, "rms_norm_eps", 1e-6),
             quant_config=None,
             prefix="model.visual",
-            use_data_parallel=False,
+            use_data_parallel=use_data_parallel,
         )
     module.eval()
     return module, backend

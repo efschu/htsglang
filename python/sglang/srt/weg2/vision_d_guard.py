@@ -71,10 +71,13 @@ def transient_group_without_tower(hf_config: Any, env: Optional[Dict[str, str]] 
 
 
 def image_spans(req: Any) -> List[Tuple[int, int]]:
-    """Every multimodal placeholder span of the request, (start, end) inclusive."""
+    """Every multimodal placeholder span of the request whose rows are NOT yet attached,
+    (start, end) inclusive."""
     mm = getattr(req, "multimodal_inputs", None)
     spans: List[Tuple[int, int]] = []
     for it in getattr(mm, "mm_items", None) or []:
+        if getattr(it, "precomputed_embeddings", None) is not None:
+            continue  # rows already attached (the D stage, user order 27.10.): D encodes nothing here
         for off in getattr(it, "offsets", None) or []:
             spans.append((int(off[0]), int(off[1])))
     return spans
