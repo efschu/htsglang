@@ -59,9 +59,10 @@ def _item(end=9):
     return types.SimpleNamespace(feature=torch.zeros(1), precomputed_embeddings=None, offsets=[(end - 3, end)])
 
 
-def _req(rid, n=1):
+def _req(rid, n=1, streamed=0):
     return types.SimpleNamespace(rid=rid, multimodal_inputs=types.SimpleNamespace(
-        mm_items=[_item() for _ in range(n)]), prefix_indices=None, host_hit_length=0)
+        mm_items=[_item() for _ in range(n)]), prefix_indices=None, host_hit_length=0,
+        output_ids=[7] * streamed, full_untruncated_fill_ids=list(range(120)))
 
 
 def _sched(queue, leader, aborts=None):
@@ -124,7 +125,7 @@ def test_a_refused_stage_holds_the_request_on_every_rank_and_the_abort_is_the_le
     assert [r.rid for _i, r in parked_l] == [r.rid for _i, r in parked_f] == ["a", "b"]
     assert lead.waiting_queue == [] and fol.waiting_queue == []
     assert len(lead._weg2_vision_origin_aborts) == 2 and fol._weg2_vision_origin_aborts == []
-    assert lead._weg2_vision_origin_aborts[0][1].startswith("W105b")
+    assert "W105b" in lead._weg2_vision_origin_aborts[0][1]
     vrr.vision_unpark(lead, parked_l)
     assert [r.rid for r in lead.waiting_queue] == ["a", "b"]
     # the held rids are not planned again: no collective on the next pass
@@ -140,3 +141,18 @@ def test_the_guard_admits_an_image_whose_rows_are_attached():
     assert vdg.image_spans(r) != []
     r.multimodal_inputs.mm_items[0].precomputed_embeddings = torch.zeros(4, WIDTH)
     assert vdg.image_spans(r) == [] and vdg.image_end(r) == 0 and vdg.verdict(r, covered=0) == vdg.ADMIT
+
+
+def test_a_refused_stage_sends_an_unstreamed_request_back_through_p_and_names_a_streamed_one():
+    """The abort text is the front's X-REQUEUE key (the W50 marker with the extent sentence) for a
+    request that has sent no byte: P has the tower. A request that already streamed keeps the stage's
+    named code -- RESUME-VIA-P's P leg carries no image, so a requeue would lose it."""
+    wire = _Wire()
+    lead = _sched([_req("fresh"), _req("streamed", streamed=3)], True)
+    fol = _sched([_req("fresh"), _req("streamed", streamed=3)], False)
+    vdr.d_pass(lead, comm=_Comm(wire, True), stage=_stage_refuse)
+    vdr.d_pass(fol, comm=_Comm(wire, False))
+    msgs = dict(lead._weg2_vision_origin_aborts)
+    assert "Weg2TpPrefillExceeded" in msgs["fresh"] and "extent after prefix matching is 120" in msgs["fresh"]
+    assert "W105b" in msgs["fresh"]
+    assert msgs["streamed"].startswith("W105b") and "Weg2TpPrefillExceeded" not in msgs["streamed"]

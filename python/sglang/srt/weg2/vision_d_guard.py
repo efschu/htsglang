@@ -180,6 +180,21 @@ def reroute_message(req: Any, covered: Optional[int]) -> str:
     )
 
 
+def stage_reroute_message(req: Any, code: str, detail: str) -> str:
+    """The same W50 refusal for the D vision STAGE's own refusal (user order 27.10.): the stage on
+    D's TP0 refused this image (``code``: ``detail``, e.g. W105b air short), so the request goes
+    back through P with its original body -- P has the tower -- instead of ending as a 503 to the
+    client. Same marker and extent sentence as :func:`reroute_message`; the front's bound ends it."""
+    fill = getattr(req, "full_untruncated_fill_ids", None)
+    total = 0 if fill is None else len(fill)
+    return (
+        f"W50 Weg2TpPrefillExceeded (vision reroute): group D cannot serve this request "
+        f"itself; this request's extent after prefix matching is {total}. "
+        f"Re-routed through the prefill group, which has the vision tower -- "
+        f"the D vision stage refused it: {code}: {detail}"
+    )
+
+
 # -- the draft side (V2 death 11:20:26, weg2-14-72) ---------------------------------
 _DRAFT_NO_EMBEDS_N = [0]
 

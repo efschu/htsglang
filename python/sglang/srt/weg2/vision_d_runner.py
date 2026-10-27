@@ -205,5 +205,15 @@ def _run_pass(scheduler: Any, entries, comm: Any, stage) -> set:
         scheduler._weg2_vision_refused.add(r.rid)
         held.add(r.rid)
         if leader:
-            scheduler._weg2_vision_origin_aborts.append((r.rid, f"{got.code}: {got.detail}"))
+            scheduler._weg2_vision_origin_aborts.append((r.rid, _refusal_message(r, got.code, got.detail)))
     return held
+
+
+def _refusal_message(req: Any, code: str, detail: str) -> str:
+    """A request that has sent no byte yet goes back through P (the front's X-REQUEUE, keyed on the
+    W50 text); one that has streamed keeps the stage's named code (RESUME-VIA-P carries no image)."""
+    from sglang.srt.weg2 import vision_d_guard as vdg
+
+    if vdg.reroute_eligible(req):
+        return vdg.stage_reroute_message(req, code, detail)
+    return f"{code}: {detail}"
