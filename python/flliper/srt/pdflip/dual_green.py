@@ -93,6 +93,12 @@ PROBE_ENV = "FLLIPER_PDFLIP_DUAL_GREEN_PROBE"
 #: on the 75 % rung (SM ratio 1.31-1.33: an effect of 0.8 would read only 0.15 there), so 0.3 sits above the
 #: noise and below every measured rung. The 0.8-effect reading is logged next to it, never gated on.
 PROBE_MIN_SLOWDOWN_FRAC_ENV = "FLLIPER_PDFLIP_DUAL_GREEN_PROBE_MIN_FRAC"
+#: a rung is dropped only when EVERY one of this many timings misses the criterion (default 3). One timing is one
+#: reading of a wall clock on a card with a power cap and neighbours: boot dkr27bnvfp4dualbar1drei10271155 PP2
+#: (RTX 3080) read x1.05 for 52/68 SM once and lost the 75 % rung for the boot, PP1 (same card type, same boot)
+#: and 121 of 122 3080 ladders in the archived P logs passed it. A mask that does not bite reads ~x1.0 every time.
+PROBE_ATTEMPTS_ENV = "FLLIPER_PDFLIP_DUAL_GREEN_PROBE_ATTEMPTS"
+PROBE_ATTEMPTS_DEFAULT = 3
 
 HOLD_ARENA_HI_DEFAULT = 0.97
 HOLD_ARENA_LO_DEFAULT = 0.90
@@ -439,17 +445,19 @@ class GreenLadder:
 
     def __init__(self, backend: GreenBackend, fractions: Sequence[float], *, probe: bool = True,
                  min_slowdown_frac: float = 0.3, log: Callable[[str], None] = logger.info,
-                 warn: Callable[[str], None] = logger.warning, rank: int = 0):
+                 warn: Callable[[str], None] = logger.warning, rank: int = 0,
+                 probe_attempts: int = PROBE_ATTEMPTS_DEFAULT):
         self.backend = backend
         self.fractions = tuple(float(f) for f in fractions)
         self.probe = bool(probe)
         self.min_frac = float(min_slowdown_frac)
+        self.probe_attempts = max(1, int(probe_attempts))
         self._log, self._warn = log, warn
         self.rank = int(rank)
         self.rungs: Dict[int, Rung] = {}
         self.failed: Dict[int, str] = {}
         self.info: Optional[DevInfo] = None
-        self.counters = {"created": 0, "create_failed": 0, "probe_rejected": 0, "probe_run": 0}
+        self.counters = {"created": 0, "create_failed": 0, "probe_rejected": 0, "probe_run": 0, "probe_retries": 0}
 
     @property
     def healthy_count(self) -> int:
@@ -501,29 +509,61 @@ class GreenLadder:
         except Exception as e:  # noqa: BLE001
             self._warn(_ds.fallback_line("green", info.uuid, f"probe baseline failed ({e}) -> rungs kept unprobed"))
             return
-        done: Dict[int, Tuple[float, float, bool]] = {}
+        done: Dict[int, Tuple[float, float, bool, List[float]]] = {}
         for i in sorted(self.rungs):
             r = self.rungs[i]
             if r.sm in done:
-                ratio, eff, ok = done[r.sm]
+                ratio, eff, ok, ratios = done[r.sm]
             else:
                 try:
-                    t = float(self.backend.time_stream(r.stream))
+                    ratio, ok, ratios = self._time_rung(r, t_full)
                 except Exception as e:  # noqa: BLE001
                     self._reject(i, f"probe failed ({e})")
                     continue
                 self.counters["probe_run"] += 1
-                ratio = t / t_full if t_full > 0 else 1.0
                 sm_ratio = info.sm_total / max(1, r.sm)
                 eff = ratio / sm_ratio if sm_ratio > 0 else 1.0
-                predicted = sm_ratio - 1.0
-                # a rung that rounded up to the whole card has no mask to bite
-                ok = True if predicted <= 1e-9 else (ratio - 1.0) >= self.min_frac * predicted
-                done[r.sm] = (ratio, eff, ok)
+                done[r.sm] = (ratio, eff, ok, ratios)
             r.timed_ratio, r.effect = ratio, eff
+            # every rung's reading is logged, passed or not: the pass/fail margin was invisible before (27.10.)
+            self._log(f"{MARK} P probe pp={self.rank} rung {i} f={r.fraction:.2f} sm={r.sm}/{info.sm_total} "
+                      f"ratio=x{ratio:.3f} effect={eff:.2f} attempts={len(ratios)} "
+                      f"ratios=[{','.join(f'{x:.3f}' for x in ratios)}] need>=x{self._need(r):.3f} ok={int(ok)}")
             if not ok:
                 self._reject(i, f"mask does not bite: time x{ratio:.2f} for {r.sm}/{info.sm_total} SM "
-                                f"(effect {eff:.2f}; need >= {self.min_frac:.2f} of the predicted slowdown)")
+                                f"(effect {eff:.2f}; need >= {self.min_frac:.2f} of the predicted slowdown, "
+                                f"best reading after {len(ratios)} attempts)")
+
+    def _predicted(self, r: Rung) -> float:
+        return self.info.sm_total / max(1, r.sm) - 1.0
+
+    def _need(self, r: Rung) -> float:
+        """The least time ratio that counts as a bite (a rung that rounded up to the whole card has no mask to
+        bite: 0.0, every reading passes, as before)."""
+        p = self._predicted(r)
+        return 0.0 if p <= 1e-9 else 1.0 + self.min_frac * p
+
+    def _time_rung(self, r: Rung, t_full: float) -> Tuple[float, bool, List[float]]:
+        """Timings of one rung until one bites or ``probe_attempts`` are used: (decisive ratio, ok, all ratios).
+        Attempt 0 is against the boot baseline (as before). A retry measures a FRESH baseline right before and right
+        after the rung and divides by the faster of the two: a neighbour that disturbed the baseline can only make
+        it slower, so the minimum is the clean one. A rung that bites in any attempt is kept; one that never bites
+        reports its best ratio."""
+        need = self._need(r)
+        ratios: List[float] = []
+        base = float(t_full)
+        for attempt in range(self.probe_attempts):
+            if attempt:
+                self.counters["probe_retries"] += 1
+                base = float(self.backend.time_stream(None))
+            t = float(self.backend.time_stream(r.stream))
+            if attempt:
+                base = min(base, float(self.backend.time_stream(None)))
+            ratio = t / base if base > 0 else 1.0
+            ratios.append(ratio)
+            if ratio >= need - 1e-12:
+                return ratio, True, ratios
+        return max(ratios), False, ratios
 
     def _reject(self, i: int, why: str) -> None:
         r = self.rungs.pop(i, None)
@@ -1010,6 +1050,7 @@ def maybe_arm(sched, env: Optional[Mapping[str, str]] = None, *, backend: Option
     m0 = _mem(be)
     ladder = GreenLadder(be, cfg.rungs, probe=probe,
                          min_slowdown_frac=_envf(e, PROBE_MIN_SLOWDOWN_FRAC_ENV, 0.3, 0.0, 1.0),
+                         probe_attempts=int(_envf(e, PROBE_ATTEMPTS_ENV, PROBE_ATTEMPTS_DEFAULT, 1, 8)),
                          log=log, warn=warn, rank=pp_rank).build()
     m1 = _mem(be)
     log(ladder.marker())
