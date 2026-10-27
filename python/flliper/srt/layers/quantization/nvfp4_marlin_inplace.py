@@ -45,6 +45,7 @@ Default OFF: nothing here runs unless native-mixed resolved this rank to
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -146,6 +147,28 @@ def _k_chunk(rows: int, k: int, max_bytes: Optional[int] = None) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _born_in_tag_pool():
+    """Allocation context of a process-lifetime device constant (the cached
+    permutation tables below).
+
+    W-DUAL-P-UNTAGGED (dkr27bnvfp4dualbar1drei10271237, PP1/PP2 = the sm_86
+    cards, ``marlin_native_inplace``): the first ``_scale_perms('cuda:N')`` call
+    happens inside the dual shared part's transient load scope, i.e. in the load
+    pool; the ``lru_cache`` then keeps those blocks (2 x 512 B) alive for the
+    whole process, the after-load release keeps the pool ("PDFLIP-TAG-POOL
+    transient pool KEPT ... live=0.0 MiB") and the untagged-live riegel stops
+    the boot. A table that outlives the load and is read after every wake
+    belongs under the weights tag (paused and restored with P; the sleeping dual
+    P rank has the weights CPU backup armed, riegel W-DUAL-P-NO-BACKUP).
+    ``back_into_tag_pool(force=True)`` is a no-op outside a stepped-out block, so
+    every other arm allocates exactly as before."""
+    try:
+        from flliper.srt.managers.pdflip_memory_saver import back_into_tag_pool
+    except Exception:  # noqa: BLE001 -- no saver module (hermetic use): plain allocation
+        return contextlib.nullcontext()
+    return back_into_tag_pool(force=True)
+
+
 @lru_cache(maxsize=None)
 def _weight_perm_cpu() -> torch.Tensor:
     perm_list: List[int] = []
@@ -166,7 +189,8 @@ def _weight_perm_cpu() -> torch.Tensor:
 def _weight_perms(device_str: str) -> Tuple[torch.Tensor, torch.Tensor]:
     perm = _weight_perm_cpu()
     inv = torch.argsort(perm)
-    return perm.to(device_str), inv.to(device_str)
+    with _born_in_tag_pool():
+        return perm.to(device_str), inv.to(device_str)
 
 
 def native_rows_to_nibbles_kn(w_u8: torch.Tensor) -> torch.Tensor:
@@ -239,7 +263,9 @@ def _scale_perms(device_str: str) -> Tuple[torch.Tensor, torch.Tensor]:
     for i in range(8):
         scale_perm.extend(i + 8 * j for j in range(8))
     p = torch.tensor(scale_perm, dtype=torch.long)
-    return p.to(device_str), torch.argsort(p).to(device_str)
+    inv = torch.argsort(p)
+    with _born_in_tag_pool():
+        return p.to(device_str), inv.to(device_str)
 
 
 _I4 = [0, 2, 1, 3]  # nvfp4_marlin_process_scales' group-of-4 swap (self-inverse)

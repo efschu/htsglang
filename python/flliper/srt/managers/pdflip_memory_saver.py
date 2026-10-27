@@ -4203,9 +4203,9 @@ def assert_no_untagged_live(kept_mib: Optional[Dict[str, float]] = None,
     live = sum(kept.values())
     if live > tolerance_mib:
         raise PdFlipDualPUntagged(
-            "W-DUAL-P-UNTAGGED: %.1f MiB of live device memory is untracked by the memory saver after "
-            "load (%s) -- it would survive P's sleep; re-home it with back_into_tag_pool(force=True) or "
-            "keep P resident (--dual-p-sleep off)" % (live, ", ".join(
+            "W-DUAL-P-UNTAGGED: %.1f MiB (%.1f KiB) of live device memory is untracked by the memory saver "
+            "after load (%s) -- it would survive P's sleep; re-home it with back_into_tag_pool(force=True) or "
+            "keep P resident (--dual-p-sleep off)" % (live, live * 1024.0, ", ".join(
                 "%s=%.1f MiB" % kv for kv in sorted(kept.items()))))
 
 
@@ -4259,17 +4259,20 @@ def _pool_has_live_blocks(pool: Any, reason: str) -> bool:
             return False
     except Exception:  # noqa: BLE001 -- cannot tell: keep it rather than risk v56
         pass
-    live = sum(
+    sizes = [
         b["size"]
         for s in torch.cuda.memory_snapshot(pool.id)
         for b in s["blocks"]
         if str(b.get("state", "")).startswith("active")
-    )
+    ]
+    live = sum(sizes)
+    # bytes and block count too: a few cached 512 B tables read as 'live=0.0 MiB'
+    # (dkr27bnvfp4dualbar1drei10271237) and hid what the riegel stopped on
     logger.warning(
-        "PDFLIP-TAG-POOL transient pool KEPT reason=%s live=%.1f MiB -- a tensor "
+        "PDFLIP-TAG-POOL transient pool KEPT reason=%s live=%.1f MiB (%d B in %d block(s)) -- a tensor "
         "that outlives the block was born outside back_into_tag_pool; the pool "
         "stays referenced so its destructor never frees live blocks",
-        reason or "?", live / 2**20,
+        reason or "?", live / 2**20, live, len(sizes),
     )
     return True
 
