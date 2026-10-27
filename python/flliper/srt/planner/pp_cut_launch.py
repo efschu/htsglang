@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launcher-side wiring of the PP cut solver: makespan under a pool floor.
 
+DUAL LAYOUT (27B NVFP4): the P cut of the dual layout is PINNED (31,17,16 / 7,5,4), not solved -- read docs/dev/dual-layout.md
+(user explanation: weights in the D layout, P loads only the byte difference, no all-reduce in prefill, MPS) before changing it.
+
 WHAT THIS ADDS, AND WHAT IT DELIBERATELY DOES NOT.
 
 ``planner/pp_cut.py`` already carries every piece: ``PrefillTiming`` +

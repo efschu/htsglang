@@ -1,5 +1,8 @@
 """``Scheduler`` methods moved out of ``scheduler.py`` (refactor, behaviour-neutral): bodies are byte-identical,
-the class stays reachable as ``Scheduler.<name>`` through the mixin. Logger name unchanged."""
+the class stays reachable as ``Scheduler.<name>`` through the mixin. Logger name unchanged.
+
+Dual layout (27B NVFP4): see docs/dev/dual-layout.md (weights in the D layout, P loads only the byte difference, prefill and
+decode run at once, GEMM share by load via MPS) before changing anything that touches the dual phase layout."""
 
 from flliper.srt.managers.log_cycle_collapse import CycleCollapse
 from flliper.srt.managers.schedule_batch import Req
