@@ -320,40 +320,82 @@ def segment_checksum(view: torch.Tensor) -> Tuple[int, ...]:
 
 
 class HostImage:
-    """The victims' bytes in ONE anonymous, pageable host buffer, for one
-    stage (plan §6: never pinned per stage -- cudaHostAlloc of 1.5 GB cost
-    8-10 s, draft_park; never /dev/shm -- a dead rank leaves nothing). The
-    copies are synchronous: the D2H is complete before anything writes the
-    victims, and the H2D before the checksum reads them."""
+    """The victims' bytes in ONE anonymous host buffer.
 
-    def __init__(self, alloc: Callable[[int], torch.Tensor] = None):
-        self._alloc = alloc or (lambda n: torch.empty(n, dtype=torch.uint8))
+    Per stage (``pinned=False``, plan §6): pageable, allocated by the stash
+    and freed by the release -- never pinned per stage (cudaHostAlloc of 1.5 GB
+    cost 8-10 s, draft_park), never /dev/shm (a dead rank leaves nothing). The
+    copies are synchronous: the D2H is complete before anything writes the
+    victims, and the H2D before the checksum reads them.
+
+    Standing (``pinned=True``, user order 27.10.: "pinned Dauerkopie im Host
+    RAM"): ONE pinned buffer allocated once (:meth:`reserve` at arming, so no
+    image pays the cudaHostAlloc) and kept for the life of the rank. The
+    victims are weights: a stage whose device checksums equal the ones the
+    buffer was written under (``sums``, computed by the lease BEFORE the
+    stash) skips the D2H altogether; a changed layout (weight exchange after a
+    flip) rewrites it. Restore is a stream-ordered H2D from pinned memory, one
+    sync at the end."""
+
+    def __init__(self, alloc: Callable[[int], torch.Tensor] = None, *, pinned: bool = False):
+        self._pinned = bool(pinned)
+        self._alloc = alloc or (lambda n: torch.empty(n, dtype=torch.uint8, pin_memory=self._pinned))
         self.host: Optional[torch.Tensor] = None
         self._spans: List[Tuple[int, int]] = []
+        self._sums: Optional[Tuple[Tuple[int, ...], ...]] = None
+        #: the last stash found the standing buffer valid and copied nothing
+        self.reused = False
+
+    @property
+    def pinned(self) -> bool:
+        return self._pinned
 
     @property
     def nbytes(self) -> int:
         return 0 if self.host is None else int(self.host.numel())
 
-    def stash(self, views: Sequence[torch.Tensor]) -> None:
+    def reserve(self, nbytes: int) -> None:
+        """Allocate the standing buffer ahead of the first stage (arming)."""
+        if self._pinned and (self.host is None or int(self.host.numel()) < int(nbytes)):
+            self.host = self._alloc(max(1, int(nbytes)))
+
+    def stash(self, views: Sequence[torch.Tensor], *, sums: Optional[Sequence[Tuple[int, ...]]] = None) -> None:
         spans, off = [], 0
         for v in views:
             spans.append((off, int(v.numel())))
             off += int(v.numel())
-        self.host = self._alloc(max(1, off))
+        if (self._pinned and sums is not None and self.host is not None and self._sums is not None
+                and spans == self._spans and tuple(sums) == self._sums):
+            self.reused = True
+            return
+        self.reused = False
+        if not self._pinned or self.host is None or int(self.host.numel()) < off:
+            self.host = self._alloc(max(1, off))
         self._spans = spans
+        self._sums = None  # not valid until every byte is in
         for (o, n), v in zip(spans, views):
-            self.host[o:o + n].copy_(v)
+            self.host[o:o + n].copy_(v, non_blocking=self._pinned)
+        self._sync(views)
+        if self._pinned and sums is not None:
+            self._sums = tuple(sums)
 
     def restore(self, views: Sequence[torch.Tensor]) -> None:
         if self.host is None:
             raise RuntimeError("no host image to restore from")
         for (o, n), v in zip(self._spans, views):
-            v.copy_(self.host[o:o + n])
+            v.copy_(self.host[o:o + n], non_blocking=self._pinned)
+        self._sync(views)
 
     def release(self) -> None:
+        if self._pinned:
+            return  # standing: kept for the next stage
         self.host = None
         self._spans = []
+        self._sums = None
+
+    def _sync(self, views: Sequence[torch.Tensor]) -> None:
+        if self._pinned and views and views[0].is_cuda:
+            torch.cuda.current_stream(views[0].device).synchronize()
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +413,7 @@ class VictimSource(Protocol):
 
     def views(self, segments: Sequence[VictimSegment]) -> List[torch.Tensor]: ...
 
-    def stash(self, views: Sequence[torch.Tensor]) -> None: ...
+    def stash(self, views: Sequence[torch.Tensor], *, sums: Optional[Sequence[Tuple[int, ...]]] = None) -> None: ...
 
     def restore(self, views: Sequence[torch.Tensor]) -> None: ...
 
@@ -435,8 +477,22 @@ class HostImageVictims:
             out.append(hit[1][seg.offset:seg.offset + seg.nbytes])
         return out
 
-    def stash(self, views: Sequence[torch.Tensor]) -> None:
-        self._image.stash(views)
+    def stash(self, views: Sequence[torch.Tensor], *, sums: Optional[Sequence[Tuple[int, ...]]] = None) -> None:
+        self._image.stash(views, sums=sums)
+
+    def keep_pinned(self, nbytes: int = 0, *, alloc: Optional[Callable[[int], torch.Tensor]] = None) -> None:
+        """Standing pinned host image (user order 27.10.), allocated now for
+        ``nbytes`` so that no image pays the cudaHostAlloc."""
+        self._image = HostImage(alloc, pinned=True)
+        self._image.reserve(nbytes)
+
+    @property
+    def image_reused(self) -> bool:
+        return self._image.reused
+
+    @property
+    def image_pinned(self) -> bool:
+        return self._image.pinned
 
     def restore(self, views: Sequence[torch.Tensor]) -> None:
         self._image.restore(views)
@@ -579,7 +635,7 @@ class VictimLease:
         probe.mark("before")
         t0 = clock()
         try:
-            source.stash(views)
+            source.stash(views, sums=sums0)
         except (MemoryError, RuntimeError) as exc:
             # plan §6.8: before any device byte moved -- W105b, rig intact
             source.release()
@@ -636,7 +692,15 @@ class VictimLease:
         segs = self.plan.segments
         return (f"victim={self.source.kind} victim_mib={self.plan.victim_bytes / MIB:.1f} "
                 f"segments={len(segs)} largest_run_mib={self.plan.largest_run / MIB:.1f} "
-                f"split_tensors={len(self.split)} host_image_mib={self.stashed_bytes / MIB:.1f}")
+                f"split_tensors={len(self.split)} host_image_mib={self.stashed_bytes / MIB:.1f} "
+                f"host_image={self._image_state()}")
+
+    def _image_state(self) -> str:
+        """pinned-standing / written (the D2H ran) / reused (standing, checksums
+        matched, no D2H) / pageable (per stage, the old form)."""
+        if not isinstance(self.source, HostImageVictims) or not self.source.image_pinned:
+            return "pageable"
+        return "pinned-reused" if self.source.image_reused else "pinned-written"
 
     def host_line(self, run: int) -> str:
         """Coordinator 09.10. (3): the host-RAM price of the displacement,
@@ -851,6 +915,14 @@ def arming_line(source: VictimSource, ckpt: Sequence[CkptTensor],
     stage WILL make for the checkpoint's tower (sizes from the header, names
     mapped to the module's, the split the source asks for) -- or the
     W105b refusal."""
+    line, _plan, why = arming_plan(source, ckpt, map_name)
+    return line, why
+
+
+def arming_plan(source: VictimSource, ckpt: Sequence[CkptTensor],
+                map_name: Callable[[str], str]) -> Tuple[str, Optional[VictimPlan], str]:
+    """(line, plan, refusal): :func:`arming_line` plus the plan itself, whose
+    ``victim_bytes`` is what the standing pinned host image is sized for."""
     inv = source.inventory()
     largest = max((c.nbytes for c in inv), default=0)
     adjacent = largest_adjacent_run(inv)
@@ -870,6 +942,6 @@ def arming_line(source: VictimSource, ckpt: Sequence[CkptTensor],
     try:
         plan = plan_victims(inv, pieces)
     except VisionVictimShort as exc:
-        return f"{head} plan=REFUSED", str(exc)
+        return f"{head} plan=REFUSED", None, str(exc)
     return (f"{head} planned_victim_mib={plan.victim_bytes / MIB:.1f} planned_segments={len(plan.segments)} "
-            f"planned_host_image_mib={plan.victim_bytes / MIB:.1f}"), ""
+            f"planned_host_image_mib={plan.victim_bytes / MIB:.1f}"), plan, ""
