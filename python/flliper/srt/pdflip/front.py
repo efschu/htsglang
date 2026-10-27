@@ -8475,7 +8475,7 @@ class Front:
 
         if _xp is not None and _probe.mm_spans:
             # S56: D's image spans decide the vision terms exactly -- cached = every image inside the covered prefix
-            mm_cached = not _xp.image_in_tail
+            mm_cached = _dmp.image_cached(_xp)   # not image_in_tail: with D's own vision stage that is always True
             d_reach = d_floor = int(_xp.covered)
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
                                # VISION-SHORT-1014: what the shared store proved at arrival

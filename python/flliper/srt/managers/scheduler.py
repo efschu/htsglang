@@ -12247,7 +12247,8 @@ class Scheduler(
                 v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
                 out = _vdg.bounded(v, str(req.rid), defers)
         if (out == _vdg.REFUSE and covered is not None and getattr(self, "_pdflip_vision_d_stage", False)
-                and _vdg.reroute_eligible(req)):
+                and _vdg.reroute_eligible(req) and Scheduler._pdflip_vision_d_stage_has_items(req)
+                and not Scheduler._pdflip_vision_d_stage_exhausted(self, req)):
             # user order 27.10. (vision on D in the flip layouts): the group's covered prefix, after the store read and the
             # rows attempt, does not reach this image -- D encodes it itself (``pdflip/vision_d_runner.d_pass``) instead of
             # refusing it (W123 -> P). Group-uniform like every input above, so every rank marks the same request. A request
@@ -12255,6 +12256,30 @@ class Scheduler(
             req._pdflip_vision_d_stage_wanted = True
             return "stage"
         return out
+
+    @staticmethod
+    def _pdflip_vision_d_stage_has_items(req: Req) -> bool:
+        """The D stage can encode only items that still carry their pixels. A request whose items arrived feature-less
+        (probe copy) gets no stage: it falls through to the refusal (W123 -> requeue through P) instead of waiting for a
+        pass that plans nothing."""
+        from flliper.srt.pdflip import vision_rank_runner as _vrr
+
+        return bool(_vrr.unstaged_items(req))
+
+    def _pdflip_vision_d_stage_exhausted(self, req: Req) -> bool:
+        """Bound of the stage wait per rid (the defer bound ``DEFER_BOUND_PASSES`` does not cover a ``stage`` verdict): a
+        stage that has not run after that many passes is refused by name, never waited for without end. Group-uniform:
+        the count follows the group-uniform verdict, every rank counts the same passes. The count lives on the request (it
+        goes with it, no table to prune)."""
+        from flliper.srt.pdflip import vision_d_guard as _vdg
+
+        n = int(getattr(req, "_pdflip_vision_d_stage_passes", 0) or 0) + 1
+        req._pdflip_vision_d_stage_passes = n
+        if n > _vdg.DEFER_BOUND_PASSES:
+            logger.error("W125c PdFlipVisionStage rid=%s: the D stage did not run in %d passes -- refused (W123 -> P)",
+                         str(req.rid), n - 1)
+            return True
+        return False
 
     def _pdflip_vision_d_rows(self, req: Req, bound: int, covered: int) -> bool:
         """VISION-ROWS (D side, ``pdflip/vision_row_store.py``): attach the rows of every image of ``req`` that

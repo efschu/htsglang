@@ -56,6 +56,15 @@ def d_stage_wanted(hf_config: Any, env: Optional[Dict[str, str]] = None) -> bool
     return getattr(hf_config, "vision_config", None) is not None
 
 
+def d_leg_without_pixels(model_config: Any, env: Optional[Dict[str, str]] = None) -> bool:
+    """A group D whose legs need no pixels: tower-less (``vision_d_guard.d_guard_armed``) AND no stage of its own. With the
+    stage (:func:`d_stage_wanted`) the leg's items must keep their features -- the stage encodes from them; feature-less
+    items there are planned by nobody and the request waits for ever (27.10. boot formb98v, pdflip-2-2)."""
+    from flliper.srt.pdflip.vision_d_guard import d_guard_armed
+
+    return d_guard_armed(model_config, env) and not d_stage_wanted(getattr(model_config, "hf_config", None), env)
+
+
 def arm_d_stage(scheduler: Any, env: Optional[Dict[str, str]] = None) -> bool:
     """Arm this TP rank of group D. Returns whether the rank takes part in the pass. An arming
     refusal of the leader still arms the pass: it then refuses every image by name."""

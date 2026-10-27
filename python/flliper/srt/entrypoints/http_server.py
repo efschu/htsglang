@@ -1560,10 +1560,13 @@ async def pdflip_match_probe(raw_request: Request):
             # (D never needs the pixels -- no host RAM held for a request that goes to P); features on the card
             # (CUDA-IPC / keep-on-device): nothing is cached, the leg tokenizes itself
             from flliper.srt.pdflip import tok_ahead as _tah
-            from flliper.srt.pdflip import vision_d_guard as _vdg
 
             if not _tah.gpu_side_reason():
-                _sched_mm, _cache_mm = _tah.d_cache_mm(mm, _vdg.d_guard_armed(tm.model_config))
+                # a D with its own vision stage needs the pixels in its leg (27.10. boot formb98v, pdflip-2-2: running=1
+                # queue=1 for 8 min on feature-less items): vision_d_runner.d_leg_without_pixels
+                from flliper.srt.pdflip import vision_d_runner as _vdr
+
+                _sched_mm, _cache_mm = _tah.d_cache_mm(mm, _vdr.d_leg_without_pixels(tm.model_config))
                 if _sched_mm is not None:
                     _ta.put(obj.rid, _tah.obj_digest(obj), list(tokenized.input_ids or ()), _cache_mm,
                             tokenized.token_type_ids, t_tok, "d_probe")

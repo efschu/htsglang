@@ -4,6 +4,7 @@ rows attempt, and only where a refusal could go back through P (review 27.10. H1
 import types
 
 import pytest
+import torch
 
 from flliper.srt.managers.scheduler import Scheduler
 from flliper.srt.pdflip import vision_d_guard as g
@@ -14,6 +15,8 @@ def _verdict(armed, streamed=0):
     h = _sched()
     h._pdflip_vision_d_stage = armed
     req = _req()
+    for it in req.multimodal_inputs.mm_items:
+        it.feature = torch.zeros(1)   # the leg's item still carries its pixels: the stage can encode it
     req.output_ids = [7] * streamed
     return Scheduler._pdflip_vision_d_verdict(h, req, None), req
 

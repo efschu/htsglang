@@ -518,6 +518,16 @@ class ExactPrice:
     #: or they are the prefix) -- they cost D's admission no allocation and are not in D's free reading. None: a D
     #: build without the field (the front prices as before)
     device_locked: Optional[int] = None
+    #: an image item ends past ``covered`` and no rows of it are published. Unlike ``image_in_tail`` this does NOT
+    #: depend on who encodes it: with group D's own vision stage (``d_encodes``) the image is no P-only tail, but it
+    #: is still NOT cached -- it needs a tower pass, so it must not be priced and routed like text (27.10. boot
+    #: formb98v: ``image-cached (credit=0 >= image_end=1028)`` -> no stage, D admitted the image without rows, hung)
+    image_uncached: bool = False
+
+
+def image_cached(price: "ExactPrice") -> bool:
+    """Every image inside what D already covers or with published rows: no tower pass is needed (priced like text)."""
+    return not price.image_uncached
 
 
 def exact_price(ans: ProbeAnswer, store_tokens: int, *, d_encodes: bool = False) -> ExactPrice:
@@ -534,13 +544,15 @@ def exact_price(ans: ProbeAnswer, store_tokens: int, *, d_encodes: bool = False)
     # rows -- it is no P-only tail (R9 is for an image D cannot compute); only the other images decide
     rows = set((int(a), int(b)) for a, b in getattr(ans, "mm_rows", ()) or ())
     past = [(int(a), int(b)) for a, b in ans.mm_spans if int(b) > covered]
-    tail = (not d_encodes) and any(s not in rows for s in past)
+    uncached_img = any(s not in rows for s in past)
+    tail = (not d_encodes) and uncached_img
     src = "d_tree" if tree >= store and tree > 0 else ("store" if store > 0 else "none")
     locked = (locked_rows_continued(getattr(ans, "device_locked_spans", ()) or (), covered)
               if getattr(ans, "device_locked_known", False) else None)
     return ExactPrice(uncached=max(0, n - covered), uncached_p=max(0, n - store), covered=covered,
                       tree_tokens=tree, store_tokens=store, image_in_tail=bool(tail), src=src,
-                      tail_rows=sum(1 for s in past if s in rows), device_locked=locked)
+                      tail_rows=sum(1 for s in past if s in rows), device_locked=locked,
+                      image_uncached=bool(uncached_img))
 
 
 def class_uncached(price: ExactPrice) -> int:

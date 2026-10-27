@@ -107,6 +107,10 @@ def armed_reason(*, server_args: Any, model_config: Any, mm_processor: Any) -> s
         return "no Qwen-VL processor"
     if not d_guard_armed(model_config):
         return "not a tower-less multimodal group D"
+    from flliper.srt.pdflip import vision_d_runner as _vdr
+
+    if _vdr.d_stage_wanted(getattr(model_config, "hf_config", None)):
+        return "group D encodes images itself (vision on D): its items keep their pixels"
     if server_args.language_only or server_args.skip_tokenizer_init:
         return "language_only / skip_tokenizer_init"
     return hash_reason(server_args)
