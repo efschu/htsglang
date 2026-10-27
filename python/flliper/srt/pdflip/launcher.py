@@ -16283,6 +16283,50 @@ def dual_alloc_cache_book_env(ns, cards: List[Card], log: Log) -> Dict[str, str]
     return {_dual_p_kv.ALLOC_CACHE_BOOK_ENV: ",".join("" if v is None else str(int(v)) for v in vals)}
 
 
+def dual_outside_free_env(ns, cards: List[Card], user_reserve_by_card: Optional[Dict[str, int]],
+                          log: Log) -> Dict[str, str]:
+    """PDFLIP-USER-RESERVE-BOOK (user rule 24.10.): P's env carrying the MiB per card ordinal that the card keeps
+    free BESIDE its KV ledger (record ``D_DUAL_OUTSIDE_FREE_MIB`` of the profile, fmt = the checkpoint's format,
+    pdflip/budget_rest.py). P's join books ``max(0, reserve - outside_free)`` out of the card budget so that the
+    user's reserve is the floor of the card's free memory (dual_p_kv_stage.book_user_reserve). RECORD >
+    UNMEASURED: a profile / format without the record books nothing and the line says so loudly. {} and no line
+    when the layout is not dual-share + unified KV or the user stated no reserve (byte-identical to before);
+    ``FLLIPER_PDFLIP_DUAL_USER_RESERVE_BOOK=0`` is the named off switch (default ON)."""
+    if not getattr(ns, "dual_share", False) or str(getattr(ns, "dual_unified_kv", "off")) != "on":
+        return {}
+    if not any(int(v) > 0 for v in (user_reserve_by_card or {}).values()):
+        return {}
+    from flliper.srt.pdflip import dual_p_kv_stage as _dual_p_kv
+
+    marker = _budget_rest.RESERVE_BOOK_MARKER
+    if not _dual_p_kv.reserve_book_armed():
+        log(f"{marker} OFF ({_dual_p_kv.RESERVE_BOOK_SWITCH_ENV}=0): the user's reserve is NOT booked in the card "
+            f"ledger on this boot (switch off, named)")
+        return {_dual_p_kv.RESERVE_BOOK_SWITCH_ENV: "0"}
+    name = _budget_rest.outside_free_record_name("D")
+    fmt = d_reshard_format(str(getattr(ns, "model", "") or ""))
+    sel = pdflip_form.profile_record(name, getattr(ns, "profile", None), fmt=fmt)
+    if sel is None:
+        log(f"{marker} {_budget_rest.SOURCE_UNMEASURED} profile={getattr(ns, 'profile', None)} fmt={fmt or '-'}: no "
+            f"record {name} of this checkpoint and form -- the user's reserve is NOT booked in the card ledger "
+            f"on this boot (named, not measured); measure the tightest 'LEDGER-PHYS' phys_free - ledger_free of a "
+            f"serving boot per card")
+        return {}
+    vals = list(sel.record.value)
+    if len(vals) != len(cards):
+        raise PdFlipLaunchRefused(
+            f"{marker}: {name} has {len(vals)} entries for {len(cards)} cards; re-measure the tightest "
+            f"'LEDGER-PHYS' phys_free - ledger_free per card")
+    parts = []
+    for i, (c, v) in enumerate(zip(cards, vals)):
+        res = int((user_reserve_by_card or {}).get(c.uuid, 0))
+        parts.append(f"ordinal {i} nvml{c.nvml_index} reserve {res} MiB, outside_free "
+                     + ("UNMEASURED" if v is None else f"{int(v)} MiB -> book {_dual_p_kv.reserve_deficit_mib(res, int(v))} MiB"))
+    log(f"{marker} {_budget_rest.SOURCE_RECORD} {name} fmt={fmt} boot {','.join(sel.record.boots)}: "
+        + ", ".join(parts) + " -- booked out of the card ledger at P's join")
+    return {_dual_p_kv.OUTSIDE_FREE_ENV: ",".join("" if v is None else str(int(v)) for v in vals)}
+
+
 class PdFlipDualPSleepShareRefused(SystemExit):
     """W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share. Not resident, P's
     weights load inside the memory-saver's private MemPool; the union bind frees
@@ -29561,6 +29605,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
     apply_dual_p_sleep(ns, spec_p, log)  # D PRIORITY stage 2 (dual unified KV only)
     spec_p.env.update(dual_alloc_cache_book_env(ns, cards, log))  # item 170: D's cache growth, booked at P's join
+    spec_p.env.update(dual_outside_free_env(ns, cards, user_reserve_by_card, log))  # user rule 24.10.: the reserve, booked at P's join
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
     if ns._dual_mps_env and not dry:
         # persisted AT ONCE: every exit path (cli() early exits, teardown() in a fresh process) reads it

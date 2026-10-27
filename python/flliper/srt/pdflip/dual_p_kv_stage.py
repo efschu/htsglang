@@ -40,6 +40,17 @@ MAX_TOKENS_ENV = "FLLIPER_PDFLIP_DUAL_P_KV_MAX_TOKENS"
 #: PDFLIP-ALLOC-CACHE-BOOK (item 170): MiB per card ordinal (P stage s on card s) of D's allocator
 #: cache growth the card ledger books at P's join (launcher: record D_DUAL_ALLOC_CACHE_BOOK_MIB)
 ALLOC_CACHE_BOOK_ENV = "FLLIPER_PDFLIP_DUAL_ALLOC_CACHE_BOOK_MIB"
+#: PDFLIP-USER-RESERVE-BOOK (user rule 24.10., "ganzer VRAM minus Nutzer-Reserve"): MiB per card ordinal
+#: (P stage s on card s) of memory that is free BESIDE the card ledger at the tightest instant of a serving
+#: boot (cuMemGetInfo free - ledger free; launcher: record D_DUAL_OUTSIDE_FREE_MIB). The part of the user's
+#: reserve this does not already cover is booked out of the card budget at P's join.
+OUTSIDE_FREE_ENV = "FLLIPER_PDFLIP_DUAL_OUTSIDE_FREE_MIB"
+#: default ON (user order 14.10.); 0/false/off/no = the booking is skipped, named in the log
+RESERVE_BOOK_SWITCH_ENV = "FLLIPER_PDFLIP_DUAL_USER_RESERVE_BOOK"
+RESERVE_BOOK_MARK = "USER-RESERVE-BOOK"
+RESERVE_SHORT_MARK = "USER-RESERVE-SHORT"
+#: one USER-RESERVE-SHORT / owed-waits line per this many seconds (instruments, never an action)
+RESERVE_LOG_S = 60.0
 #: the token lattice every P KV span plan is cut at (a live move keeps whole
 #: cells) and the unit ``ensure`` rounds up to
 STEP_TOKENS_ENV = "FLLIPER_PDFLIP_DUAL_P_KV_STEP_TOKENS"
@@ -265,6 +276,10 @@ class PKvStage:
         self._sync = sync or (lambda: None)
         self.mapped_tokens = 0
         self.cuts = None
+        #: PDFLIP-USER-RESERVE-BOOK: the user's reserve on this card (MiB, 0 = none) and the part of the
+        #: booking the ledger could not take at the join (bytes, retried by ``settle_reserve_owed``)
+        self._user_reserve_mib = 0
+        self._reserve_owed = 0
 
     def bytes_for(self, tokens: int) -> int:
         from flliper.srt.pdflip.d_seat_vram import kv_mapped_bytes
@@ -450,9 +465,13 @@ def card_law(led, group: str):
     dual-grant-1024 MUSS-1). The law here prices the boot's own transient; it
     reserves nothing: the ledger is the ONE place that hands the card's bytes
     to KV, and a full commit must leave the card at the transient its own
-    windows need, never at 0. No user reserve enters (house rule 19.09.); the
-    launcher's reserve only shapes the boot sizing, and at run time the caches
-    ate it in boot ..._1ecda02a58_1024_115913 (gap 9938 -> 0 MiB).
+    windows need, never at 0. No user reserve enters THIS law (house rule 19.09.;
+    the launcher's reserve only shapes the boot sizing, and at run time the caches
+    ate it in boot ..._1ecda02a58_1024_115913, gap 9938 -> 0 MiB). Since the user
+    rule of 24.10. the stated reserve is booked out of the budget once, at P's
+    join (``book_user_reserve``, PDFLIP-USER-RESERVE-BOOK) -- not here: a floor
+    measured at run time cannot tell the user's own use of the card (a game)
+    from the system's growth and would ratchet the budget down for good.
 
     Each process max-merges its own group's value into ``<ledger>.law`` (flock),
     and both groups' ticks read the same max -- the price does not depend on
@@ -581,6 +600,7 @@ def phys_check(actor, group: str) -> None:
     if t < getattr(actor, "_phys_next", 0.0):
         return
     actor._phys_next = t + PHYS_CHECK_S
+    settle_reserve_owed(actor)            # PDFLIP-USER-RESERVE-BOOK: what the join could not take (0 = no-op)
     led = getattr(actor, "ledger", None)
     path = getattr(led, "path", None)
     phys1 = phys_free_bytes()
@@ -596,6 +616,7 @@ def phys_check(actor, group: str) -> None:
     # only under-reads the over -- the safe side)
     phys2 = phys_free_bytes()
     phys_raw = max(int(phys1), int(phys2)) if phys2 is not None else int(phys1)
+    _note_reserve_short(actor, phys_raw, int(st.free))
     law, law_src = card_law(led, group)
     if law <= 0 and not getattr(actor, "_law_zero_said", False):
         actor._law_zero_said = True
@@ -670,6 +691,9 @@ def attach(runner) -> Optional["PKvStage"]:
     boot_bytes = actor.bytes_for(boot) - actor.bytes_for(0)
     ledger.contribute(boot_bytes, committed=0)
     book_alloc_cache(ledger, int(getattr(runner, "pp_rank", 0) or 0), card)
+    # user rule 24.10.: the reserve is the lower bound of the card's physical free memory -- booked here, per card
+    actor._user_reserve_mib, _booked, actor._reserve_owed = book_user_reserve(
+        ledger, int(getattr(runner, "pp_rank", 0) or 0), card)
     actor._engage_cap(actor.allocator, 0, actor.page)
     setattr(runner, ACTOR_ATTR, actor)
     # #1962 P-LAYER-STREAM (PP0, default off): weights out, KV in, by the prompt's level
@@ -722,6 +746,160 @@ def book_alloc_cache(ledger, pp_rank: int, card: str, env=None) -> int:
                 int(pp_rank), got, want, "" if got == want else " -- the rest does not fit under what is "
                 "committed (I1) and stays unbooked")
     return got
+
+
+# -- PDFLIP-USER-RESERVE-BOOK -----------------------------------------------------------------
+#
+# User rule 24.10. (verbatim in CLAUDE.md "VRAM-NUTZUNG UND 1-GB-KORRIDOR"): the system may use the whole
+# VRAM minus the reserve the user stated per card (--user-reserve-mib), "weil jemand anderes moechte ja
+# vielleicht speicher frei haben ... unter umstaenden sogar ich, wenn ich gleichzeitig zocken will".
+# The dual layout never booked it: the D budget replaces it by the awake-rest record (launcher
+# ``effective_reserve_by_card``, the D ranks read 0), the P budget is set far below its ceiling, and the
+# ledger below prices only the measured transient (``card_law``, house rule 19.09.). Boot
+# dkr27bnvfp4dualbar1drei10271355 (dualm): beside the ledger the card kept 1621 / 787 / 749 MiB at the
+# quiet instant and 1009 / 128 / 32 MiB at the tightest, against a reserve of 1800 / 1400 / 1400.
+#
+# THE BOOKING (accounting, like the alloc-cache booking beside it): per card
+#     book = max(0, reserve - outside_free)
+# comes out of the card budget at P's join (``CardKvLedger.book_unpriced``), so a fully committed pool
+# leaves at least the reserve free. No runtime gate: a game that takes memory never collapses the budget
+# (a measured, ratcheting floor would -- it cannot tell the user's use from the system's), and no grant is
+# refused. What the ledger cannot take at the join (D still holds its boot pool: nothing is free) stays
+# OWED and is booked as soon as the pool has the bytes (``settle_reserve_owed``, from ``phys_check``).
+
+
+def reserve_book_armed(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(RESERVE_BOOK_SWITCH_ENV, "") or "").strip().lower() not in ("0", "false", "off", "no")
+
+
+def outside_free_mib(pp_rank: int, env=None) -> Optional[int]:
+    """The MiB the launcher's record gives for this stage's card (``None``: no record / this card unpriced)."""
+    env = os.environ if env is None else env
+    raw = str(env.get(OUTSIDE_FREE_ENV, "") or "").strip()
+    if not raw:
+        return None
+    parts = [x.strip() for x in raw.split(",")]
+    if not (0 <= int(pp_rank) < len(parts)) or not parts[int(pp_rank)]:
+        return None
+    try:
+        return max(0, int(parts[int(pp_rank)]))
+    except ValueError:
+        return None
+
+
+def user_reserve_mib(card: str, env=None) -> int:
+    """The reserve the user stated for ``card`` (MiB; 0 = none). The published mapping is the group's EFFECTIVE
+    one (a D rank reads 0 where the launcher booked D's awake rest); the stated value of such a card sits in the
+    masked mapping -- the ledger is the card's, so it prices the STATED reserve whichever group asks. Keys are
+    compared by ``card_key`` (NVML says "GPU-...", torch's uuid has no prefix)."""
+    import json
+
+    from flliper.srt.managers import corridor_guard as _cg
+    from flliper.srt.pdflip.card_kv_ledger import card_key
+
+    env = os.environ if env is None else env
+    want, best = card_key(card), 0
+    for name in (_cg.USER_RESERVE_ENV, _cg.USER_RESERVE_MASKED_ENV):
+        raw = env.get(name)
+        if not raw:
+            continue
+        try:
+            for key, val in json.loads(raw).items():
+                if card_key(key) == want:
+                    best = max(best, int(val))
+        except (ValueError, TypeError, AttributeError):
+            continue   # a malformed hint is no reserve here (corridor_guard.user_reserve_by_card says so loudly)
+    return max(0, best)
+
+
+def reserve_deficit_mib(reserve_mib: int, outside_free_mib_: int) -> int:
+    """The part of the reserve the card does not keep free beside the ledger by itself."""
+    return max(0, int(reserve_mib) - int(outside_free_mib_))
+
+
+def book_user_reserve(ledger, pp_rank: int, card: str, env=None) -> Tuple[int, int, int]:
+    """After P's boot KV and the alloc-cache record joined the card pool: book the user's reserve out of the
+    budget (module note above). Returns ``(reserve_mib, booked_bytes, owed_bytes)``; ``owed`` is what the
+    ledger could not take now (``min(want, ledger free)``) and ``settle_reserve_owed`` retries. One line per
+    card, always: reserve, outside free, the deduction, the budget before and after."""
+    env = os.environ if env is None else env
+    cardname = str(card)[-12:]
+    reserve = user_reserve_mib(card, env)
+    if reserve <= 0:
+        logger.info("%s %s card=%s pp_rank=%d: reserve=0 MiB -- the user stated none for this card, nothing to "
+                    "keep free, nothing booked", MARK, RESERVE_BOOK_MARK, cardname, int(pp_rank))
+        return 0, 0, 0
+    if not reserve_book_armed(env):
+        logger.warning("%s %s card=%s pp_rank=%d: reserve=%d MiB but %s=0 -- the reserve is NOT booked in the "
+                       "card ledger on this boot (switch off, named)", MARK, RESERVE_BOOK_MARK, cardname,
+                       int(pp_rank), reserve, RESERVE_BOOK_SWITCH_ENV)
+        return reserve, 0, 0
+    outside = outside_free_mib(pp_rank, env)
+    if outside is None:
+        logger.warning("%s %s card=%s pp_rank=%d: reserve=%d MiB, UNMEASURED (no record D_DUAL_OUTSIDE_FREE_MIB "
+                       "prices what this card keeps free beside the ledger) -- the reserve is NOT booked in the "
+                       "card ledger on this boot (named, not measured)", MARK, RESERVE_BOOK_MARK, cardname,
+                       int(pp_rank), reserve)
+        return reserve, 0, 0
+    want = reserve_deficit_mib(reserve, outside) << 20
+    before = int(ledger.state().budget) if want > 0 else 0
+    got = int(ledger.book_unpriced(want)) if want > 0 else 0
+    after = int(ledger.state().budget) if want > 0 else 0
+    logger.info("%s %s card=%s pp_rank=%d: reserve=%d MiB outside_free=%d MiB (record) -> deduction %d B (%d MiB): "
+                "booked %d B, owed %d B; card budget K_c %d -> %d B (%d -> %d MiB)%s", MARK, RESERVE_BOOK_MARK,
+                cardname, int(pp_rank), reserve, outside, want, want >> 20, got, want - got, before, after,
+                before >> 20, after >> 20,
+                "" if got == want else " -- the rest does not fit under what is committed (I1) now, it is "
+                "booked as soon as the pool has the bytes")
+    return reserve, got, want - got
+
+
+def settle_reserve_owed(actor) -> int:
+    """Book what ``book_user_reserve`` could not take at the join (D held the whole pool then) as soon as the
+    pool has free bytes; returns the bytes booked now. Called from ``phys_check`` (throttled to its 10 s)."""
+    owed = int(getattr(actor, "_reserve_owed", 0) or 0)
+    if owed <= 0:
+        return 0
+    led = actor.ledger
+    before = int(led.state().budget)
+    got = int(led.book_unpriced(owed))
+    if got > 0:
+        actor._reserve_owed = owed - got
+        logger.info("%s %s card=%s settle: booked %d B of the owed %d B (reserve=%d MiB), owed left %d B; card "
+                    "budget K_c %d -> %d B (%d -> %d MiB)", MARK, RESERVE_BOOK_MARK,
+                    os.path.basename(str(getattr(led, "path", ""))), got, owed, int(actor._user_reserve_mib),
+                    owed - got, before, before - got, before >> 20, (before - got) >> 20)
+        return got
+    t = _now()
+    if t >= float(getattr(actor, "_reserve_owed_log_next", 0.0) or 0.0):
+        actor._reserve_owed_log_next = t + RESERVE_LOG_S
+        logger.info("%s %s card=%s settle: %d B of the reserve booking are still owed -- the pool has no free "
+                    "bytes yet (D holds them); retried every %.0f s", MARK, RESERVE_BOOK_MARK,
+                    os.path.basename(str(getattr(led, "path", ""))), owed, PHYS_CHECK_S)
+    return 0
+
+
+def _note_reserve_short(actor, phys_raw: int, ledger_free: int) -> None:
+    """Instrument (log only, one line per RESERVE_LOG_S): the card keeps LESS free beside the ledger than the
+    user's reserve. The reading is the tuning series of the record (D_DUAL_OUTSIDE_FREE_MIB): its tightest value
+    over a boot is what the record should say."""
+    res = int(getattr(actor, "_user_reserve_mib", 0) or 0)
+    if res <= 0:
+        return
+    outside = int(phys_raw) - int(ledger_free)
+    if outside >= (res << 20):
+        return
+    t = _now()
+    if t < float(getattr(actor, "_reserve_short_next", 0.0) or 0.0):
+        return
+    actor._reserve_short_next = t + RESERVE_LOG_S
+    logger.warning("%s %s card=%s reserve=%d MiB outside_free=%d MiB (phys_free %d - ledger_free %d MiB) short=%d "
+                   "MiB owed=%d B: the card keeps less free beside the ledger than the user's reserve at this "
+                   "instant (instrument only; the booking is made at the join from the record)", MARK,
+                   RESERVE_SHORT_MARK, os.path.basename(str(getattr(getattr(actor, "ledger", None), "path", ""))),
+                   res, outside >> 20, int(phys_raw) >> 20, int(ledger_free) >> 20, res - (outside >> 20),
+                   int(getattr(actor, "_reserve_owed", 0) or 0))
 
 
 def _actor(sched) -> Optional["PKvStage"]:

@@ -1362,6 +1362,27 @@ def alloc_cache_record_name(group: str) -> str:
     return ALLOC_CACHE_RECORD_FMT.format(group=str(group).upper())
 
 
+# --------------------------------------------------------------------------
+# PDFLIP-USER-RESERVE-BOOK (user rule 24.10.): what the card keeps free BESIDE the card ledger
+#
+# The user's reserve (--user-reserve-mib per card) is the lower bound of the card's physical free memory
+# ("ganzer VRAM minus Nutzer-Reserve"). The dual layout books it nowhere (the awake-rest record replaces it
+# in the D budget, the ledger prices only the measured transient). Record ``D_DUAL_OUTSIDE_FREE_MIB`` per
+# card ordinal: the TIGHTEST ``phys_free - ledger_free`` of the boot's ``LEDGER-PHYS`` lines (the free
+# memory beside the pool after the allocator caches of both groups grew and P's chunks ran); the ledger
+# books ``max(0, reserve - outside_free)`` out of the card budget at P's join
+# (``dual_p_kv_stage.book_user_reserve``). RECORD > UNMEASURED: a profile / format without the record books
+# nothing and says so loudly (the rule is then NOT kept on that boot, by name).
+# --------------------------------------------------------------------------
+
+OUTSIDE_FREE_RECORD_FMT = "{group}_DUAL_OUTSIDE_FREE_MIB"
+RESERVE_BOOK_MARKER = "PDFLIP-USER-RESERVE-BOOK"
+
+
+def outside_free_record_name(group: str) -> str:
+    return OUTSIDE_FREE_RECORD_FMT.format(group=str(group).upper())
+
+
 @dataclass(frozen=True)
 class CacheSeries:
     """One D rank of one boot."""

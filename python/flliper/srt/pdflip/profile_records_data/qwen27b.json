@@ -162,6 +162,23 @@
    "n": 4
   },
   {
+   "name": "D_DUAL_OUTSIDE_FREE_MIB",
+   "value": [
+    1009,
+    128,
+    32
+   ],
+   "provenance": "desk/27b-user-reserve-book-1027 (user rule 24.10.): the free memory BESIDE the card ledger at the TIGHTEST instant of the boot, per card ordinal (5090 nvml0, nvml1, nvml2) = cuMemGetInfo free - ledger free of the P log's 'P-KV LEDGER-PHYS' lines (ok and OVER-PROMISE; PP0/PP1/PP2 = cards 0/1/2, committed = mapped there). Boot dkr27bnvfp4dualbar1drei10271355 (27B NVFP4 dual, dualm marlin_native_inplace, formb99w, 27b789dd0b; 42 readings per card 13:56:54-14:07:39, ALLOC-CACHE-BOOK 952/0/0 MiB applied): tightest 1009 / 128 / 32 MiB, all at 14:07:39 (PP1 and PP2 flagged OVER-PROMISE 94 / 193 MiB there: four 262k-class P grants waiting, D shrinking, both allocator caches grown); the quiet instants (P committed 0, 14:05:48) read 1621 / 787 / 749 MiB, the series fell from 3439 / 2372 / 2192 at the first reading (caches grow, never shrink). Boot ...10271415 (same build, lighter load, 54-56 readings per card 14:16-14:37, no OVER-PROMISE): tightest 1613 / 668 / 602 MiB, no tighter instant -- the spread between the two boots (1009 vs 1613 on the 5090, 32 vs 602 on the 3080b) is the load, the record takes the tightest. The user's reserve (1800 / 1400 / 1400 MiB) is the lower bound of the card's free memory; the ledger books max(0, reserve - outside_free) = 791 / 1272 / 1368 MiB out of the card budget at P's join (dual_p_kv_stage.book_user_reserve). SAMPLED every 10 s per rank, not continuously, and from ONE serving boot: an UPPER bound of the tightest free memory (a tighter instant lowers the value and raises the booking) -- the P log line USER-RESERVE-SHORT names every instant the card keeps less than the reserve; re-measure with the tightest outside_free over the newest serving boots. Same checkpoint and form only (fmt nvfp4, dual layout).",
+   "boots": [
+    "dkr27bnvfp4dualbar1drei10271355"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded per record; the boot ran 5090 400 W / 3080 230 W (boot json power_limit_w)",
+   "fmt": "nvfp4",
+   "n": 1
+  },
+  {
    "name": "D_EXTEND_CAP_PER_ROW_MIB",
    "value": [
     0.3091,

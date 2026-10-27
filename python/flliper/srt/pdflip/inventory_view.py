@@ -71,6 +71,8 @@ RECORD_POLICY: Dict[str, str] = {
     "D_TORCH_CAP_OTHER_MIB": CLASS_MAX,
     "D_AWAKE_REST_CAPPED_MIB": CLASS_MAX,
     "D_DUAL_ALLOC_CACHE_BOOK_MIB": CLASS_MAX,
+    # PDFLIP-USER-RESERVE-BOOK 27.10.: the tightest free memory beside the card ledger -- SMALLER is the safe side
+    "D_DUAL_OUTSIDE_FREE_MIB": CLASS_MIN,
     "D_EXTEND_CAP_PER_ROW_MIB": UNIFORM,
     # VOTE-LINE-SINGLE 24.10.: one measured value for every rank (TP-symmetric shards)
     "D_EXTEND_VOTE_FIXED_MIB": UNIFORM,
