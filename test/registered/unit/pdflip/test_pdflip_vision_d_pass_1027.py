@@ -81,7 +81,7 @@ def _leader(queue, wire, skip=(), wait=(), ok=True, code="", attach_rows=True):
         if ok and attach_rows:
             it.precomputed_embeddings = torch.randn(3 + k, WIDTH, generator=g).to(torch.bfloat16)
     packet, rows = vdp.leader_packet(chosen, ok=ok, code=code, detail="boom" if not ok else "")
-    got, mine = vdp.exchange(chosen, packet, rows, is_leader=True, comm=comm, width=WIDTH)
+    got, mine = vdp.exchange(chosen, packet, rows, is_leader=True, comm=comm)
     return chosen, got, mine, sel
 
 
@@ -90,7 +90,7 @@ def _follower(queue, wire):
     comm = _Comm(wire, False)
     sel = comm.broadcast_obj(None)
     chosen = vdp.resolve(entries, sel)
-    got, rows = vdp.exchange(chosen, None, [], is_leader=False, comm=comm, width=WIDTH)
+    got, rows = vdp.exchange(chosen, None, [], is_leader=False, comm=comm)
     n = vdp.attach_followers(chosen, rows, attach=attach_precomputed_embeddings, width=WIDTH) if got.ok else 0
     return chosen, got, rows, n, sel
 
@@ -152,7 +152,7 @@ def test_a_follower_that_staged_other_items_than_the_packet_attaches_nothing():
     fq = [_req("a", 1), _req("b", 1)]
     entries = _plan(fq)
     with pytest.raises(vdp.DisagreeError, match="W124"):
-        vdp.exchange(entries[:1], None, [], is_leader=False, comm=_Comm(_second_wire(wire), False), width=WIDTH)
+        vdp.exchange(entries[:1], None, [], is_leader=False, comm=_Comm(_second_wire(wire), False))
     assert all(it.precomputed_embeddings is None for _r, _i, it in entries)
 
 
@@ -176,6 +176,6 @@ def test_a_width_mismatch_stops_the_follower_by_name():
     comm = _Comm(wire, False)
     sel = comm.broadcast_obj(None)
     chosen = vdp.resolve(_plan(fq), sel)
-    _got, rows = vdp.exchange(chosen, None, [], is_leader=False, comm=comm, width=WIDTH)
+    _got, rows = vdp.exchange(chosen, None, [], is_leader=False, comm=comm)
     with pytest.raises(VisionEmbeddingRefused, match="width"):
         vdp.attach_followers(chosen, rows, attach=attach_precomputed_embeddings, width=WIDTH + 1)

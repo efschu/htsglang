@@ -59,10 +59,11 @@ def _item(end=9):
     return types.SimpleNamespace(feature=torch.zeros(1), precomputed_embeddings=None, offsets=[(end - 3, end)])
 
 
-def _req(rid, n=1, streamed=0):
+def _req(rid, n=1, streamed=0, marked=True):
     return types.SimpleNamespace(rid=rid, multimodal_inputs=types.SimpleNamespace(
         mm_items=[_item() for _ in range(n)]), prefix_indices=None, host_hit_length=0,
-        output_ids=[7] * streamed, full_untruncated_fill_ids=list(range(120)))
+        output_ids=[7] * streamed, full_untruncated_fill_ids=list(range(120)),
+        _pdflip_vision_d_stage_wanted=marked, _pdflip_vision_need=11, _pdflip_vision_tail_lost=True)
 
 
 def _sched(queue, leader, aborts=None):
@@ -86,13 +87,13 @@ def _stage_refuse(scheduler, reqs):
 
 
 @pytest.mark.parametrize("env,want", [
-    ({"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_VISION": "transient"}, True),
-    ({"FLLIPER_PDFLIP_GROUP": "P", "FLLIPER_PDFLIP_VISION": "transient"}, False),
-    ({"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_VISION": "off"}, False),
-    ({"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_VISION": "transient", "FLLIPER_PDFLIP_DUAL_LAYOUT": "1"}, False),
-    ({"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_VISION": "transient", "FLLIPER_PDFLIP_VISION_D": "0"}, False),
+    ({"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_VISION_D": "1"}, True),     # what the launcher publishes for D
+    ({"FLLIPER_PDFLIP_GROUP": "P", "FLLIPER_PDFLIP_VISION_D": "1"}, False),
+    ({"FLLIPER_PDFLIP_GROUP": "D"}, False),                                    # nothing is inferred
+    ({"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_VISION": "transient"}, False),  # the launcher pops that one for D anyway
+    ({"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_PDFLIP_VISION_D": "0"}, False),
 ])
-def test_the_d_stage_is_armed_on_group_d_of_a_transient_flip_boot_only(env, want):
+def test_the_d_stage_is_armed_on_group_d_by_the_launchers_decision_only(env, want):
     cfg = types.SimpleNamespace(vision_config=object())
     assert vdr.d_stage_wanted(cfg, env) is want
     assert vdr.d_stage_wanted(types.SimpleNamespace(vision_config=None), env) is False
@@ -156,3 +157,46 @@ def test_a_refused_stage_sends_an_unstreamed_request_back_through_p_and_names_a_
     assert "PdFlipTpPrefillExceeded" in msgs["fresh"] and "extent after prefix matching is 120" in msgs["fresh"]
     assert "W105b" in msgs["fresh"]
     assert msgs["streamed"].startswith("W105b") and "PdFlipTpPrefillExceeded" not in msgs["streamed"]
+
+
+def test_only_requests_the_verdict_marked_are_candidates_and_staging_clears_the_admission_bookkeeping():
+    """Review H1/H3/M2. The candidate set is the group-uniform verdict's mark, never a rank-local prefix match: an unmarked
+    request (its image is covered, or P's leg already read it from the store) makes NO collective and stays unstaged. A staged
+    request loses its mark and the ``need``/``tail_lost`` the refused verdict had left -- stale ones would block the admission
+    loop's head of line for good."""
+    wire = _Wire()
+    lead = _sched([_req("covered", marked=False), _req("a")], True)
+    fol = _sched([_req("covered", marked=False), _req("a")], False)
+    assert vdr.d_pass(lead, comm=_Comm(wire, True), stage=_stage_ok) == []
+    assert vdr.d_pass(fol, comm=_Comm(wire, False)) == []
+    for s in (lead, fol):
+        covered, staged = s.waiting_queue
+        assert covered.multimodal_inputs.mm_items[0].precomputed_embeddings is None   # never staged
+        assert staged.multimodal_inputs.mm_items[0].precomputed_embeddings is not None
+        assert staged._pdflip_vision_d_stage_wanted is False
+        assert staged._pdflip_vision_need == 0 and staged._pdflip_vision_tail_lost is False
+        assert covered._pdflip_vision_d_stage_wanted is False and covered._pdflip_vision_need == 11
+    assert len(wire.rows) == 1
+    only_unmarked = _sched([_req("covered", marked=False)], True)
+    assert vdr.d_pass(only_unmarked, comm=_Comm(_Wire(), True, forbid=True)) == []
+
+
+def test_the_follower_sizes_its_buffer_from_the_packets_width_not_from_a_config_field():
+    """Review M1: a tower with deepstack ships rows ``out_hidden_size * (1 + len(deepstack))`` wide; the follower must allocate
+    what the leader actually encoded."""
+    wide = WIDTH * 4
+
+    def stage(scheduler, reqs):
+        for r in reqs:
+            for it in r.multimodal_inputs.mm_items:
+                it.precomputed_embeddings = torch.ones(3, wide, dtype=torch.bfloat16)
+        return True, "", ""
+
+    wire = _Wire()
+    lead, fol = _sched([_req("a")], True), _sched([_req("a")], False)
+    vdr.d_pass(lead, comm=_Comm(wire, True), stage=stage)
+    try:
+        vdr.d_pass(fol, comm=_Comm(wire, False))
+    except Exception as exc:  # the attach's own width check stays: the config says WIDTH, the rows are wider
+        raise AssertionError(f"the follower must follow the packet's width, got {exc!r}")
+    assert tuple(fol.waiting_queue[0].multimodal_inputs.mm_items[0].precomputed_embeddings.shape) == (3, wide)

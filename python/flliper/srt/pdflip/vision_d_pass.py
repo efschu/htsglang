@@ -18,7 +18,7 @@ One pass (all ranks; the queue is the same on every rank by the lockstep):
    requests to stage, which to skip (every image position already covered) and
    which to hold one pass. :class:`Selection` is broadcast; a follower
    :func:`resolve`s it against ITS queue (a rid or item it does not have is
-   :data:`W_DISAGREE`, nothing is done).
+   :data:`W_DISAGREE`, a named crash-stop of the group).
 3. the leader runs the stage on the chosen requests, :func:`leader_packet` reads
    what it attached, :func:`exchange` broadcasts the verdict and one rows tensor
    per item; a follower attaches (:func:`attach_followers`).
@@ -64,6 +64,9 @@ class Packet(msgspec.Struct, frozen=True):
     code: str = ""
     detail: str = ""
     wanted: Tuple[Wanted, ...] = ()
+    #: width of every row the leader encoded (review M1: the followers size their buffers from THIS, not from a config
+    #: field that omits the deepstack part)
+    width: int = 0
 
 
 class Comm(Protocol):
@@ -75,7 +78,8 @@ class Comm(Protocol):
 
 
 class DisagreeError(RuntimeError):
-    """The ranks planned different items: nothing is attached (W124)."""
+    """The ranks planned different items (W124). Nothing is attached on the rank that raises; the group STOPS (named
+    crash-stop): the other ranks sit in the next collective and end at its timeout. Review M3: this is no soft refusal."""
 
 
 def plan(waiting: Sequence[Any], *, unstaged_items: Callable[[Any], Sequence[Any]],
@@ -121,12 +125,15 @@ def leader_packet(entries: Sequence[Entry], *, ok: bool, code: str = "",
             return Packet(ok=False, code=W_NO_ROWS,
                           detail=f"rid={r.rid} item {i}: the stage reported ok but attached no rows"), []
         rows.append(emb)
+    widths = {int(emb.shape[1]) for emb in rows}
+    if len(widths) != 1:
+        return Packet(ok=False, code=W_NO_ROWS, detail=f"the stage attached rows of different widths {sorted(widths)}"), []
     wanted = tuple(Wanted(r.rid, i, int(emb.shape[0])) for (r, i, _it), emb in zip(entries, rows))
-    return Packet(ok=True, wanted=wanted), rows
+    return Packet(ok=True, wanted=wanted, width=widths.pop()), rows
 
 
 def exchange(entries: Sequence[Entry], packet: Optional[Packet], rows: Sequence[torch.Tensor], *,
-             is_leader: bool, comm: Comm, width: int,
+             is_leader: bool, comm: Comm,
              dtype: torch.dtype = torch.bfloat16) -> Tuple[Packet, List[torch.Tensor]]:
     """The collectives after the stage. ``entries`` = the chosen entries of
     this rank (:func:`resolve`). Returns (packet, rows on this rank); a
@@ -142,7 +149,7 @@ def exchange(entries: Sequence[Entry], packet: Optional[Packet], rows: Sequence[
             raise DisagreeError(f"{W_DISAGREE}: this rank staged {mine}, the leader {theirs}; nothing attached")
     out = []
     for k, w in enumerate(got.wanted):
-        t = rows[k] if is_leader else torch.empty((w.rows, int(width)), dtype=dtype)
+        t = rows[k] if is_leader else torch.empty((w.rows, int(got.width)), dtype=dtype)
         out.append(comm.broadcast_rows(t))
     return got, out
 

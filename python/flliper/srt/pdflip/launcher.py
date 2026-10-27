@@ -8832,7 +8832,20 @@ VISION_PLACE_AUTO = "auto"
 #: of P's PP0 (pdflip.vision_victim); off until the metal proof
 VISION_PLACES = (VISION_PLACE_AUTO, "kvtail", "free", "weights")
 VISION_SOURCE_ENV = "FLLIPER_PDFLIP_VISION_SOURCE"
+#: user order 27.10.: group D's own vision stage. Published by build_env for group D ONLY, from the ONE launcher decision
+#: (:func:`vision_on_d_of`, the front's ``vision_on_d``) -- the group never infers it from other variables (the launcher pops
+#: FLLIPER_PDFLIP_VISION for D, and the dual layout is published only in the dual env)
+VISION_D_ENV = "FLLIPER_PDFLIP_VISION_D"
 VISION_PLACE_ENV = "FLLIPER_PDFLIP_VISION_PLACE"
+
+
+def vision_on_d_of(ns) -> bool:
+    """The launcher's ONE decision whether group D encodes images (user order 27.10.: flip layouts yes, dual layout no,
+    ``FLLIPER_PDFLIP_VISION_D=0`` off). The front reads the same function (``front.vision_on_d``) with the same inputs."""
+    from flliper.srt.pdflip.front import vision_on_d
+
+    dual = bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False))
+    return vision_on_d(str(getattr(ns, "pdflip_vision", VISION_OFF)), dual)
 
 
 def vision_stage_knobs_refusal(vision: str, source: str, place: str) -> str:
@@ -11571,6 +11584,7 @@ def _env_knobs(ns) -> Dict[str, object]:
         # H125: source and place of the transient stage (P only, see build_env).
         "vision_source": _vision_knob(ns, "pdflip_vision_source", VISION_SOURCE_DISK),
         "vision_place": _vision_knob(ns, "pdflip_vision_place", VISION_PLACE_AUTO),
+        "vision_on_d": vision_on_d_of(ns),
         # PDFLIP-FORM: the one resolved form (launcher.main sets it on ns).
         "boot_form": getattr(ns, "pdflip_boot_form", None),
         # 27B FP8: one byte layout on every rank of BOTH groups (the two
@@ -11850,6 +11864,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # defaults publish nothing (byte-identical env).
               vision_source: str = VISION_SOURCE_DISK,
               vision_place: str = VISION_PLACE_AUTO,
+              # user order 27.10.: D encodes images in the flip layouts (front.vision_on_d); published for group D only
+              vision_on_d: bool = False,
               group_env_extra: Optional[Dict[str, str]] = None,
               xchg_env: Optional[Dict[str, str]] = None,
               # PDFLIP-FORM (24.09.): the ONE resolved form of this boot
@@ -11906,6 +11922,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env[VISION_PLACE_ENV] = vision_place
     else:
         env.pop(VISION_PLACE_ENV, None)
+    if group == "D" and vision_on_d:
+        env[VISION_D_ENV] = "1"
+    else:
+        env.pop(VISION_D_ENV, None)
     _refuse_if_transient_mm_hash_unstable(vision, env, group)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
     # as FLLIPER_PDFLIP_GROUP and the host-ring family below (R19): this is

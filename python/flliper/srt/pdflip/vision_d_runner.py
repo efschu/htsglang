@@ -4,16 +4,19 @@ in D und in P, für die flip layouts, vision nur auf P in dual layout"; "die 509
 
 The wiring half of ``vision_d_pass`` (the pure half): arming and the scheduler pass.
 
-* Arming (``Scheduler.__init__``): group D of a ``--pdflip-vision transient`` boot that is NOT the
-  dual layout (``FLLIPER_PDFLIP_DUAL_LAYOUT``) and has a vision config. Every TP rank takes part in
-  the pass; TP0 (the 5090) is the leader and alone arms the victim source (the MLP storages of
-  its own D shard) and the standing pinned tower copy -- exactly as PP0 does on P.
-* The pass runs right before the admission, on every rank, like ``vision_rank_pass`` on P: the
-  leader decides (``skip_cached``), runs the in-rank stage with the weights lease on its card and
-  the tower built UNSHARDED (``use_data_parallel=True``: the group is TP3, the tower must not be),
-  and the rows reach the other ranks over the TP cpu group before anything is admitted. D's decode
-  stands for the duration of the pass (VISION-SYNC LAW: the lease lives only inside one synchronous
-  pass), which is the price of an image instead of a flip to P.
+* Arming (``Scheduler.__init__``): group D, and the launcher published ``FLLIPER_PDFLIP_VISION_D=1`` (flip layouts only;
+  ``launcher.vision_on_d_of`` is the ONE decision the front reads too) and the model has a vision config. Every TP rank
+  takes part in the pass; TP0 (the 5090) is the leader and alone arms the victim source (the MLP storages of its own D
+  shard) and the standing pinned tower copy -- exactly as PP0 does on P.
+* WHO is a candidate (review 27.10. H1/H3): only a request the D verdict marked (``STAGE_WANTED_ATTR``): the GROUP's covered
+  prefix -- after the store read of P's leg and after the VISION-ROWS attempt -- does not reach its image, the request has
+  sent no byte yet (so a refusal can go back through P) and this group has a stage. The verdict is group-uniform by
+  construction, so every rank plans the same items; no rank-local prefix match decides anything here.
+* The pass runs right before the admission, on every rank, like ``vision_rank_pass`` on P: the leader runs the in-rank
+  stage with the weights lease on its card and the tower built UNSHARDED (``use_data_parallel=True``: the group is TP3,
+  the tower must not be), and the rows reach the other ranks over the TP cpu group before anything is admitted. D's decode
+  stands for the duration of the pass (VISION-SYNC LAW: the lease lives only inside one synchronous pass), which is the
+  price of an image instead of a flip to P.
 * A refused pass holds the requests on every rank (``_pdflip_vision_refused``) and the leader sends
   the abort to the origin (``_pdflip_vision_origin_aborts``), as on P.
 
@@ -24,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -35,7 +38,6 @@ from flliper.srt.pdflip import vision_rank_stage as vrs
 logger = logging.getLogger(__name__)
 
 D_ENV = "FLLIPER_PDFLIP_VISION_D"
-DUAL_LAYOUT_ENV = "FLLIPER_PDFLIP_DUAL_LAYOUT"
 
 
 def _on(value: str) -> bool:
@@ -43,15 +45,13 @@ def _on(value: str) -> bool:
 
 
 def d_stage_wanted(hf_config: Any, env: Optional[Dict[str, str]] = None) -> bool:
-    """Group D of a transient boot, not the dual layout, with a vision config, switch on."""
+    """Group D, the launcher published the decision (``launcher.vision_on_d_of`` -> ``FLLIPER_PDFLIP_VISION_D=1``, flip
+    layouts only, kill switch ``FLLIPER_PDFLIP_VISION_D=0``), and the model has a vision config. Nothing is inferred from
+    other variables: the launcher pops FLLIPER_PDFLIP_VISION for D and publishes the dual layout only in the dual env."""
     e = os.environ if env is None else env
     if (e.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper() != "D":
         return False
-    if (e.get(vrr.VISION_ENV, "") or "").strip() != vrr.VISION_TRANSIENT:
-        return False
-    if (e.get(DUAL_LAYOUT_ENV, "") or "").strip().lower() in ("1", "true", "on", "yes"):
-        return False
-    if not _on(e.get(D_ENV, "1")):
+    if (e.get(D_ENV, "") or "").strip() != "1":
         return False
     return getattr(hf_config, "vision_config", None) is not None
 
@@ -145,27 +145,40 @@ def _requests(entries) -> List[Any]:
     return out
 
 
-def _leader_selection(scheduler: Any, entries) -> vdp.Selection:
-    reqs = _requests(entries)
-    stage, wait = vrr.skip_cached(scheduler, reqs)
-    kept = {r.rid for r in stage} | {r.rid for r in wait}
-    skip = [r.rid for r in reqs if r.rid not in kept]
-    return vdp.selection_of(entries, skip=skip, wait=[r.rid for r in wait])
+#: the request attribute the scheduler's D verdict sets (``Scheduler._pdflip_vision_d_verdict``): the GROUP's covered prefix
+#: (after the store read and the VISION-ROWS attempt) does not reach the image and D has a stage -- the only candidates
+STAGE_WANTED_ATTR = "_pdflip_vision_d_stage_wanted"
+
+
+def _wanted_items(req: Any) -> List[Any]:
+    """The unstaged items of a request the D verdict marked. Review H1/H3: the candidate set comes from the group-uniform
+    verdict AFTER the store read -- never from a rank-local prefix match -- so every rank plans the same items and P's
+    already-prefilled images are not encoded a second time."""
+    return vrr.unstaged_items(req) if getattr(req, STAGE_WANTED_ATTR, False) else []
+
+
+def _mark_staged(reqs: Sequence[Any]) -> None:
+    """The rows are attached: the request is no longer a candidate, and the verdict's bookkeeping of the refusal it just
+    avoided goes (review M2: a stale ``need``/``tail_lost`` would keep the admission loop from ever admitting it)."""
+    for r in reqs:
+        setattr(r, STAGE_WANTED_ATTR, False)
+        r._pdflip_vision_need = 0
+        r._pdflip_vision_tail_lost = False
 
 
 def d_pass(scheduler: Any, *, comm: Any = None,
            stage: Callable[[Any, List[Any]], Tuple[bool, str, str]] = _leader_stage) -> List[Tuple[int, Any]]:
     """Right before D's admission, on EVERY TP rank. Returns the requests held out of THIS pass as
-    (index, req) -- refused ones and ones waiting a pass for their prefix -- the caller puts them
-    back with ``vision_unpark``. Collectives happen only when a candidate exists (the queue is the
-    same on every rank, so that is a rank-uniform condition)."""
+    (index, req) -- the refused ones, until their abort lands -- the caller puts them back with
+    ``vision_unpark``. Collectives happen only when a marked candidate exists (the marks come from the
+    group-uniform verdict, so that is a rank-uniform condition)."""
     if getattr(scheduler, "pdflip_dormant", False):
         return []
     wq = scheduler.waiting_queue
     refused = scheduler._pdflip_vision_refused
     refused.intersection_update({r.rid for r in wq})
     held = set(refused)
-    entries = vdp.plan(wq, unstaged_items=vrr.unstaged_items, refused=refused)
+    entries = vdp.plan(wq, unstaged_items=_wanted_items, refused=refused)
     if entries:
         held |= _run_pass(scheduler, entries, comm if comm is not None else TpComm(scheduler), stage)
     if not held:
@@ -180,26 +193,19 @@ def _run_pass(scheduler: Any, entries, comm: Any, stage) -> set:
     from flliper.srt.planner.vision_stage_load import attach_precomputed_embeddings
 
     leader = scheduler._pdflip_vision_d_leader
-    sel = comm.broadcast_obj(_leader_selection(scheduler, entries) if leader else None)
+    sel = comm.broadcast_obj(vdp.selection_of(entries) if leader else None)
     chosen = vdp.resolve(entries, sel)
-    skipped = set(sel.skip)
-    for r in _requests(entries):
-        if r.rid in skipped:
-            r._pdflip_vision_skip = True
-    held = set(sel.wait)
-    if not chosen:
-        return held
+    held: set = set()
     reqs = _requests(chosen)
     packet, rows = (None, [])
     if leader:
         ok, code, detail = stage(scheduler, reqs)
         packet, rows = vdp.leader_packet(chosen, ok=ok, code=code, detail=detail)
-    got, rows = vdp.exchange(chosen, packet, rows, is_leader=leader, comm=comm,
-                             width=int(scheduler.model_config.hf_config.vision_config.out_hidden_size))
+    got, rows = vdp.exchange(chosen, packet, rows, is_leader=leader, comm=comm)
     if got.ok:
         if not leader:
-            vdp.attach_followers(chosen, rows, attach=attach_precomputed_embeddings,
-                                 width=int(scheduler.model_config.hf_config.vision_config.out_hidden_size))
+            vdp.attach_followers(chosen, rows, attach=attach_precomputed_embeddings, width=got.width)
+        _mark_staged(reqs)
         return held
     for r in reqs:
         scheduler._pdflip_vision_refused.add(r.rid)

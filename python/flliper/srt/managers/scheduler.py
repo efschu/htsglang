@@ -16371,6 +16371,14 @@ class Scheduler(
                 req._pdflip_vision_need = _vdg.image_end(req)
                 v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
                 out = _vdg.bounded(v, str(req.rid), defers)
+        if (out == _vdg.REFUSE and covered is not None and getattr(self, "_pdflip_vision_d_stage", False)
+                and _vdg.reroute_eligible(req)):
+            # user order 27.10. (vision on D in the flip layouts): the group's covered prefix, after the store read and the
+            # rows attempt, does not reach this image -- D encodes it itself (``pdflip/vision_d_runner.d_pass``) instead of
+            # refusing it (W123 -> P). Group-uniform like every input above, so every rank marks the same request. A request
+            # that already streamed keeps the refusal (RESUME-VIA-P); a stage refusal could not go back through P for it.
+            req._pdflip_vision_d_stage_wanted = True
+            return "stage"
         return out
 
     def _pdflip_vision_d_rows(self, req: Req, bound: int, covered: int) -> bool:
@@ -19328,6 +19336,9 @@ class Scheduler(
                 )
                 if _vd == "defer":
                     _note_skip("pdflip_vision_defer", req.rid)
+                    continue
+                if _vd == "stage":
+                    _note_skip("pdflip_vision_stage_d", req.rid)  # marked: D's vision pass encodes it before the next admission
                     continue
                 if _vd == "refuse":
                     _note_skip("pdflip_vision_refused", req.rid)

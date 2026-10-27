@@ -410,6 +410,14 @@ def get_embedding_chunk(
     return embedding_chunk, start_index, end_index
 
 
+def _extend_reaches_items(
+    prefix_len: int, extend_len: int, items_offset: List[Tuple[int, int]]
+) -> bool:
+    """Does the extend window [prefix_len, prefix_len + extend_len) hold at least one placeholder position?"""
+    lo, hi = int(prefix_len), int(prefix_len) + int(extend_len) - 1
+    return any(int(a) <= hi and int(b) >= lo for a, b in items_offset)
+
+
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
     items_size: List[int],
@@ -433,6 +441,12 @@ def _get_precomputed_embedding(
         extend_len = extend_length[i] if i < len(extend_length) else 0
         items_offset = items_offset_list[i]
 
+        if not _extend_reaches_items(prefix_length[i], extend_len, items_offset):
+            # every image of this request lies inside its cached prefix: no row of it is consumed by this extend, so it
+            # neither needs precomputed rows nor may it turn a batch with other requests' rows into "only some items are
+            # precomputed" (review 27.10. H2: group D's own vision stage staged one request, another one's image sat in
+            # the prefix)
+            continue
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
         else:
