@@ -10715,12 +10715,43 @@ class Scheduler(
             return 0
         cap = int(self.chunked_prefill_size or 0)
         out = min(int(width), cap) if cap > 0 else int(width)
+        out = self._p_chunk_mem_guard(out)
         # SF (b23 #1004): remember where this budget was planned, so a #988
         # prefix move to another start replans (pdflip/pp_slot_fidelity.py).
         from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
         _sf.note_budget(self, head, out)
         return out
+
+    def _p_chunk_mem_guard(self, width: int) -> int:
+        """P-CHUNK-MEM-GUARD: PP0 executes the width, so only PP0 reads its card. A width above the
+        guard's floor is cut to what the free memory carries (pdflip/p_chunk_policy.mem_guard_width);
+        the measured 16384-token chunk killed PP0 (the 5090) with an OOM while the planner and the
+        static ceiling both allowed it. Never raises, never lifts a width, never touches <= 2048."""
+        from flliper.srt.pdflip.p_chunk_policy import (
+            P_MEM_GUARD_MIN_WIDTH,
+            P_MEM_GUARD_RATE_MIB_PER_TOKEN,
+            mem_guard_width,
+        )
+
+        if int(width) <= P_MEM_GUARD_MIN_WIDTH or int(getattr(self, "pp_rank", 0) or 0) != 0:
+            return int(width)
+        try:
+            import torch
+
+            free_mib = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+            guarded = mem_guard_width(int(width), free_mib)
+        except Exception as exc:  # noqa: BLE001 - a guard must never stop a pass
+            logger.debug("P-CHUNK-MEM-GUARD skipped: %r", exc)
+            return int(width)
+        if guarded != int(width) and guarded != getattr(self, "_p_mem_guard_last", None):
+            logger.warning(
+                "P-CHUNK-MEM-GUARD PP0 width %d -> %d (free %.0f MiB; near-OOM 400 + fixed 238 MiB, "
+                "%.4f MiB/token): the planned chunk would not fit this card",
+                int(width), guarded, free_mib, P_MEM_GUARD_RATE_MIB_PER_TOKEN,
+            )
+        self._p_mem_guard_last = guarded
+        return guarded
 
     def _log_dynamic_chunk_engagement(self, dynamic_size: int, history_len: int):
         """ENGAGEMENT PROOF for the dynamic-chunking arm, at INFO.

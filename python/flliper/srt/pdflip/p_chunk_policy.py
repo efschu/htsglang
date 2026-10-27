@@ -763,9 +763,34 @@ def bubble_share(chunks: Sequence[int], start: int, stage_time_model: Sequence[S
     return max(0.0, 1.0 - max(busy) / wall)
 
 
+#: P-CHUNK-MEM-GUARD (27.10.2026, Messung: Boot dkr27bbar1drei10272209, P-Sweep 2048/4096/8192/16384 auf der 5090 = PP0):
+#: der Planer waehlt die Breite aus dem Stufenmodell, der Scheduler kappte sie nur an der statischen --chunked-prefill-size; bei 16384
+#: lief PP0 in torch.OutOfMemoryError (107 MiB frei, GPU 0, 192 MiB angefordert) und die Gruppe P starb (W17). Der Launcher kannte den
+#: Transient (PP-CUT activation post: 3696.6 MiB bei 16384 auf PP0), buchte aber 0 MiB. Diese Wache kappt die Breite einer Breite > 2048
+#: am freien Karten-Speicher von PP0: free - near-OOM - fester Puffer, geteilt durch die Rate je Token der Launcher-Tabelle.
+P_MEM_GUARD_MIN_WIDTH = 2048          # bis hierher laeuft der Planer unveraendert (Standardprofil: 2048, gemessen sicher)
+P_MEM_GUARD_NEAR_OOM_MIB = 400.0      # harte Grenze (Nutzerregel 24.10.: hart ist nur near-OOM)
+P_MEM_GUARD_FIXED_MIB = 238.0         # fester Puffer (D_EXTEND_VOTE_FIXED_MIB, gemessen)
+P_MEM_GUARD_RATE_MIB_PER_TOKEN = 0.2256   # PP0, 3696.6 MiB / 16384 Token (Launcher-Tabelle P_PREFILL_TRANSIENT_SUPPORT)
+P_MEM_GUARD_STEP = 512                # Leiter 512 * 2^k, auf 512 abrunden
+
+
+def mem_guard_width(width: int, free_mib: float, *, rate: float = P_MEM_GUARD_RATE_MIB_PER_TOKEN,
+                    near_oom_mib: float = P_MEM_GUARD_NEAR_OOM_MIB, fixed_mib: float = P_MEM_GUARD_FIXED_MIB,
+                    min_width: int = P_MEM_GUARD_MIN_WIDTH) -> int:
+    """Die Breite, die der freie Karten-Speicher traegt: ``min(width, floor((free - near_oom - fixed) / rate))``, auf 512 abgerundet,
+    nie unter ``min_width`` (die Wache hebt nie an und greift nur bei ``width > min_width``). Rein, ohne Geraet."""
+    width = int(width)
+    if width <= int(min_width) or rate <= 0:
+        return width
+    cap = int((float(free_mib) - float(near_oom_mib) - float(fixed_mib)) / float(rate))
+    cap = (cap // P_MEM_GUARD_STEP) * P_MEM_GUARD_STEP
+    return max(int(min_width), min(width, cap))
+
+
 __all__ = [
     "POLICY_FIXED", "POLICY_DYNAMIC", "POLICIES", "POLICY_ENV", "SPEC_ENV", "LOG_TAG",
     "ChunkPolicyError", "StageModel", "ChunkLimits", "PlanResult", "PolicySpec", "ChunkPlanner",
     "chunk_plan", "plan_detail", "makespan_ms", "bubble_share", "policy_from_env", "format_plan",
-    "plan_line", "armed_line", "planner_from_env", "forward_budget",
+    "plan_line", "armed_line", "planner_from_env", "forward_budget", "mem_guard_width",
 ]
