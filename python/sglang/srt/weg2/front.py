@@ -1035,6 +1035,18 @@ def vision_flip_urgent(env=None) -> bool:
     return str(raw if raw is not None else "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def vision_on_d(vision: str, dual_layout: bool, env=None) -> bool:
+    """User order 27.10. ("vision natürlich in D und in P, für die flip layouts, vision nur auf P
+    in dual layout"): under ``--weg2-vision transient`` and the flip layouts D encodes images too
+    (``weg2/vision_d_runner``), so an image request is no longer P-only: it is routed and priced by
+    its exact uncached length like text (R9, user 19.10.). Dual layout: P only, as before.
+    ``SGLANG_WEG2_VISION_D=0`` switches it off -- the same switch the D group reads."""
+    src = os.environ if env is None else env
+    if str(vision) != VISION_MODE_TRANSIENT or dual_layout:
+        return False
+    return str(src.get("SGLANG_WEG2_VISION_D", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 #: verdicts of :func:`vision_verdict`
 VERDICT_ROUTE = "route"
 VERDICT_STAGE = "stage"
@@ -4782,6 +4794,13 @@ class Front:
         #: D is `awake`), SHORT work is served on D as in every D phase.
         #: Default off: the front is byte-identical.
         self.dual_layout = bool(dual_layout)
+        self.vision_on_d = vision_on_d(self.vision, self.dual_layout)
+        if self.vision == VISION_MODE_TRANSIENT:
+            logger.info("WEG2 VISION-ON-D %s (dual_layout=%s, SGLANG_WEG2_VISION_D=%r): %s",
+                        "on" if self.vision_on_d else "off", self.dual_layout,
+                        os.environ.get("SGLANG_WEG2_VISION_D"),
+                        "flip layouts encode images on D too; an image request is routed and priced "
+                        "like text" if self.vision_on_d else "an image request is prefilled on P only")
         self._dual_task: Optional[asyncio.Task] = None
         self._dual_backoff_until = 0.0
         #: DUAL-TP3PP3 unified KV (user order 30.09. 07:25Z): the card KV
@@ -9448,7 +9467,7 @@ class Front:
                 "W102 Weg2VisionStage rid=%s image-cached (credit=%d >= image_end=%d) -- "
                 "route %s stands: no tower, priced as text", rid, int(_xx.credit),
                 int(_xx.image_end), route)
-        elif _verdict == VERDICT_STAGE and route != "none" and route != "long":
+        elif _verdict == VERDICT_STAGE and not self.vision_on_d and route != "none" and route != "long":
             logger.info(
                 "W102 Weg2VisionStage rid=%s -- route %s -> long (P): an image "
                 "request is prefilled on P by rule; its embeddings are "
@@ -9665,7 +9684,7 @@ class Front:
                     skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch),
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
-                    p_only=_verdict == VERDICT_STAGE and not _mm_cached,
+                    p_only=_verdict == VERDICT_STAGE and not _mm_cached and not self.vision_on_d,
                     mm_image_end=(int(getattr(_xx, "image_end", 0) or 0) if _xx is not None else 0),
                     # UNIFY S7 (27B RC7-X): queued by the busy/idle split, not by the phase.
                     x_deferred=_x_band_deferred and not short_refused,

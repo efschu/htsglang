@@ -65,6 +65,14 @@ def _payload(text="Describe this picture in one short sentence, please.", images
     return {"model": "m", "messages": [{"role": "user", "content": content}], "max_tokens": 16}
 
 
+@pytest.fixture(autouse=True)
+def _p_only_form(monkeypatch):
+    """These cases pin the P-only form of vision (every image is prefilled on P). Since 27.10. the
+    flip layouts encode images on D too by default; ``SGLANG_WEG2_VISION_D=0`` is the form pinned
+    here, the D form is pinned in test_weg2_vision_on_d_front_1027."""
+    monkeypatch.setenv("SGLANG_WEG2_VISION_D", "0")
+
+
 def _front(vision="transient", **kw):
     return Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
                  tp_prefill_max_tokens=X, vision=vision, **kw)
