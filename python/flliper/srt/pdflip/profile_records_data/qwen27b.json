@@ -440,6 +440,49 @@
    "n": 1076
   },
   {
+   "name": "P_CHUNK_BUILTIN",
+   "value": [
+    {
+     "a_ms": 112.73,
+     "b_ms_per_1k": 1.0086,
+     "fwd_overhead_ms": 0.17,
+     "eager_floor_ms": 63.0
+    },
+    {
+     "a_ms": 84.26,
+     "b_ms_per_1k": 0.3538,
+     "fwd_overhead_ms": 0.0,
+     "eager_floor_ms": 42.0
+    },
+    {
+     "a_ms": 81.39,
+     "b_ms_per_1k": 0.7545,
+     "fwd_overhead_ms": 0.0,
+     "eager_floor_ms": 74.0
+    }
+   ],
+   "provenance": "the --p-chunk-model builtin-fp8 stage lines (27.10. fp8 desk seat, desk/fp8-optima-1027): a_ms/b_ms_per_1k = pgap_stage_fit.fit_rank_lines over prefixes [0, 32768) of boot dkr27bfp8bar1drei10271317 (1aa5341d8d, image formb98v, Qwen3.8-27B-FP8 --fp8-uniform-marlin = W8A16 Marlin on every card, cut 44/11/9, 512 graph, 219/237/238 device-bound chunks per rank, sd 2.0/3.1/4.1 ms), per 512 chunk t = a + b*(prefix+256)/1000; fwd_overhead_ms = PP0 mean #PGAP gpu_gap_ms below 50 ms of the same log (0.17, n=929; the INT8 record's 3.73 predates the host overlap), PP1/PP2 0 as in the INT8 record; eager_floor_ms BORROWED from the INT8 record (xsn422 63/42/74: no eager fp8 P forward was measured). fp8 per layer and 512-token forward (p_stage_model fit of the same log): 5090 2.549 ms, 3080 7.270 ms (INT8: 0.92-1.00 / 3.12-3.17), last-stage fixed 12.96 ms. WIDTH CURVE UNMEASURED: only 512-token forwards exist, so the model is used with --p-chunk-mscale flat (no gain assumed above 512); the P sweep of the next window (512,1024,2048,4096) replaces it.",
+   "boots": [
+    "dkr27bfp8bar1drei10271317"
+   ],
+   "kind": "timing",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "POWER-LIMIT rank lines of the same boot (P.log 13:18:01Z): 5090 400 W, 3080 230 W",
+   "fmt": "fp8",
+   "pp_layer_ratio": [
+    44,
+    11,
+    9
+   ],
+   "n": 219,
+   "borrowed_parts": [
+    "eager_floor_ms <- int8"
+   ]
+  },
+  {
    "name": "D_SPEED_DECODE",
    "value": {
     "points": [

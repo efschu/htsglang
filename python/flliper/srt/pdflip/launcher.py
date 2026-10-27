@@ -1752,6 +1752,17 @@ P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT = 8192
 _P_CHUNK_BUILTIN_RECORD = pdflip_form.profile_record(
     "P_CHUNK_BUILTIN", pdflip_form.PROFILE_QWEN27B, fmt="int8").record
 P_CHUNK_BUILTIN_INT8 = tuple(dict(row) for row in _P_CHUNK_BUILTIN_RECORD.value)
+#: FP8 (27.10., desk/fp8-optima-1027): the same record kind for the W8A16-Marlin checkpoint (``--fp8-uniform-marlin``),
+#: fitted from the 512-token #PGAP lines of boot dkr27bfp8bar1drei10271317 on cut 44/11/9. Its width curve is UNMEASURED
+#: (only 512-token forwards exist), so a profile uses it with ``--p-chunk-mscale flat`` until the P sweep measures it.
+_P_CHUNK_BUILTIN_RECORD_FP8 = pdflip_form.profile_record(
+    "P_CHUNK_BUILTIN", pdflip_form.PROFILE_QWEN27B, fmt="fp8").record
+P_CHUNK_BUILTIN_FP8 = tuple(dict(row) for row in _P_CHUNK_BUILTIN_RECORD_FP8.value)
+#: ``--p-chunk-model`` names that are a record of this module: name -> (rows, record, label of the fit)
+P_CHUNK_BUILTIN_SOURCES = {
+    "builtin-int8": (P_CHUNK_BUILTIN_INT8, _P_CHUNK_BUILTIN_RECORD, "weg2rc7c fit [0,32k)"),
+    "builtin-fp8": (P_CHUNK_BUILTIN_FP8, _P_CHUNK_BUILTIN_RECORD_FP8, "dkr27bfp8bar1drei10271317 fit [0,32k)"),
+}
 #: Per-token cost relative to M=512, per stage, as a function of the chunk.
 #: 'int8' PP0 (5090): kernel bench n4b_bench_0925_1239 -- the INT8 GEMMs
 #: (gate_up/down/qkvz/o) cost 12.3 % less per token at M=4096 than at 512
@@ -1828,11 +1839,12 @@ def p_chunk_model_power_limits(src: str, stages: int) -> Tuple[Optional[List[Opt
 
     src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
     classes = list(P_STAGE_CARD_CLASSES[:stages]) + [P_STAGE_CARD_CLASSES[-1]] * max(0, stages - 3)
-    if src == "builtin-int8":
-        # UNIFY S9: the record's own limit (the rig limits of 24.09.)
-        lim = _P_CHUNK_BUILTIN_RECORD.power_limits() or {}
+    if src in P_CHUNK_BUILTIN_SOURCES:
+        # UNIFY S9: the record's own limit (int8: the rig limits of 24.09.; fp8: its own boot's POWER-LIMIT lines)
+        record = P_CHUNK_BUILTIN_SOURCES[src][1]
+        lim = record.power_limits() or {}
         return ([lim.get(c) for c in classes],
-                f"builtin rig limits ({_P_CHUNK_BUILTIN_RECORD.power_limit_source or 'record'})")
+                f"builtin rig limits ({record.power_limit_source or 'record'})")
     if src.startswith("fit:"):
         path = src[4:]
         try:
@@ -1963,9 +1975,9 @@ def p_chunk_stage_model(src: str, mscale: str, stages: int = 3, profile: Optiona
     if mscale not in P_CHUNK_MSCALES:
         raise SystemExit(f"--p-chunk-mscale {mscale!r}: one of {sorted(P_CHUNK_MSCALES)}")
     curves = P_CHUNK_MSCALES[mscale]
-    if src == "builtin-int8":
-        rows = P_CHUNK_BUILTIN_INT8
-        source = f"builtin-int8 (weg2rc7c fit [0,32k), mscale={mscale})"
+    if src in P_CHUNK_BUILTIN_SOURCES:
+        rows, _record, label = P_CHUNK_BUILTIN_SOURCES[src]
+        source = f"{src} ({label}, mscale={mscale})"
     elif src.startswith("fit:"):
         from flliper.srt.planner import pgap_stage_fit as _psf
 
@@ -1987,7 +1999,7 @@ def p_chunk_stage_model(src: str, mscale: str, stages: int = 3, profile: Optiona
                 data = json.load(fh)
             models = tuple(_pcp.StageModel.from_json(s) for s in data["stages"])
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise SystemExit(f"--p-chunk-model {src}: not builtin-int8, fit:<P.log> or a "
+            raise SystemExit(f"--p-chunk-model {src}: not {'/'.join(P_CHUNK_BUILTIN_SOURCES)}, fit:<P.log> or a "
                              f"readable JSON with 'stages': {exc}")
         mapped = _p_chunk_by_class(models, lambda m: float(m.points[-1][1]), stages, profile)
         if mapped is not None:
@@ -2104,8 +2116,8 @@ def p_chunk_model_cut(src: str) -> Tuple[Tuple[int, ...], str]:
     from flliper.srt.pdflip import p_graph_policy as _pgp
 
     src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
-    if src == "builtin-int8":
-        return tuple(_P_CHUNK_BUILTIN_RECORD.pp_layer_ratio), "record P_CHUNK_BUILTIN"
+    if src in P_CHUNK_BUILTIN_SOURCES:
+        return tuple(P_CHUNK_BUILTIN_SOURCES[src][1].pp_layer_ratio), "record P_CHUNK_BUILTIN"
     if src.startswith("fit:"):
         return (), f"fit:{os.path.basename(src[4:])} (the fit log's own cut, not stated)"
     try:
@@ -2144,9 +2156,9 @@ def p_chunk_model_cut_check(ns, cut, log) -> str:
     if not gapped and counts == tuple(table):
         log(f"PDFLIP {P_CHUNK_CUT_TAG} CUT-MATCH table={tcut} boot={boot} -> used ({where})")
         return "match"
-    if src == "builtin-int8":
+    if src in P_CHUNK_BUILTIN_SOURCES:
         log(f"PDFLIP {P_CHUNK_CUT_TAG} CUT-MISMATCH WARNING table={tcut} boot={boot} ({where}): the "
-            f"builtin INT8 model was fitted on {tcut}; its per-stage times do not describe this cut "
+            f"{src} model was fitted on {tcut}; its per-stage times do not describe this cut "
             f"-- the plan is a HOCHRECHNUNG here (not refused: the builtin is the desk default); "
             f"export a model for this cut (p_stage_model) to plan on a measurement")
         return "mismatch"
@@ -5086,12 +5098,17 @@ def attn_anchor_stage(cards: Sequence["Card"], log: Optional["Log"] = None) -> i
 #: --pp-cut-stage-model auto (rank-line fit of 09290020 cut 43,11,10 and four
 #: 44,10,10 boots of 01.10., pdflip/p_stage_model_data/)
 PP_CUT_STAGE_MODEL_27B_INT8 = "27b_int8_rc12z30"
+#: FP8 (27.10., desk/fp8-optima-1027): rank-line fit (``p_stage_model fit``) of boot dkr27bfp8bar1drei10271317 (cut 44/11/9, 512
+#: graph, W8A16 Marlin on every card). Per layer and 512-token forward the 5090 costs 2.55 ms and a 3080 7.27 ms (INT8: ~1.0 / ~3.1),
+#: so the INT8-priced solve left PP0 the bottleneck (44,11,9: PP0 177 ms against PP1 116 / PP2 137 ms at prefix 65k, berechnet).
+PP_CUT_STAGE_MODEL_27B_FP8 = "27b_fp8_drei1027"
 #: HW-GENERIC 1002: the stage models --pp-cut-stage-model auto may pick,
 #: keyed by (profile, weight format, the card inventory the fit was measured
 #: on, in P-stage order). Replaces the profile-NAME branch: a model is
 #: selected only where profile, format AND cards are the ones it measured.
 PP_CUT_STAGE_MODELS = {
     ("qwen27b", "int8", card_identity.REFERENCE_INVENTORY): PP_CUT_STAGE_MODEL_27B_INT8,
+    ("qwen27b", "fp8", card_identity.REFERENCE_INVENTORY): PP_CUT_STAGE_MODEL_27B_FP8,
 }
 
 
@@ -25393,6 +25410,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--p-chunk-model", default=P_CHUNK_MODEL_DEFAULT, metavar="SRC",
         help="Only with --p-chunk-policy dynamic: the per-stage time model. "
              "'builtin-int8' (default; the weg2rc7c #PGAP fit, INT8 cut 42/11/11), "
+             "'builtin-fp8' (the W8A16-Marlin fp8 checkpoint, boot dkr27bfp8bar1drei10271317 cut 44/11/9, "
+             "512-token forwards only: use with --p-chunk-mscale flat), "
              "'fit:<P.log>' (fit the #PGAP lines of that boot's P log, prefixes "
              "[0,32k)), or a JSON file {\"stages\": [StageModel JSON, ...]}.")
     ap.add_argument(
@@ -26325,8 +26344,8 @@ def build_parser() -> argparse.ArgumentParser:
              "'Prefill rank batch' + '#1469 RETAIN' lines) over the CHUNK MIX of the predecessor "
              "boot (the same P log the design prefix comes from, --pp-cut-design-prefix-from), "
              "instead of the card-rate/family split at one design prefix. 'auto' (default) = "
-             f"profile qwen27b on its int8 checkpoint -> {PP_CUT_STAGE_MODEL_27B_INT8}; any other "
-             "profile/format -> off. 'off' = the previous pricing, byte-identical. NAME = a file "
+             f"profile qwen27b on its int8 checkpoint -> {PP_CUT_STAGE_MODEL_27B_INT8}, on its fp8 checkpoint -> "
+             f"{PP_CUT_STAGE_MODEL_27B_FP8}; any other profile/format -> off. 'off' = the previous pricing, byte-identical. NAME = a file "
              "under pdflip/p_stage_model_data/ (without .json), PATH = a JSON. Why: the old pricing "
              "ranked 44,10,10 ahead of 43,11,10 while the rank lines measure 43,11,10 +4.5 %% faster "
              "with +15 %% P pool.")

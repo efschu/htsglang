@@ -1,0 +1,65 @@
+{
+ "cards": {
+  "RTX3080": {
+   "attn": {
+    "graph": [
+     [
+      512,
+      0.56138
+     ]
+    ]
+   },
+   "gemm_ms": {
+    "graph": [
+     [
+      512,
+      7.2698
+     ]
+    ]
+   },
+   "last_fixed_ms": {
+    "graph": [
+     [
+      512,
+      12.962
+     ]
+    ]
+   },
+   "name": "RTX3080"
+  },
+  "RTX5090": {
+   "attn": {
+    "graph": [
+     [
+      512,
+      0.17008
+     ]
+    ]
+   },
+   "gemm_ms": {
+    "graph": [
+     [
+      512,
+      2.5491
+     ]
+    ]
+   },
+   "name": "RTX5090"
+  }
+ },
+ "layer_layout": {
+  "n_layers": 64,
+  "offset": 3,
+  "period": 4
+ },
+ "power_limit_w": {
+  "RTX3080": 230.0,
+  "RTX5090": 400.0
+ },
+ "source": "rank-line fit (p_stage_model.fit_model_from_logs, prefix = #1469 RETAIN token_ids_len - #new-token) of boot_weg2_dkr27bfp8bar1drei10271317_1aa5341d8d_1027_131728.P.log cut 44,11,9 || cut 44,11,9: PP0 w512 graph a=112.16 s=1.8709 n=444; PP1 w512 graph a=79.97 s=1.0169 n=264; PP2 w512 graph a=78.39 s=1.7548 n=274 || notes: RTX5090 graph: first fixed term not separable or negative at some width -- folded into the per-layer rate at every graph width",
+ "stage_cards": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ]
+}
