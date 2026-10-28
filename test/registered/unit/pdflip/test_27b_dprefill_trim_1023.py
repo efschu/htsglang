@@ -40,8 +40,13 @@ THRESHOLD = 1104
 
 @pytest.fixture(autouse=True)
 def _law_1024(monkeypatch):
-    """The metal boot's line: the stated law 1024 (``EXTEND-CORRIDOR-LINE ... source=UNMEASURED-FALLBACK:1024``)."""
+    """The metal boot's line: the stated law 1024 (``EXTEND-CORRIDOR-LINE ... source=UNMEASURED-FALLBACK:1024``).
+
+    EXTEND-CAP-SOFT (27.10.): this module pins the pre-soft vote the 23.10. boot ran (plan line, start rate -- the
+    FLLIPER_PDFLIP_EXTEND_SOFT_LINE=0 path); the soft rule is pinned in test_pdflip_extend_soft_line_1027."""
     monkeypatch.setenv(LAW_ENV, "1024")
+    monkeypatch.setenv("FLLIPER_PDFLIP_EXTEND_SOFT_LINE", "0")
+    ET.reset_for_tests()
     yield
 
 
