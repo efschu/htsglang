@@ -13,6 +13,18 @@ from flliper.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="stage-a-pdflip-unit")
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class Test1465(unittest.TestCase):
     def test_priority_unset_is_default_and_bad_values_fall_back(self):
         for raw, want in (("", 0), ("-1", -1), ("  -2 ", -2), ("high", 0), ("0", 0)):
@@ -29,7 +41,7 @@ class Test1465(unittest.TestCase):
         self.assertIn("self.load_stream = device_module.Stream()", src)
 
     def test_launcher_sets_it_for_group_p_only(self):
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         self.assertIn('env_p.setdefault("FLLIPER_HICACHE_WRITE_STREAM_PRIORITY", "-1")', src)
         self.assertNotIn('env_d.setdefault("FLLIPER_HICACHE_WRITE_STREAM_PRIORITY"', src)
         self.assertNotIn('env_d["FLLIPER_HICACHE_WRITE_STREAM_PRIORITY"]', src)

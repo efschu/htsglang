@@ -30,6 +30,18 @@ PEAKS = [11666, 15000, 15500]
 MASTER = {"FLLIPER_PDFLIP_L15": "1"}
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class SwitchesAreOffByDefault(CustomTestCase):
     def test_master_and_handover_default_off(self):
         self.assertFalse(LP.master_on({}))
@@ -134,7 +146,7 @@ class L15Is27BOnly(CustomTestCase):
 
         from flliper.srt.pdflip import launcher
 
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         i = src.index("l15_plan.refuse_not_27b(ns.profile, os.environ)")
         self.assertLess(i, src.index("l15_posts = l15_plan.resolve_posts("))
         self.assertIn("raise PdFlipLaunchRefused(_not27b)", src[i:i + 200])

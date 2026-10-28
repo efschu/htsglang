@@ -58,8 +58,20 @@ KNOWN_POSITIONAL_CALLS = {
 _FLOOR = 7
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _profile():
-    src = inspect.getsource(lc)
+    src = _launcher_text()
     out = {}
     for node in ast.walk(ast.parse(src)):
         if (isinstance(node, ast.Call)

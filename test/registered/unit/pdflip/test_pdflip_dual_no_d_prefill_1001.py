@@ -31,6 +31,18 @@ from flliper.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class DualNoDPrefill(CustomTestCase):
     def test_x_outside_dual_unchanged(self):
         self.assertIsNone(L.dual_x_tokens(types.SimpleNamespace(dual_layout=False, dual_d_prefill_tokens=0)))
@@ -53,7 +65,7 @@ class DualNoDPrefill(CustomTestCase):
         self.assertEqual(ns.dual_d_prefill_tokens, 0)
 
     def test_launcher_applies_it_to_d_and_front(self):
-        src = inspect.getsource(L)
+        src = _launcher_text()
         i = src.index("_dual_x = dual_x_tokens(ns)")
         block = src[i:i + 1500]
         self.assertIn("x_tokens = d_x_tokens = _dual_x", block)

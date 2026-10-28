@@ -52,6 +52,18 @@ SWITCHES = (IMM, "FLLIPER_PDFLIP_STANDARD_FORM", "FLLIPER_PDFLIP_D_PARK",
             "FLLIPER_PDFLIP_ENABLE_D_PARK_DRAFT_KV", "FLLIPER_PDFLIP_X_IDLE_REGRANT")
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _form_env(profile):
     arch, experts, draft, kv = (("dense", "none", "dflash", "paged_dcp") if profile == "qwen27b"
                                 else ("moe", "offload", "mtp", "qsa_forma"))
@@ -702,7 +714,7 @@ def test_the_rendered_27b_registry_env_boots_with_the_park_default(clean):
 def test_the_launcher_main_runs_the_refusal_before_anything_spawns():
     from flliper.srt.pdflip import launcher as L
 
-    src = open(L.__file__).read()
+    src = _launcher_text()
     i_ref = src.index("_park_split = d_park_split_refusal(ns)")
     i_sf = src.index("_sf_on, _sf_src = standard_form_resolved(ns)")
     assert i_ref < i_sf

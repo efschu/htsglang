@@ -9,6 +9,18 @@ calls, and an EXTRA override that would drop language_model_only is refused.
 import pytest
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def test_the_launcher_gives_d_the_vision_form_and_keeps_the_env_p_only():
     from flliper.srt.pdflip import launcher as lz
 
@@ -33,7 +45,7 @@ def test_main_passes_the_form_to_every_d_argv_call():
 
     from flliper.srt.pdflip import launcher as lz
 
-    src = inspect.getsource(lz)
+    src = _launcher_text()
     calls = [line for line in src.splitlines() if "spec_d = GroupSpec(\"D\"" in line]
     # UNIFY S7: three builders now -- dry run, boot and the NF line's --d-only
     # (Nutzer 25.09.); every one carries the vision form.

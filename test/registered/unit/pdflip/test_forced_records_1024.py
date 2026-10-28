@@ -536,7 +536,7 @@ class MaxOverSleeps(Base):
         self.assertIn('rec["vram_residue_kind"] = "first_sleep"', src)
         self.assertIn('rec["vram_residue_sleeps"] = 1', src)                    # R1: the first sleep counts 1
         self.assertIn('rec["vram_residue_sleeps"] = n_sleeps', src)             # R1: later samples carry the count
-        lsrc = open(LAUNCHER_SRC, encoding="utf-8").read()
+        lsrc = _launcher_text()
         self.assertRegex(lsrc, r"DC_ONE_SLEEP_MARK in _dc_record_prov:\n\s+log\(f\"#227 R1 \{DC_ONE_SLEEP_MARK\}")
 
     # ---- #227 R1: a boot that saw ONE D sleep has not reached its maximum -> first sleep + 256, named ----

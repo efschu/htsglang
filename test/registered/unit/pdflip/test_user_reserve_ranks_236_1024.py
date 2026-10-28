@@ -43,6 +43,18 @@ C3080B = "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
 RESERVE = {C5090: 1800, C3080A: 1400, C3080B: 1400}
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _main_text() -> str:
     """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
     (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
@@ -119,7 +131,7 @@ class GroupEnvCarriesTheReserve(unittest.TestCase):
         self.assertIn("user_reserve_env_value(user_reserve_by_card)", src)
 
     def test_t3_every_build_env_call_site_in_main_passes_the_reserve(self):
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         calls = [ln for ln in src.splitlines() if "= build_env(" in ln]
         self.assertGreaterEqual(len(calls), 3)
         for ln in calls:

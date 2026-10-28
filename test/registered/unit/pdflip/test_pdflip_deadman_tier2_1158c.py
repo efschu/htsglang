@@ -26,6 +26,18 @@ ROOT = pathlib.Path(__file__).resolve().parents[4]
 DEADMAN = ROOT / "scripts" / "pdflip" / "devtools" / "boot_deadman.sh"
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _armed_cmd(name, port, probe_s):
     lines = []
     launcher.arm_deadman(lines.append, f"/x/boot.{name}.log", port, f"launch_server.*--port {port}", probe_s,
@@ -50,7 +62,7 @@ class TestLauncherHandsTheSwitch(unittest.TestCase):
         self.assertIn("PROBE_S=120 ", cmd)
 
     def test_the_call_sites_arm_exactly_p_d_front(self):
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         names = re.findall(r'arm_deadman\(log, [^\n]*?, ns\.tag, "(\w+)", dry\)', src)
         self.assertEqual(sorted(names), ["D", "P", "front"])
         self.assertEqual(tuple(launcher.GROUP_DEADMEN_TIER1_ONLY), ("P", "D"))

@@ -42,6 +42,18 @@ NF_MODEL = (
 
 # ---- (1) the count on the wake, one replicated number ----------------------
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def test_phase_seats_is_the_handed_count_clamped_to_the_cap():
     s = d_seats.phase_seats(4, 1, cap=6, epoch="e7")
     assert (s.n, s.handoff_n, s.parked_n, s.cap, s.clamped) == (5, 4, 1, 6, False)
@@ -224,7 +236,7 @@ def test_nextflash_d_runs_up_to_six_seats_with_two_pool_waves():
 def test_the_launcher_main_applies_both_nextflash_defaults_first():
     from flliper.srt.pdflip import launcher as L
 
-    src = open(L.__file__).read()
+    src = _launcher_text()
     j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags
     head = src[j:j + 600]
     assert "apply_profile_d_bs_default(ns," in head

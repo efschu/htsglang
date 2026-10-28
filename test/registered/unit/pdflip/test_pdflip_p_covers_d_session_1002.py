@@ -25,6 +25,18 @@ X = 4096
 
 # ---- the route --------------------------------------------------------------------
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def test_above_the_carrier_is_the_p_route_never_a_d_prefill():
     assert F.serviceable_route(500, 30000, X, 27466) == "long"
     assert F.serviceable_route(500, 30000, 0, 27466) == "long"
@@ -78,7 +90,7 @@ def test_the_carrier_must_hold_ds_session():
 
 
 def test_the_launcher_refuses_before_spec_p_and_after_the_carrier_census():
-    src = inspect.getsource(L)
+    src = _launcher_text()
     i = src.index("_cov_ok, _cov_line = p_covers_d_session(")
     assert i < src.index('spec_p = GroupSpec("P", PORT_P, transport_argv(shipped_argv_p')
     assert "raise PdFlipLaunchRefused(_cov_line)" in src[i:i + 400]

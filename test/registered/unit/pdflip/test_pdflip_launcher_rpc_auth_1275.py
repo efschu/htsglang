@@ -49,7 +49,21 @@ from flliper.srt.pdflip import admin_key as ak
 from flliper.srt.pdflip import launcher as L
 from flliper.test.test_utils import CustomTestCase
 
-LAUNCHER_SRC = inspect.getsource(L)
+
+
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
+LAUNCHER_SRC = _launcher_text()
 
 
 def _main_text() -> str:

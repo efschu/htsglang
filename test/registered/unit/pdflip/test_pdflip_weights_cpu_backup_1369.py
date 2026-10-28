@@ -44,6 +44,18 @@ from flliper.srt.pdflip import weight_exchange as wx
 from flliper.test.test_utils import CustomTestCase
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _reset_env():
     for k in (wx.WEIGHT_SOURCE_ENV, wx.INJECT_ENV, wx.WEIGHTS_CPU_BACKUP_ENV):
         os.environ.pop(k, None)
@@ -173,7 +185,7 @@ class ThePublicationReachesBothGroupsFromOneDict(CustomTestCase):
         # name across every `build_env(...)` call site, which is the
         # structural guarantee no per-group copy has crept in.
         import inspect
-        src = inspect.getsource(L)
+        src = _launcher_text()
         count = src.count("xchg_env=xchg_env)") + src.count("xchg_env=xchg_env,")
         self.assertGreaterEqual(
             count, 3,

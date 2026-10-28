@@ -49,6 +49,18 @@ Z30Y_COLD = 38.97
 Z30X2_PEAK, Z30X2_SHMEM = 79.54, 53.3  # [M] z30x2 kvdemand dauer 09291223, mem csv
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _arm(cold, ceiling=84 * GIB):
     return host_ledger.price(int(125.70 * GIB), int(100.64 * GIB), 1, 600, **RING_KW,
                              cg_current_bytes=int(1.18 * GIB), cg_ceiling_bytes=ceiling,
@@ -118,7 +130,7 @@ class TestRiegelDerived(CustomTestCase):
     def test_the_launcher_feeds_the_arena_the_derived_latch(self):
         import inspect
 
-        self.assertIn('getattr(arm, "riegel_effective"', inspect.getsource(launcher))
+        self.assertIn('getattr(arm, "riegel_effective"', _launcher_text())
 
 
 NF_MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist"
@@ -170,7 +182,7 @@ class TestArenaOneSource(CustomTestCase):
     def test_the_launcher_writes_the_resize_into_the_groups(self):
         import inspect
 
-        self.assertIn("arena_gib_into_groups(ns, _ledger_group_envs, _arena_new)", inspect.getsource(launcher))
+        self.assertIn("arena_gib_into_groups(ns, _ledger_group_envs, _arena_new)", _launcher_text())
 
     @unittest.skipUnless(_NF_CHECKPOINT_PRESENT, "NF checkpoint absent")
     def test_arena8_group_env_prices_8_not_22(self):

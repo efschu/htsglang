@@ -4,6 +4,18 @@ from types import SimpleNamespace
 from flliper.srt.pdflip.launcher import dual_front_kv_tag_env as F
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _ns(dual=True, tag="dkr27bX"):
     return SimpleNamespace(dual_layout=dual, tag=tag)
 
@@ -29,7 +41,7 @@ def test_operator_value_is_never_overwritten():
 def test_wired_after_the_p_sleep_front_env_and_registered():
     import inspect
     from flliper.srt.pdflip import launcher as L
-    src = inspect.getsource(L)
+    src = _launcher_text()
     assert src.index("fenv.update(dual_p_sleep_front_env(") < src.index("fenv.update(dual_front_kv_tag_env(ns))")
     from flliper.srt.environ import envs
     assert envs.FLLIPER_PDFLIP_DUAL_FRONT_KV_TAG_FIX.get() is True

@@ -34,6 +34,18 @@ from flliper.srt.pdflip import host_ledger
 RIDS = ["r-a", "r-b", "r-c"]
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _canonical(rids=RIDS):
     return thc.canonical_head_rids(rids)
 
@@ -157,7 +169,7 @@ def test_x_is_floored_at_the_chunk_size_on_every_path():
     # and it is still the ONLY call site.
     import re
 
-    main_src = inspect.getsource(launcher)
+    main_src = _launcher_text()
     calls = re.findall(r"(?<![\w.])resolve_x\(([^)]*(?:\([^)]*\)[^)]*)*)\)", main_src)
     calls = [c for c in calls if not c.lstrip().startswith("override")]
     assert len(calls) == 1, f"resolve_x must keep ONE call site, found {calls}"
@@ -351,7 +363,7 @@ def test_every_host_ledger_call_in_the_launcher_matches_the_callee_signature():
 
     from flliper.srt.pdflip import launcher
 
-    calls = _host_ledger_calls_in(inspect.getsource(launcher))
+    calls = _host_ledger_calls_in(_launcher_text())
     assert calls, "no host_ledger.<fn>( calls found -- the walker is broken"
     checked = 0
     for fn, kws in calls:

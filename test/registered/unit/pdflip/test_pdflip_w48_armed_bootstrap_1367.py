@@ -35,6 +35,18 @@ from flliper.test.test_utils import CustomTestCase
 ARMED = sorted(launcher.WEIGHT_SOURCE_ARMED)[0]
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _table(*, form_same, same_form_candidates=(), boot="boot_weg2_xsn29"):
     return ring_table.RingTable(
         boot=boot, instrument="test", lines_read=1,
@@ -130,7 +142,7 @@ class TheCallsiteConsumesIt(CustomTestCase):
         would pass every behavioural test above and still lose the line."""
         import ast
 
-        tree = ast.parse(inspect.getsource(launcher))
+        tree = ast.parse(_launcher_text())
         calls = [n for n in ast.walk(tree)
                  if isinstance(n, ast.Assign)
                  and isinstance(n.value, ast.Call)
@@ -138,7 +150,7 @@ class TheCallsiteConsumesIt(CustomTestCase):
                  == "refuse_unless_same_form_source"]
         self.assertEqual(len(calls), 1,
                          "the callsite must bind the result exactly once")
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         i = src.index("= refuse_unless_same_form_source(ring_plan.table")
         window = src[i:i + 400]
         self.assertIn("ring_plan.lines.append", window)

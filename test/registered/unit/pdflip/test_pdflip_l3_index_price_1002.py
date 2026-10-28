@@ -42,6 +42,18 @@ SFX = "_Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist_898fe1bf454ff7c1"
 X = 4855
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _ids(n, seed=0):
     rng = np.random.default_rng(seed)
     out = rng.integers(1, 240000, size=n, dtype=np.int64).astype(np.int32)
@@ -444,10 +456,7 @@ def test_the_launcher_no_longer_declares_the_carrier_route():
     prompt longer than group D's host staging pool ... is served by ONE prefill
     on D (front route CARRIER-EXCEEDS, no leg 1)' -- a route 9bdfe50185 deleted.
     The declaration names what the boot does: every BATCH prompt on P's leg 1."""
-    import importlib.util
-
-    with open(importlib.util.find_spec("flliper.srt.pdflip.launcher").origin) as f:
-        src = f.read()
+    src = _launcher_text()
     i = src.index("state.deviations = [")
     block = src[i:src.index("]\n", i)]
     assert "CARRIER-EXCEEDS, no leg 1" not in block

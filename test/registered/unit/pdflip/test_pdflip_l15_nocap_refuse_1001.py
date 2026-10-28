@@ -13,6 +13,18 @@ from flliper.srt.pdflip import l15_plan
 from flliper.srt.pdflip.l15_plan import L15Post
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _posts(*mibs):
     return [L15Post(card=i, mib=m, src="X")
             for i, m in enumerate(mibs)]
@@ -59,7 +71,7 @@ def test_launcher_raises_on_the_refusal():
 
     from flliper.srt.pdflip import launcher as L
 
-    src = inspect.getsource(L)
+    src = _launcher_text()
     i = src.index("l15_posts = l15_plan.resolve_posts(")
     block = src[i:i + 2500]   # S4 grew the L15-POOL boot-line block between the two
     assert "l15_plan.refuse_no_caps(" in block

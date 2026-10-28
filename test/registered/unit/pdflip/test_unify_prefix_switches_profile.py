@@ -37,6 +37,18 @@ MZ = "FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE"
 NF3 = ("FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY", "FLLIPER_PDFLIP_TOLD_PACED", "FLLIPER_PDFLIP_P_TWIN_DEFER", MZ, PF)
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _main_text() -> str:
     """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
     (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
@@ -239,7 +251,7 @@ def test_p_d_front_agree(clean, profile):
 def test_the_front_spawn_publishes_on_its_env():
     import inspect
 
-    src = inspect.getsource(L)
+    src = _launcher_text()
     i = src.index('fenv["PYTHONUNBUFFERED"] = "1"')
     j = src.index("subprocess.Popen(front_argv, env=fenv")
     assert "pdflip_form.publish_prefix_switches(fenv, ns.pdflip_boot_form.profile)" in src[i:j]

@@ -40,6 +40,18 @@ from flliper.srt.pdflip import d_seat_vram as dsv  # noqa: E402
 import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _models_cache_overlay_1539():
     with MODEL_FX.overlay():
@@ -164,7 +176,7 @@ def test_an_operators_stage_tokens_win():
 def test_the_solve_takes_back_its_own_form_before_it_prices():
     from flliper.srt.pdflip import launcher as L
 
-    src = open(L.__file__).read()
+    src = _launcher_text()
     i = src.index("def log_d_rank_vram_solve(")
     j = src.index("d_kv_stage_undo(ns)", i)
     assert j < src.index("parse_group_env(getattr(ns, \"env_d\"", i)

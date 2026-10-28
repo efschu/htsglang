@@ -31,6 +31,18 @@ EVIDENCE = "/spinning/evidence-665-f1"
 ZR2 = "boot_weg2_weg2zr2_7e3a9150b4_0907_153801"
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 @dataclass
 class FakeCard:
     nvml_index: int
@@ -1648,7 +1660,7 @@ class MemfdArmIsDeletedTest(unittest.TestCase):
     def test_no_source_of_this_slice_still_creates_or_passes_a_ring_fd(self):
         from flliper.srt.pdflip import launcher
 
-        src = open(launcher.__file__).read()
+        src = _launcher_text()
         for token in ("memfd_create", "pass_fds", '"MEMFD"', "'MEMFD'"):
             self.assertNotIn(token, src, f"{token} survives in the launcher")
 

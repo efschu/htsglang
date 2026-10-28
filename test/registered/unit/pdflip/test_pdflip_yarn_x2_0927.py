@@ -35,6 +35,18 @@ OVERRIDE_X2 = ('{"language_model_only":true,"text_config":{"rope_parameters":'
                '{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":262144}}}')
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _ns(extra_d="", extra_p=""):
     return types.SimpleNamespace(extra_d=extra_d, extra_p=extra_p)
 
@@ -85,7 +97,7 @@ def test_d_solve_prices_the_forms_kv_not_the_constant():
     """The three D-solve call sites take the form's duty (wiring)."""
     import inspect
 
-    src = inspect.getsource(L)
+    src = _launcher_text()
     body = src[src.index("_d_kv, _d_kv_src = group_kv_tokens(ns, \"d\")"):]
     body = body[:body.index("if plan.refusal is not None:")]
     assert body.count("kv_tokens=_d_kv,") == 3

@@ -50,6 +50,18 @@ from flliper.srt.pdflip import ring_table as RT  # noqa: E402
 import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _solve_p_cut_text() -> str:
     """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
     step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
@@ -307,7 +319,7 @@ def test_the_seat_table_reader_cannot_kill_a_launch_on_a_gguf_path():
     info line, and the only exception let through is the operator's named A/B
     refusal.  Remove the guard (or let the handler raise) and this goes red --
     then ``d_seat_table_lines`` must take ``model_config_path`` like the rest."""
-    tree = ast.parse(inspect.getsource(L))
+    tree = ast.parse(_launcher_text())
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "d_seat_table_lines")
     guarded = None

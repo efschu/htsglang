@@ -47,6 +47,18 @@ from flliper.test.test_utils import CustomTestCase
 HTTP_SERVER = "python/flliper/srt/entrypoints/http_server.py"
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _main_text() -> str:
     """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
     (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
@@ -317,7 +329,7 @@ class TheDocumentedDirectCall(CustomTestCase):
     def test_the_launcher_prints_a_runnable_curl_with_the_bearer_header(self):
         from flliper.srt.pdflip import launcher as L
 
-        src = inspect.getsource(L)
+        src = _launcher_text()
         self.assertIn("/hicache/storage-backend/resize", src)
         self.assertIn("Authorization: Bearer $(cat", src,
                       "the documented call must read the key from the 0600 file, "

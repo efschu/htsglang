@@ -56,6 +56,18 @@ SN6S_WTAGS_GIB = 28.83
 RANKS = 3
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _images(gib=SN6S_IMAGE_GIB):
     return hl.ImageTerms(
         p_gib=gib, d_gib=gib, p_source="sample", d_source="sample",
@@ -527,7 +539,7 @@ def test_the_ledger_arm_the_launcher_publishes_carries_the_deposit():
 
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     i = src.index('ledger_arm={"s_gb":')
     window = src[i:i + 700]
     assert '"xchg_bounce_gib"' in window, (

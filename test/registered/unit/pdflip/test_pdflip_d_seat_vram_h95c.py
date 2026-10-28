@@ -61,6 +61,18 @@ NF_MODEL = (
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _nf_geometry(rows_boot=120, x=15):
     slot = dsv.SlotTensorGeom("gdn_temporal", 36, 39, 48 * 128 * 128 * 2,
                               dsv.align_up(36 * 39 * 48 * 128 * 128 * 2, G))
@@ -872,7 +884,7 @@ def test_the_launcher_default_and_an_operators_word():
     assert told.env_d == "FLLIPER_OPT_PDFLIP_D_SEAT_VRAM=0"
     other = types.SimpleNamespace(profile=L.PROFILE_QWEN27B, env_d="")
     assert L.apply_profile_d_seat_vram_default(other) is None and other.env_d == ""
-    src = open(L.__file__).read()
+    src = _launcher_text()
     j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags
     assert "apply_profile_d_seat_vram_default(ns)" in src[j:j + 1200]  # HW-P1a set_card_selection (+ d_bs/gc/pool-waves lines) sit before it
     ns = types.SimpleNamespace(env_d="FLLIPER_PDFLIP_D_SEAT_EXPERT_ROWS=9,0,0")

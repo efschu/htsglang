@@ -54,6 +54,18 @@ CARDS = [
 XSN14_MEASURED = {SM1: 2588, BIG: 3084, SM2: 2588}
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _main_text() -> str:
     """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
     (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
@@ -238,7 +250,7 @@ class TheExcessIsAttributedOnOneInstrument(CustomTestCase):
         old residual as an open question either."""
         import inspect
 
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         # UNIFY S3: the value lives in the registry row (pdflip/form.py); the name,
         # its alias line and the provenance comment above it stay here.
         i = src.index("DC_MEASURED_D_XCHG_MIB = _PROFILE_27B.constant(")

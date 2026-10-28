@@ -36,6 +36,18 @@ T_BAD = 1790592700.0   # inside it
 WIN = (1790592684.0, 1790593039.0)  # 10:51:24Z .. 10:57:19Z
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class _Log:
     def __init__(self):
         self.lines = []
@@ -139,7 +151,7 @@ class TestRevokeWindow(CustomTestCase):
     def test_the_launch_site_reads_the_rope_before_the_identity(self):
         import inspect
 
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         rope = src.index("l3_persist_check_rope(getattr(ns")
         ident = src.index("l3_persist_check_identity(store_plan.directory")
         self.assertLess(rope, ident)

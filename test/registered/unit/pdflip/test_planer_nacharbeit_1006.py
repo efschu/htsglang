@@ -32,6 +32,18 @@ W64_MSG = ("W64 PdFlipTpOperatingPointInfeasible: position tp3 derives weights [
            "boot's budgets [15000, 15000, 15000] -- the weight shards plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank.")
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _result(exc_type, exc_msg, forced=()):
     return O.DryRunResult(None, exc_type, exc_msg, "PLAN\n", "PLAN\n", [dict(f) for f in forced], ["--x"], "")
 
@@ -127,7 +139,7 @@ class TestSupplement(unittest.TestCase):
         import inspect
 
         from flliper.srt.pdflip import dual_w64
-        lsrc, dsrc = inspect.getsource(launcher), inspect.getsource(dual_w64)
+        lsrc, dsrc = _launcher_text(), inspect.getsource(dual_w64)
         self.assertIn('"W64-DUAL: the refusal names no weight vector', lsrc)
         self.assertIn('"W64-DUAL: no measured dual-share D log of', lsrc)
         self.assertIn("W64-DUAL MEASURED (", dsrc)

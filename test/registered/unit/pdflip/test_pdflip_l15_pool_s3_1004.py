@@ -62,6 +62,18 @@ import test_pdflip_l15_retain_0930 as R0  # make_scenario
 _REAL_LOAD_BARLINK_RATES = l15_pool.load_barlink_rates
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 @pytest.fixture(autouse=True)
 def _no_host_matrix(monkeypatch):
     """The barlink cache of the machine running the tests is not an input."""
@@ -845,14 +857,14 @@ def test_pool_with_the_deposit_region_is_refused_by_name():
     assert l15_plan.refuse_pool_with_deposit({"FLLIPER_PDFLIP_L15_DEPOSIT": "1"}) is None
     assert l15_plan.refuse_pool_with_deposit({}) is None
     from flliper.srt.pdflip import launcher
-    assert "refuse_pool_with_deposit(os.environ)" in inspect.getsource(launcher)
+    assert "refuse_pool_with_deposit(os.environ)" in _launcher_text()
 
 
 def test_boot_line_s3_mode_and_wiring():
     po = l15_pool.boot_line([8, 8, 40], ["RECORD"] * 3, 8, mode=l15_pool.S3_MODE)
     assert "mode=POOL(S3" in po and "total_mib=56" in po
     from flliper.srt.pdflip import launcher
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     assert "refuse_pool_s3_without_pool(os.environ)" in src
     assert "else l15_pool.S3_MODE" in src and "mode=l15_pool.POOL_MODE if not l15_pool.pool_s3_on" in src
     from flliper.srt.managers.scheduler_components import weight_updater as wu

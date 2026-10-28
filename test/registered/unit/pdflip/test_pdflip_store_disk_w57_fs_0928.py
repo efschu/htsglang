@@ -38,6 +38,18 @@ KV_MIB = 0.0078125  # 8 KiB/token/layer -> 96 KiB/token -> 24 GiB pool
 DIR = "l3-nextflash-model-fe3b0e1fce"
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class _Statvfs:
     def __init__(self, free, total=2300 * GIB):
         self.f_frsize = 4096
@@ -151,7 +163,7 @@ def test_fs_of_takes_the_longest_mount_above_the_path(tmp_path):
 
 
 def test_the_launcher_logs_the_line_before_the_store_line():
-    src = open(launcher.__file__).read()
+    src = _launcher_text()
     k = src.index("store_cfg = store_plan.extra_config()")
     assert src.index("log(store_plan.disk_line(", k) < src.index('f"PDFLIP-STORE: dir=', k)
 
@@ -193,7 +205,7 @@ def test_xfs_passes_and_the_switch_can_empty_the_list(tmp_path):
 
 
 def test_the_launcher_passes_dry_and_names_the_warning():
-    src = open(launcher.__file__).read()
+    src = _launcher_text()
     k = src.index("store_plan = plan_store(")
     body = src[k:src.index('f"PDFLIP-STORE: dir=', k)]
     assert "dry=dry," in body

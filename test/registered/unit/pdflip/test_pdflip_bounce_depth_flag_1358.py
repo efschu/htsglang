@@ -36,6 +36,18 @@ WIDEST = 756323776  # gdncov INT8's widest layer, 721.3 MiB
 HOLDERS = 5         # measured on weg2xsn27 by the #1358 reader
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class TheDepthFlagChangesTheSlotsAndTheTerm(CustomTestCase):
     def test_depth_1_gives_two_slots_under_shadow(self):
         self.assertEqual(xb.assemble_slots(1, comparing=True), 2)
@@ -132,7 +144,7 @@ class OneSourcePricesIt(CustomTestCase):
         from flliper.srt.pdflip import launcher as lc
 
         src = "\n".join(
-            ln for ln in inspect.getsource(lc).splitlines()
+            ln for ln in _launcher_text().splitlines()
             if not ln.strip().startswith("#"))
         i = src.index('"depth": int(bounce_depth)')
         self.assertIn("int(bounce_depth)", src[i:i + 400],
@@ -152,7 +164,7 @@ class OneSourcePricesIt(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as lc
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         self.assertNotIn("depth=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT", src,
                          "a call site still prices a depth the flag cannot move")
 

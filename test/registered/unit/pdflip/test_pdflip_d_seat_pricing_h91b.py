@@ -22,6 +22,18 @@ NF_MODEL = (
 
 # ---- the budget: seat-proportional posts are re-booked, never carried -------
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def test_the_built_in_nf_references_were_measured_with_one_seat():
     for ref in (er.D_RESIDENCY_REFERENCE_FNFL2, er.D_RESIDENCY_REFERENCE_FNFL2_H39):
         assert ref.max_running == 1
@@ -181,7 +193,7 @@ def test_the_effective_seats_and_the_graph_list_are_read_off_extra_d():
 def test_the_d_solve_is_told_the_seats_and_the_main_resolves_the_nf_default():
     from flliper.srt.pdflip import launcher as L
 
-    src = open(L.__file__).read()
+    src = _launcher_text()
     i = src.index("replayssm_spec=d_replayssm_spec_plan_form(ns),")
     assert "seats=d_stated_seats(ns)," in src[i:i + 600]
     j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags

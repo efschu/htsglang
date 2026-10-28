@@ -31,6 +31,18 @@ from flliper.srt.pdflip import ring_table as rt
 from flliper.test.test_utils import CustomTestCase
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class TheOffSwitchIsSpellable(CustomTestCase):
     def test_the_tri_state_has_all_three_spellings(self):
         from flliper.srt.server_args import ServerArgs
@@ -54,7 +66,7 @@ class TheOffSwitchIsSpellable(CustomTestCase):
 
         src = inspect.getsource(sa)
         self.assertIn("--language-only is set without --encoder-urls", src)
-        self.assertNotIn("language_only", inspect.getsource(lc))
+        self.assertNotIn("language_only", _launcher_text())
 
 
 class BothGroupsBootTextOnly(CustomTestCase):
@@ -219,7 +231,7 @@ class TheProductionCallerBuildsTheArgv(CustomTestCase):
         import ast
         import inspect
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         n_pos = len([
             p for p in inspect.signature(lc.argv_p).parameters.values()
             if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
@@ -240,7 +252,7 @@ class TheProductionCallerBuildsTheArgv(CustomTestCase):
     def test_both_production_callsites_are_keyword_form(self):
         import inspect
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         for marker in ("form_argv_p = xchg_form_argv(argv_p(",
                        "shipped_argv_p = argv_p("):
             with self.subTest(callsite=marker):

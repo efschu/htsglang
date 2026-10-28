@@ -49,6 +49,18 @@ GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint
 MIB = 1 << 20
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def card(i, name, mib, cc, uuid=None, reserved=0):
     return L.Card(i, uuid or f"GPU-{i:04d}", name, mib, reserved_mib=reserved, cc=cc)
 
@@ -337,7 +349,7 @@ class Stage2TopologyEnabling(unittest.TestCase):
         t = T.plan_topology(3)
         self.assertEqual((t.p_tp, t.p_pp, t.d_tp, t.d_pp, t.host_ordinal), (1, 3, 3, 1, 0))
         self.assertEqual(T.rank_gpu_id_csv(L.PDFLIP_CARD_COUNT), "0,1,2")
-        src = open(L.__file__).read()
+        src = _launcher_text()
         self.assertNotIn('"--pp-size", "3"', src)
         self.assertNotIn('"--tp-size", "3"', src)
         self.assertNotIn('"--rank-gpu-id", "0,1,2"', src)

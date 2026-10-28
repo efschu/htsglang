@@ -56,6 +56,18 @@ MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-voca
 import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _models_cache_overlay_1539():
     with MODEL_FX.overlay():
@@ -539,7 +551,7 @@ class TestMaxRunningRequestsReader(unittest.TestCase):
 
         from flliper.srt.pdflip import launcher as L
 
-        src = inspect.getsource(L)
+        src = _launcher_text()
         for line in src.splitlines():
             if "common_flags(" in line and "def common_flags" not in line:
                 self.assertNotIn("--max-running-requests", line)

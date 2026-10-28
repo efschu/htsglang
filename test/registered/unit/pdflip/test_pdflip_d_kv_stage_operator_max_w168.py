@@ -29,6 +29,18 @@ from flliper.srt.planner import expert_residency as er  # noqa: E402
 from flliper.srt.pdflip import d_seat_vram as dsv  # noqa: E402
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 @pytest.fixture(autouse=True)
 def _kv_stage_table_path():
     """29.09.: #251d is the default now; this file covers the table path, so
@@ -126,7 +138,7 @@ def test_a_value_the_table_cannot_take_is_refused_by_name(raw):
 def test_the_refusal_is_not_swallowed_by_the_seat_table():
     from flliper.srt.pdflip import launcher as L
 
-    src = open(L.__file__).read()
+    src = _launcher_text()
     k = src.index("def d_seat_table_lines(")
     body = src[k:src.index("\ndef ", k + 10)]
     assert body.index("except PdFlipDKvStageMaxRefused:") < body.index("except Exception as exc:")

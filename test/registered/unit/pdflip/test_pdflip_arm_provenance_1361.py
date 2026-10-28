@@ -32,6 +32,18 @@ MT = 126 * 1024 ** 3
 MA = 110 * 1024 ** 3
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _lines(**kw):
     _, _, lines = hl.choose(MT, MA, ring_bytes=1, ring_span1_bytes=1,
                             ring_provenance="t", **kw)
@@ -124,7 +136,7 @@ class TheSlotsAgreeWithTheInjectModeOnTheSameLine(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as lc
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         i = src.index('"slots": int(xchg_bounce.assemble_slots(')
         window = src[i:i + 400]
         self.assertIn("comparing=", window,

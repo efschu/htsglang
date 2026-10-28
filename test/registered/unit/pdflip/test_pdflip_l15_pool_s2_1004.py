@@ -47,6 +47,18 @@ from flliper.srt.pdflip.l15_policy import Candidate, select_hold
 import test_pdflip_l15_park_1002 as T  # _World, _bufs, _entries, _run_ranks
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with the split functions expanded back to the original statement
+    order: the launcher was split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _mutant(modname, old, new, *more):
     """The module with source lines changed (a mutant to be killed);
     ``more`` = further (old, new) pairs."""
@@ -513,7 +525,7 @@ def test_boot_line_modes():
 
 def test_scheduler_and_launcher_wiring():
     from flliper.srt.pdflip import launcher
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     assert "refuse_pool_without_master(os.environ)" in src
     assert "mode=l15_pool.POOL_MODE" in src
     from flliper.srt.managers.scheduler_components import weight_updater as wu
