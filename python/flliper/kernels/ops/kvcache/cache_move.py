@@ -77,6 +77,70 @@ def set_kv_buffer_prefix_valid_tiled(
 
 
 @triton.jit
+def set_kv_buffer_prefix_valid_layers_tiled(
+    src_k_ptr,
+    src_v_ptr,
+    dst_k0_ptr,
+    dst_v0_ptr,
+    dst_k_off_ptr,
+    dst_v_off_ptr,
+    loc_2d_ptr,
+    commit_len_ptr,
+    src_k_layer_stride,
+    src_v_layer_stride,
+    src_k_row_stride,
+    src_v_row_stride,
+    dst_k_row_stride,
+    dst_v_row_stride,
+    block_size,
+    bs,
+    bound,
+    ROW_BYTES: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    """formhp-devdraft-xkv-1028: ``set_kv_buffer_prefix_valid_tiled`` for ALL layers of one materialization in ONE launch.
+
+    Program 0 runs over ``layer * bs + bid``; layer ``l``'s source rows start ``l * src_*_layer_stride`` bytes after the source
+    base (the [layers, rows, row] projection), its destination buffer ``dst_*_off[l]`` bytes after layer 0's buffer (an int64 byte
+    offset, any sign: the per-layer pool buffers are separate allocations in one address space). Per (layer, row) the bytes copied,
+    the commit mask and the bound check are the per-layer kernel's -- the same block-uniform early return before the assert."""
+    pid = tl.program_id(0)
+    layer = pid // bs
+    bid = pid % bs
+    row = tl.program_id(1)
+    tid = tl.program_id(2)
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    if row >= commit_len:
+        return
+
+    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < ROW_BYTES
+    tl.multiple_of(byte_off, 16)
+
+    loc = tl.load(loc_2d_ptr + bid * block_size + row)
+    tl.device_assert(
+        (loc >= 0) & (loc < bound), "set_kv_buffer_prefix_valid_layers: loc out of range"
+    )
+    src_row = bid * block_size + row
+
+    src_k_ptr = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8))
+    src_v_ptr = tl.cast(src_v_ptr, tl.pointer_type(tl.uint8))
+    dst_k_ptr = tl.cast(dst_k0_ptr, tl.pointer_type(tl.uint8)) + tl.load(dst_k_off_ptr + layer)
+    dst_v_ptr = tl.cast(dst_v0_ptr, tl.pointer_type(tl.uint8)) + tl.load(dst_v_off_ptr + layer)
+
+    src_k_row_ptr = src_k_ptr + layer * src_k_layer_stride + src_row * src_k_row_stride + byte_off
+    src_v_row_ptr = src_v_ptr + layer * src_v_layer_stride + src_row * src_v_row_stride + byte_off
+    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + byte_off
+    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + byte_off
+
+    k_val = tl.load(src_k_row_ptr, mask=mask_byte, other=0)
+    v_val = tl.load(src_v_row_ptr, mask=mask_byte, other=0)
+    tl.store(dst_k_row_ptr, k_val, mask=mask_byte)
+    tl.store(dst_v_row_ptr, v_val, mask=mask_byte)
+
+
+@triton.jit
 def copy_all_layer_kv_cache_tiled(
     data_ptrs,
     strides,

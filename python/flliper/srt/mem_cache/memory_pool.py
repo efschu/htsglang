@@ -40,6 +40,7 @@ import triton.language as tl
 from flliper.jit_kernel.kvcache import can_use_store_cache, store_cache
 from flliper.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_layers_tiled,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
@@ -347,6 +348,157 @@ def _set_kv_buffer_prefix_valid_impl(
         num_stages=2,
         debug=kv_bound_check_enabled(),
     )
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# 27b-xkv-1028 (FLLIPER_FORMHP_XKV_LAYERS, tag FORMHP-XKV-LAYERS; port of NF b64dd98df): the DFLASH draft-KV commit of ALL draft
+# layers of one materialization in one cast + one launch instead of one cast + one launch per layer
+# ---------------------------------------------------------------------------------------------------------------------------
+XKV_LAYERS_ENV = "FLLIPER_FORMHP_XKV_LAYERS"
+XKV_LAYERS_TAG = "FORMHP-XKV-LAYERS"
+
+
+def xkv_layers_on() -> bool:
+    """``FLLIPER_FORMHP_XKV_LAYERS`` (default on; 0/false/no/off = one cast + one launch per layer, as before). Read per call."""
+    return str(os.environ.get(XKV_LAYERS_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def xkv_tile_config(row_bytes: int) -> Tuple[int, int]:
+    """(bytes_per_tile, num_warps) of the all-layers launch: the same choice the per-layer launch makes for this row size."""
+    if row_bytes >= 8192:
+        return 512, 8
+    if row_bytes >= 4096:
+        return 256, 4
+    return 128, 4
+
+
+def layer_buffer_offsets(k_bufs, v_bufs, device):
+    """int64 byte offsets of every layer buffer from buffer 0 (K and V), on ``device``."""
+    k0, v0 = int(k_bufs[0].data_ptr()), int(v_bufs[0].data_ptr())
+    k_off = torch.tensor([int(b.data_ptr()) - k0 for b in k_bufs], dtype=torch.int64, device=device)
+    v_off = torch.tensor([int(b.data_ptr()) - v0 for b in v_bufs], dtype=torch.int64, device=device)
+    return k_off, v_off
+
+
+def layer_buffers_uniform(k_bufs, v_bufs) -> bool:
+    """Every layer buffer has layer 0's dtype, shape, strides and device (one launch addresses them alike)."""
+    if not k_bufs or len(k_bufs) != len(v_bufs):
+        return False
+    for bufs in (k_bufs, v_bufs):
+        b0 = bufs[0]
+        for b in bufs:
+            if b.dtype != b0.dtype or b.shape != b0.shape or b.stride() != b0.stride() or b.device != b0.device:
+                return False
+    return True
+
+
+def _set_kv_buffer_prefix_valid_layers_impl(
+    k_all: torch.Tensor,
+    v_all: torch.Tensor,
+    k_bufs,
+    v_bufs,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+    store_dtype: torch.dtype,
+    size_limit: int,
+    dst_offsets=None,
+) -> None:
+    """``_set_kv_buffer_prefix_valid_impl`` for every layer at once. ``k_all`` / ``v_all``: [layers, rows, ...] in the store dtype;
+    ``k_bufs`` / ``v_bufs``: the layers' pool buffers (same dtype, shape and strides); ``dst_offsets``: optional cached
+    (k_offsets, v_offsets) int64 device tensors of byte offsets from buffer 0 (built here when None)."""
+    n_layers = int(k_all.shape[0])
+    if n_layers == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0 or k_all[0].numel() == 0:
+        return
+    k_all = k_all.contiguous().view(n_layers, -1, row_dim)
+    v_all = v_all.contiguous().view(n_layers, -1, row_dim)
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+    row_bytes = row_dim * store_dtype.itemsize
+    if row_bytes <= 0:
+        return
+    bytes_per_tile, num_warps = xkv_tile_config(row_bytes)
+    if dst_offsets is None:
+        dst_offsets = layer_buffer_offsets(k_bufs, v_bufs, k_all.device)
+    k_off, v_off = dst_offsets
+    k0, v0 = k_bufs[0], v_bufs[0]
+    bound = min(
+        kv_store_bound(size_limit, k0, int(k0.stride(0))),
+        kv_store_bound(size_limit, v0, int(v0.stride(0))),
+    )
+    bs = int(loc_2d.shape[0])
+    grid = (n_layers * bs, int(loc_2d.shape[1]), triton.cdiv(row_bytes, bytes_per_tile))
+    es_k, es_v = k_all.element_size(), v_all.element_size()
+    set_kv_buffer_prefix_valid_layers_tiled[grid](
+        k_all,
+        v_all,
+        k0,
+        v0,
+        k_off,
+        v_off,
+        loc_2d,
+        commit_lens,
+        int(k_all.stride(0) * es_k),
+        int(v_all.stride(0) * es_v),
+        int(k_all.stride(1) * es_k),
+        int(v_all.stride(1) * es_v),
+        int(k0.stride(0) * k0.element_size()),
+        int(v0.stride(0) * v0.element_size()),
+        int(loc_2d.shape[1]),
+        bs,
+        bound,
+        ROW_BYTES=row_bytes,
+        BYTES_PER_TILE=bytes_per_tile,
+        num_warps=num_warps,
+        num_stages=2,
+        debug=kv_bound_check_enabled(),
+    )
+
+
+def _selftest_cast(t: torch.Tensor, *, dtype: torch.dtype, store_dtype: torch.dtype) -> torch.Tensor:
+    """The pool's cast (bf16 -> pool dtype, then the byte view of the store dtype) for the self-test's reference and batched side."""
+    t = t.to(dtype) if t.dtype != dtype else t
+    return t.contiguous().view(store_dtype) if store_dtype != dtype else t.contiguous()
+
+
+def prefix_valid_layers_selftest(device, *, src_dtype, dtype, store_dtype, row_dim: int, n_layers: int, bs: int = 2,
+                                 block: int = 8, slots: int = 64, seed: int = 1028):
+    """FORMHP-XKV-LAYERS self-test on scratch buffers: per layer cast + per-layer kernel (the old path) against one batched cast + the
+    one launch, byte for byte over every slot (written rows AND the untouched ones). Returns (ok, why)."""
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+    rows = bs * block
+    src_k = (torch.randn(n_layers, rows, row_dim, generator=gen) * 4).to(src_dtype).to(device)
+    src_v = (torch.randn(n_layers, rows, row_dim, generator=gen) * 4).to(src_dtype).to(device)
+    perm = torch.randperm(slots - 1, generator=gen)[:rows] + 1
+    loc_2d = perm.view(bs, block).to(torch.int64).to(device)
+    commit = torch.tensor([block // 2 + 1] + [block] * (bs - 1), dtype=torch.int32)[:bs].to(device)
+    fill = torch.randint(0, 256, (slots, row_dim * torch.empty((), dtype=store_dtype).element_size()), generator=gen,
+                         dtype=torch.uint8)
+
+    def bufs():
+        return [fill.clone().to(device).view(store_dtype).view(slots, row_dim) for _ in range(n_layers)]
+
+    a_k, a_v, b_k, b_v = bufs(), bufs(), bufs(), bufs()
+    for layer in range(n_layers):
+        _set_kv_buffer_prefix_valid_impl(
+            _selftest_cast(src_k[layer], dtype=dtype, store_dtype=store_dtype),
+            _selftest_cast(src_v[layer], dtype=dtype, store_dtype=store_dtype),
+            a_k[layer], a_v[layer], loc_2d, commit, row_dim=row_dim, store_dtype=store_dtype, size_limit=slots)
+    _set_kv_buffer_prefix_valid_layers_impl(
+        _selftest_cast(src_k, dtype=dtype, store_dtype=store_dtype), _selftest_cast(src_v, dtype=dtype, store_dtype=store_dtype),
+        b_k, b_v, loc_2d, commit, row_dim=row_dim, store_dtype=store_dtype, size_limit=slots)
+    written = 0
+    for layer in range(n_layers):
+        for name, x, y in (("k", a_k[layer], b_k[layer]), ("v", a_v[layer], b_v[layer])):
+            xb, yb = x.view(torch.uint8), y.view(torch.uint8)
+            if not torch.equal(xb, yb):
+                return False, f"layer {layer} {name}: {int((xb != yb).sum())} bytes differ"
+        written += int((a_k[layer].view(torch.uint8) != fill.to(device)).any(dim=1).sum())
+    if written == 0:
+        return False, "the reference wrote nothing (vacuous comparison)"
+    return True, f"{n_layers} layers, {bs}x{block} rows, {written} slots written: every slot byte-identical"
 
 
 _REQ_POOL_BINDING_SEQ = itertools.count(1)
@@ -4797,6 +4949,96 @@ class MHATokenToKVPool(KVCache):
             # helper widens it to the buffer's VA row count where they differ.
             size_limit=self.size + self.page_size,
         )
+
+    # FORMHP-XKV-LAYERS state: None = self-test not run yet, False = off for this pool (failed / not uniform), True = passed
+    _xkv_layers_ok: Optional[bool] = None
+    _xkv_layers_offsets = None  # (key, (k_offsets, v_offsets)) of the draft layer buffers last seen
+
+    @staticmethod
+    def _xkv_scale_is_identity(scale) -> bool:
+        """No scale, or exactly 1.0: the per-layer path's ``div_(scale)`` is x / 1.0 == x bit for bit, so the batched cast may skip it."""
+        return scale is None or float(scale) == 1.0
+
+    def _xkv_layers_gate(self, layers, loc_2d, commit_lens, cache_k_all, cache_v_all) -> bool:
+        """True when the batched writer may handle this call. False = the caller writes layer by layer as before (switch off, failed
+        self-test, a non-unit k/v scale with a cast, non-CUDA pool, a pool class with its own prefix-valid writer, CUDA-graph capture,
+        wrong shapes)."""
+        if not xkv_layers_on() or self._xkv_layers_ok is False or not (_is_cuda or _is_hip):
+            return False
+        if type(self).set_kv_buffer_prefix_valid is not MHATokenToKVPool.set_kv_buffer_prefix_valid:
+            return False  # e.g. the page-major pool: its own (refusing) writer decides
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return False  # the first-use self-test syncs: never inside a capture
+        if cache_k_all.dtype != self.dtype and not all(
+            self._xkv_scale_is_identity(a.k_scale) and self._xkv_scale_is_identity(a.v_scale) for a in layers
+        ):
+            return False  # the per-layer path divides by each layer's scale before the cast: kept as it is
+        if loc_2d.ndim != 2 or commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+            return False
+        n = len(layers)
+        return cache_k_all.shape[0] == n and cache_v_all.shape[0] == n and cache_k_all.shape[1] == loc_2d.numel()
+
+    def _xkv_layers_run_selftest(self, device, *, src_dtype, n_layers: int) -> bool:
+        """FORMHP-XKV-LAYERS self-test at the first use; the verdict is kept on the pool (False keeps the per-layer loop)."""
+        try:
+            ok, why = prefix_valid_layers_selftest(
+                device, src_dtype=src_dtype, dtype=self.dtype, store_dtype=self.store_dtype,
+                row_dim=int(self.row_dim), n_layers=n_layers)
+        except Exception as e:  # noqa: BLE001 -- the per-layer path is always correct
+            ok, why = False, f"{type(e).__name__}: {e}"
+        self._xkv_layers_ok = bool(ok)
+        (logger.info if ok else logger.error)(
+            "%s self-test %s (%s; %s=0 = off)", XKV_LAYERS_TAG,
+            "PASSED -> the draft-KV commit of all layers is one cast + one launch" if ok else "FAILED -> layer by layer", why,
+            XKV_LAYERS_ENV)
+        return bool(ok)
+
+    def set_kv_buffer_prefix_valid_layers(
+        self,
+        layers,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k_all: torch.Tensor,
+        cache_v_all: torch.Tensor,
+    ) -> bool:
+        """27b-xkv-1028 (FORMHP-XKV-LAYERS): ``set_kv_buffer_prefix_valid`` for every layer of ``layers`` in ONE cast + ONE launch.
+        ``cache_*_all``: [len(layers), rows, heads, dim]. False = not handled: the caller writes layer by layer as before."""
+        if not self._xkv_layers_gate(layers, loc_2d, commit_lens, cache_k_all, cache_v_all):
+            return False
+        slots = tuple(self.local_slot(a.layer_id) for a in layers)
+        k_bufs = [self.k_buffer[i] for i in slots]
+        v_bufs = [self.v_buffer[i] for i in slots]
+        key = (slots, tuple(int(b.data_ptr()) for b in k_bufs), tuple(int(b.data_ptr()) for b in v_bufs))
+        cached = self._xkv_layers_offsets
+        if cached is None or cached[0] != key:
+            if not layer_buffers_uniform(k_bufs, v_bufs):
+                self._xkv_layers_ok = False
+                logger.warning("%s OFF: the draft layer buffers differ in dtype / shape / strides", XKV_LAYERS_TAG)
+                return False
+            cached = self._xkv_layers_offsets = (key, layer_buffer_offsets(k_bufs, v_bufs, k_bufs[0].device))
+        if self._xkv_layers_ok is None and not self._xkv_layers_run_selftest(
+            k_bufs[0].device, src_dtype=cache_k_all.dtype, n_layers=len(layers)
+        ):
+            return False
+        if cache_k_all.dtype != self.dtype:
+            cache_k_all = cache_k_all.to(self.dtype)
+            cache_v_all = cache_v_all.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k_all = cache_k_all.contiguous().view(self.store_dtype)
+            cache_v_all = cache_v_all.contiguous().view(self.store_dtype)
+        device = k_bufs[0].device
+        if loc_2d.device != device:
+            loc_2d = loc_2d.to(device=device, non_blocking=True)
+        if commit_lens.device != device:
+            commit_lens = commit_lens.to(device=device, non_blocking=True)
+        if loc_2d.dtype != torch.int64:
+            loc_2d = loc_2d.to(torch.int64)
+        if commit_lens.dtype != torch.int32:
+            commit_lens = commit_lens.to(torch.int32)
+        _set_kv_buffer_prefix_valid_layers_impl(
+            cache_k_all, cache_v_all, k_bufs, v_bufs, loc_2d, commit_lens, row_dim=self.row_dim, store_dtype=self.store_dtype,
+            size_limit=self.size + self.page_size, dst_offsets=cached[1])
+        return True
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.

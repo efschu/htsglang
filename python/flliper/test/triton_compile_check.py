@@ -1,4 +1,4 @@
-"""formhp-hcdfastfix-1028: compile a Triton kernel for a GPU target WITHOUT a GPU, from the arguments its real wrapper passes.
+"""27b-xkv-1028 (port of NF's formhp-hcdfastfix-1028 helper, extended by ``debug``): compile a Triton kernel for a GPU target WITHOUT a GPU, from the arguments its real wrapper passes.
 
 Why: a CPU test under TRITON_INTERPRET=1 runs the kernel as Python and never meets the compiler's rules -- formb164 (20:41:27 TP0) failed the
 DFAST variant of the fused HC read with ``NameError('NGK is not defined')`` (a constexpr bound inside a static ``if`` block, invisible to the
@@ -61,7 +61,9 @@ def _signature(launch: Launch) -> Tuple[Dict[str, str], Dict[str, Any], Dict[tup
     for k, v in launch.kwargs.items():
         if k in names:
             vals[k] = v
-        elif k in ("num_warps", "num_stages", "num_ctas", "maxnreg"):
+        elif k in ("num_warps", "num_stages", "num_ctas", "maxnreg", "debug"):
+            # ``debug`` is a compile option: it decides whether ``tl.device_assert`` lowers to a real device assert (the masked KV
+            # writers pass debug=kv_bound_check_enabled(), default True) -- the production variant must be the one compiled here
             options[k] = v
         # launch-only keywords (launch_pdl, ...) do not change the compiled code
     sig: Dict[str, str] = {}
