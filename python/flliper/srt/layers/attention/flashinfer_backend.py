@@ -7970,6 +7970,11 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        # formhp-devdraft-b2-1028 (FORMHP-DRAFT-PLAN-SKIP, speculative/dflash_plan_skip.py): wrapper ids of the sliding dispatch whose plan
+        # is skipped (no layer reads them; armed by the DFLASH worker after its self-test) / planned on the self-test's one-key probe
+        # layout. Both empty by default: every other caller plans exactly as before.
+        self.skip_wrapper_ids = frozenset()
+        self.probe_wrapper_ids = frozenset()
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -8115,8 +8120,19 @@ class FlashInferIndicesUpdaterPrefill:
         sliding_window_size = self.sliding_window_size
         assert sliding_window_size is not None
         for wrapper_id in range(2):
+            if wrapper_id in self.skip_wrapper_ids:
+                continue  # FORMHP-DRAFT-PLAN-SKIP: no layer reads this wrapper (static scan + boot self-test)
             swa_paged_custom_mask = None
-            if wrapper_id == 0:
+            if wrapper_id == 1 and wrapper_id in self.probe_wrapper_ids:
+                # FORMHP-DRAFT-PLAN-SKIP self-test: the full wrapper on a deliberately different, valid layout -- the last key of each
+                # row only. A layer that read this wrapper would attend 1 key instead of the context and its output would differ.
+                paged_kernel_lens = torch.ones_like(seq_lens)
+                paged_kernel_lens_sum = int(seq_lens.shape[0])
+                paged_kernel_lens_cpu = (
+                    torch.ones_like(fresh_seq_lens_cpu) if fresh_seq_lens_cpu is not None else None
+                )
+                kv_start_idx = seq_lens - paged_kernel_lens
+            elif wrapper_id == 0:
                 if use_ragged:
                     # K for extend tokens is written after the paged wrapper runs, so
                     # the paged wrapper sees prefix-only. Trim to the last `window` tokens

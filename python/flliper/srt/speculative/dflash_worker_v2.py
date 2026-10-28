@@ -3271,6 +3271,86 @@ class DFlashWorkerV2(BaseSpecWorker):
             return False
         return _verify_plain_greedy(sampling_info)
 
+    # -- formhp-devdraft-b2-1028: FORMHP-DRAFT-PLAN-SKIP (speculative/dflash_plan_skip.py) --------------------------------------------
+    def _draft_plan_skip_updater(self):
+        from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+
+        backend = self.draft_model_runner.attn_backend
+        if not isinstance(backend, FlashInferAttnBackend) and isinstance(
+            getattr(backend, "full_attn_backend", None), FlashInferAttnBackend
+        ):
+            backend = backend.full_attn_backend  # a hybrid wrapper keeps the FlashInfer half there
+        if not isinstance(backend, FlashInferAttnBackend):
+            return None
+        return backend.indices_updater_prefill
+
+    def _draft_plan_skip_state(self):
+        ps = self.__dict__.get("_draft_plan_skip")
+        if ps is None:
+            from flliper.srt.speculative.dflash_plan_skip import DraftPlanSkip
+
+            ps = self.__dict__["_draft_plan_skip"] = DraftPlanSkip()
+        return ps
+
+    def _draft_plan_skip_probe_ids(self, batch, host_lens_exact, hole_buf):
+        """The wrapper ids the self-test probes this round, or ``()``: the verdict is taken, the switch is off, this rank is a solo shadow,
+        a collective could sit inside the draft forward (TP draft that is not the solo host), a non-greedy round (a sampler would draw
+        twice), the device-length plan (the probe layout is host-planned), or the hole mask (zeroed after the first forward)."""
+        ps = self._draft_plan_skip_state()
+        if ps.verdict is not None:
+            return ()
+        if self._solo_is_shadow or not host_lens_exact or hole_buf is not None:
+            return ()
+        # the solo host's draft is built weight-TP=1 (no collective inside the forward; the solo sampling reduction runs eager after it)
+        no_collective = self._spec_solo_is_host or int(self.draft_model_runner.tp_size) == 1
+        if not no_collective or not _is_all_greedy(batch.sampling_info):
+            return ()
+        return ps.candidate(self._draft_plan_skip_updater(), self.draft_model_runner.model)
+
+    def _draft_plan_skip_snapshot(self, draft_out, bs):
+        lo = draft_out.logits_output
+        hs = lo.hidden_states
+        tok = None
+        if self._draft_sampler is not None and draft_out.can_run_graph:
+            tok = self._draft_sampler.out[: bs * (int(self.block_size) - 1)]
+        return (
+            bool(draft_out.can_run_graph),
+            hs.clone() if hs is not None else None,
+            tok.clone() if tok is not None else None,
+        )
+
+    def _draft_plan_skip_probe(self, make_fb, ids, bs):
+        """The self-test's first forward: wrapper(s) ``ids`` planned on the one-key probe layout. Returns its snapshot or None (an error
+        decides FAILED)."""
+        ps = self.__dict__["_draft_plan_skip"]
+        upd = self._draft_plan_skip_updater()
+        try:
+            upd.probe_wrapper_ids = frozenset(ids)
+            out = self.draft_model_runner.forward(make_fb())
+            return self._draft_plan_skip_snapshot(out, bs)
+        except Exception as e:  # noqa: BLE001 -- a self-test never breaks a round
+            ps.decide(upd, False, f"probe forward raised {type(e).__name__}: {e}")
+            return None
+        finally:
+            upd.probe_wrapper_ids = frozenset()
+
+    def _draft_plan_skip_judge(self, snap, draft_out, bs, ids):
+        from flliper.srt.speculative.dflash_plan_skip import outputs_equal
+
+        ps = self.__dict__["_draft_plan_skip"]
+        ref = self._draft_plan_skip_snapshot(draft_out, bs)
+        if not (snap[0] and ref[0]):
+            # an eager draft round proves nothing about the captured one: decide on a graph round, at most a few probes
+            ps.undecided += 1
+            if ps.undecided >= ps.max_undecided:
+                ps.decide(self._draft_plan_skip_updater(), False, f"{ps.undecided} probe rounds without a draft graph replay")
+            return
+        if snap[1] is None and snap[2] is None:
+            ps.decide(self._draft_plan_skip_updater(), False, "the draft forward exposed neither hidden rows nor tokens")
+            return
+        ok, why = outputs_equal(snap[1:], ref[1:])
+        ps.decide(self._draft_plan_skip_updater(), ok, f"bs {bs}, probe (wrapper {list(ids)} on one key) vs old plan: {why}", ids)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -3752,21 +3832,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                         batch, prefix_lens, verify_out_cache_loc, bs
                     )
 
-            forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.TARGET_VERIFY,
-                batch_size=bs,
-                input_ids=block_ids.flatten(),
-                req_pool_indices=batch.req_pool_indices,
-                seq_lens=draft_seq_lens,
-                out_cache_loc=draft_out_cache_loc,
-                seq_lens_sum=draft_seq_lens_sum,
-                seq_lens_cpu=seq_lens_cpu,
-                positions=positions,
-                input_embeds=input_embeds,
-                spec_algorithm=SpeculativeAlgorithm.DFLASH,
-                spec_info=self._draft_block_spec_info,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-            )
+            def _draft_forward_batch():
+                return ForwardBatch(
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    batch_size=bs,
+                    input_ids=block_ids.flatten(),
+                    req_pool_indices=batch.req_pool_indices,
+                    seq_lens=draft_seq_lens,
+                    out_cache_loc=draft_out_cache_loc,
+                    seq_lens_sum=draft_seq_lens_sum,
+                    seq_lens_cpu=seq_lens_cpu,
+                    positions=positions,
+                    input_embeds=input_embeds,
+                    spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                    spec_info=self._draft_block_spec_info,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                )
+
+            forward_batch = _draft_forward_batch()
 
             if self.selector is not None:
                 # DFlash2 (upstream #35371): the candidate selector replaces the
@@ -3783,9 +3866,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             # lowered again whatever happens inside it.
             self._draft_block_spec_info.host_lens_exact = draft_host_lens_exact
             _d_hostgap_split_mark("fb")
+            # FORMHP-DRAFT-PLAN-SKIP (port from formhp-devdraft-b2-1028): once per process, the self-test's probe forward runs first; the
+            # forward below is the round's (old path) result either way.
+            _ps_ids = self._draft_plan_skip_probe_ids(batch, draft_host_lens_exact, _hole_buf)
+            _ps_snap = None
             try:
                 with torch.inference_mode():
+                    if _ps_ids:
+                        _ps_snap = self._draft_plan_skip_probe(_draft_forward_batch, _ps_ids, bs)
                     draft_out = self.draft_model_runner.forward(forward_batch)
+                    if _ps_snap is not None:
+                        self._draft_plan_skip_judge(_ps_snap, draft_out, bs, _ps_ids)
             finally:
                 self._draft_block_spec_info.host_lens_exact = False
                 if _hole_buf is not None:
