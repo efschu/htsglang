@@ -1799,6 +1799,15 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
+        # 27b-gdn-form-1028 (27B-GDN-FORM): one census line per rank -- the GDN form this stage built and whether NF's GDN fusions apply
+        from flliper.srt.layers import gdn_form
+
+        gdn_form.log_census(
+            layers=self.layers,
+            gdn_cls=Qwen3_5GatedDeltaNet,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+        )
         # WP8 expert lookahead (FLLIPER_MOE_EXPERT_LOOKAHEAD, 0 = off): chain the
         # MoE blocks so each can run a later block's router on its own stream.
         from flliper.srt.environ import envs as _envs
