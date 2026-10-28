@@ -13,8 +13,10 @@ import torch
 
 from flliper.srt.environ import envs
 from flliper.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
+from flliper.srt.speculative import dflash_verify_width as dvw
 from flliper.srt.speculative.dflash_verify_width import (
     DFlashVerifyWidth,
+    accept_selftest,
     VerifyWidthState,
     pad_out_tokens,
     verify_views,
@@ -104,10 +106,10 @@ def _env(**kv):
 
 
 class TestRuntime(unittest.TestCase):
-    def _rt(self):
+    def _rt(self, census=0):
         with _env(FLLIPER_ADAPTIVE_K=True, FLLIPER_ADAPTIVE_K_CURVE="", FLLIPER_ADAPTIVE_K_WARMUP=0,
                   FLLIPER_ADAPTIVE_K_PROBE_EVERY=0, FLLIPER_ADAPTIVE_K_MIN_DWELL=0,
-                  FLLIPER_ADAPTIVE_K_MARGIN_PCT=0.0, FLLIPER_ADAPTIVE_K_CENSUS_EVERY=0):
+                  FLLIPER_ADAPTIVE_K_MARGIN_PCT=0.0, FLLIPER_ADAPTIVE_K_CENSUS_EVERY=census):
             rt = DFlashVerifyWidth(block_size=B, tp_rank=0)
         boot = object()
         rt.boot_runner = boot
@@ -147,6 +149,52 @@ class TestRuntime(unittest.TestCase):
             rt.record(commit_lens=torch.tensor([2, 2, 2], dtype=torch.int32), width=w)
             rt.restore(target_model_runner=mr)
         self.assertEqual(seen, [0, 0, 1, 2])
+
+    def test_census_adopts_measured_fit_and_breaks_chain_on_prefill(self):
+        """Fake clock, host-bound period (30 ms whatever the rows): the census
+        installs the measured fit (c = 0) for bs1, after which bs1 runs N.
+        A prefill between two decode rounds must not be billed as a period."""
+        rt, mr, _ = self._rt(census=16)
+        rt.cfg = rt.controller.cfg = dvw.AdaptiveKConfig(
+            block_size=B, warmup_rounds=0, probe_every=0, min_dwell=0,
+            margin_pct=0.0, census_every=16, fit_probe_every=2,
+        )
+        clock = SimpleNamespace(t=100.0)
+        real = dvw.time.perf_counter
+        dvw.time.perf_counter = lambda: clock.t
+        try:
+            for i in range(16):
+                rt.begin_forward(target_model_runner=mr, is_decode=True)
+                rt.begin_round(target_model_runner=mr, batch_size=1, eligible=True)
+                rt.restore(target_model_runner=mr)
+                clock.t += 0.030
+            rt.begin_forward(target_model_runner=mr, is_decode=False)
+            self.assertIsNone(rt.last_round)
+        finally:
+            dvw.time.perf_counter = real
+        (bs, a, c), = rt.controller.state.adopted_fit
+        self.assertEqual(bs, 1)
+        self.assertAlmostEqual(a, 30.0, places=3)
+        self.assertEqual(c, 0.0)
+        self.assertEqual(rt.begin_round(target_model_runner=mr, batch_size=1, eligible=True), B)
+
+
+class TestBootSelftest(unittest.TestCase):
+    def test_selftest_passes_on_cpu_and_catches_a_broken_accept(self):
+        """The boot self-test is green for the real accept at every tier and
+        red when the accept ignores its width (a kernel reading B columns)."""
+        self.assertTrue(accept_selftest(device="cpu", block_size=B, widths=(5, B), use_triton=False))
+        real = dvw._eager_accept
+
+        def wrong(*, candidates, target_predict):
+            commit, out = real(candidates=candidates, target_predict=target_predict)
+            return torch.full_like(commit, int(candidates.shape[1]) + 1), out
+
+        dvw._eager_accept = wrong
+        try:
+            self.assertFalse(accept_selftest(device="cpu", block_size=B, widths=(5, B), use_triton=False))
+        finally:
+            dvw._eager_accept = real
 
 
 if __name__ == "__main__":
