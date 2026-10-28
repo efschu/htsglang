@@ -41,6 +41,18 @@ _ENVS = (pov.P_HOST_OVERLAP_ENV, pov.P_HOSTGAP_ENV, pov.P_NOSYNC_ENV,
          pov.SKIP_PURE_CHUNK_OUTPUT_ENV)
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class _Env:
     def __enter__(self):
         self._saved = {k: os.environ.pop(k, None) for k in _ENVS}
@@ -131,7 +143,7 @@ class ResetAndGroups(unittest.TestCase):
         self.assertLess(i_rel, i_drop)
 
     def test_only_env_p_gets_the_switches(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         i = src.index("p_host_overlap_env(")
         line = src[src.rindex("\n", 0, i) + 1:src.index("\n", i)]
         self.assertIn("env_p.update(", line)

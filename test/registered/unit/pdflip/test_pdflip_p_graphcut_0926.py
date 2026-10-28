@@ -32,6 +32,18 @@ WIDTHS = {"512": {"graph_ms": [41, 34, 38], "eager_ms": [45, 33, 37]},
           "2048": {"graph_ms": [150, 150, 150], "eager_ms": [161, 163, 168]}}
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class TestCutField(unittest.TestCase):
     def test_parse_and_round_trip(self):
         for raw in ("43,11,10", [43, 11, 10], " 43, 11 ,10"):
@@ -196,7 +208,7 @@ class TestLauncherCutCheck(unittest.TestCase):
         self.assertEqual(logs, [])
 
     def test_main_checks_the_shipped_cut_and_resolves(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         i_solve = src.index("cut = solve_p_cut(")
         i_check = src.index("if p_prefill_graph_cut_check(ns, cut, log):")
         i_resolve = src.index("cut = solve_p_cut(", i_check)

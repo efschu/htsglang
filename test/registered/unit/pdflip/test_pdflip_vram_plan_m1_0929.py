@@ -27,6 +27,18 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 BIG, S0, S2 = "GPU-31d7ef41", "GPU-5c648f96", "GPU-62dbbae1"
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _cards():
     return L.order_cards([
         L.Card(nvml_index=0, uuid=S0, name="NVIDIA GeForce RTX 3080", total_mib=20480, reserved_mib=425),
@@ -231,7 +243,7 @@ class Wiring(CustomTestCase):
     def test_each_pass_emits(self):
         self.assertIn("vram_plan_emit(", inspect.getsource(L.log_d_rank_vram_solve))
         self.assertIn("note_d_solve(", inspect.getsource(L.log_d_rank_vram_solve))
-        main = inspect.getsource(L.main)
+        main = _main_text()
         self.assertIn('vram_plan_emit(ns, cards, "p_budget", log, group="P")', main)
         self.assertIn("vram_view().reset(overrides=_vpv.profile_pins(ns)", main)
         self.assertIn("note_asleep(", inspect.getsource(L.d_expect_dormant_other))

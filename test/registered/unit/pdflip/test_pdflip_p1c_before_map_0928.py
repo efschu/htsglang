@@ -29,6 +29,18 @@ FR_P = (0.26, 0.45, 0.39)
 P_STAGE_LAYERS = [29, 11, 8]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _ns(env_extra=""):
     fr = ",".join(map(str, PROFILE_FR))
     return SimpleNamespace(
@@ -55,7 +67,7 @@ def test_an_armed_p1c_is_solved_before_the_map():
     assert not L.d_fr_ceiling_before_map(owned)                       # pinned by its own solve
     dense = SimpleNamespace(extra_d="", env_d="FLLIPER_PDFLIP_TORCH_CACHE_CAP=1")
     assert not L.d_fr_ceiling_before_map(dense)                       # no MoE D form
-    src = inspect.getsource(L.main)
+    src = _main_text()
     cond = src.index("d_form_solved_by_planner(ns) or d_fr_ceiling_before_map(ns)")
     assert cond < src.index("_pin = pin_d_form_for_map(ns, log)") < src.index(
         "_emap = publish_expert_map(")

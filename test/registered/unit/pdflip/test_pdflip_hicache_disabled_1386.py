@@ -56,6 +56,17 @@ GB = host_ledger.GB
 import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
 
 
+def _main_text() -> str:
+    """``launcher.main`` with every ``_main_stepNN_*`` call expanded to the step body, in call order (split behaviour-neutrally, refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _models_cache_overlay_1539():
     with MODEL_FX.overlay():
@@ -663,7 +674,7 @@ class TheFiveTestsAboveAreActuallyHermeticNow(_HermeticMainBase):
         (see the class docstring for why a bare call is silently inert)."""
         import inspect
 
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         self.assertIn("shm_dir=SHM_DIR", src)
         self.assertIn("meminfo_path=MEMINFO_PATH", src)
         self.assertIn("cgroup_root=CGROUP_ROOT", src)

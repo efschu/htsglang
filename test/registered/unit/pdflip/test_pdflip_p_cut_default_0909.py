@@ -158,14 +158,28 @@ FRONTIER_SN5PRE = (
 )
 
 
-def _launcher_text() -> str:
-    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
     import pathlib
 
-    from flliper.srt.pdflip import launcher as _lc
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
 
-    pdflip = pathlib.Path(_lc.__file__).resolve().parent
-    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order: the
+    functions were split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
 
 
 def _field(frontier):
@@ -527,7 +541,7 @@ class TheLauncherSeam(CustomTestCase):
     def test_the_rule_is_logged_before_the_solve_and_the_number_after(self):
         import inspect
 
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = _solve_p_cut_text()
         self.assertLess(src.index("PP-CUT POOL FLOOR RULE"), src.index("solve_launch_cut("))
         self.assertGreater(src.index("log(pool_floor_line(decision))"), src.index("solve_launch_cut("))
         self.assertIn("pool_floor_from_cut=pool_floor_from_cut", src)
@@ -576,7 +590,7 @@ class TheCapIsTheShippedPool(CustomTestCase):
     def test_the_provenance_line_prints_cap_and_floor(self):
         import inspect
 
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = _solve_p_cut_text()
         self.assertIn("PP-CUT P-CAP: --max-total-tokens=%d", src)
         self.assertIn("pool_floor=%s", src)
 

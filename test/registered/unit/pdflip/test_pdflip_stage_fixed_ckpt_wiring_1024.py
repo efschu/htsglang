@@ -44,6 +44,18 @@ RECORD_2 = (1418.4, 4960.6)
 EMB_DELTA = 2425.0 - 1212.97
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
 def _terms(emb_mib, head_mib):
     return SimpleNamespace(
         embedding_weight_bytes=emb_mib * MIB, lm_head_weight_bytes=head_mib * MIB
@@ -194,7 +206,7 @@ class TheGivenFlag(CustomTestCase):
 
 class TheOrderInSolvePCut(CustomTestCase):
     def test_vector_is_moved_before_the_pool_model_is_built(self):
-        src = inspect.getsource(L.solve_p_cut)
+        src = _solve_p_cut_text()
         move = src.index("p_stage_fixed_for_checkpoint(")
         build = src.index("stage_fixed_mib=_stage_fixed")
         self.assertLess(move, build)

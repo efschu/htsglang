@@ -43,6 +43,18 @@ NF_EXTRA_P = [
 ]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _p(draft_kv_on_p):
     return L.argv_p(py="/nonexistent/python", model="/nonexistent/model",
                     budgets=[28208, 17840, 17168], s_gb=1, m_mib=600,
@@ -98,7 +110,7 @@ class TestOneResolution(unittest.TestCase):
     def test_main_publishes_before_the_cut_and_any_family_reader(self):
         import inspect
 
-        src = inspect.getsource(L.main)
+        src = _main_text()
         pub = src.index("envs.FLLIPER_PDFLIP_DRAFT_ON_P.set(")
         self.assertLess(pub, src.index("solve_p_cut("))
         self.assertLess(pub, src.index("weights_family_tags(chunk_count)"))

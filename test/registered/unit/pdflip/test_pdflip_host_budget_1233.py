@@ -55,6 +55,17 @@ DK5_STORE_CHOSEN_GIB = 9
 DK5_STORE_MIN_GIB = 8.0
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order (refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _choose(*, with_cgroup=True, **over):
     """One seam both trees answer through, so red/green is BEHAVIOURAL.
 
@@ -493,8 +504,7 @@ class TestTheLauncherCallSites(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as L
 
-        with open(L.__file__) as f:
-            return ast.parse(f.read()), L
+        return ast.parse(_launcher_text()), L
 
     def _calls(self, tree, name):
         import ast

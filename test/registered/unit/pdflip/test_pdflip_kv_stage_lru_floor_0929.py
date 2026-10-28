@@ -26,6 +26,18 @@ PEAK, SPAN = [89, 32, 43], [204, 61, 94]
 HEAD = "D-KV-STUFEN"
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _form(c2=48, r2=67, e2=152, stage2=(0, 10, 19), cap=6):
     """dry run (b) z30v, rang2: E 152, R 67, scratch 48, stage rows 0/10/19."""
     last = SimpleNamespace(scratch_given=(100, 48, c2), max_rows=(129, 124, r2 + c2),
@@ -101,7 +113,7 @@ class Wiring(CustomTestCase):
         # (dry run b before this: 'Scratch rang2 +13 waere noetig, die Karte ist gebaut')
         self.assertIn("_d_kv_stage_lru_scratch = list(_new)",
                       inspect.getsource(launcher.log_d_rank_vram_solve))
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         self.assertLess(src.index("ns.env_d = _env_d_before"),
                         src.index('getattr(ns, "_d_kv_stage_lru_scratch", None)'))
 

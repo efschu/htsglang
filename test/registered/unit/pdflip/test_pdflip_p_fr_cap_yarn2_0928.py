@@ -32,6 +32,30 @@ H160 = (0.332, 0.605, 0.733887)
 YARN = (0.324, 0.637, 0.733887)
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _fit(stage, card, fraction, rows, headroom, ceiling, max_rows):
     return pc.PCardFit(
         stage=stage, card=card, fraction=fraction, buffer_rows=rows, layer_row_mib=ROW_MIB,
@@ -152,12 +176,12 @@ def test_the_cap_line_is_not_counted_as_a_refusal_by_the_arm():
 
 
 def test_the_pool_model_and_the_record_read_the_capped_value():
-    src = inspect.getsource(lc.solve_p_cut)
+    src = _solve_p_cut_text()
     i = src.index("_capped = p_card_verdict(")
     j = src.index("if _capped is not None:", i)
     k = src.index("fracs = list(_capped)", j)
     assert src.index("layer_mib_by_stage = tuple(", k) < src.index("model_pool = ", k)
-    main = inspect.getsource(lc.main)
+    main = _main_text()
     a = main.index("cut = solve_p_cut(")
     assert main.index('state.p_fr_cap = dict(getattr(ns, "_w132_fr_cap", None) or {})', a) > a
     assert "p_fr_cap" in {f for f in lc.BootState.__dataclass_fields__}

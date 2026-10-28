@@ -46,6 +46,18 @@ BASE_ARGV = ["/venv/bin/python", "-m", "flliper.launch_server",
              "--model-path", "/m", "--pp-size", "3", "--pp-stage-ratio", "39,13,12"]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class FakeTable:
     def __init__(self, form_same, boot="boot_weg2_weg2sn5b_x_0909_185632",
                  source_form_key="e3fe683c5d40", form_key="f003de5bc71a",
@@ -175,7 +187,7 @@ class BothHalvesAreWiredIntoMain(CustomTestCase):
         import inspect
         import re
 
-        return re.sub(r"\s+", " ", inspect.getsource(launcher.main))
+        return re.sub(r"\s+", " ", _main_text())
 
     def test_main_builds_the_form_argv_through_the_helper(self):
         self.assertIn("form_argv_p = xchg_form_argv(", self._main_src())

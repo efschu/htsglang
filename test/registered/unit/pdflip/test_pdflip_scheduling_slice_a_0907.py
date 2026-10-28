@@ -29,6 +29,18 @@ from flliper.srt.pdflip.front import (Front, Pending, Seat, double_prefill_verdi
                                    is_x_refusal)
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 # ------------------------------------------------------------------ fakes
 class FakeGroup:
     """A stand-in for group P or group D.
@@ -1549,7 +1561,7 @@ def test_g3_the_launcher_states_the_carrierless_pp_arm_at_launch_from_the_argv_i
     # group P would produce, and the line must then stop claiming the cost.
     assert launcher_mod.w38_armed_line(["--pp-size", "1"]).startswith("PDFLIP #1245 NOT ARMED")
     # WIRED, not merely written (desk-written-never-executed): main logs it.
-    main_src = inspect.getsource(launcher_mod.main)
+    main_src = _main_text()
     assert "log(w38_armed_line(spec_p.argv))" in main_src
 
 

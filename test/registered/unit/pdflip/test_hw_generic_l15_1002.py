@@ -42,6 +42,18 @@ MASTER = {"FLLIPER_PDFLIP_L15": "1"}
 LEGACY = "c1=7616,c2=1792"
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _rig():
     """Card order: [5090 (nvml1), 3080 (nvml0), 3080 (nvml2)]."""
     return L.order_cards([
@@ -328,7 +340,7 @@ def test_launcher_master_off_prints_no_cap0_line():
 
 
 def test_launcher_main_resolves_before_posts_and_before_build_env():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     i = src.index("l15_mib_by_card_identity(ns, cards, log)")
     assert i < src.index("l15_plan.resolve_posts(")
     assert i < src.index("env_p = build_env(")

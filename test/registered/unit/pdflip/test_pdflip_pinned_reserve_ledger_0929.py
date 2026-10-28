@@ -36,6 +36,18 @@ ENVS = (phb.PINNED_HOST_RESERVE_ENV, phb.PINNED_HOST_RESERVE_LEDGER_ENV,
         phb.PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV)
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class _CleanEnv(CustomTestCase):
     def setUp(self):
         self._saved = {k: os.environ.pop(k, None) for k in ENVS}
@@ -171,7 +183,7 @@ class Wiring(CustomTestCase):
         self.assertIn("chosen.pinned_reserve = ", src)
 
     def test_the_launcher_exports_it_unless_the_env_is_explicit(self):
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         self.assertIn("PINNED_HOST_RESERVE_LEDGER_ENV", src)
         self.assertIn("pinned_reserve_line(", src)
 

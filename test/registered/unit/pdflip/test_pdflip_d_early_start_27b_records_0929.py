@@ -78,6 +78,18 @@ SERIES_27B = [
 ]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _rec(row):
     tag, at, commit, b, s0, s2 = row
     return {"group": "P", "boot_tag": tag, "at": at, "commit": commit,
@@ -224,7 +236,7 @@ def test_w185_refuses_on_where_the_expectation_is_still_legacy():
 
 
 def test_early_branch_publishes_the_expectation_for_the_check():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     early = src[src.index("_early_d = None\n    if _d_early_start_armed(ns):"):
                 src.index("def _d_early_verdict(")]
     i_sel = early.index("d_expect_dormant_other(")

@@ -48,6 +48,18 @@ from flliper.srt.mem_cache import hicache_storage as hs
 import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _models_cache_overlay_1539():
     with MODEL_FX.overlay():
@@ -177,7 +189,7 @@ def test_build_env_hands_the_resolved_value_to_both_groups():
 
 
 def test_main_resolves_the_producer_and_names_the_tier():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     assert '_SPEC_FORM["draft_kv_on_p"] = bool(draft_kv_on_p)' in src
     # NF: after H25's resolve_draft_on_p, whose value draft_kv_on_p carries
     assert src.index("resolve_draft_on_p(") < src.index(

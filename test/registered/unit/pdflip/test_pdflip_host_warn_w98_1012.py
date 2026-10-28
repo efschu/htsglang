@@ -59,6 +59,17 @@ MARKER = "HOST-RAM-WARN"
 INT24G = dict(nonreclaim_gib=89.78, shmem_gib=61.27, cushion=0.38, memfree_gib=1.0)
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order (refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _pr(nonreclaim, shmem, cushion, memfree=1.0):
     return {
         "current_gib": nonreclaim, "nonreclaim_gib": nonreclaim,
@@ -296,7 +307,7 @@ class TheLaunchGuardWarns(CustomTestCase):
     def test_no_launch_refusal_remains_for_the_latch(self):
         from flliper.srt.pdflip import launcher as lc
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         hand = src[src.index("_launch_guard.stop("):src.index("front_argv = front_argv_for(")]
         self.assertNotIn("raise", hand)
         self.assertNotIn("PdFlipLaunchHostLatched", hand)

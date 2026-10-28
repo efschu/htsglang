@@ -42,6 +42,18 @@ from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 register_cpu_ci(est_time=3, suite="stage-a-pdflip-unit")
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 @pytest.fixture
 def models():
     with tempfile.TemporaryDirectory() as root:
@@ -148,7 +160,7 @@ def test_stated_form_outranks_the_default_and_refuses_a_contradicting_env(models
 
 # ------------------------------------------------------------- one writer
 def test_the_launcher_reads_the_axis_and_does_not_resolve_twice():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     assert "draft_on_p_rule=resolve_draft_on_p" in src
     assert 'getattr(ns, "pdflip_draft_on_p", None)' in src
     assert src.index("draft_on_p_rule=resolve_draft_on_p") < src.index(

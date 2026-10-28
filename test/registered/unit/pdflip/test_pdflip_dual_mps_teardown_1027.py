@@ -35,6 +35,18 @@ from flliper.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 @pytest.fixture
 def root(tmp_path, monkeypatch):
     monkeypatch.setattr(L, "DUAL_MPS_ROOT_PREFIX", str(tmp_path) + "/pdflip-dual-mps-")
@@ -211,7 +223,7 @@ def test_teardown_stops_the_daemon_after_the_group_kill_and_before_the_cards_are
 
 
 def test_main_records_the_mps_root_in_the_state_at_once():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     i = src.index("ns._dual_mps_env = start_dual_mps(ns, log, dry)")
     tail = src[i:i + 500]
     assert "state.dual_mps_root = dual_mps_root(ns.tag)" in tail and "_write_state(state)" in tail

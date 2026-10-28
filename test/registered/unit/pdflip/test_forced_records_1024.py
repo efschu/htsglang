@@ -51,6 +51,17 @@ INT4AR_CROSSING = (
 ENV_KEYS = (R.ENV_FORCED_BOOT, R.ENV_FORCED_RECORDS, R.ENV_FORCED_PAST_EP) + tuple(R.ENV_FORCE_REQUEST_NAMES)
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order (refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def card(i, name, mib, cc, uuid=None):
     return L.Card(i, uuid or f"GPU-{i:04d}", name, mib, reserved_mib=0, cc=cc)
 
@@ -384,7 +395,7 @@ class CardSetPick(unittest.TestCase):
         self.assertEqual(L.pick_d_residue_record([], cards), (None, "no sample"))
 
     def test_the_launcher_reads_all_d_samples_through_the_pick(self):
-        src = open(LAUNCHER_SRC, encoding="utf-8").read()
+        src = _launcher_text()
         self.assertIn("_dc_rec_d, _dc_from_record, _dc_record_prov, _dc_pick_note = dc_residue_for(\n"
                       "        measured_record_path(), _dc_accept, cards, ns.pdflip_weight_source)", src)
 
@@ -628,7 +639,7 @@ class LauncherWiring(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
         ls = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(ls)
-        main = ls.definition_source("main")          # def main stays in launcher.py; the text after it moved (refactor, 28.10.)
+        main = ls.expanded_main_source()          # main with its _main_stepNN_* calls expanded in call order (refactor, 28.10.)
         seal = main.index("refusals.seal_records()")
         spawn = main.index("fp = subprocess.Popen(front_argv")
         self.assertLess(seal, main.index("host_ledger.flush_held_records(log)"))
@@ -643,7 +654,7 @@ class LauncherWiring(unittest.TestCase):
                 self.assertLess(m.start(), seal, f"{call} at offset {m.start()} after the seal")
 
     def test_help_and_header_name_the_narrowed_rule(self):
-        src = open(LAUNCHER_SRC, encoding="utf-8").read()
+        src = _launcher_text()
         self.assertIn("unless every refusal it passed is a proof gap of its own form (#227", src)
         self.assertIn("FORCED-RECORDS entrypoint list", src)
 

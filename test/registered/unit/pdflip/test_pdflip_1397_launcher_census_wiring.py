@@ -104,6 +104,18 @@ XSN31_3 = dict(
 )
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _terms(slot_mib: int, **kw):
     base = dict(XSN31_3, slot_bytes=slot_mib * (1 << 20))
     base.update(kw)
@@ -156,7 +168,7 @@ class OneSourceReachesBothPublicationSides(CustomTestCase):
             inspect.signature(L.choose_host_ledger).parameters)
 
     def test_main_resolves_the_flag_exactly_once(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertEqual(
             src.count('getattr(ns, "xchg_band_credit", False)'), 1,
             "the flag must be read from ns exactly once in main() -- a "
@@ -172,7 +184,7 @@ class OneSourceReachesBothPublicationSides(CustomTestCase):
         """main() must hand the ONE resolved local (`_band_credit`) to BOTH
         the ranks' publication call and choose_host_ledger -- never re-read
         `ns` a second time for the ledger side."""
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertGreaterEqual(src.count("band_credit=_band_credit"), 2,
                                 "expected _band_credit forwarded to both "
                                 "the ranks' publication call and "

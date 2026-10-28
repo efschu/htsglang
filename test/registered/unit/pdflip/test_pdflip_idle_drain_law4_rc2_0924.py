@@ -34,6 +34,18 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 X = 4096
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _front(n_max, x=X):
     return front_mod.Front("http://p", "http://d", "D", "law4", "", 0, 0, {}, 45.0,
                            tp_prefill_max_tokens=x, d_short_drain_tokens=n_max)
@@ -70,7 +82,7 @@ def test_the_launcher_passes_off_and_n_up_to_x(n, x):
 
 
 def test_main_checks_n_against_the_x_it_hands_out():
-    src = inspect.getsource(launcher_mod.main)
+    src = _main_text()
     seed = src.index("x_tokens, x_provenance = x_seed.tokens, x_seed.provenance")
     call = src.index("refuse_short_drain_above_x(int(ns.d_short_drain_tokens or 0), x_tokens, x_provenance)")
     assert seed < call, "the check must read the X resolve_x produced (flag after the front floor, or derived)"

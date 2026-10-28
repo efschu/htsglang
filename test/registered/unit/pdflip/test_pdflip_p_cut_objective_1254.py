@@ -69,6 +69,18 @@ GAPPED = CutCandidate(layers=(62, 1, 1), attn=(14, 1, 1), makespan_ms=537.7,
                       pool_tokens=153611.0, kind="gapped", layer_set="0-61,62,63")
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
 def _decision(chosen=KV_FLOOR, ranked=(SPEED, KV_FLOOR, INCUMBENT), pinned=False):
     return CutDecision(
         chosen=chosen,
@@ -222,7 +234,7 @@ class TestShippedCutObjective(CustomTestCase):
         import inspect
         import textwrap
 
-        fn = ast.parse(textwrap.dedent(inspect.getsource(launcher.solve_p_cut))).body[0]
+        fn = ast.parse(textwrap.dedent(_solve_p_cut_text())).body[0]
         # The PRICING of the alternatives is ABOUT the ranking and legitimately
         # names decision.chosen; the argv and the returned facts may not.
         watched = []

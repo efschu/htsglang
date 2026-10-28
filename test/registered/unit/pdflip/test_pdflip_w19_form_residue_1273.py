@@ -54,6 +54,18 @@ CARDS = [
 XSN14_MEASURED = {SM1: 2588, BIG: 3084, SM2: 2588}
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class TheMeasuredTripleIsTheConstant(CustomTestCase):
     def test_the_triple_is_the_boots_own_numbers(self):
         self.assertEqual(launcher.DC_MEASURED_D_XCHG_MIB, (2588, 3084, 2588))
@@ -135,7 +147,7 @@ class OneConsumerFormSwitched(CustomTestCase):
         import inspect
         import textwrap
 
-        tree = ast.parse(textwrap.dedent(inspect.getsource(launcher.main)))
+        tree = ast.parse(textwrap.dedent(_main_text()))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 f = node.func
@@ -151,7 +163,7 @@ class OneConsumerFormSwitched(CustomTestCase):
         import inspect
         import textwrap
 
-        src = textwrap.dedent(inspect.getsource(launcher.main))
+        src = textwrap.dedent(_main_text())
         tree = ast.parse(src)
         found = None
         for node in ast.walk(tree):
@@ -167,7 +179,7 @@ class OneConsumerFormSwitched(CustomTestCase):
     def test_there_is_exactly_one_selector_call_site_in_main(self):
         import inspect
 
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         self.assertEqual(src.count("dc_measured_d_mib("), 1)
 
 

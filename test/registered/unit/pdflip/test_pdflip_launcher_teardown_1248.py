@@ -126,15 +126,40 @@ RAISE_COUNTS_BY_HELPER = {
 # the swallow-detector itself is not vacuous.
 # --------------------------------------------------------------------------
 
+def _is_launcher_main(fn) -> bool:
+    return getattr(fn, "__name__", "") == "main" and getattr(fn, "__module__", "") == "flliper.srt.pdflip.launcher"
+
+
+def _getsource(fn) -> str:
+    return _main_text() if _is_launcher_main(fn) else inspect.getsource(fn)
+
+
+def _getsourcelines(fn):
+    if _is_launcher_main(fn):
+        return _main_text().splitlines(keepends=True), inspect.getsourcelines(fn)[1]
+    return inspect.getsourcelines(fn)
+
+
+def _main_text() -> str:
+    """``launcher.main`` with every ``_main_stepNN_*`` call expanded to the step body, in call order (split behaviour-neutrally, refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _fn_ast(fn) -> ast.Module:
-    return ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    return ast.parse(textwrap.dedent(_getsource(fn)))
 
 
 def _fn_ast_with_offset(fn):
     """`(tree, offset)` such that `node.lineno + offset` is the file's real
     line number -- needed only for `main()`, whose sites are cited by real
     file line in this module's docstring and in the #1248 task text."""
-    src, start = inspect.getsourcelines(fn)
+    src, start = _getsourcelines(fn)
     return ast.parse(textwrap.dedent("".join(src))), start - 1
 
 

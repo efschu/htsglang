@@ -37,6 +37,18 @@ MZ = "FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE"
 NF3 = ("FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY", "FLLIPER_PDFLIP_TOLD_PACED", "FLLIPER_PDFLIP_P_TWIN_DEFER", MZ, PF)
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _nf_on(name):
     return name in NF3
 
@@ -275,7 +287,7 @@ def test_the_launcher_refuses_the_mz_split_and_names_the_line():
 def test_main_announces_before_argparse_defaults():
     import inspect
 
-    src = inspect.getsource(L.main)
+    src = _main_text()
     i = src.index("os.environ[pdflip_form.FORM_ENV] = boot_form.env_value()")
     j = src.index("apply_profile_arg_defaults(ns")
     assert "print(prefix_switches_announce(ns, boot_form), flush=True)" in src[i:j]

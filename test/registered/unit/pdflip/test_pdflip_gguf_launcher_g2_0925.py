@@ -50,6 +50,30 @@ from flliper.srt.pdflip import ring_table as RT  # noqa: E402
 import model_dir_fixtures_1539 as MODEL_FX  # noqa: E402
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _models_cache_overlay_1539():
     with MODEL_FX.overlay():
@@ -274,7 +298,7 @@ def test_no_reader_joins_config_json_onto_the_model_path():
             if "model" in arg or arg == "_dp"
         }
         assert found <= allowed, (mod.__name__, sorted(found - allowed))
-    assert "model_config_path(model)" in inspect.getsource(L.solve_p_cut)
+    assert "model_config_path(model)" in _solve_p_cut_text()
 
 
 def test_the_seat_table_reader_cannot_kill_a_launch_on_a_gguf_path():
@@ -489,7 +513,7 @@ def test_the_arch_decision_is_the_servers_peek(gguf_ckpt, tmp_path):
 def test_the_cli_flag_and_its_install_order():
     ns = L.build_parser().parse_args(["--tree", "t", "--tag", "x"])
     assert ns.tokenizer_path == ""
-    src = inspect.getsource(L.main)
+    src = _main_text()
     assert src.index("apply_tokenizer_path(ns)") < src.index("common_flags(")
 
 

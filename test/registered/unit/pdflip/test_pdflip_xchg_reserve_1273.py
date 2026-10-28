@@ -78,6 +78,31 @@ CARDS = [
 FAMILY = [f"weights_{k}" for k in range(8)] + ["weights"]
 
 
+def _is_launcher_main(fn) -> bool:
+    return getattr(fn, "__name__", "") == "main" and getattr(fn, "__module__", "") == "flliper.srt.pdflip.launcher"
+
+
+def _getsource(fn) -> str:
+    return _main_text() if _is_launcher_main(fn) else inspect.getsource(fn)
+
+
+def _getsourcelines(fn):
+    if _is_launcher_main(fn):
+        return _main_text().splitlines(keepends=True), inspect.getsourcelines(fn)[1]
+    return inspect.getsourcelines(fn)
+
+
+def _main_text() -> str:
+    """``launcher.main`` with every ``_main_stepNN_*`` call expanded to the step body, in call order (split behaviour-neutrally, refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _census(path, dormant=None, drop=()):
     dormant = dormant or CENSUS_DORMANT
     cards = {}
@@ -109,7 +134,7 @@ class _Collect:
 
 
 def _fn_ast_with_offset(fn):
-    src, start = inspect.getsourcelines(fn)
+    src, start = _getsourcelines(fn)
     return ast.parse(textwrap.dedent("".join(src))), start - 1
 
 

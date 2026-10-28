@@ -79,6 +79,18 @@ SERIES = [
 ]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _prec(tag="09290548", at="2026-09-29T05:53:05Z", form=XCHG, vals=None):
     return {"group": "P", "boot_tag": "dkrnf" + tag, "at": at, "vram_residue_form": form,
             "vram_residue_mib": dict(P_MEASURED if vals is None else vals)}
@@ -313,7 +325,7 @@ class ExpectationPassesUseTheSelector(CustomTestCase):
     through the gated reader only; the real pass prints the check."""
 
     def test_wiring(self):
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         tree = ast.parse(src)
         calls = [getattr(n.func, "id", None) or getattr(n.func, "attr", None)
                  for n in ast.walk(tree) if isinstance(n, ast.Call)]

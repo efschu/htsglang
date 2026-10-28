@@ -16,6 +16,18 @@ from flliper.srt.pdflip import d_early_start as des
 from flliper.srt.pdflip import launcher as L
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def test_flag_defaults_auto_and_help_renders():
     ap = L.build_parser()
     ns = ap.parse_known_args(["--tree", "t", "--tag", "x"])[0]
@@ -28,7 +40,7 @@ def test_flag_defaults_auto_and_help_renders():
 
 
 def _main_src():
-    return inspect.getsource(L.main)
+    return _main_text()
 
 
 def test_early_start_is_armed_only_by_the_flag_and_after_the_dry_branch():

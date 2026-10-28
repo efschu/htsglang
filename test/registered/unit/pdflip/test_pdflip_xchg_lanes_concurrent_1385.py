@@ -146,6 +146,18 @@ XSN31_3 = dict(
 )
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _terms(**kw):
     base = dict(XSN31_3)
     base.update(kw)
@@ -461,7 +473,7 @@ class OneSourceReachesBothSides(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as lc
 
-        src = inspect.getsource(lc.main)
+        src = _main_text()
         self.assertEqual(
             src.count("resolve_lanes_concurrent("), 1,
             "the flag must be resolved exactly once in main()")
@@ -744,7 +756,7 @@ class TheLauncherPricesTheOnlyPermitCount(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as lc
 
-        src = inspect.getsource(lc.main)
+        src = _main_text()
         i = src.index("create_lane_permit_semaphore(")
         window = src[max(0, i - 200):i + 200]
         self.assertIn("bounce_terms_for_ranks.lanes_priced", window)
@@ -755,7 +767,7 @@ class TheLauncherPricesTheOnlyPermitCount(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as lc
 
-        src = inspect.getsource(lc.main)
+        src = _main_text()
         i = src.index("create_lane_permit_semaphore(")
         preceding = src[max(0, i - 1500):i]
         self.assertIn("if int(_lanes_concurrent) > 0:", preceding)

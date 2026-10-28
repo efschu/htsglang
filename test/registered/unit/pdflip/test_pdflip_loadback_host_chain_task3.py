@@ -28,13 +28,15 @@ from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
 
 
 def _launcher_text() -> str:
-    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order: the
+    functions were split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
     import pathlib
 
-    from flliper.srt.pdflip import launcher as _lc
-
-    pdflip = pathlib.Path(_lc.__file__).resolve().parent
-    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
 
 
 def test_a_pre_pinned_arena_answers_pin_slots_without_a_tensor_walk():

@@ -28,6 +28,18 @@ _ENVS = (pov.P_HOST_OVERLAP_ENV, pov.P_HOSTGAP_ENV, pov.SKIP_PURE_CHUNK_OUTPUT_E
          pov.P_NOSYNC_ENV, pov.L2NORM_RUNTIME_T_ENV)
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _loop_src() -> str:
     text = open(inspect.getsourcefile(ppm)).read()
     return text[text.index("    def _event_loop_pp_body(self"):text.index("    def event_loop_pp_disagg_prefill(")]
@@ -89,7 +101,7 @@ class TestLauncherSwitch(unittest.TestCase):
         self.assertEqual(set(both), set(_ENVS))
 
     def test_env_p_is_the_only_group_that_gets_it(self):
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         i = src.index("env_p.update(p_host_overlap_env(")
         self.assertNotIn("env_d.update(p_host_overlap_env(", src)
         # after build_env for P, i.e. P's own environment

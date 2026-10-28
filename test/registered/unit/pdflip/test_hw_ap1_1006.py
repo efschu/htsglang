@@ -49,6 +49,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def card(i, name, mib, cc, uuid=None):
     return L.Card(i, uuid or f"GPU-ap1-{i:02d}", name, mib, reserved_mib=0, cc=cc)
 
@@ -307,8 +331,8 @@ class TestPinnedCutFallback(_Armed):
     def test_solve_p_cut_is_the_wrapped_solver_and_keeps_its_source(self):
         import inspect
         self.assertTrue(hasattr(L.solve_p_cut, "__wrapped__"))
-        self.assertIn("def solve_p_cut(", inspect.getsource(L.solve_p_cut))
-        self.assertIn("cut = solve_p_cut(", inspect.getsource(L.main))
+        self.assertIn("def solve_p_cut(", _solve_p_cut_text())
+        self.assertIn("cut = solve_p_cut(", _main_text())
 
 
 class TestHwSimSeesTheGates(_Armed):

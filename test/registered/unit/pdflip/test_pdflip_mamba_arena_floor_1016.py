@@ -25,6 +25,18 @@ EXTRA_D = "--page-size 64 --max-running-requests 6 --hicache-size 4"
 ENV_LIVE = "FLLIPER_HICACHE_ARENA_GIB=4.75;FLLIPER_HICACHE_ARENA_MAMBA_SLOTS=32;FLLIPER_X=1"
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _ns(env_p=ENV_LIVE, env_d=ENV_LIVE, extra_p=EXTRA_P, extra_d=EXTRA_D, **kw):
     return types.SimpleNamespace(env_p=env_p, env_d=env_d, extra_p=extra_p, extra_d=extra_d, **kw)
 
@@ -94,7 +106,7 @@ class TheOtherCases(unittest.TestCase):
 
 class TheLauncherRunsItBeforeTheLedger(unittest.TestCase):
     def test_main_raises_before_the_ledger_prices(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         i = src.index("log(mamba_arena_slots_into_groups(ns, _ledger_group_envs))")
         self.assertLess(src.index("_ledger_group_envs = [parse_group_env("), i)
         self.assertLess(i, src.index("def _price_host_ledger():"))

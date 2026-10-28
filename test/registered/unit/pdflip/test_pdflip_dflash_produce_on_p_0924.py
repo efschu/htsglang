@@ -39,6 +39,18 @@ from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 ENV = "FLLIPER_PDFLIP_DFLASH_PRODUCE"
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 @pytest.fixture
 def restore_form():
     saved = dict(L._SPEC_FORM)
@@ -137,7 +149,7 @@ def test_launcher_names_the_form_in_one_line(restore_form, tmp_path):
     _dflash(tmp_path, dflash_produce_on_p="on")
     line = L.dflash_produce_line()
     assert line.startswith("PDFLIP DFLASH-PRODUCE-ON-P: on") and f"{ENV}=1" in line
-    assert "log(dflash_produce_line())" in inspect.getsource(L.main)
+    assert "log(dflash_produce_line())" in _main_text()
 
 
 # --------------------------------------------------------------------- rank
@@ -317,7 +329,7 @@ def test_p_produces_draft_pages_follows_the_form(restore_form, tmp_path):
 
 
 def test_main_routes_w10_through_the_gate():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     assert "gate_w10(spec_p.log, spec_d.log, log," in src
     assert "p_produces_draft_pages=p_produces_draft_pages()" in src
     assert "check_drafter_identity(" not in src  # one grader, not two

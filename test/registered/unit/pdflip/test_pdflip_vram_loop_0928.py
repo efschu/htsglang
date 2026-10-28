@@ -14,6 +14,18 @@ import unittest
 from flliper.srt.pdflip import launcher as L
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class _Line:
     def accepts_log(self, path):
         return True
@@ -116,7 +128,7 @@ class TestFrCeilingAdopt(unittest.TestCase):
         import inspect
         src = inspect.getsource(L.log_d_rank_vram_solve)
         self.assertIn("map_built=bool(_pinned or getattr(ns, \"_expert_map_path\", \"\"))", src)
-        self.assertIn("ns._expert_map_path = _emap", inspect.getsource(L.main))
+        self.assertIn("ns._expert_map_path = _emap", _main_text())
 
 
 from flliper.srt.pdflip import torch_cache_cap as TCC

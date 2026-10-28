@@ -49,6 +49,17 @@ MIB = 1 << 20
 GIB = 1 << 30
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order (refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 def _mixed_file(root):
     g = torch.Generator().manual_seed(7)
     d = {}
@@ -131,7 +142,7 @@ class SharedCacheRelease(CustomTestCase):
         path; and it writes the event through the ONE state writer."""
         from flliper.srt.pdflip import launcher as L
 
-        src = inspect.getsource(L)
+        src = _launcher_text()
         ready = src.rindex('state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid')
         call = src.index("release_shared_cache(spec_d, log)")
         self.assertLess(ready, call)

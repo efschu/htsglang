@@ -25,6 +25,30 @@ from flliper.srt.pdflip import launcher
 from flliper.test.test_utils import CustomTestCase
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class TheDefaultIsMakespan(CustomTestCase):
     def test_the_parser_default(self):
         ns = launcher.build_parser().parse_args(["--tree", "/t", "--tag", "x"])
@@ -82,7 +106,7 @@ class ThePickerShipsTheMakespanRow(CustomTestCase):
         """--pp-stage-ratio must remain an order, not a suggestion."""
         import inspect
 
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = _solve_p_cut_text()
         i = src.index("if decision.pinned:")
         self.assertIn("PINNED by --pp-stage-ratio", src[i:i + 400])
 
@@ -93,7 +117,7 @@ class TheConsumersReadTheOneSeam(CustomTestCase):
     def test_the_argv_split_comes_from_the_chosen_candidate(self):
         import inspect
 
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = _solve_p_cut_text()
         self.assertIn("stage_ratio = _csv(chosen.layers)", src)
         self.assertIn("attn_ratio = _csv(chosen.attn)", src)
 
@@ -102,7 +126,7 @@ class TheConsumersReadTheOneSeam(CustomTestCase):
         runs -- this is what makes 'the consumers follow' checkable."""
         import inspect
 
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = _solve_p_cut_text()
         self.assertIn("does not survive", src)
         self.assertIn("derive_pp_layer_split", src)
 
@@ -110,9 +134,9 @@ class TheConsumersReadTheOneSeam(CustomTestCase):
         import inspect
 
         self.assertIn("stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio",
-                      inspect.getsource(launcher.main))
+                      _main_text())
         # and the incumbent constant is NOT what argv is built from
-        solve = inspect.getsource(launcher.solve_p_cut)
+        solve = _solve_p_cut_text()
         i = solve.index("stage_ratio = _csv(chosen.layers)")
         self.assertNotIn("P_PP_STAGE_RATIO_SCORES", solve[i:i + 600])
 
@@ -146,7 +170,7 @@ class ThePriceOfBothAlternativesIsPrintedEveryBoot(CustomTestCase):
                       "makespan_ms=%.1f"):
             self.assertIn(token, window)
         # and it is still the line the boot emits, not an orphaned formatter
-        self.assertIn("shipped_line(", inspect.getsource(launcher.solve_p_cut))
+        self.assertIn("shipped_line(", _solve_p_cut_text())
 
 
 if __name__ == "__main__":

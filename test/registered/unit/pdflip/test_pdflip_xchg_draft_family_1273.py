@@ -84,6 +84,31 @@ from flliper.srt.pdflip import weight_exchange as wx  # noqa: E402
 MIB = 1024 * 1024
 
 
+def _is_launcher_main(fn) -> bool:
+    return getattr(fn, "__name__", "") == "main" and getattr(fn, "__module__", "") == "flliper.srt.pdflip.launcher"
+
+
+def _getsource(fn) -> str:
+    return _main_text() if _is_launcher_main(fn) else inspect.getsource(fn)
+
+
+def _getsourcelines(fn):
+    if _is_launcher_main(fn):
+        return _main_text().splitlines(keepends=True), inspect.getsourcelines(fn)[1]
+    return inspect.getsourcelines(fn)
+
+
+def _main_text() -> str:
+    """``launcher.main`` with every ``_main_stepNN_*`` call expanded to the step body, in call order (split behaviour-neutrally, refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class _Exchange:
     """Arm the exchange the way the launcher arms it: the env var the ONE
     reader (``weight_exchange.weight_source``) reads."""
@@ -450,7 +475,7 @@ class TheArmReachesTheLauncherAndTheFront(unittest.TestCase):
 
         from flliper.srt.pdflip import launcher as L
 
-        src, _start = inspect.getsourcelines(L.main)
+        src, _start = _getsourcelines(L.main)
         tree = ast.parse(__import__("textwrap").dedent("".join(src)))
         writes = [
             n for n in ast.walk(tree)

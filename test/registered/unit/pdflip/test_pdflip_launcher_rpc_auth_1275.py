@@ -52,6 +52,18 @@ from flliper.test.test_utils import CustomTestCase
 LAUNCHER_SRC = inspect.getsource(L)
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _tree():
     return ast.parse(LAUNCHER_SRC)
 
@@ -213,7 +225,7 @@ class TheKeyDiesWithTheBoot(CustomTestCase):
 
 class TheAuthLineIsPublished(CustomTestCase):
     def test_the_launcher_prints_the_site_count(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertIn("PDFLIP-LAUNCH RPC auth=bearer sites=", src)
         self.assertIn("rpc_site_count()", src)
 
@@ -223,7 +235,7 @@ class TheAuthLineIsPublished(CustomTestCase):
         AST order inside `main`: the arming statement's line must precede every
         `http(`/`sleep_group(` call site in that function.
         """
-        tree = ast.parse(textwrap.dedent(inspect.getsource(L.main)))
+        tree = ast.parse(textwrap.dedent(_main_text()))
         arm = [n.lineno for n in ast.walk(tree)
                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                and n.func.id == "set_admin_key"]

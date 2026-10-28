@@ -20,6 +20,18 @@ from flliper.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class ExpertMapDir(CustomTestCase):
     def test_writable_evidence_dir_is_kept_silently(self):
         lines = []
@@ -44,7 +56,7 @@ class ExpertMapDir(CustomTestCase):
         import inspect
 
         self.assertIn("expert_map_dir(", inspect.getsource(launcher.publish_expert_map))
-        self.assertIn("expert_map_dir(", inspect.getsource(launcher.main))
+        self.assertIn("expert_map_dir(", _main_text())
 
 
 if __name__ == "__main__":

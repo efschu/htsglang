@@ -47,6 +47,18 @@ from flliper.test.test_utils import CustomTestCase
 HTTP_SERVER = "python/flliper/srt/entrypoints/http_server.py"
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _repo_root():
     here = os.path.abspath(__file__)
     while here != "/" and not os.path.isdir(os.path.join(here, "python", "flliper")):
@@ -241,7 +253,7 @@ class TheSecretDoesNotLeak(CustomTestCase):
     def test_the_launcher_logs_the_path_and_not_the_key(self):
         from flliper.srt.pdflip import launcher as L
 
-        src = inspect.getsource(L.main)
+        src = _main_text()
         i = src.find("PDFLIP ADMIN-KEY")
         self.assertGreater(i, -1, "no minting log line found")
         stmt = src[i:i + 1200]
@@ -255,7 +267,7 @@ class TheSecretDoesNotLeak(CustomTestCase):
         """Broader than the one line: the secret must not reach ANY log call."""
         from flliper.srt.pdflip import launcher as L
 
-        src = inspect.getsource(L.main)
+        src = _main_text()
         for m in re.finditer(r"log\(f?\"[^\"]*\{admin_api_key\}", src):
             self.fail(f"a log call interpolates the key: {m.group(0)[:80]}")
 
@@ -332,7 +344,7 @@ class ADryRunWritesNothing(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as L
 
-        tree = _ast.parse(textwrap.dedent(inspect.getsource(L.main)))
+        tree = _ast.parse(textwrap.dedent(_main_text()))
         guarded = False
         for node in _ast.walk(tree):
             if not isinstance(node, _ast.If):
@@ -348,7 +360,7 @@ class ADryRunWritesNothing(CustomTestCase):
     def test_the_dry_log_line_says_it_did_not_write(self):
         from flliper.srt.pdflip import launcher as L
 
-        self.assertIn("DRY: not written", inspect.getsource(L.main))
+        self.assertIn("DRY: not written", _main_text())
 
 
 if __name__ == "__main__":

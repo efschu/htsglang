@@ -45,6 +45,18 @@ NF_STATED = {
 }
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _form_env(profile):
     arch, experts, draft, kv = (("dense", "none", "dflash", "paged_dcp") if profile == Q
                                 else ("moe", "offload", "mtp", "qsa_forma"))
@@ -252,7 +264,7 @@ def test_vision_axis_default_runs_before_the_form_is_resolved():
 
     from flliper.srt.pdflip import launcher as L
 
-    src = inspect.getsource(L.main)
+    src = _main_text()
     assert src.index("apply_profile_vision_default(") < src.index("pdflip_form.resolve_form(")
 
 
@@ -294,7 +306,7 @@ def test_vision_async_refusal_is_wired_into_main():
 
     from flliper.srt.pdflip import launcher as L
 
-    src = inspect.getsource(L.main)
+    src = _main_text()
     assert "vision_async_refusal(ns)" in src and "raise SystemExit(_vis_async)" in src
 
 

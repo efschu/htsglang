@@ -29,6 +29,18 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 X = 4096
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _ns(*extra):
     return L.build_parser().parse_args(["--tree", "/x", "--tag", "t", *extra])
 
@@ -79,7 +91,7 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertTrue(any("PDFLIP-DUAL MPS" in ln for ln in lines))
 
     def test_main_skips_the_p_sleep_and_the_dormant_record_under_dual(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         i = src.index('if getattr(ns, "dual_layout", False):\n        # DUAL-TP3PP3: P stays awake.')
         blk = src[i:i + 1600]
         self.assertIn("state.sleep_p_ms = 0.0", blk)
@@ -123,7 +135,7 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertEqual(dc, {"A": 28000, "B": 17000, "C": 17000})
 
     def test_main_launches_d_right_after_p_under_dual_share(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         i = src.index('spec_p.env.update(dual_share_env(ns, "P"))')
         blk = src[i:i + 2600]
         self.assertLess(blk.index("launch_group(spec_p"), blk.index("launch_group(_sd"))
@@ -141,14 +153,14 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertEqual(L.dual_p_sm_env(_ns("--dual-layout", "--dual-mps", "on")), {})
         with self.assertRaises(L.PdFlipDualLayoutRefused):
             L.dual_p_sm_env(_ns("--dual-layout", "--dual-mps", "on", "--dual-p-sm-pct", "0"))
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertIn("spec_p.env.update(dual_p_sm_env(ns))", src)
 
     def test_p_loads_only_after_d_is_ready(self):
         from flliper.srt.model_executor import dual_stage_hull as H
 
         self.assertEqual(L.DUAL_D_READY_FILE, H.D_READY_FILE)
-        src = inspect.getsource(L.main)
+        src = _main_text()
         i = src.index("launch_group(_sd, tree, log, dry)")
         blk = src[i:i + 1400]
         self.assertLess(blk.index('wait_ready(PORT_D, _sd.pid'), blk.index("DUAL_D_READY_FILE"))

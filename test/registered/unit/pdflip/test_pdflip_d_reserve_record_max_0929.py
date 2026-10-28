@@ -44,6 +44,18 @@ D_ROWS = [("09290450", "2026-09-29T04:55:26Z", 1690, 676, 678),
           ("09290654", "2026-09-29T06:59:51Z", 1692, 678, 680)]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _drecs(rows=D_ROWS):
     return [{"group": "D", "boot_tag": "dkrnf" + t, "at": at, "vram_residue_form": XCHG,
              "vram_residue_mib": {BIG: b, S0: s0, S2: s2}} for t, at, b, s0, s2 in rows]
@@ -98,7 +110,7 @@ class DReserve(CustomTestCase):
 
 class Wiring(CustomTestCase):
     def test_census_loop_uses_the_selector(self):
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         calls = [getattr(n.func, "id", None) or getattr(n.func, "attr", None)
                  for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call)]
         self.assertEqual(calls.count("d_reserve_from_records_or_census"), 1)

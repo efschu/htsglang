@@ -49,6 +49,18 @@ P_STAGE_LAYERS = [29, 11, 8]
 LAYERS = (0, 30, 45)  # one layer per P stage (the D layout is kept per stage)
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _runtime_windows(ratios):
     """The window the rank's FusedMoE layer takes (fused_moe_triton/layer.py:
     tp_partition_offset/size over num_experts units, family "moe"), under the
@@ -218,7 +230,7 @@ def test_every_d_start_is_checked_against_the_map():
     """RED before: no check; d-only, dry run and the real start build D's env."""
     from flliper.srt.pdflip import launcher as L
 
-    src = inspect.getsource(L.main)
+    src = _main_text()
     starts = [i for i in range(len(src)) if src.startswith("env_d = build_env(", i)]
     assert len(starts) == 3
     for i in starts:
@@ -241,7 +253,7 @@ def test_the_store_geometry_follows_the_pinned_form():
     assert em.MAP_ENV not in xchg
     bs, bc = em.band_geometry(list(SOLVED), TOTAL)
     assert xchg.get("FLLIPER_PDFLIP_EXPERT_BAND_SIZE") == (str(bs) if bs > 0 else None)
-    src = inspect.getsource(L.main)
+    src = _main_text()
     pin = src.index("_pin = pin_d_form_for_map(ns, log)")
     repoint = src.index("repoint_store_geometry_at_pinned_form(")
     emap_at = src.index("_emap = publish_expert_map(")

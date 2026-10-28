@@ -43,6 +43,18 @@ C3080B = "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
 RESERVE = {C5090: 1800, C3080A: 1400, C3080B: 1400}
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 @dataclass
 class _Card:
     uuid: str
@@ -103,7 +115,7 @@ class GroupEnvCarriesTheReserve(unittest.TestCase):
             _env("P", RESERVE)[cg.USER_RESERVE_ENV],
             launcher.user_reserve_env_value(RESERVE),
         )
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         self.assertIn("user_reserve_env_value(user_reserve_by_card)", src)
 
     def test_t3_every_build_env_call_site_in_main_passes_the_reserve(self):

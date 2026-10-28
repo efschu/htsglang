@@ -16,6 +16,18 @@ from flliper.srt.pdflip import launcher as L
 from flliper.test.test_utils import CustomTestCase
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _identity(repo: str) -> "F.CalibrationIdentity":
     return F.CalibrationIdentity(model="/m/Qwen3.8-27B-INT8", evidence_dir="/nonexistent",
                                  fields=("checkpoint", "form", "line"), repo=repo,
@@ -41,7 +53,7 @@ class HeadUnresolvable(CustomTestCase):
         self.assertIsNone(ident.head_unresolvable_line())
 
     def test_launcher_prints_it_beside_the_identity(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertIn("calib_identity.head_unresolvable_line()", src)
 
 

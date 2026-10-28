@@ -31,6 +31,18 @@ NF_TAGS = [f"weights_{i}" for i in range(16)] + ["weights_draft", "weights"]
 NF_FREE = {0: 7211, 1: 7804, 2: 5567}
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _card_queue(order, cards, card):
     return [t for t in order if t in cards and cards[t][0] == card]
 
@@ -79,7 +91,7 @@ def test_the_launcher_publishes_the_drafts_card_next_to_the_chunk_map():
 
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher.main)
+    src = _main_text()
     assert re.search(
         r'src_chunk_cards\["P"\]\["weights_draft"\]\s*=\s*\[int\(cards\[-1\]\.nvml_index\)\]',
         src), "launcher.main no longer maps weights_draft to the last stage's card"

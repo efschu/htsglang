@@ -57,6 +57,18 @@ RELEASE = (0.328, 0.64, 0.733887)
 FOUR_SEAT_BOOTS = ("fnFL2x163", "fnFL2x164", "fnFL2x165")
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
 def _boot(name):
     with open(os.path.join(FIX, name + ".P.lines")) as fh:
         return name, fh.read()
@@ -174,7 +186,7 @@ class TestMambaPost:
     def test_solve_p_cut_charges_the_argv_slots(self):
         """The PhasePoolModel's ``mamba_slots`` is p_mamba_slots' number, and the
         P card gets the SAME number (one reader, two consumers)."""
-        tree = ast.parse(textwrap.dedent(inspect.getsource(lc.solve_p_cut)))
+        tree = ast.parse(textwrap.dedent(_solve_p_cut_text()))
         pool_kw, card_kw, assigned = None, None, False
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):

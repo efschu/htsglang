@@ -34,6 +34,18 @@ ROW_MIB = 1238.0 / 512
 REST, EMBED, HEAD = int(1522.8 * MIB), int(1212.5 * MIB), int(1212.5 * MIB)
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
 def _draft_dir():
     d = tempfile.mkdtemp(prefix="h25draft")
     header = {"mtp.layers.0.w": {"dtype": "U8", "shape": [REST], "data_offsets": [0, REST]},
@@ -118,7 +130,7 @@ class TestPublishedToAllThreePlaces(unittest.TestCase):
     def test_solve_p_cut_applies_it_only_when_p_has_no_draft(self):
         import inspect
 
-        src = inspect.getsource(L.solve_p_cut)
+        src = _solve_p_cut_text()
         i = src.index("apply_p_draft_post(")
         self.assertIn('== "off"', src[src.rindex("if ", 0, i):i])
         # before the pool term the model prices

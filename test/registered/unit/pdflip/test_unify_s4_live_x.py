@@ -42,6 +42,18 @@ register_cpu_ci(est_time=5, suite="stage-a-pdflip-unit")
 SRC = Path(L.__file__).resolve().parent
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _defs(path: Path, name: str) -> int:
     # launcher.py is split over launcher*.py (refactor, 28.10.): "launcher.py" means the launcher as a whole
     paths = sorted(path.parent.glob("launcher*.py")) if path.name == "launcher.py" else [path]
@@ -101,7 +113,7 @@ def test_x_busy_reaches_the_front_only_when_set():
 
 
 def test_main_resolves_x_with_the_calibration_identity():
-    tree = ast.parse(inspect.getsource(L.main))
+    tree = ast.parse(_main_text())
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
              and isinstance(n.func, ast.Name) and n.func.id == "resolve_x"]
     assert len(calls) == 1

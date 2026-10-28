@@ -46,6 +46,18 @@ SERVING_ENV_D = ("FLLIPER_QWEN4_PLE_CKPT_GATHER=pread;FLLIPER_MOE_SCRATCH_SLOTS=
                  "FLLIPER_PDFLIP_D_KV_STAGE_TOKENS=262144")
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _ns(**kw):
     ns = types.SimpleNamespace(dry_run=False, d_only=False, d_kv_token_cut="owned",
                                pdflip_disable_hicache=False, env_d=SERVING_ENV_D)
@@ -149,7 +161,7 @@ def test_the_post_check_leaves_every_other_boot_alone(form, kw):
 
 
 def test_main_checks_before_every_flip_d_start():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     starts = [i for i in range(len(src))
               if src.startswith("refuse_d_form_off_the_map(ns, log)", i)]
     checks = [i for i in range(len(src))
@@ -189,6 +201,6 @@ def test_stage_tokens_are_read_from_the_d_env():
 
 
 def test_main_calls_it_right_after_the_seam_riegel():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     i = src.index("refuse_unwired_token_cut(ns, boot_form)")
     assert src.index("refuse_flip_under_token_cut(ns, boot_form)", i) - i < 200

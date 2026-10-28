@@ -22,6 +22,18 @@ from flliper.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class Sizing(CustomTestCase):
     def test_over_the_guard_gives_the_excess_back_rounded_up(self):
         new, why = launcher.arena_from_ledger(22.0, 93.15, 93.0)
@@ -50,7 +62,7 @@ class Sizing(CustomTestCase):
 
 class Wiring(CustomTestCase):
     def test_main_prices_twice_when_the_arena_moves(self):
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         self.assertIn("def _price_host_ledger():", src)
         # 29.09.: a third pricing after the map is written (cold_tier_shm post)
         self.assertEqual(src.count("= _price_host_ledger()"), 3)

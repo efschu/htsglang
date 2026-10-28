@@ -57,14 +57,28 @@ from .test_pdflip_xchg_transport_1273 import (  # noqa: E402 -- after the env gu
 )
 
 
-def _launcher_text() -> str:
-    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
     import pathlib
 
-    from flliper.srt.pdflip import launcher as _lc
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
 
-    pdflip = pathlib.Path(_lc.__file__).resolve().parent
-    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order: the
+    functions were split behaviour-neutrally (refactor 28.10.), see ``_launcher_source.expanded_launcher_text``."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
 
 
 @pytest.fixture()
@@ -4375,7 +4389,7 @@ def test_the_launcher_charges_the_deposit_only_on_an_armed_boot():
     assert inspect.signature(
         lc.xchg_bounce_arm_pins_host).return_annotation in (bool, "bool")
     assert "host_ledger.xchg_bounce_bytes(" not in predicate, predicate
-    main_src = inspect.getsource(lc.main)
+    main_src = _main_text()
     assert "weight_source=ns.pdflip_weight_source" in main_src, \
         "the arm must reach the ledger call site"
 
@@ -4576,7 +4590,7 @@ def test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it():
         inspect.getsource(lc.choose_host_ledger)
     assert "xchg_bounce_arm_pins_host(weight_source" in \
         inspect.getsource(lc.xchg_bounce_terms_for_arm)
-    main_src = inspect.getsource(lc.main)
+    main_src = _main_text()
     assert "oncard_mode=ns.pdflip_xchg_oncard" in main_src, \
         "the arm must reach BOTH the ledger call site and the shadow env"
     assert main_src.count("oncard_mode=ns.pdflip_xchg_oncard") == 2, main_src

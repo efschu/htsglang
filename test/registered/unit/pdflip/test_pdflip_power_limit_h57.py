@@ -44,6 +44,30 @@ PIN = [29, 11, 8]
 FR_P_X163 = "0.36,0.64,0.39"
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _fixture(tag: str) -> str:
     with open(os.path.join(FIX, tag + ".P.lines")) as fh:
         return fh.read()
@@ -603,7 +627,7 @@ def test_the_cut_stays_one_arm_variable_with_no_default():
 
 
 def test_main_logs_the_power_limit_right_after_the_card_map_and_hands_it_to_the_cut():
-    src = inspect.getsource(L.main)
+    src = _main_text()
     i_map = src.index('log("NVML -> CUDA ordinal map: "')
     i_pow = src.index("power_reading = log_power_limits(state, cards, log)")
     i_cut = src.index("cut = solve_p_cut(")
@@ -612,7 +636,7 @@ def test_main_logs_the_power_limit_right_after_the_card_map_and_hands_it_to_the_
 
 
 def test_solve_p_cut_prints_the_rate_cut_first_and_only_logs_it():
-    fn = ast.parse(textwrap.dedent(inspect.getsource(L.solve_p_cut))).body[0]
+    fn = ast.parse(textwrap.dedent(_solve_p_cut_text())).body[0]
     parents = {}
     for node in ast.walk(fn):
         for child in ast.iter_child_nodes(node):
@@ -627,7 +651,7 @@ def test_solve_p_cut_prints_the_rate_cut_first_and_only_logs_it():
     assert len(calls) == 1
     outer = parents[calls[0]]
     assert isinstance(outer, ast.Call) and getattr(outer.func, "id", None) == "log"
-    src = inspect.getsource(L.solve_p_cut)
+    src = _solve_p_cut_text()
     assert src.index("_power.rate_cut_line(") < src.index("p_card_verdict(")
     assert src.index("_power.rate_cut_line(") < src.index("_cut.solve_launch_cut(")
 

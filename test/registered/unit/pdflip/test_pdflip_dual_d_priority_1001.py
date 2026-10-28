@@ -32,6 +32,18 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 DUAL_D = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D"}
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 class _Touched(Exception):
     """the batch's retract_decode ran (the decode was interrupted)"""
 
@@ -380,4 +392,4 @@ def test_apply_dual_p_sleep_pops_the_host_ring_and_adds_the_backup():
     assert L.apply_dual_p_sleep(on, spec, logs.append)
     assert spec.argv == ["--a", "--enable-weights-cpu-backup"] and "TMS_HOST_RING_DIR" not in spec.env
     assert "TMS_HOST_RING_MAP" not in spec.env and spec.env["X"] == "1" and logs
-    assert "apply_dual_p_sleep(ns, spec_p, log)" in inspect.getsource(L.main)
+    assert "apply_dual_p_sleep(ns, spec_p, log)" in _main_text()

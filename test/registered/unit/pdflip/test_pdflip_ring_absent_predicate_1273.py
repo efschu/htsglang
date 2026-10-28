@@ -49,6 +49,31 @@ XSN13_RING_BYTES = 46133149696
 XSN13_SPAN1_BYTES = 44559237120
 
 
+def _is_launcher_main(fn) -> bool:
+    return getattr(fn, "__name__", "") == "main" and getattr(fn, "__module__", "") == "flliper.srt.pdflip.launcher"
+
+
+def _getsource(fn) -> str:
+    return _main_text() if _is_launcher_main(fn) else inspect.getsource(fn)
+
+
+def _getsourcelines(fn):
+    if _is_launcher_main(fn):
+        return _main_text().splitlines(keepends=True), inspect.getsourcelines(fn)[1]
+    return inspect.getsourcelines(fn)
+
+
+def _main_text() -> str:
+    """``launcher.main`` with every ``_main_stepNN_*`` call expanded to the step body, in call order (split behaviour-neutrally, refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _price(**kw):
     base = dict(
         memtotal_bytes=int(118.05 * hl.GIB), memavail_bytes=int(104.02 * hl.GIB),
@@ -142,7 +167,7 @@ class BothArmsReachTheOneCallSite(CustomTestCase):
         import inspect
         import re
 
-        return re.sub(r"\s+", " ", inspect.getsource(fn))
+        return re.sub(r"\s+", " ", _getsource(fn))
 
     def test_choose_host_ledger_takes_the_inject_mode(self):
         import inspect
@@ -169,7 +194,7 @@ class BothArmsReachTheOneCallSite(CustomTestCase):
         import inspect
         import textwrap
 
-        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        tree = ast.parse(textwrap.dedent(_getsource(fn)))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

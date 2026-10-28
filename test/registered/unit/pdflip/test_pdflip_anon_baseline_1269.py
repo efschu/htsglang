@@ -44,6 +44,18 @@ from flliper.test.test_utils import CustomTestCase
 NS = L.build_parser().parse_args(["--tree", "/x", "--tag", "t"])
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def argv(**kw):
     return L.front_argv_for("py", "/s", 1, 2, {}, [], NS, 0, 0, 8, 8, 1, 1, "D", **kw)
 
@@ -75,7 +87,7 @@ class TheFrontReceivesTheMeasuredValue(CustomTestCase):
 
 class TheBaselineIsThePreflightsOwnReading(CustomTestCase):
     def test_main_takes_it_from_the_ledger_snapshot_not_a_second_read(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertIn('anon_preboot_bytes = int(cg.get("anon") or 0)', src)
         # exactly one read_cgroup in main -- the preflight's, via the ledger
         tree = ast.parse(textwrap.dedent(src))
@@ -85,20 +97,20 @@ class TheBaselineIsThePreflightsOwnReading(CustomTestCase):
         self.assertEqual(reads, [], "main must not re-read the cgroup itself")
 
     def test_the_capture_precedes_the_front_launch(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertLess(src.index("anon_preboot_bytes = int("),
                         src.index("front_argv = front_argv_for("),
                         "the baseline must be captured before the front is built")
 
     def test_the_launcher_names_the_baseline_in_one_line(self):
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertIn("PDFLIP-LAUNCH ANON-BASELINE", src)
         self.assertIn("preboot_anon=", src)
 
     def test_both_front_argv_call_sites_pass_it(self):
         """The dry-run print and the real launch must agree, or --dry-run stops
         showing what a real boot runs."""
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertEqual(src.count("anon_preboot_bytes=anon_preboot_bytes"), 2)
 
 

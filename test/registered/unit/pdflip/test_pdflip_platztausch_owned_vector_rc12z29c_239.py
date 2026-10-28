@@ -37,6 +37,18 @@ CUT = (0.0, 48.0, 16.0)
 P_STAGE_LAYERS = [29, 11, 8]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _ns():
     return SimpleNamespace(
         extra_d=f"--rank-moe-ratio {STATED} --rank-moe-resident-fraction {FR_D_STATED} "
@@ -119,7 +131,7 @@ def test_main_solves_the_form_before_the_map_is_built():
     """RED before: the map was published first, the owned solve ran after P's sleep."""
     from flliper.srt.pdflip import launcher as L
 
-    src = inspect.getsource(L.main)
+    src = _main_text()
     pre = src.index('"D(Karte, Erwartung)"')
     pin = src.index("pin_d_form_for_map(ns, log)")
     emap_at = src.index("_emap = publish_expert_map(")

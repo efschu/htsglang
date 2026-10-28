@@ -29,6 +29,18 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 X = 4096
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _front(**kw):
     return front_mod.Front("http://p", "http://d", "D", "hold0", "", 0, 0, {}, 45.0,
                            tp_prefill_max_tokens=X, **kw)
@@ -76,7 +88,7 @@ def test_a_positive_hold_still_reaches_the_front():
 
 def test_the_argv_and_the_policy_line_share_the_definition():
     assert "d_hold_active(" in inspect.getsource(launcher_mod.front_argv_for)
-    src = inspect.getsource(launcher_mod.main)
+    src = _main_text()
     line = src[src.index("IDLE POLICY (27B, user order 2026-09-24)"):]
     line = line[:line.index("\n    log(") if "\n    log(" in line else 1200]
     assert "d_hold_active(ns.d_hold_s)" in line, "the IDLE POLICY line must call 0 off, as the argv does"

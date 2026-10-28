@@ -42,6 +42,18 @@ CONSTANT_27B = {BIG: 3084, SM1: 2588, SM2: 2588}
 FAMILY = [f"weights_{k}" for k in range(8)] + ["weights"]
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _census(dormant):
     blob = {"cards": {u: {"tags": {g: {t: 100 for t in FAMILY} for g in ("P", "D")},
                           "dormant_proc_used_mib": dormant[u],
@@ -91,7 +103,7 @@ class MainGatesTheBudgetOverrideByTheSameProfile(unittest.TestCase):
     decision, never two."""
 
     def test_main_passes_the_profile_and_gates_the_override(self):
-        src = inspect.getsource(launcher.main)
+        src = _main_text()
         self.assertEqual(src.count("xchg_form_dormant_reserve("), 1)
         self.assertIn("xchg_form_dormant_reserve(cards, ns.pdflip_xchg_census, log=log, "
                       "profile=ns.profile)", src)

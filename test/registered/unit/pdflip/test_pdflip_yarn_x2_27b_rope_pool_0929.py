@@ -41,6 +41,18 @@ YARN = ("'{\"language_model_only\":true,\"text_config\":{\"rope_parameters\":{\"
         "\"factor\":2.0,\"original_max_position_embeddings\":262144},\"max_position_embeddings\":524288}}'")
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
 def _dirs(tmp_path):
     m, d = tmp_path / "target", tmp_path / "draft"
     m.mkdir()
@@ -100,7 +112,7 @@ def test_cols_match_the_measured_x1_caches():
 def test_the_pool_model_takes_the_priced_posts():
     """Wiring: solve_p_cut hands the posts PLUS the rope delta to the pool
     model (one construction site), not the bare flag vector."""
-    src = inspect.getsource(L.solve_p_cut)
+    src = _solve_p_cut_text()
     assert "p_rope_context_delta_mib(ns, len(_stage_fixed))" in src
     assert "stage_fixed_mib=_stage_fixed," in src
     assert "stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib))" not in src

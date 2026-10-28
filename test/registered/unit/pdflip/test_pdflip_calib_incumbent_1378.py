@@ -31,6 +31,18 @@ import unittest
 from flliper.srt.pdflip import host_ledger
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
 def _write_checkpoint(root, n_layers, layer_types):
     os.makedirs(root, exist_ok=True)
     cfg = {
@@ -124,7 +136,7 @@ class SolveConsultsCalibrationTest(unittest.TestCase):
         import inspect
         from flliper.srt.pdflip import launcher
 
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = _solve_p_cut_text()
         self.assertIn("resolve_calibrated_stage_layer_counts", src,
                       "solve_p_cut's incumbent must consult the same "
                       "model-identity guard argv_p already uses (#1362 "

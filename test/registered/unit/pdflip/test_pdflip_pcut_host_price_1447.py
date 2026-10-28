@@ -27,6 +27,18 @@ from flliper.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
+def _solve_p_cut_text() -> str:
+    """``launcher.solve_p_cut`` as it read before the split into ``_solve_p_cut_stepNN_*`` functions: every step call replaced by the
+    step body, in call order (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_source("solve_p_cut", decorators=True)
+
+
 def _row(layers, ms, pool):
     return SimpleNamespace(layers=layers, attn=(9, 4, 3), makespan_ms=ms, pool_tokens=pool)
 
@@ -148,7 +160,7 @@ class ExchangeArmPrice(CustomTestCase):
 
 class Wiring(CustomTestCase):
     def test_solver_applies_the_host_price(self):
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = _solve_p_cut_text()
         self.assertIn("host_priced_pick(", src)
         self.assertIn("host_price_for_cut(", src)
         self.assertIn("PCUT_BOUNCE_SLACK_ENV", src)

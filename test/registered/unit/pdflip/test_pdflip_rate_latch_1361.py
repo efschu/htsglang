@@ -35,6 +35,17 @@ XSN26B_LAST = 82.279
 XSN26B_PEAK = 95.863
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text (launcher.py + launcher_*.py) with ``main`` expanded back to the original statement order (refactor 28.10.)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_launcher_text()
+
+
 class TheLatchPreEmptsTheMeasuredRamp1361(CustomTestCase):
     def test_the_real_ramp_latches_before_the_mark_is_reached(self):
         lat = hl.RateLatch(reap_mark_gib=95.90)
@@ -417,7 +428,7 @@ class TheGuardRunsFromLAUNCHNotFromREADY1361a(CustomTestCase):
     def _launcher_src(self):
         import inspect
         from flliper.srt.pdflip import launcher as lc
-        return inspect.getsource(lc)
+        return _launcher_text()
 
     def test_the_guard_is_armed_before_the_first_group_is_launched(self):
         """RATCHET, red on f299988d06: there was no launcher-side guard at all."""

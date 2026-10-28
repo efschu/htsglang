@@ -52,6 +52,18 @@ MIB = 1024 * 1024
 X = 4096
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _front(**kw):
     kw.setdefault("flip_min_work_tokens", X)
     f = front_mod.Front(
@@ -433,7 +445,7 @@ class LauncherFlags(CustomTestCase):
     def test_main_logs_the_policy_and_refuses_negatives(self):
         from flliper.srt.pdflip import launcher as L
 
-        src = inspect.getsource(L.main)
+        src = _main_text()
         self.assertIn("IDLE POLICY (27B, user order 2026-09-24)", src)
         self.assertIn("both must be >= 0", src)
 

@@ -8476,25 +8476,8 @@ def _unpin_foreign_cut(solve):
     return wrapper
 
 
-@_unpin_foreign_cut
-def solve_p_cut(
-    ns,
-    cards: List[Card],
-    budgets_p: List[int],
-    model: str,
-    log,
-    chunk_tokens: int = 4096,
-    user_reserve_by_card: Optional[Dict[str, int]] = None,
-    power_reading: Optional["_power.PowerReading"] = None,
-) -> PCutFacts:
-    """Group P's layer + attention cut, and the ONE provenance line for it.
-
-    Returns the flag strings plus the pool facts the depth solver prices
-    against (:class:`PCutFacts`). Everything it feeds the solver is either measured on this box
-    (NVML card names, the per-rank budgets this launcher just derived, the
-    checkpoint's own weight headers and KV cell) or a flag whose default
-    carries its provenance in the help text -- no number is chosen here.
-    """
+def _solve_p_cut_step01__pp_cut(*, cards, chunk_tokens, log, model, ns, power_reading):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     from flliper.srt.planner import pp_cut as _pp_cut
     from flliper.srt.planner import pp_cut_launch as _cut
 
@@ -8524,6 +8507,12 @@ def solve_p_cut(
         chunk_tokens=int(chunk_tokens),
         fr_p=str(getattr(ns, "pp_cut_expert_device_fraction", "") or ""),
     ))
+    return _cut, _pp_cut, cfg, kinds, n_attn, n_layers, text_cfg
+
+
+
+def _solve_p_cut_step02_kv_mib(*, _pp_cut, cfg, log, model, n_layers, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     # The KV cell is CONSUMED from config, never fitted (#704 D1).
     kv_mib = _pp_cut.kv_mib_per_token_per_attn_layer_from_config(
         cfg, "fp8_e4m3", n_layers
@@ -8550,6 +8539,12 @@ def solve_p_cut(
         "#140 PP-CUT FRACTION-SOLVE", getattr(ns, "pdflip_boot_form", None))
     if _skip_140 and terms.expert_layer_weight_bytes <= 0.0:
         log(_skip_140)
+    return _p_mamba_slots, _p_mamba_src, kv_mib, layer_mib_by_stage, mean_layer_mib, terms
+
+
+
+def _solve_p_cut_step03__acc(*, _p_mamba_slots, _pp_cut, budgets_p, cards, chunk_tokens, kinds, layer_mib_by_stage, log, mean_layer_mib, model, ns, terms, text_cfg):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     if terms.expert_layer_weight_bytes > 0.0:
         frac_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "").strip()
         rows_text = str(getattr(ns, "pp_cut_expert_lru_rows", "") or "").strip()
@@ -8818,6 +8813,12 @@ def solve_p_cut(
                 + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
                 for f, r in zip(fracs, rows)
             )
+    return layer_mib_by_stage
+
+
+
+def _solve_p_cut_step04_ms(*, budgets_p, log, model, ns, terms, text_cfg):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     # YaRN x2 27B (29.09.): the posts were read at 262144; a longer P context
     # grows the eager RoPE cache before the pool is sized (p_rope_context_delta_mib).
@@ -8842,6 +8843,12 @@ def solve_p_cut(
                                          if _booked else ((), None))
     if _p_draft_cell_line is not None:
         log(_p_draft_cell_line)
+    return _booked, _p_draft_cell, _stage_fixed, ms
+
+
+
+def _solve_p_cut_step05_model_pool(*, _booked, _p_draft_cell, _p_mamba_slots, _pp_cut, _stage_fixed, budgets_p, chunk_tokens, kv_mib, layer_mib_by_stage, mean_layer_mib, model, ns, user_reserve_by_card):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     model_pool = _pp_cut.PhasePoolModel(
         free_mib=tuple(float(b) for b in budgets_p),
         # The FAMILY split of weights is deliberately averaged: a stage's
@@ -8952,6 +8959,12 @@ def solve_p_cut(
         ) + (("prefill activation reserve",)
              if _booked and ns.pp_cut_activation_reserve_mib is None else ()),
     )
+    return model_pool
+
+
+
+def _solve_p_cut_step06_if__booked(*, _booked, _cut, _pp_cut, budgets_p, kinds, log, model_pool, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     if _booked:
         log("PP-CUT POSTEN (p_pool_posts_as_booked, %s): corridor holdback %s, prefill activation %s, "
             "mamba slots from P's argv -- what group P books (KV budget holdback=0.0 on every P rank; the P budget "
@@ -8974,33 +8987,12 @@ def solve_p_cut(
         else _pp_cut.LAYER_FAMILY_LINEAR
         for k in kinds
     )
-    # FIX 2: the incumbent is the cost model's MEASUREMENT BASIS -- the cut
-    # MEASURED_MS_PER_LAYER was taken under -- and that is what
-    # P_PP_STAGE_RATIO_SCORES is defined to be. It was restated here as a bare
-    # "32,18,14", a fourth copy of a vector whose whole point is one
-    # definition; an operator pin still overrides it.
-    #
-    # #1362 [22-fix follow, DESK6 #1378]: THE SAME MODEL-IDENTITY GUARD AS
-    # argv_p(), not a second unguarded reader of "the incumbent ratio".
-    # Measured live: without this, a 24-layer model with its OWN complete
-    # calibration record still crashed here with the bare
-    # pp_cut.family_costs_from_measurement ValueError
-    # (refuse_foreign_calibration's own message already quotes that exact
-    # text as the failure #1362 exists to name) -- because this line ran
-    # BEFORE argv_p ever got a chance to consult the calibration record.
-    if ns.pp_stage_ratio:
-        incumbent = _csv_ints(ns.pp_stage_ratio)
-    elif len(budgets_p) != len(P_PP_STAGE_RATIO_SCORES):
-        # HW-P1c 1003: the measurement basis is a THREE-stage cut; a P group of
-        # another size starts the solver from a cut sized to its stage rates
-        incumbent = n_stage_incumbent(len(budgets_p), n_layers, ms)
-    else:
-        incumbent = (
-            host_ledger.resolve_calibrated_stage_layer_counts(
-                model, ns.pp_stage_ratio,
-                _pconst("CALIBRATION_LAYERS", getattr(ns, "profile", None)))
-            or list(P_PP_STAGE_RATIO_SCORES)
-        )
+    return families
+
+
+
+def _solve_p_cut_step07_design_src(*, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     # THE GAPPED DEFAULT IS NOT TAKEN, AND THE HOOK IS NAMED RATHER THAN LEFT
     # OPEN (#753 / boot weg2gp1, 2026-09-08, /spinning/gpu-arb/weg2/
     # BOOT_weg2gp1_0908.md). The user's 0,8,8 layout was probed on metal for
@@ -9035,51 +9027,12 @@ def solve_p_cut(
     # function of it and a table without it stated is a table about nothing.
     design_src = ns.pp_cut_design_prefix_from or newest_prefill_census_log(
         EVIDENCE_DIR, accept=calib_log_accept_of(ns))
-    census = read_mean_prefill_prefix(design_src) if design_src else None
-    if ns.pp_cut_design_prefix_tokens is not None:
-        design_prefix = int(ns.pp_cut_design_prefix_tokens)
-        design_prov = "PINNED by --pp-cut-design-prefix-tokens"
-    elif census is not None:
-        design_prefix = int(round(census[0]))
-        design_prov = (
-            "MEASURED mean prefix over %d prefill-batch chunks of %s (rank %s, "
-            "one rank only: every stage prints the same batch)"
-            % (census[1], design_src, census[2])
-        )
-    else:
-        design_prefix = int(DESIGN_PREFIX_FALLBACK_TOKENS)
-        design_prov = (
-            "FALLBACK: no P log %sin %s carries a prefill census, so the design "
-            "prefix is one chunk -- the shallowest depth this boot can run. "
-            "This is an absence of the instrument, not a measured shallow rig."
-            % (
-                ("of " + pdflip_form.model_key(model) + " (PDFLIP-FORM calibration identity) ")
-                if calib_log_accept_of(ns) is not None else "",
-                EVIDENCE_DIR,
-            )
-        )
+    return design_src
 
-    if len(budgets_p) != len(P_PP_STAGE_RATIO_SCORES):
-        # HW-P1c 1003: the family split is fitted on the REFERENCE basis and
-        # mapped to the live stages by card class (see derived_family_cost)
-        family_cost, family_prov = derived_family_cost(ns, cards, families, int(chunk_tokens))
-    else:
-        measured_attn = _pp_cut.attention_counts(families, incumbent)
-        # HW-GENERIC 1002: the stage whose card is of the class the deep
-        # attention anchor (ATTN_ANCHOR_MS, "a 3080 ... 0.4 s per chunk") was
-        # measured on -- by calibration class, not "the first card that is not a
-        # 5090". On the reference rig that is stage 1, as before.
-        anchor_stage = attn_anchor_stage(cards, log)
-        family_cost, family_prov = _pp_cut.family_costs_from_measurement(
-            measured_ms_per_layer=ms,
-            measured_counts=incumbent,
-            measured_attn_counts=measured_attn,
-            chunk_tokens=int(chunk_tokens),
-            ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens),
-            anchor_stage=anchor_stage,
-            anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
-            anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
-        )
+
+
+def _solve_p_cut_step08__power_now(*, cards, log):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     # 27B line (user 24.09.): every boot prints its P cards' power limits --
     # the record a later --pp-cut-stage-fit is checked against.
     _power_now = card_power_limits_w(cards)
@@ -9087,9 +9040,12 @@ def solve_p_cut(
     # --pp-cut-stage-fit (default off): the stage cost FITTED from a boot's own
     # #PGAP lines replaces the bsscale family split above.
     _fitted_log = None
-    if str(getattr(ns, "pp_cut_stage_fit", "") or "").strip():
-        family_cost, family_prov, _fitted_log = stage_fit_family_cost(
-            ns, cards, int(chunk_tokens), _power_now, log)
+    return _fitted_log, _power_now
+
+
+
+def _solve_p_cut_step09__depth_profile(*, _fitted_log, cards, chunk_tokens, log, ns, text_cfg):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     # --pp-cut-depth-profile (default off): price each candidate over a depth
     # profile instead of the single design prefix.
     _depth_profile = None
@@ -9111,18 +9067,12 @@ def solve_p_cut(
     payload_bytes = int(chunk_tokens) * int(text_cfg["hidden_size"]) * 2
     lanes = forced_lane_borrow(cards, pcie_lanes(cards), log)
     pair_ms = per_pair_crossing_ms(lanes, payload_bytes)
-    log(
-        "PP-CUT depth axis: design_prefix=%d tokens (%s); calibration prefix "
-        "%d (%s); %s"
-        % (
-            design_prefix,
-            design_prov,
-            int(ns.pp_cut_calibration_prefix_tokens),
-            "boot bsscale, ~12k prompt = 3 full chunks at 4096 -> mean 4096, "
-            "BSSCALE_0907.md",
-            family_prov,
-        )
-    )
+    return _depth_profile, lanes, pair_ms, payload_bytes
+
+
+
+def _solve_p_cut_step10_log_pp_cut(*, _pp_cut, chunk_tokens, lanes, log, ns, pair_ms, payload_bytes, text_cfg):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     log(
         "PP-CUT crossing prices: PCIe lanes per ordinal %s, frame %.1f MiB "
         "(chunk %d x hidden %d x 2 B), measured pair ms %s (pairs absent from "
@@ -9145,6 +9095,12 @@ def solve_p_cut(
     # shipped default or something the operator typed, sends the reader to the
     # wrong flag.
     _floor_flag = ns.pp_solve_pool_floor
+    return _floor_flag
+
+
+
+def _solve_p_cut_step11__cap_floor_default(*, _floor_flag, budgets_p, chunk_tokens, log, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     # #1441b (xsn204): the cap-floor rule shipped 40,12,12 and the launch was
     # refused at the ledger -- the exchange bounce term for that form is 27.75
     # GiB against 15.75 for 39,13,12 (+12 GiB of pinned host lanes: the 8-layer
@@ -9173,6 +9129,12 @@ def solve_p_cut(
     pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(
         _floor_flag, n_stages=len(budgets_p))
     log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
+    return pool_floor, pool_floor_from_cut
+
+
+
+def _solve_p_cut_step12_model_pool(*, cards, families, log, model, model_pool, ns, pool_floor):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     # --p-prefill-graph-policy auto: extra buckets only where the pool still
     # clears the floor with their capture pool (no-op without extras).
     model_pool = p_prefill_graph_vram_gate(
@@ -9183,23 +9145,313 @@ def solve_p_cut(
         str(getattr(ns, "pp_cut_stage_model", "off")), getattr(ns, "profile", None), model,
         inventory=card_identity.inventory_signature(cards))
     _chunk_mix = None
-    if _stage_model is not None:
-        from flliper.srt.pdflip import p_stage_model as _psm
-        from flliper.srt.pdflip import power_limit as _plim
+    return _chunk_mix, _stage_model, _stage_prov, model_pool
 
-        _current = {}
-        for _c, _w in zip(cards, _power_now):
-            if _w is not None:
-                _current.setdefault(card_identity.class_label(_c), float(_w))
-        _stage_model, _plines = _psm.check_power(_stage_model, _current)
-        for _ln in _plines:
-            log("PP-CUT STAGE MODEL " + _ln)
-        _chunk_mix, _mix_prov = pp_cut_chunk_mix(
-            design_src, int(chunk_tokens), int(design_prefix), int(p_prefill_graph_bucket()))
-        log("PP-CUT STAGE MODEL (--pp-cut-stage-model): %s; %s -- every candidate's makespan below is the "
-            "mean ms per chunk over that mix (per chunk the bottleneck stage)" % (_stage_prov, _mix_prov))
+
+
+def _solve_p_cut_step13_log_pool_floor_line(*, _pp_cut, budgets_p, decision, kv_mib, log, mean_layer_mib, model, n_attn, n_layers, ns, terms):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1305: THE NUMBER, now that the frontier exists.  A W67/W40 raised by
+    # the solve above carries the cut and the floor in its own text.
+    log(pool_floor_line(decision))
+    log(
+        f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
+        f"kv={kv_mib * 1024 * 1024:.0f} B/token/attn-layer (from config, fp8_e4m3) "
+        f"weights attn {terms.attn_layer_weight_bytes / _pp_cut.MIB:.1f} / linear "
+        f"{terms.linear_layer_weight_bytes / _pp_cut.MIB:.1f} MiB per layer -> mean "
+        f"{mean_layer_mib:.1f} used; free={budgets_p} MiB (this launcher's own "
+        f"per-rank budgets); arming floor {ns.pp_cut_arming_floor_mib} MiB/rank "
+        f"(rank0 layer cap only -- the pool model charges the corridor holdback "
+        f"instead, #1286)"
+    )
+    # #1286: the posts, on their own line, in the runtime's own order and with
+    # the runtime's own names, so this line and the boot's `KV budget posts`
+    # line can be read side by side without a translation step.
+    _act_heuristic_mib, _act_provenance = p_activation_reserve_provenance(
+        model, int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+    )
+    return _act_heuristic_mib, _act_provenance
+
+
+
+def _solve_p_cut_step14_log_pp_cut(*, chunk_tokens, log, model_pool, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # #114: the post's OWN provenance, next to the posts line it feeds.
+    log(
+        "PP-CUT activation post (#114): chunk %d -> measured prefill transient "
+        "per stage %s MiB (support points %s, linear between, H41 -- see the "
+        "PP-CUT ACTIVATION lines); post = %.1f MiB/rank (%s)"
+        % (
+            int(chunk_tokens),
+            list(p_prefill_transient_vector_mib(int(chunk_tokens))),
+            list(P_PREFILL_TRANSIENT_SUPPORT.chunks),
+            float(model_pool.activation_reserve_mib),
+            "pinned by --pp-cut-activation-reserve-mib"
+            if ns.pp_cut_activation_reserve_mib is not None
+            else "max(reference 1024, binding stage)",
+        )
+    )
+
+
+
+def _solve_p_cut_step15__rec(*, log, model_pool, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    if model_pool.activation_reserve_mib_by_stage:
+        _rec, _rec_boots = p_activation_record(getattr(ns, "profile", None) or None)
+        log(
+            "PP-CUT activation post (#242): PER STAGE %s MiB (record %s %s at chunk "
+            "%d, %s) -- charged in place of the one scalar %.1f above, the same "
+            "vector group P's ranks book as %s; the P-KARTE takes max(builtin, "
+            "record) %s"
+            % (
+                ["%.1f" % v for v in model_pool.activation_reserve_mib_by_stage],
+                P_ACTIVATION_RECORD,
+                list(_rec or ()),
+                P_ACTIVATION_RECORD_CHUNK,
+                _rec_boots or "no boots named",
+                float(model_pool.activation_reserve_mib),
+                P_PREFILL_TRANSIENT_ENV,
+                [list(pt.mib) for pt in p_transient_support(
+                    getattr(ns, "profile", None) or None, card=True).points
+                 if pt.chunk == P_ACTIVATION_RECORD_CHUNK][0],
+            )
+        )
+
+
+
+def _solve_p_cut_step16_log_pp_cut(*, _p_mamba_src, log, mean_layer_mib, model_pool, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    log(
+        "PP-CUT budget posts (the boot's own list, MiB/rank): "
+        "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
+        "%.1f; mamba %.4f/linear-layer/slot x %d slots (%s; %s); speculative "
+        "intermediate %.1f; prefill activation reserve %.1f; mamba pre-capture "
+        "reserve %.1f; page_size %d. Zero posts ACKNOWLEDGED (absent from both "
+        "reference boots' emitted lists, not merely unmeasured): %s. Every one "
+        "of these was UNFUNDED or wrong before #1286 and each omission "
+        "over-prices; measured on weg2sb5f, the same cut published 499967 "
+        "tokens and group P sized 304655 (+64.1%%)."
+        % (
+            mean_layer_mib,
+            ",".join("%.1f" % v for v in model_pool.stage_fixed_mib),
+            float(model_pool.corridor_holdback_mib or 0.0),
+            float(model_pool.mamba_mib_per_linear_layer_per_slot),
+            int(model_pool.mamba_slots),
+            _p_mamba_src,
+            p_mamba_floor_text(int(model_pool.mamba_slots), p_seats(ns)),
+            float(model_pool.speculative_intermediate_mib),
+            float(model_pool.activation_reserve_mib),
+            float(model_pool.mamba_precapture_reserve_mib),
+            int(model_pool.page_size),
+            ", ".join(model_pool.zero_posts_acknowledged) or "none",
+        )
+    )
+
+
+
+def _solve_p_cut_step17_log_pp_cut(*, _act_heuristic_mib, _act_provenance, decision, kv_mib, log, model_pool):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1286 F2: the ONE post in that list whose value is not a runtime
+    # constant. Named with its exposure and its detection line, because an
+    # unpriced risk reads as no risk -- the same lesson one level up.
+    log(
+        "PP-CUT activation reserve RISK: charging %.0f MiB/rank, %s. The gap "
+        "is %+.0f MiB/rank, i.e. %.0f tokens per ATTENTION LAYER on whichever "
+        "stage binds -- OVER-pricing, silently, in the direction that clears a "
+        "pool floor the boot cannot hold. NOT PRICED IN, and NOT auto-resolved "
+        "here on purpose: building the boot's ActivationProfile in this "
+        "process would restate profile_from_server_args, and a restatement "
+        "wrong by one field returns None = 'uncalibrated' = a false refusal of "
+        "a healthy launch. DETECTION, one grep of group P's log: "
+        "`grep -c 'Using the INHERITED activation heuristic' P.log` -- 0 means "
+        "the calibrated branch was taken and the prices above stand; >=1 means "
+        "every price above is stale by the gap and only the boot's own sizing "
+        "line counts."
+        % (
+            float(model_pool.activation_reserve_mib),
+            _act_provenance,
+            _act_heuristic_mib - float(model_pool.activation_reserve_mib),
+            (_act_heuristic_mib - float(model_pool.activation_reserve_mib))
+            / max(1e-9, kv_mib),
+        )
+    )
+    log(decision.provenance_line())
+    log(decision.trade_line())
+
+
+
+def _solve_p_cut_step18_log_decision_frontie(*, decision, log):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1286b -- THE CURVE. provenance_line prices TWO points of it (the two
+    # objectives' cuts); this line prices every point that is not beaten on
+    # both axes at once, so "what would a floor of N cost me in ms" is read off
+    # one boot log instead of re-solved. It is also how a value for
+    # --pp-solve-pool-floor is chosen.
+    log(decision.frontier_line())
+    for row in decision.table_lines():
+        log(row)
+
+
+
+def _solve_p_cut_step19_incumbent_row(*, decision):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # ALL THREE ARMS PRICED ON EVERY BOOT, the shipped one named.  The two the
+    # boot did NOT take are the whole reason this line exists: the makespan
+    # default was paid for weeks because its alternative was never printed
+    # beside it, and a trade nobody can see is a trade nobody selected.
+    incumbent_row = incumbent_candidate(
+        decision, P_PP_STAGE_RATIO_SCORES, P_PP_ATTN_STAGE_RATIO_SCORES
+    )
+    makespan_row = decision.makespan or decision.chosen
+    return incumbent_row, makespan_row
+
+
+
+def _solve_p_cut_step20__cell_bytes_per_attn_lay(*, _pp_cut, kv_mib):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1286 F1: the join KEY comes from the pool model's own cell, never from a
+    # typed 2048. The price above already uses
+    # `kv_mib_per_token_per_attn_layer` (consumed from config by
+    # kv_mib_per_token_per_attn_layer_from_config), and the inputs line one
+    # screen up already prints it correctly -- so a hardcoded 2048 here would
+    # publish a cell_bytes that does not equal P's own `cell_size=` on ANY
+    # config with a different KV dtype or head geometry, while the price
+    # itself stayed right. That is the one failure this line exists to
+    # prevent: a join key that silently stops joining.
+    _cell_bytes_per_attn_layer = int(round(kv_mib * _pp_cut.MIB))
+    return _cell_bytes_per_attn_layer
+
+
+def _solve_p_cut_step21__cut(*, budgets_p, cards, chunk_tokens, log, model, ns, power_reading, user_reserve_by_card):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    _cut, _pp_cut, cfg, kinds, n_attn, n_layers, text_cfg = _solve_p_cut_step01__pp_cut(cards=cards, chunk_tokens=chunk_tokens, log=log, model=model, ns=ns, power_reading=power_reading)
+    _p_mamba_slots, _p_mamba_src, kv_mib, layer_mib_by_stage, mean_layer_mib, terms = _solve_p_cut_step02_kv_mib(_pp_cut=_pp_cut, cfg=cfg, log=log, model=model, n_layers=n_layers, ns=ns)
+    layer_mib_by_stage = _solve_p_cut_step03__acc(_p_mamba_slots=_p_mamba_slots, _pp_cut=_pp_cut, budgets_p=budgets_p, cards=cards, chunk_tokens=chunk_tokens, kinds=kinds, layer_mib_by_stage=layer_mib_by_stage, log=log, mean_layer_mib=mean_layer_mib, model=model, ns=ns, terms=terms, text_cfg=text_cfg)
+    _booked, _p_draft_cell, _stage_fixed, ms = _solve_p_cut_step04_ms(budgets_p=budgets_p, log=log, model=model, ns=ns, terms=terms, text_cfg=text_cfg)
+    model_pool = _solve_p_cut_step05_model_pool(_booked=_booked, _p_draft_cell=_p_draft_cell, _p_mamba_slots=_p_mamba_slots, _pp_cut=_pp_cut, _stage_fixed=_stage_fixed, budgets_p=budgets_p, chunk_tokens=chunk_tokens, kv_mib=kv_mib, layer_mib_by_stage=layer_mib_by_stage, mean_layer_mib=mean_layer_mib, model=model, ns=ns, user_reserve_by_card=user_reserve_by_card)
+    families = _solve_p_cut_step06_if__booked(_booked=_booked, _cut=_cut, _pp_cut=_pp_cut, budgets_p=budgets_p, kinds=kinds, log=log, model_pool=model_pool, ns=ns)
+    return _cut, _p_mamba_src, _pp_cut, families, kinds, kv_mib, mean_layer_mib, model_pool, ms, n_attn, n_layers, terms, text_cfg
+
+
+
+def _solve_p_cut_step22_incumbent(*, budgets_p, model, ms, n_layers, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # FIX 2: the incumbent is the cost model's MEASUREMENT BASIS -- the cut
+    # MEASURED_MS_PER_LAYER was taken under -- and that is what
+    # P_PP_STAGE_RATIO_SCORES is defined to be. It was restated here as a bare
+    # "32,18,14", a fourth copy of a vector whose whole point is one
+    # definition; an operator pin still overrides it.
+    #
+    # #1362 [22-fix follow, DESK6 #1378]: THE SAME MODEL-IDENTITY GUARD AS
+    # argv_p(), not a second unguarded reader of "the incumbent ratio".
+    # Measured live: without this, a 24-layer model with its OWN complete
+    # calibration record still crashed here with the bare
+    # pp_cut.family_costs_from_measurement ValueError
+    # (refuse_foreign_calibration's own message already quotes that exact
+    # text as the failure #1362 exists to name) -- because this line ran
+    # BEFORE argv_p ever got a chance to consult the calibration record.
+    if ns.pp_stage_ratio:
+        incumbent = _csv_ints(ns.pp_stage_ratio)
+    elif len(budgets_p) != len(P_PP_STAGE_RATIO_SCORES):
+        # HW-P1c 1003: the measurement basis is a THREE-stage cut; a P group of
+        # another size starts the solver from a cut sized to its stage rates
+        incumbent = n_stage_incumbent(len(budgets_p), n_layers, ms)
     else:
-        log("PP-CUT STAGE MODEL off: %s" % _stage_prov)
+        incumbent = (
+            host_ledger.resolve_calibrated_stage_layer_counts(
+                model, ns.pp_stage_ratio,
+                _pconst("CALIBRATION_LAYERS", getattr(ns, "profile", None)))
+            or list(P_PP_STAGE_RATIO_SCORES)
+        )
+    design_src = _solve_p_cut_step07_design_src(ns=ns)
+    census = read_mean_prefill_prefix(design_src) if design_src else None
+    return census, design_src, incumbent
+
+
+
+def _solve_p_cut_step23_design_prefix(*, census, design_src, model, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    if ns.pp_cut_design_prefix_tokens is not None:
+        design_prefix = int(ns.pp_cut_design_prefix_tokens)
+        design_prov = "PINNED by --pp-cut-design-prefix-tokens"
+    elif census is not None:
+        design_prefix = int(round(census[0]))
+        design_prov = (
+            "MEASURED mean prefix over %d prefill-batch chunks of %s (rank %s, "
+            "one rank only: every stage prints the same batch)"
+            % (census[1], design_src, census[2])
+        )
+    else:
+        design_prefix = int(DESIGN_PREFIX_FALLBACK_TOKENS)
+        design_prov = (
+            "FALLBACK: no P log %sin %s carries a prefill census, so the design "
+            "prefix is one chunk -- the shallowest depth this boot can run. "
+            "This is an absence of the instrument, not a measured shallow rig."
+            % (
+                ("of " + pdflip_form.model_key(model) + " (PDFLIP-FORM calibration identity) ")
+                if calib_log_accept_of(ns) is not None else "",
+                EVIDENCE_DIR,
+            )
+        )
+    return design_prefix, design_prov
+
+
+
+def _solve_p_cut_step24_anchor_stage(*, _pp_cut, budgets_p, cards, chunk_tokens, families, incumbent, log, ms, ns, text_cfg):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    if len(budgets_p) != len(P_PP_STAGE_RATIO_SCORES):
+        # HW-P1c 1003: the family split is fitted on the REFERENCE basis and
+        # mapped to the live stages by card class (see derived_family_cost)
+        family_cost, family_prov = derived_family_cost(ns, cards, families, int(chunk_tokens))
+    else:
+        measured_attn = _pp_cut.attention_counts(families, incumbent)
+        # HW-GENERIC 1002: the stage whose card is of the class the deep
+        # attention anchor (ATTN_ANCHOR_MS, "a 3080 ... 0.4 s per chunk") was
+        # measured on -- by calibration class, not "the first card that is not a
+        # 5090". On the reference rig that is stage 1, as before.
+        anchor_stage = attn_anchor_stage(cards, log)
+        family_cost, family_prov = _pp_cut.family_costs_from_measurement(
+            measured_ms_per_layer=ms,
+            measured_counts=incumbent,
+            measured_attn_counts=measured_attn,
+            chunk_tokens=int(chunk_tokens),
+            ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens),
+            anchor_stage=anchor_stage,
+            anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
+            anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
+        )
+    _fitted_log, _power_now = _solve_p_cut_step08__power_now(cards=cards, log=log)
+    if str(getattr(ns, "pp_cut_stage_fit", "") or "").strip():
+        family_cost, family_prov, _fitted_log = stage_fit_family_cost(
+            ns, cards, int(chunk_tokens), _power_now, log)
+    _depth_profile, lanes, pair_ms, payload_bytes = _solve_p_cut_step09__depth_profile(_fitted_log=_fitted_log, cards=cards, chunk_tokens=chunk_tokens, log=log, ns=ns, text_cfg=text_cfg)
+    return _depth_profile, _fitted_log, _power_now, family_cost, family_prov, lanes, pair_ms, payload_bytes
+
+
+
+def _solve_p_cut_step25_log_pp_cut(*, _pp_cut, budgets_p, cards, chunk_tokens, design_prefix, design_prov, families, family_prov, lanes, log, model, model_pool, ns, pair_ms, payload_bytes, text_cfg):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    log(
+        "PP-CUT depth axis: design_prefix=%d tokens (%s); calibration prefix "
+        "%d (%s); %s"
+        % (
+            design_prefix,
+            design_prov,
+            int(ns.pp_cut_calibration_prefix_tokens),
+            "boot bsscale, ~12k prompt = 3 full chunks at 4096 -> mean 4096, "
+            "BSSCALE_0907.md",
+            family_prov,
+        )
+    )
+    _floor_flag = _solve_p_cut_step10_log_pp_cut(_pp_cut=_pp_cut, chunk_tokens=chunk_tokens, lanes=lanes, log=log, ns=ns, pair_ms=pair_ms, payload_bytes=payload_bytes, text_cfg=text_cfg)
+    pool_floor, pool_floor_from_cut = _solve_p_cut_step11__cap_floor_default(_floor_flag=_floor_flag, budgets_p=budgets_p, chunk_tokens=chunk_tokens, log=log, ns=ns)
+    _chunk_mix, _stage_model, _stage_prov, model_pool = _solve_p_cut_step12_model_pool(cards=cards, families=families, log=log, model=model, model_pool=model_pool, ns=ns, pool_floor=pool_floor)
+    return _chunk_mix, _stage_model, _stage_prov, model_pool, pool_floor, pool_floor_from_cut
+
+
+
+def _solve_p_cut_step26_decision(*, _chunk_mix, _cut, _depth_profile, _fitted_log, _stage_model, _stage_prov, cards, design_prefix, families, family_cost, incumbent, model_pool, ms, ns, pair_ms, pool_floor, pool_floor_from_cut):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     decision = _cut.solve_launch_cut(
         stage_model=_stage_model,
         chunk_mix=_chunk_mix,
@@ -9239,119 +9491,201 @@ def solve_p_cut(
         pool_floor_from_cut=pool_floor_from_cut,
         depth_profile=_depth_profile,
     )
-    # #1305: THE NUMBER, now that the frontier exists.  A W67/W40 raised by
-    # the solve above carries the cut and the floor in its own text.
-    log(pool_floor_line(decision))
-    log(
-        f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
-        f"kv={kv_mib * 1024 * 1024:.0f} B/token/attn-layer (from config, fp8_e4m3) "
-        f"weights attn {terms.attn_layer_weight_bytes / _pp_cut.MIB:.1f} / linear "
-        f"{terms.linear_layer_weight_bytes / _pp_cut.MIB:.1f} MiB per layer -> mean "
-        f"{mean_layer_mib:.1f} used; free={budgets_p} MiB (this launcher's own "
-        f"per-rank budgets); arming floor {ns.pp_cut_arming_floor_mib} MiB/rank "
-        f"(rank0 layer cap only -- the pool model charges the corridor holdback "
-        f"instead, #1286)"
+    return decision
+
+
+
+def _solve_p_cut_step27__act_heuristic_mib(*, _p_mamba_src, _pp_cut, budgets_p, chunk_tokens, decision, kv_mib, log, mean_layer_mib, model, model_pool, n_attn, n_layers, ns, terms):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    _act_heuristic_mib, _act_provenance = _solve_p_cut_step13_log_pool_floor_line(_pp_cut=_pp_cut, budgets_p=budgets_p, decision=decision, kv_mib=kv_mib, log=log, mean_layer_mib=mean_layer_mib, model=model, n_attn=n_attn, n_layers=n_layers, ns=ns, terms=terms)
+    _solve_p_cut_step14_log_pp_cut(chunk_tokens=chunk_tokens, log=log, model_pool=model_pool, ns=ns)
+    _solve_p_cut_step15__rec(log=log, model_pool=model_pool, ns=ns)
+    _solve_p_cut_step16_log_pp_cut(_p_mamba_src=_p_mamba_src, log=log, mean_layer_mib=mean_layer_mib, model_pool=model_pool, ns=ns)
+    _solve_p_cut_step17_log_pp_cut(_act_heuristic_mib=_act_heuristic_mib, _act_provenance=_act_provenance, decision=decision, kv_mib=kv_mib, log=log, model_pool=model_pool)
+    _solve_p_cut_step18_log_decision_frontie(decision=decision, log=log)
+
+
+
+def _solve_p_cut_step28_incumbent_row(*, chosen, decision, log, ship_why):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    incumbent_row, makespan_row = _solve_p_cut_step19_incumbent_row(decision=decision)
+    # #1286b: THE FLOOR APPLIES TO WHAT SHIPS, not only to what the objective
+    # ranked. `incumbent` names a candidate and looks it up in the ranked field,
+    # so it never passes through the set --pp-solve-pool-floor narrowed; without
+    # this call an operator could set a floor, take that arm, and boot below it
+    # with every line saying the floor was honoured. Same writer as the solver's
+    # own refusals (CutDecision.refuse_shipped_below_floors -> refuse_below_floors).
+    decision.refuse_shipped_below_floors(
+        chosen, "the SHIPPED cut (%s)" % (ship_why.split(" (")[0],)
     )
-    # #1286: the posts, on their own line, in the runtime's own order and with
-    # the runtime's own names, so this line and the boot's `KV budget posts`
-    # line can be read side by side without a translation step.
-    _act_heuristic_mib, _act_provenance = p_activation_reserve_provenance(
-        model, int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
-    )
-    # #114: the post's OWN provenance, next to the posts line it feeds.
     log(
-        "PP-CUT activation post (#114): chunk %d -> measured prefill transient "
-        "per stage %s MiB (support points %s, linear between, H41 -- see the "
-        "PP-CUT ACTIVATION lines); post = %.1f MiB/rank (%s)"
-        % (
-            int(chunk_tokens),
-            list(p_prefill_transient_vector_mib(int(chunk_tokens))),
-            list(P_PREFILL_TRANSIENT_SUPPORT.chunks),
-            float(model_pool.activation_reserve_mib),
-            "pinned by --pp-cut-activation-reserve-mib"
-            if ns.pp_cut_activation_reserve_mib is not None
-            else "max(reference 1024, binding stage)",
+        shipped_line(
+            decision,
+            chosen,
+            ship_why,
+            incumbent_row,
+            makespan_row,
+            incumbent_fallback="%s / %s"
+            % (_csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)),
+            floor_source=floor_source_for_shipped_line(decision),
         )
     )
-    if model_pool.activation_reserve_mib_by_stage:
-        _rec, _rec_boots = p_activation_record(getattr(ns, "profile", None) or None)
-        log(
-            "PP-CUT activation post (#242): PER STAGE %s MiB (record %s %s at chunk "
-            "%d, %s) -- charged in place of the one scalar %.1f above, the same "
-            "vector group P's ranks book as %s; the P-KARTE takes max(builtin, "
-            "record) %s"
-            % (
-                ["%.1f" % v for v in model_pool.activation_reserve_mib_by_stage],
-                P_ACTIVATION_RECORD,
-                list(_rec or ()),
-                P_ACTIVATION_RECORD_CHUNK,
-                _rec_boots or "no boots named",
-                float(model_pool.activation_reserve_mib),
-                P_PREFILL_TRANSIENT_ENV,
-                [list(pt.mib) for pt in p_transient_support(
-                    getattr(ns, "profile", None) or None, card=True).points
-                 if pt.chunk == P_ACTIVATION_RECORD_CHUNK][0],
-            )
-        )
+
+
+
+def _solve_p_cut_step29_per_rank_priced(*, _pp_cut, chosen, kv_mib, model_pool):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1286 -- THE JOIN LINE. `PP-CUT SHIPPED` prices the three objectives, but
+    # nothing on it could be JOINED against what group P then sized: the two
+    # halves are emitted by different processes, in different units, with no
+    # shared key, so the +64.1 % of weg2sb5f sat in plain sight across two logs
+    # for a whole boot. `cell_bytes` is that key -- it is the per-rank
+    # `cell_size=` of P's own `KV pool sizing:` line, byte for byte -- and the
+    # per-rank priced capacities line up against P's per-rank
+    # `KV token sizing: rank r local capacity N tokens`.
+    #
+    # ONE GREP FINDS BOTH HALVES, and that is the whole point of the marker:
+    #   grep -h 'PP-POOL-JOIN\|KV pool sizing\|KV token sizing' front.log P.log
+    per_rank_priced = _pp_cut.stage_pp_capacities(
+        chosen.layers, chosen.attn, model_pool
+    ) if chosen.kind == "contiguous" else ()
+    _cell_bytes_per_attn_layer = _solve_p_cut_step20__cell_bytes_per_attn_lay(_pp_cut=_pp_cut, kv_mib=kv_mib)
+    return _cell_bytes_per_attn_layer, per_rank_priced
+
+
+
+def _solve_p_cut_step30_log_pp_poo(*, _cell_bytes_per_attn_layer, chosen, log, model_pool, ns, per_rank_priced):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
     log(
-        "PP-CUT budget posts (the boot's own list, MiB/rank): "
-        "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
-        "%.1f; mamba %.4f/linear-layer/slot x %d slots (%s; %s); speculative "
-        "intermediate %.1f; prefill activation reserve %.1f; mamba pre-capture "
-        "reserve %.1f; page_size %d. Zero posts ACKNOWLEDGED (absent from both "
-        "reference boots' emitted lists, not merely unmeasured): %s. Every one "
-        "of these was UNFUNDED or wrong before #1286 and each omission "
-        "over-prices; measured on weg2sb5f, the same cut published 499967 "
-        "tokens and group P sized 304655 (+64.1%%)."
+        "PP-POOL-JOIN: objective=%s layers=%s attn=%s PRICED pool_tokens=%d "
+        "priced_per_rank=%s cell_bytes=%s page_size=%d mamba_slots=%d -- "
+        "REALISED is group P's own sizing: "
+        "join on cell_bytes against 'KV pool sizing: available_bytes=... "
+        "cell_size=...' per rank, and compare the world against 'KV token "
+        "sizing: ... min-reduced across ranks to N'. PRICED minus REALISED is "
+        "this pool model's error FOR THIS CUT and belongs in the boot record; "
+        "it was +64.1%% before #1286 and the residual the posts carry now is "
+        "the two-boot spread of --pp-cut-stage-fixed-mib (<=12.7 MiB/rank). "
+        "SECOND JOIN, same discipline: mamba_slots is P's --max-mamba-cache-size "
+        "(H92c; the demand bound only for an argv without it) against the boot's "
+        "'Mamba Cache is allocated. max_mamba_cache_size: N', so N <= %d must "
+        "hold; N above it means the mamba post is under-charged and the pool "
+        "over-priced (#1286 F4)."
         % (
-            mean_layer_mib,
-            ",".join("%.1f" % v for v in model_pool.stage_fixed_mib),
-            float(model_pool.corridor_holdback_mib or 0.0),
-            float(model_pool.mamba_mib_per_linear_layer_per_slot),
-            int(model_pool.mamba_slots),
-            _p_mamba_src,
-            p_mamba_floor_text(int(model_pool.mamba_slots), p_seats(ns)),
-            float(model_pool.speculative_intermediate_mib),
-            float(model_pool.activation_reserve_mib),
-            float(model_pool.mamba_precapture_reserve_mib),
+            str(ns.pp_solve_objective),
+            ",".join(str(n) for n in chosen.layers),
+            ",".join(str(a) for a in chosen.attn),
+            int(chosen.pool_tokens),
+            ",".join("%d" % int(c) for c in per_rank_priced) or "n/a (gapped)",
+            ",".join(
+                str(int(a) * _cell_bytes_per_attn_layer) for a in chosen.attn
+            ),
             int(model_pool.page_size),
-            ", ".join(model_pool.zero_posts_acknowledged) or "none",
+            int(model_pool.mamba_slots),
+            int(model_pool.mamba_slots),
         )
     )
-    # #1286 F2: the ONE post in that list whose value is not a runtime
-    # constant. Named with its exposure and its detection line, because an
-    # unpriced risk reads as no risk -- the same lesson one level up.
+
+
+
+def _solve_p_cut_step31_log_pp_cut(*, chosen, decision, log):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1305 item 2 (boot weg2sn5pre): THE CAP AND THE FLOOR, SIDE BY SIDE.
+    # Group P's `--max-total-tokens` was a constant 428,000 from boot weg2zr2
+    # and cut the realised pool 7.7 % below the priced one -- and below the
+    # floor the boot claimed to hold. It is now the shipped cut's priced pool
+    # (argv_p, p_max_total_tokens), so realised = min(P's own sizing, priced)
+    # and the floor binds the REALISED pool: a cap below the floor is
+    # impossible by construction (the shipped pool clears the floor or the
+    # solve refused above), which is why this line prints both numbers rather
+    # than carrying a second refusal.
     log(
-        "PP-CUT activation reserve RISK: charging %.0f MiB/rank, %s. The gap "
-        "is %+.0f MiB/rank, i.e. %.0f tokens per ATTENTION LAYER on whichever "
-        "stage binds -- OVER-pricing, silently, in the direction that clears a "
-        "pool floor the boot cannot hold. NOT PRICED IN, and NOT auto-resolved "
-        "here on purpose: building the boot's ActivationProfile in this "
-        "process would restate profile_from_server_args, and a restatement "
-        "wrong by one field returns None = 'uncalibrated' = a false refusal of "
-        "a healthy launch. DETECTION, one grep of group P's log: "
-        "`grep -c 'Using the INHERITED activation heuristic' P.log` -- 0 means "
-        "the calibrated branch was taken and the prices above stand; >=1 means "
-        "every price above is stale by the gap and only the boot's own sizing "
-        "line counts."
+        "PP-CUT P-CAP: --max-total-tokens=%d (= the SHIPPED cut's priced pool; "
+        "was the boot-weg2zr2 constant 428000 until 2026-09-09, which undercut "
+        "the priced pool by 7.7 %% on weg2sn5pre) pool_floor=%s -- the floor "
+        "binds the REALISED pool by construction: realised = min(group P's own "
+        "'KV token sizing' min-reduce, this cap), and PRICED minus REALISED "
+        "reads off PP-POOL-JOIN"
         % (
-            float(model_pool.activation_reserve_mib),
-            _act_provenance,
-            _act_heuristic_mib - float(model_pool.activation_reserve_mib),
-            (_act_heuristic_mib - float(model_pool.activation_reserve_mib))
-            / max(1e-9, kv_mib),
+            int(chosen.pool_tokens),
+            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
         )
     )
-    log(decision.provenance_line())
-    log(decision.trade_line())
-    # #1286b -- THE CURVE. provenance_line prices TWO points of it (the two
-    # objectives' cuts); this line prices every point that is not beaten on
-    # both axes at once, so "what would a floor of N cost me in ms" is read off
-    # one boot log instead of re-solved. It is also how a value for
-    # --pp-solve-pool-floor is chosen.
-    log(decision.frontier_line())
-    for row in decision.table_lines():
-        log(row)
+
+
+
+def _solve_p_cut_step32_stage_ratio(*, chosen, kinds):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
+    # --pp-stage-ratio entries are SCORES: server_args hands them to
+    # derive_pp_layer_split, which SNAPS the boundary into the window that
+    # realizes the attention target -- and snaps SILENTLY when an attention
+    # vector is given (the #505(a) warning in _handle_pp_stage_ratio only
+    # fires when attn_scores is None). MEASURED: 43,10,11 with attn 5,6,5
+    # comes back as 23,24,17. A solved cut that does not survive this call is
+    # a cut the boot would not run, so it is refused here rather than logged
+    # and departed from.
+    # THE SHIPPED candidate, not the ranking's winner: train 2 reconciled the
+    # objective knob into ONE flag, so ``chosen`` and ``decision.chosen`` are
+    # the same row only when the arm is the solver's own objective. Everything
+    # below -- the round trip, the argv strings, PCutFacts -- must describe the
+    # cut the boot RUNS.
+    stage_ratio = _csv(chosen.layers)
+    attn_ratio = _csv(chosen.attn)
+    # FIX 2: through ``p_stage_layers``, the launcher's ONE score-pair ->
+    # split seam, rather than a second direct call to the same upstream
+    # function. Same authority, one caller of it.
+    realized = p_stage_layers(
+        [str(k) == "full_attention" for k in kinds],
+        scores=list(chosen.layers),
+        attn_scores=list(chosen.attn),
+    )
+    return attn_ratio, realized, stage_ratio
+
+
+
+def _solve_p_cut_step33_if_list_realized(*, attn_ratio, chosen, log, realized, stage_ratio):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.)."""
+    if list(realized) != list(chosen.layers):
+        raise PdFlipLaunchRefused(
+            f"W40 PdFlipPPCutRefused: the cut this launcher solved "
+            f"({stage_ratio} / attn {attn_ratio}) does not survive "
+            f"derive_pp_layer_split -- it would run as "
+            f"{','.join(str(c) for c in realized)}. Refusing rather than "
+            f"booting a layout the provenance line misdescribes."
+        )
+    log(
+        f"PP-CUT round trip: derive_pp_layer_split({stage_ratio}, attn "
+        f"{attn_ratio}) = {','.join(str(c) for c in realized)} -- the argv "
+        f"states what the boot will run."
+    )
+
+
+
+def _solve_p_cut_step34_stage_model_mix(*, _chunk_mix, _power_now, _stage_model, _stage_prov, cards, chunk_tokens, design_prefix, design_src, log):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.): check the stage model against the live power limits, build the chunk mix."""
+    if _stage_model is not None:
+        from flliper.srt.pdflip import p_stage_model as _psm
+        from flliper.srt.pdflip import power_limit as _plim
+
+        _current = {}
+        for _c, _w in zip(cards, _power_now):
+            if _w is not None:
+                _current.setdefault(card_identity.class_label(_c), float(_w))
+        _stage_model, _plines = _psm.check_power(_stage_model, _current)
+        for _ln in _plines:
+            log("PP-CUT STAGE MODEL " + _ln)
+        _chunk_mix, _mix_prov = pp_cut_chunk_mix(
+            design_src, int(chunk_tokens), int(design_prefix), int(p_prefill_graph_bucket()))
+        log("PP-CUT STAGE MODEL (--pp-cut-stage-model): %s; %s -- every candidate's makespan below is the "
+            "mean ms per chunk over that mix (per chunk the bottleneck stage)" % (_stage_prov, _mix_prov))
+    else:
+        log("PP-CUT STAGE MODEL off: %s" % _stage_prov)
+    return _chunk_mix, _stage_model
+
+
+def _solve_p_cut_step35_shipped_cut(*, budgets_p, decision, log, ns):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.): WHICH priced row this boot ships (pin, objective, host price)."""
     # WHICH of those priced rows this boot actually SHIPS (#1254 -- see
     # :func:`pick_shipped_cut`).  An operator pin outranks the objective: it IS
     # the chosen candidate, and overriding it here would make --pp-stage-ratio
@@ -9404,200 +9738,102 @@ def solve_p_cut(
                     "incumbent's + slack (#1447 host-priced; the makespan pick %s/%s costs more host)"
                     % (_csv((decision.makespan or decision.chosen).layers),
                        _csv((decision.makespan or decision.chosen).attn)))
-    # ALL THREE ARMS PRICED ON EVERY BOOT, the shipped one named.  The two the
-    # boot did NOT take are the whole reason this line exists: the makespan
-    # default was paid for weeks because its alternative was never printed
-    # beside it, and a trade nobody can see is a trade nobody selected.
-    incumbent_row = incumbent_candidate(
-        decision, P_PP_STAGE_RATIO_SCORES, P_PP_ATTN_STAGE_RATIO_SCORES
-    )
-    makespan_row = decision.makespan or decision.chosen
-    # #1286b: THE FLOOR APPLIES TO WHAT SHIPS, not only to what the objective
-    # ranked. `incumbent` names a candidate and looks it up in the ranked field,
-    # so it never passes through the set --pp-solve-pool-floor narrowed; without
-    # this call an operator could set a floor, take that arm, and boot below it
-    # with every line saying the floor was honoured. Same writer as the solver's
-    # own refusals (CutDecision.refuse_shipped_below_floors -> refuse_below_floors).
-    decision.refuse_shipped_below_floors(
-        chosen, "the SHIPPED cut (%s)" % (ship_why.split(" (")[0],)
-    )
-    log(
-        shipped_line(
-            decision,
-            chosen,
-            ship_why,
-            incumbent_row,
-            makespan_row,
-            incumbent_fallback="%s / %s"
-            % (_csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)),
-            floor_source=floor_source_for_shipped_line(decision),
-        )
-    )
-    # #1286 -- THE JOIN LINE. `PP-CUT SHIPPED` prices the three objectives, but
-    # nothing on it could be JOINED against what group P then sized: the two
-    # halves are emitted by different processes, in different units, with no
-    # shared key, so the +64.1 % of weg2sb5f sat in plain sight across two logs
-    # for a whole boot. `cell_bytes` is that key -- it is the per-rank
-    # `cell_size=` of P's own `KV pool sizing:` line, byte for byte -- and the
-    # per-rank priced capacities line up against P's per-rank
-    # `KV token sizing: rank r local capacity N tokens`.
-    #
-    # ONE GREP FINDS BOTH HALVES, and that is the whole point of the marker:
-    #   grep -h 'PP-POOL-JOIN\|KV pool sizing\|KV token sizing' front.log P.log
-    per_rank_priced = _pp_cut.stage_pp_capacities(
-        chosen.layers, chosen.attn, model_pool
-    ) if chosen.kind == "contiguous" else ()
-    # #1286 F1: the join KEY comes from the pool model's own cell, never from a
-    # typed 2048. The price above already uses
-    # `kv_mib_per_token_per_attn_layer` (consumed from config by
-    # kv_mib_per_token_per_attn_layer_from_config), and the inputs line one
-    # screen up already prints it correctly -- so a hardcoded 2048 here would
-    # publish a cell_bytes that does not equal P's own `cell_size=` on ANY
-    # config with a different KV dtype or head geometry, while the price
-    # itself stayed right. That is the one failure this line exists to
-    # prevent: a join key that silently stops joining.
-    _cell_bytes_per_attn_layer = int(round(kv_mib * _pp_cut.MIB))
-    log(
-        "PP-POOL-JOIN: objective=%s layers=%s attn=%s PRICED pool_tokens=%d "
-        "priced_per_rank=%s cell_bytes=%s page_size=%d mamba_slots=%d -- "
-        "REALISED is group P's own sizing: "
-        "join on cell_bytes against 'KV pool sizing: available_bytes=... "
-        "cell_size=...' per rank, and compare the world against 'KV token "
-        "sizing: ... min-reduced across ranks to N'. PRICED minus REALISED is "
-        "this pool model's error FOR THIS CUT and belongs in the boot record; "
-        "it was +64.1%% before #1286 and the residual the posts carry now is "
-        "the two-boot spread of --pp-cut-stage-fixed-mib (<=12.7 MiB/rank). "
-        "SECOND JOIN, same discipline: mamba_slots is P's --max-mamba-cache-size "
-        "(H92c; the demand bound only for an argv without it) against the boot's "
-        "'Mamba Cache is allocated. max_mamba_cache_size: N', so N <= %d must "
-        "hold; N above it means the mamba post is under-charged and the pool "
-        "over-priced (#1286 F4)."
-        % (
-            str(ns.pp_solve_objective),
-            ",".join(str(n) for n in chosen.layers),
-            ",".join(str(a) for a in chosen.attn),
-            int(chosen.pool_tokens),
-            ",".join("%d" % int(c) for c in per_rank_priced) or "n/a (gapped)",
-            ",".join(
-                str(int(a) * _cell_bytes_per_attn_layer) for a in chosen.attn
-            ),
-            int(model_pool.page_size),
-            int(model_pool.mamba_slots),
-            int(model_pool.mamba_slots),
-        )
-    )
-    # #1305 item 2 (boot weg2sn5pre): THE CAP AND THE FLOOR, SIDE BY SIDE.
-    # Group P's `--max-total-tokens` was a constant 428,000 from boot weg2zr2
-    # and cut the realised pool 7.7 % below the priced one -- and below the
-    # floor the boot claimed to hold. It is now the shipped cut's priced pool
-    # (argv_p, p_max_total_tokens), so realised = min(P's own sizing, priced)
-    # and the floor binds the REALISED pool: a cap below the floor is
-    # impossible by construction (the shipped pool clears the floor or the
-    # solve refused above), which is why this line prints both numbers rather
-    # than carrying a second refusal.
-    log(
-        "PP-CUT P-CAP: --max-total-tokens=%d (= the SHIPPED cut's priced pool; "
-        "was the boot-weg2zr2 constant 428000 until 2026-09-09, which undercut "
-        "the priced pool by 7.7 %% on weg2sn5pre) pool_floor=%s -- the floor "
-        "binds the REALISED pool by construction: realised = min(group P's own "
-        "'KV token sizing' min-reduce, this cap), and PRICED minus REALISED "
-        "reads off PP-POOL-JOIN"
-        % (
-            int(chosen.pool_tokens),
-            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
-        )
-    )
-    if chosen.kind == "gapped":
-        # A GAPPED map is not expressible as --pp-stage-ratio and does not go
-        # through derive_pp_layer_split at all: it is published as the layer
-        # SET and executed by the #753 mid-loop crossing wire. The round trip
-        # below is therefore skipped by KIND, not by accident -- and the map is
-        # instead round-tripped through the runtime's OWN parser, which is the
-        # matching authority for this form.
-        from flliper.srt.distributed.utils import parse_pp_layer_sets
+    return chosen, ship_why
 
-        back = parse_pp_layer_sets(
-            chosen.layer_set, n_layers, len(budgets_p), allow_gapped=True
-        )
-        realized_counts = tuple(len(x) for x in back)
-        if realized_counts != chosen.layers:
-            raise PdFlipLaunchRefused(
-                "W40 PdFlipPPCutRefused: the gapped map this launcher solved "
-                "(%s) does not survive parse_pp_layer_sets -- it comes back as "
-                "%s layers per stage. Refusing rather than booting a layout the "
-                "provenance line misdescribes."
-                % (chosen.layer_set, realized_counts)
-            )
-        log(
-            "PP-CUT round trip: parse_pp_layer_sets(%s) = %s layers per stage, "
-            "attn %s, %d crossings per chunk -- the --pp-layer-set argv states "
-            "what the boot will run. --pp-stage-ratio/--pp-attn-stage-ratio are "
-            "OMITTED from group P's argv for this kind: the count form cannot "
-            "state a gapped map (derive_pp_layer_split refuses an attention "
-            "count of 0 and silently re-derives a contiguous split from any "
-            "other), so the map travels once, on the wire."
-            % (
-                chosen.layer_set,
-                realized_counts,
-                ",".join(str(a) for a in chosen.attn),
-                chosen.crossings,
-            )
-        )
-        return PCutFacts(
-            # EMPTY, DELIBERATELY (FOLLOW FIX 1). A gapped map's layout is the
-            # SET, and the count form cannot state it: `48,8,8 / 0,8,8` is
-            # refused by derive_pp_layer_split outright, and a positive-count
-            # gapped map is accepted and derives a DIFFERENT contiguous split.
-            # argv_p omits both flags when these are empty, so the argv states
-            # exactly one layout -- the one on the wire.
-            stage_ratio="",
-            attn_stage_ratio="",
-            pool_tokens=float(chosen.pool_tokens),
-            attn_counts=tuple(int(a) for a in chosen.attn),
-            kv_mib_per_token_per_attn_layer=float(kv_mib),
-            hidden_size=int(text_cfg["hidden_size"]),
-            cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
-            layer_set=chosen.layer_set,
-            gapped=True,
-            layer_counts=tuple(int(c) for c in realized_counts),
-        )
-    # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
-    # --pp-stage-ratio entries are SCORES: server_args hands them to
-    # derive_pp_layer_split, which SNAPS the boundary into the window that
-    # realizes the attention target -- and snaps SILENTLY when an attention
-    # vector is given (the #505(a) warning in _handle_pp_stage_ratio only
-    # fires when attn_scores is None). MEASURED: 43,10,11 with attn 5,6,5
-    # comes back as 23,24,17. A solved cut that does not survive this call is
-    # a cut the boot would not run, so it is refused here rather than logged
-    # and departed from.
-    # THE SHIPPED candidate, not the ranking's winner: train 2 reconciled the
-    # objective knob into ONE flag, so ``chosen`` and ``decision.chosen`` are
-    # the same row only when the arm is the solver's own objective. Everything
-    # below -- the round trip, the argv strings, PCutFacts -- must describe the
-    # cut the boot RUNS.
-    stage_ratio = _csv(chosen.layers)
-    attn_ratio = _csv(chosen.attn)
-    # FIX 2: through ``p_stage_layers``, the launcher's ONE score-pair ->
-    # split seam, rather than a second direct call to the same upstream
-    # function. Same authority, one caller of it.
-    realized = p_stage_layers(
-        [str(k) == "full_attention" for k in kinds],
-        scores=list(chosen.layers),
-        attn_scores=list(chosen.attn),
+
+def _solve_p_cut_step36_gapped_facts(*, budgets_p, chosen, kv_mib, log, n_layers, ns, text_cfg):
+    """Step of :func:`solve_p_cut` (split behaviour-neutrally, refactor 28.10.): the facts of a GAPPED map (layer set, round trip through the runtime's parser)."""
+    # A GAPPED map is not expressible as --pp-stage-ratio and does not go
+    # through derive_pp_layer_split at all: it is published as the layer
+    # SET and executed by the #753 mid-loop crossing wire. The round trip
+    # below is therefore skipped by KIND, not by accident -- and the map is
+    # instead round-tripped through the runtime's OWN parser, which is the
+    # matching authority for this form.
+    from flliper.srt.distributed.utils import parse_pp_layer_sets
+
+    back = parse_pp_layer_sets(
+        chosen.layer_set, n_layers, len(budgets_p), allow_gapped=True
     )
-    if list(realized) != list(chosen.layers):
+    realized_counts = tuple(len(x) for x in back)
+    if realized_counts != chosen.layers:
         raise PdFlipLaunchRefused(
-            f"W40 PdFlipPPCutRefused: the cut this launcher solved "
-            f"({stage_ratio} / attn {attn_ratio}) does not survive "
-            f"derive_pp_layer_split -- it would run as "
-            f"{','.join(str(c) for c in realized)}. Refusing rather than "
-            f"booting a layout the provenance line misdescribes."
+            "W40 PdFlipPPCutRefused: the gapped map this launcher solved "
+            "(%s) does not survive parse_pp_layer_sets -- it comes back as "
+            "%s layers per stage. Refusing rather than booting a layout the "
+            "provenance line misdescribes."
+            % (chosen.layer_set, realized_counts)
         )
     log(
-        f"PP-CUT round trip: derive_pp_layer_split({stage_ratio}, attn "
-        f"{attn_ratio}) = {','.join(str(c) for c in realized)} -- the argv "
-        f"states what the boot will run."
+        "PP-CUT round trip: parse_pp_layer_sets(%s) = %s layers per stage, "
+        "attn %s, %d crossings per chunk -- the --pp-layer-set argv states "
+        "what the boot will run. --pp-stage-ratio/--pp-attn-stage-ratio are "
+        "OMITTED from group P's argv for this kind: the count form cannot "
+        "state a gapped map (derive_pp_layer_split refuses an attention "
+        "count of 0 and silently re-derives a contiguous split from any "
+        "other), so the map travels once, on the wire."
+        % (
+            chosen.layer_set,
+            realized_counts,
+            ",".join(str(a) for a in chosen.attn),
+            chosen.crossings,
+        )
     )
+    return PCutFacts(
+        # EMPTY, DELIBERATELY (FOLLOW FIX 1). A gapped map's layout is the
+        # SET, and the count form cannot state it: `48,8,8 / 0,8,8` is
+        # refused by derive_pp_layer_split outright, and a positive-count
+        # gapped map is accepted and derives a DIFFERENT contiguous split.
+        # argv_p omits both flags when these are empty, so the argv states
+        # exactly one layout -- the one on the wire.
+        stage_ratio="",
+        attn_stage_ratio="",
+        pool_tokens=float(chosen.pool_tokens),
+        attn_counts=tuple(int(a) for a in chosen.attn),
+        kv_mib_per_token_per_attn_layer=float(kv_mib),
+        hidden_size=int(text_cfg["hidden_size"]),
+        cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
+        layer_set=chosen.layer_set,
+        gapped=True,
+        layer_counts=tuple(int(c) for c in realized_counts),
+    )
+
+
+@_unpin_foreign_cut
+def solve_p_cut(
+    ns,
+    cards: List[Card],
+    budgets_p: List[int],
+    model: str,
+    log,
+    chunk_tokens: int = 4096,
+    user_reserve_by_card: Optional[Dict[str, int]] = None,
+    power_reading: Optional["_power.PowerReading"] = None,
+) -> PCutFacts:
+    """Group P's layer + attention cut, and the ONE provenance line for it.
+
+    Returns the flag strings plus the pool facts the depth solver prices
+    against (:class:`PCutFacts`). Everything it feeds the solver is either measured on this box
+    (NVML card names, the per-rank budgets this launcher just derived, the
+    checkpoint's own weight headers and KV cell) or a flag whose default
+    carries its provenance in the help text -- no number is chosen here.
+    """
+    _cut, _p_mamba_src, _pp_cut, families, kinds, kv_mib, mean_layer_mib, model_pool, ms, n_attn, n_layers, terms, text_cfg = _solve_p_cut_step21__cut(budgets_p=budgets_p, cards=cards, chunk_tokens=chunk_tokens, log=log, model=model, ns=ns, power_reading=power_reading, user_reserve_by_card=user_reserve_by_card)
+    census, design_src, incumbent = _solve_p_cut_step22_incumbent(budgets_p=budgets_p, model=model, ms=ms, n_layers=n_layers, ns=ns)
+    design_prefix, design_prov = _solve_p_cut_step23_design_prefix(census=census, design_src=design_src, model=model, ns=ns)
+    _depth_profile, _fitted_log, _power_now, family_cost, family_prov, lanes, pair_ms, payload_bytes = _solve_p_cut_step24_anchor_stage(_pp_cut=_pp_cut, budgets_p=budgets_p, cards=cards, chunk_tokens=chunk_tokens, families=families, incumbent=incumbent, log=log, ms=ms, ns=ns, text_cfg=text_cfg)
+    _chunk_mix, _stage_model, _stage_prov, model_pool, pool_floor, pool_floor_from_cut = _solve_p_cut_step25_log_pp_cut(_pp_cut=_pp_cut, budgets_p=budgets_p, cards=cards, chunk_tokens=chunk_tokens, design_prefix=design_prefix, design_prov=design_prov, families=families, family_prov=family_prov, lanes=lanes, log=log, model=model, model_pool=model_pool, ns=ns, pair_ms=pair_ms, payload_bytes=payload_bytes, text_cfg=text_cfg)
+    _chunk_mix, _stage_model = _solve_p_cut_step34_stage_model_mix(_chunk_mix=_chunk_mix, _power_now=_power_now, _stage_model=_stage_model, _stage_prov=_stage_prov, cards=cards, chunk_tokens=chunk_tokens, design_prefix=design_prefix, design_src=design_src, log=log)
+    decision = _solve_p_cut_step26_decision(_chunk_mix=_chunk_mix, _cut=_cut, _depth_profile=_depth_profile, _fitted_log=_fitted_log, _stage_model=_stage_model, _stage_prov=_stage_prov, cards=cards, design_prefix=design_prefix, families=families, family_cost=family_cost, incumbent=incumbent, model_pool=model_pool, ms=ms, ns=ns, pair_ms=pair_ms, pool_floor=pool_floor, pool_floor_from_cut=pool_floor_from_cut)
+    _solve_p_cut_step27__act_heuristic_mib(_p_mamba_src=_p_mamba_src, _pp_cut=_pp_cut, budgets_p=budgets_p, chunk_tokens=chunk_tokens, decision=decision, kv_mib=kv_mib, log=log, mean_layer_mib=mean_layer_mib, model=model, model_pool=model_pool, n_attn=n_attn, n_layers=n_layers, ns=ns, terms=terms)
+    chosen, ship_why = _solve_p_cut_step35_shipped_cut(budgets_p=budgets_p, decision=decision, log=log, ns=ns)
+    _solve_p_cut_step28_incumbent_row(chosen=chosen, decision=decision, log=log, ship_why=ship_why)
+    _cell_bytes_per_attn_layer, per_rank_priced = _solve_p_cut_step29_per_rank_priced(_pp_cut=_pp_cut, chosen=chosen, kv_mib=kv_mib, model_pool=model_pool)
+    _solve_p_cut_step30_log_pp_poo(_cell_bytes_per_attn_layer=_cell_bytes_per_attn_layer, chosen=chosen, log=log, model_pool=model_pool, ns=ns, per_rank_priced=per_rank_priced)
+    _solve_p_cut_step31_log_pp_cut(chosen=chosen, decision=decision, log=log)
+    if chosen.kind == "gapped":
+        return _solve_p_cut_step36_gapped_facts(budgets_p=budgets_p, chosen=chosen, kv_mib=kv_mib, log=log, n_layers=n_layers, ns=ns, text_cfg=text_cfg)
+    attn_ratio, realized, stage_ratio = _solve_p_cut_step32_stage_ratio(chosen=chosen, kinds=kinds)
+    _solve_p_cut_step33_if_list_realized(attn_ratio=attn_ratio, chosen=chosen, log=log, realized=realized, stage_ratio=stage_ratio)
     return PCutFacts(
         stage_ratio=stage_ratio,
         attn_stage_ratio=attn_ratio,
@@ -9775,12 +10011,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    global _ACTIVE_BOOT_STATE
-    # #1248: unclaimed until a BootState exists below -- a stale pointer from
-    # a PREVIOUS boot in the same process (there is none today; guards the
-    # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
-    _ACTIVE_BOOT_STATE = None
+def _main_step01_ns(*, argv):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # rename transition (compat_shims): old and new flip-flag spellings both reach the parser
     ns = build_parser().parse_args(_canonical_flags(sys.argv[1:] if argv is None else list(argv)))
     # HW-P1a 1003: the launch's --cards selection, installed before ANY card
@@ -9855,6 +10087,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # they are re-derived below, before the first floor read.
     corridor_guard.clear_boot_pointer_env()
     boot_form = None
+    return boot_form, ns
+
+
+
+def _main_step02__pad_line(*, argv, boot_form, ns):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     if not ns.teardown:
         boot_form = pdflip_form.resolve_form(
             ns, list(sys.argv[1:] if argv is None else argv),
@@ -9920,48 +10158,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # cannot price the switch one way and allocate the other (the exact
     # #1385/#1386 shape three boots already cost).
     hicache_disabled = bool(getattr(ns, "pdflip_disable_hicache", False))
-    # #1369: user order 2026-09-14. ONE resolution, here, before the form-key
-    # build and the shipped argvs both need it. Every later reader (the
-    # form-key build, the shipped `argv_p`/`argv_d`, `choose_host_ledger`)
-    # takes this ONE local.
-    #
-    # NOT a bare call to `weight_exchange.weights_cpu_backup_armed()` for the
-    # `auto` case: that function's `auto` branch reads `exchange_armed()` and
-    # `inject_authoritative()`, NEITHER of which take an `explicit` this
-    # process could hand them (`exchange_armed()` has no such parameter at
-    # all) -- exactly the S6 fix E trap `inject_mode()`'s own docstring
-    # warns about, one predicate over: the LAUNCHER's own process never has
-    # `WEIGHT_SOURCE_ENV`/`INJECT_ENV` in its bare environment, only the
-    # ranks do (`prepare_xchg_env`/`build_env` publish them there, never
-    # here). `ring_absent_by_design` already solves exactly this -- it takes
-    # `weight_source`/`inject_mode` as plain VALUES, never through the
-    # env-reading functions -- so `auto` here is that ONE authority's
-    # negation rather than a second, launcher-unsafe spelling of the same
-    # conjunction. `on`/`off` need none of this: both short-circuit inside
-    # `weights_cpu_backup_armed()` before either sub-predicate is touched.
-    if str(ns.pdflip_weights_cpu_backup) == weight_exchange.WEIGHTS_CPU_BACKUP_AUTO:
-        weights_cpu_backup_armed = not ring_absent_by_design(
-            str(ns.pdflip_weight_source), str(ns.pdflip_xchg_inject))
-    else:
-        weights_cpu_backup_armed = weight_exchange.weights_cpu_backup_armed(
-            explicit=ns.pdflip_weights_cpu_backup)
-    resolve_dual_layout(ns)
-    if getattr(ns, "flip_weights", "family") == "resident":
-        # Task #47 Scheibe 6a: the weights never sleep -> no host ring, no cpu
-        # backup, no exchange; the ring planner takes the ABSENT-BY-DESIGN path.
-        weights_cpu_backup_armed = False
-        print("PDFLIP-LAUNCH --flip-weights resident: weights of BOTH groups stay mapped, "
-              "only kv_cache flips; host ring / cpu backup ABSENT-BY-DESIGN", flush=True)
-    # #1348: both coverage instruments armed at once is a burnt window, and
-    # the cheapest place to say so is here -- before anything is started.
-    refuse_double_coverage_arm(os.environ, xchg_coverage_diff=getattr(
-        ns, "xchg_coverage_diff", False))
-    if ns.teardown:
-        # AFTER the teardown branch (review N-6): arming before it meant a
-        # `--teardown ... --xchg-coverage-diff` wrote an L-dump into the
-        # evidence dir that a LATER boot's ingest would pick up -- the stale
-        # dump problem, manufactured by the instrument itself.
-        return teardown(ns.teardown)
+    return _h87_alias_line, boot_form, calib_identity, calib_log_accept, calib_sample_accept, hicache_disabled, tokenizer_line
+
+
+
+def _main_step03__vis_place_dual(*, argv, ns):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # VISION-WEIGHTS AP4: a place that is guaranteed broken in the dual layout is refused by name, here at the verdict site (parse side; no
     # computing core). After resolve_dual_layout (--dual-share implies --dual-layout), after the teardown branch.
     _vis_place_dual = vision_place_dual_refusal(ns, list(sys.argv[1:] if argv is None else argv))
@@ -9980,10 +10182,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # arm branch did this boot NOT take"). Group `L` keeps its dump out of
     # every rank's filename space. No-op and no import when the flag is off.
     _lane_cov_dir = lane_coverage_dump_dir(ns)
-    if _lane_cov_dir:
-        from flliper.srt.pdflip import lane_coverage as _wlc
+    return _lane_cov_dir
 
-        _wlc.arm_launcher(_lane_cov_dir, boot_token=lane_coverage_boot_token(ns))
+
+
+def _main_step04_refuse_inherited_lay(*, ns):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # BEFORE build_env(), which starts from os.environ: an inherited stage map
     # would reach group P's ranks without passing through the solver at all.
     refuse_inherited_layer_set(os.environ)
@@ -10022,20 +10226,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # read here, never re-derived. The direct call stays only for a caller
     # without a resolved form.
     _resolved_draft_on_p = getattr(ns, "pdflip_draft_on_p", None)
-    if _resolved_draft_on_p is not None:
-        draft_on_p, draft_on_p_prov = _resolved_draft_on_p
-    else:
-        draft_on_p, draft_on_p_prov = resolve_draft_on_p(
-            ns.draft_kv_on_p,
-            bs_source("--draft-kv-on-p", argv) == "flag",
-            envs.FLLIPER_PDFLIP_DRAFT_ON_P.is_set(),
-            envs.FLLIPER_PDFLIP_DRAFT_ON_P.get(),
-        )
-    ns.draft_kv_on_p = "on" if draft_on_p else "off"
-    envs.FLLIPER_PDFLIP_DRAFT_ON_P.set(draft_on_p)
-    # H25 (C): what D's parked draft holds in pinned host RAM -- a desk fact,
-    # refused (W128) before any sweep or launch when it cannot be priced.
-    d_draft_host_mib, d_draft_host_prov = d_draft_park_term(ns, draft_on_p)
+    return _resolved_draft_on_p
+
+
+
+def _main_step05_vision_victim_host_mib(*, ns):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # VISION-WEIGHTS AP4: the host image of the displaced weights (ledger post vision_victim_host); a WARNING only, never a refusal
     vision_victim_host_mib, vision_victim_host_prov = vision_victim_host_term(ns)
     # #1032 RESOLVED HERE, BEFORE THE SWEEPS, THE STORE AND ANY LAUNCH: a
@@ -10058,8 +10254,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns.boot_name = os.path.basename(base)
     _VFL_ARGV["kv"] = _argv_scalar(str(getattr(ns, "extra_d", "") or ""), "--kv-cache-dtype") or ""
     dry = ns.dry_run
-    global _ANCHOR_INDEX_MODE
-    _ANCHOR_INDEX_MODE = "ro" if dry else "rw"  # S68 review: a dry run reads the W65 index, never writes it
+    return base, d_tokvec, dirty, dry, stamp, tip, tree, vision_victim_host_mib, vision_victim_host_prov
+
+
+
+def _main_step06_os_makedirs_evidence(*, _h87_alias_line, base, boot_form, calib_identity, dirty, dry, ns, stamp, tip, tree):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     os.makedirs(EVIDENCE_DIR, exist_ok=True)
     front_log = None if dry else f"{base}.front.log"
     log = Log(front_log)
@@ -10121,11 +10321,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise PdFlipLaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"
     state = BootState(tag=ns.tag, tip=tip, tree=tree, stamp=stamp)
-    # #1248: from here on, cli()'s refusal handler can see this boot's pids
-    # the instant main() mutates state.pids -- no group has spawned yet
-    # (launch_group(spec_p, ...) is still ~500 lines below), so a refusal
-    # between here and there still takes today's unchanged fast exit.
-    _ACTIVE_BOOT_STATE = state
+    return d_overhead_mib, front_log, log, py, state
+
+
+
+def _main_step07_state_logs_front(*, base, dry, front_log, log, ns, stamp, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     state.logs = {"front": front_log or "<dry>", "P": f"{base}.P.log", "D": f"{base}.D.log"}
 
     # 1. preflight
@@ -10175,25 +10376,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards_free_check(cards, log)
     cvd = ",".join(c.uuid for c in cards)
     state.cvd = cvd
-    # #1348 (review MF-1): THE BOOT DECLARES WHO MUST REPORT, here, where the
-    # rank count is first known. A report derived from the dumps it FOUND can
-    # never notice a rank that wrote nothing -- which is the #1329 shape and
-    # the whole reason the instrument exists. Both groups run one rank per
-    # card; the launcher itself is the single `L` rank.
-    if _lane_cov_dir:
-        from flliper.srt.pdflip import lane_coverage as _wlc
+    return cards, cvd
 
-        _expect_path = _wlc.write_expect_manifest(
-            _lane_cov_dir,
-            lane_coverage_boot_token(ns),
-            {"P": len(cards), "D": len(cards), _wlc.LAUNCHER_GROUP: 1},
-        )
-        log(f"PDFLIP-COVERAGE ARMED timings=CONFOUNDED token={lane_coverage_boot_token(ns)} "
-            f"expect=P={len(cards)},D={len(cards)},L=1 manifest={_expect_path} -- "
-            f"coverage.py line tracing is ON inside every exchange leg of this "
-            f"boot; it costs 2.6x-4x on EVERY Python call in the traced process "
-            f"while a leg is open, so NO ms/round, prefill, decode or flip "
-            f"duration from this boot is quotable as a measurement.")
+
+
+def _main_step08_log_nvml_cuda_or(*, cards, log, ns, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     log("NVML -> CUDA ordinal map: " + ", ".join(f"ordinal {i} = nvml {c.nvml_index} {c.name} {c.uuid} total {c.total_mib} MiB" for i, c in enumerate(cards)))
     # fnFL2 H57: the power limit per card -- one line, the state JSON, and the
     # date check of every time/rate reference (a line, never a refusal).
@@ -10218,8 +10406,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # refusal path, which is the class #1248 exists to stop. It cost this
     # cycle a red gate.
     s_gb_d, _l2_terms, _l2_lines = _derive_d_l2_budget(ns, max_kv_per_request)
-    for _ln in _l2_lines:
-        log(_ln)
+    return _l2_lines, _l2_terms, d_bs, max_kv_per_request, p_bs, power_reading, s_gb_d
+
+
+
+def _main_step09_x_seed(*, argv, cards, d_bs, log, max_kv_per_request, ns, p_bs):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # 0 = derive (the flag's default is the 4096 pin since 2026-09-15).
     x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS,
                        accept=calib_log_accept_of(ns))
@@ -10298,6 +10490,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # flag under the exchange), and a NAMED line when a non-incumbent checkpoint
     # has no P-cut calibration record (argv_p would hand it the INT8 vector).
     _quant = checkpoint_quant_method(str(ns.model))
+    return _quant, d_x_tokens, flip_min_work_tokens, front_x_ceiling, idle_layout_front, x_mode_launch, x_seed, x_tokens
+
+
+
+def _main_step10__fp8_env(*, _quant, dry, log, ns, state, tokenizer_line, tree):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     _fp8_env, _fp8_line = fp8_layout_decision(
         _quant, str(getattr(ns, "pdflip_weight_source", WEIGHT_SOURCE_DEFAULT)),
         bool(getattr(ns, "fp8_uniform_marlin", False)))
@@ -10373,6 +10571,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # re-check under "4. group P", which proves that rather than asserting it),
     # so the move is sound; ``env_p`` stays behind because it does need the ring.
     slack_mib = reserve_slack_mib(ns.transport)
+    return chunk_count, chunk_layers, chunk_tag_cards, n_layers, slack_mib, tms_so, weights_tags
+
+
+
+def _main_step11__dc_accept(*, boot_form, calib_identity, calib_sample_accept, cards, d_bs, log, ns, slack_mib, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # B4h: THE ONE CONSUMER, form-switched through the one selector, so P's
     # per-card budget follows the arm automatically and no parallel reserve
     # object exists.
@@ -10443,6 +10647,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     state.dc_expect_d = dc_expect_d
     _xchg_form = ns.pdflip_weight_source == WEIGHT_SOURCE_EXCHANGE
+    return _dc_accept, _dc_from_record, _p_dormant_recs, _xchg_form, dc_expect_d
+
+
+
+def _main_step12_if__dc_from_record_i(*, _dc_accept, _dc_from_record, _xchg_form, cards, dc_expect_d, log, ns, slack_mib, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     if _dc_from_record is None:  # #1444: the constant's provenance only when it was priced
         log(("dormant residue RESERVE for group D = MEASURED D_c(D) of boot "
              + (f"weg2xsn14 ({'/'.join(str(v) for v in DC_MEASURED_D_XCHG_MIB)} MiB, "
@@ -10521,6 +10731,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "unterbietet die aeltere nicht): "
                 + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}"
                             for c in cards) + " -- " + ", ".join(_won))
+    return dc_expect_d
+
+
+
+def _main_step13_os_environ_corridor(*, cards, d_bs, dc_expect_d, hicache_disabled, log, ns, p_bs):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across
     # boots on this rig. Everything downstream (both budget solves, the
@@ -10585,62 +10801,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if _pools4b is not None:
         raise PdFlipLaunchRefused(_pools4b)
     from flliper.srt.pdflip import l15_pool_anchor as _l15_pa4b
+    return _l15_pa4b, l15_posts, user_reserve_by_card
 
-    for _ln in _l15_pa4b.s4b_boot_lines(os.environ):
-        log(_ln)
-    _pooldep = l15_plan.refuse_pool_with_deposit(os.environ)
-    if _pooldep is not None:
-        raise PdFlipLaunchRefused(_pooldep)
-    if l15_plan.master_on(os.environ):
-        if ns.profile == pdflip_form.PROFILE_QWEN27B:
-            l15_base = budgets_from_dc(
-                cards, dc_expect_d, log, "P",
-                overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
-                overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
-                user_reserve_by_card=user_reserve_by_card,
-            )
-            try:
-                l15_peaks = list(_pconst("P_AWAKE_PEAK_MIB", ns.profile))
-            except KeyError:
-                # UNMEASURED: the pure layer prices a missing peak as a 0 post,
-                # never an estimate.
-                l15_peaks = [None] * len(cards)
-            # L15-POOL S1b: the measured per-card record as the planner input,
-            # behind FLLIPER_PDFLIP_L15_POOL_PEAK_RECORD (default off: peaks and
-            # log untouched). On: a card without a record gets None = no share.
-            l15_peaks, _l15_peak_lines = l15_pool_peak.planner_peaks(
-                ns.profile, cards, l15_peaks, os.environ)
-            for _ln in _l15_peak_lines:
-                log(_ln)
-            l15_posts = l15_plan.resolve_posts(
-                ns.profile, l15_base, l15_peaks, os.environ)
-            for post in l15_posts:
-                log(l15_plan.post_line(post))
-            # L15-POOL S1 (log only): the per-card posts seen as ONE pool.
-            from flliper.srt.pdflip import l15_keep_split, l15_pool, l15_pool_anchor
 
-            if l15_pool.pool_on(os.environ):
-                log(l15_pool.boot_line(
-                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
-                    l15_keep_split.anchor_cap(os.environ),
-                    mode=l15_pool.POOL_MODE if not l15_pool.pool_s3_on(os.environ)
-                    else l15_pool.S3_MODE))
-                if l15_pool_anchor.pool_s4_on(os.environ):
-                    # S4: the anchors are part of the whole request (second line,
-                    # the S3 boot line above stays as it was)
-                    log("L15-POOL-S4 mode=%s anchor_cap=%d" % (
-                        l15_pool_anchor.S4_MODE, l15_keep_split.anchor_cap(os.environ)))
-            elif l15_pool.pool_shadow_on(os.environ):
-                log(l15_pool.boot_line(
-                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
-                    l15_keep_split.anchor_cap(os.environ)))
-            # L15-NOCAP (N3f): armed with nothing to hold is a launch error,
-            # not a boot window spent on cap=0 (N3c/N3e).
-            _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ, cards)
-            if _nocap is not None:
-                raise PdFlipLaunchRefused(_nocap)
-        else:
-            log(f"L15-POST skipped profile={ns.profile}")
+
+def _main_step14_budgets_p(*, cards, dc_expect_d, hicache_disabled, l15_posts, log, max_kv_per_request, n_layers, ns, power_reading, state, user_reserve_by_card):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
         # #240: whose measurement the line charges -- the profile's own record
@@ -10714,6 +10880,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"what the solve moved)"
     )
     state.p_stage_layers = list(p_split)
+    return attn_stage_ratio, budgets_p, chunk_tokens, cut, p_split, p_split_note, stage_ratio
+
+
+
+def _main_step15_shipped_split(*, attn_stage_ratio, budgets_p, cut, log, ns, p_split, stage_ratio):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # W46 (#1254): THE MAP AND THE ARGV MUST BE THE SAME SPLIT -- kept as a
     # REFUSAL on train 2 even though the two halves now come from one source.
     # It was written when they did not: the map was derived from the incumbent
@@ -10767,6 +10939,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
 
+
+def _main_step16__draft_kv_on_p_requested(*, argv, hicache_disabled, ns):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # 1b'. THE FORM KEY (W48).  The argv group P will run, built with SENTINEL
     # host-ledger terms because the ledger is priced FROM the ring and cannot
     # exist yet -- and those three flags are excluded from the key BY NAME
@@ -10844,17 +11019,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "auto-fallback."
         )
     draft_kv_on_p = _draft_kv_on_p_requested and not hicache_disabled
-    # HICACHE-DRAFT-TIER: p_group_has_draft_producer reads the RESOLVED value.
-    _SPEC_FORM["draft_kv_on_p"] = bool(draft_kv_on_p)
-    if not draft_kv_on_p:
-        log(draft_kv_off_line())
-    elif spec_form_is_dflash():
-        # --dflash-produce-on-p (27B 2026-09-24): P carries the DFlash producer
-        # flags; whether it COMPUTES rides P's environment (spec_form_env).
-        log(dflash_produce_line())
-    log(draft_on_p_line(
-        draft_kv_on_p, draft_on_p_prov,
-        [] if draft_kv_on_p else strip_speculative_flags(shlex.split(ns.extra_p))[1]))
+    return _draft_kv_on_p_requested, draft_kv_on_p
+
+
+
+def _main_step17_log_f_pdflip_host_d(*, d_draft_host_mib, d_draft_host_prov, log, vision_victim_host_mib, vision_victim_host_prov):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     log(f"PDFLIP-HOST d_draft_host={d_draft_host_mib:.0f} MiB -- {d_draft_host_prov}")
     if vision_victim_host_prov and not vision_victim_host_prov.startswith("none (--pdflip-vision-place"):
         # only with --pdflip-vision-place weights: the default boots print nothing new (golden dry runs byte-equal)
@@ -10867,9 +11037,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(p_prefill_graph_line())
         for _pgl in p_prefill_graph_policy_lines():
             log("PDFLIP " + _pgl)
-    # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
-    for _pcl in p_chunk_policy_lines():
-        log(_pcl)
+
+
+
+def _main_step18__pwl(*, hicache_disabled, log):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # Row 27: the chunk model's power-limit check ([] under 'fixed').
     for _pwl in p_chunk_power_lines():
         log(_pwl)
@@ -10887,35 +11059,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # logger is available.
     if hicache_disabled:
         log(hicache_disabled_line())
-    # B4e: ONE form argv, built with the xchg token when the arm is armed, and
-    # used for BOTH the key this line prints and the argv `solve` is handed --
-    # so the printed provenance IS the form that was selected on, token
-    # included, and the two cannot drift.
-    # #1356 [fix] BY KEYWORD. This call and :10620 were the two that shifted
-    # when `vision` was inserted mid-signature; naming each term is what makes
-    # the next insert a no-op here instead of a silent re-binding.
-    form_argv_p = xchg_form_argv(argv_p(
-        py, ns.model, budgets_p, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
-        RING_FORM_SENTINEL_STORE_CFG, shlex.split(ns.extra_p),
-        p_bs=p_bs, max_kv_per_request=max_kv_per_request,
-        stage_ratio=stage_ratio, attn_stage_ratio=attn_stage_ratio,
-        write_policy=ns.p_hicache_write_policy,
-        depth=RING_FORM_SENTINEL_DEPTH,
-        window_mib=ns.p_barlink_bar1_window_mib,
-        random_seed=ns.random_seed,
-        barlink_cap_cycles=ns.barlink_bar1_cap_cycles,
-        census_interval=ns.collective_census_interval,
-        draft_kv_on_p=draft_kv_on_p,
-        spec_flags=p_draft_kv_flags(shlex.split(ns.extra_d)),
-        vision=ns.pdflip_vision,
-        profile=ns.profile,
-        p_max_total_tokens=int(cut.pool_tokens),
-        hicache_disabled=hicache_disabled,
-        # #1369: form-key must reflect the ring's real presence/absence --
-        # the same reasoning `vision` is threaded here for ("a tower that is
-        # absent IS a different weight statement").
-        weights_cpu_backup=weights_cpu_backup_armed,
-    ), ns.pdflip_weight_source)
+
+
+
+def _main_step19_form_key(*, form_argv_p, log):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     form_key, form_norm = ring_table.p_form_key(form_argv_p)
     log(
         f"PDFLIP-P-FORM key={form_key} -- the identity of what group P LOADS, "
@@ -10928,19 +11076,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"died of). A ring table solved from a boot of another form is never "
         f"MEASURED for this one. FORM: {form_norm}"
     )
+    return form_key, form_norm
 
-    # 1b. C20: the R5 corridor inequality per card per direction, and C18: the
-    # per-card region, both BEFORE either group starts.  The table it is solved
-    # from also carries the ledger's host weights term, so this runs first.
-    ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
-                                  ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe,
-                                  tree=tree, py=py, p_argv=form_argv_p,
-                                  # #1369 CLOSEOUT: the SAME resolved local
-                                  # `form_argv_p`/`choose_host_ledger` already
-                                  # read above and below -- never re-derived
-                                  # here, which is the #1358 defect class this
-                                  # order named by name.
-                                  weights_cpu_backup_armed=weights_cpu_backup_armed)
+
+
+def _main_step20_bootstrap_w48(*, log, ns, ring_plan, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # B4e (ii): with the token on, an absent same-form source is no longer an
     # EXCLUSION but a silent fall-through to the closest twin -- refuse here,
     # before either group starts, with the twin printed.
@@ -10953,23 +11094,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ring_plan.lines.append(bootstrap_w48)
     state.ring_lines = ring_plan.lines
     state.ring_epoch = str(ring_plan.epoch)
-    # A1-3: an un-armed ring has no fallback form to name.  The predecessor
-    # named the pre-ring form here instead, which told the reader of a state
-    # file that a form the launcher refuses to start had started.  The claim is
-    # retracted rather than re-quoted -- reprinting it would hand the guard test
-    # a false positive and the next reader a true one.
-    state.ring_form = (
-        ring_plan.form if ring_plan.armed else
-        # #1369 CLOSEOUT: an intentional off-switch is not a refusal -- the
-        # A1-3 text below describes a boot that COULD NOT get the ring it
-        # needed; this describes one that deliberately does not need one.
-        # Conflating the two would make a state file lie about a boot that
-        # ran exactly as asked.
-        "none -- ABSENT BY DESIGN (--pdflip-weights-cpu-backup resolved to "
-        "off for this boot; not a refusal, not a fallback)"
-        if not weights_cpu_backup_armed else
-        "none -- NOT ARMED (A1-3: no fallback form exists on "
-        "this host budget; this boot refuses by name)")
+
+
+
+def _main_step21_state_ring_dir_rin(*, cards, log, ns, ring_plan, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
     # 1c. #1273 S7: W71, the exchange's VRAM residency, per card per direction
@@ -11030,6 +11159,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # `resolve_*` function to refuse here -- `bounce_terms` itself is what
     # refuses the one real danger (band_credit armed without max_tag_bytes).
     _band_credit = bool(getattr(ns, "xchg_band_credit", False))
+    return _band_credit, _lanes_concurrent, bounce_terms_for_ranks, xchg_res
+
+
+
+def _main_step22__xchg_armed(*, _band_credit, _lanes_concurrent, bounce_terms_for_ranks, log, ns, ring_plan, stage_ratio):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # #77 (fnFL2w3, 21.09.): ZWEI FRAGEN, BISHER EINE ANTWORT.
     # `xchg_bounce_arm_pins_host` beantwortet "pinnt dieser Arm HOST-Bytes?"
     # und ist bei `oncard=ipc` korrekt FALSCH -- eine VRAM-Bounce wird mit
@@ -11110,6 +11245,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"-- a rank blocks here (W69 PdFlipXchgGateTimeout after "
                 f"{weight_exchange_transport.LANE_PERMIT_TIMEOUT_S:.0f}s) "
                 f"rather than pin a lane buffer past this budget")
+    return bounce_terms_for_ranks
+
+
+
+def _main_step23_xchg_env(*, boot_form, bounce_terms_for_ranks, dry, log, ns, ring_plan, xchg_res):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     xchg_env = prepare_xchg_env(log, str(ring_plan.epoch),
                                   ns.pdflip_weight_source, dry=dry,
                                   hop_bound_ms=ns.pdflip_shadow_hop_bound_ms,
@@ -11166,7 +11307,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f" wie vor #106. Das ist der KONSERVATIVE Fall, nicht der"
             f" gewuenschte: passen die Vektoren nicht zusammen, kollidiert"
             f" der geteilte Store weiterhin beim Oeffnen der Datei")
+    return _geom_fracs, _geom_ratios, xchg_env
 
+
+
+def _main_step24__adopt(*, boot_form, log, ns, xchg_env):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # #108 ERSTBOOT-ADOPTION: die Entscheidung an BEIDE Gruppen.
     # An P, weil P wissen muss, dass seine Bytes gebraucht werden (und es
     # nicht schlafen legen darf, bevor der Erstflip lief); an D, weil dort
@@ -11230,6 +11376,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pdflip_form.gate_skip_line("#107 PDFLIP-EXPERT-MAP", boot_form)) if x]
     for _x in _moe_skips:
         log(_x)
+    return _moe_skips
+
+
+
+def _main_step25__bands_on(*, _geom_fracs, _geom_ratios, _moe_skips, log, ns, xchg_env):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     try:
         from flliper.srt.layers.moe import expert_map as _em
 
@@ -11354,6 +11506,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"PDFLIP-EXPERT-MAP failed: {type(_exc).__name__}: {_exc}")
 
 
+
+def _main_step26_xchg_env_weight_exch(*, hicache_disabled, log, ns, ring_plan, state, xchg_env):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
     # #1369: PUBLISHED UNCONDITIONALLY, unlike everything else in `xchg_env`
     # above -- `prepare_xchg_env` returns `{}` outright under an un-armed
     # exchange (`weight_source not in WEIGHT_SOURCE_ARMED`), which is correct
@@ -11432,6 +11587,1448 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         host_ledger.checkpoint_digest(ns.model)[0] or "",
         (getattr(ns, "pdflip_boot_form", None).env_value()
          if getattr(ns, "pdflip_boot_form", None) is not None else ""))
+    return _census_key, _cold_tier_shm_gib, _form_key_matches, _hc, _l3_index_gib, _ledger_group_envs, _memhist_gib, _memhist_run_only
+
+
+
+def _main_step27_arm(*, _ledger_group_envs, _price_host_ledger, hicache_disabled, log, ns, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+    # #1453 (user 16.09.: 'L2-Groesse aus Ledger-Spielraum'): the arena is the
+    # largest host term (33.6 GiB with draft+mamba); when the priced run peak
+    # sits ABOVE the riegel, the KV arena gives that excess back and the
+    # ledger prices once more -- the boot then funds itself without the
+    # --host-ledger-deviation it needed before (weg2xsn207: 93.15 vs 93.00).
+    _arena_new, _arena_why = arena_from_ledger(
+        float(_group_env_value("FLLIPER_HICACHE_ARENA_GIB", _ledger_group_envs, "22")),
+        # 29.09.: the latch the ledger derived (a flag only tightens it)
+        _arm_run_peak_gib(arm), getattr(arm, "riegel_effective", getattr(ns, "host_riegel_gib", None)),
+        enabled=(os.environ.get("FLLIPER_PDFLIP_ARENA_FROM_LEDGER", "1") == "1" and not hicache_disabled))
+    log("#1453 L2-ARENA FROM LEDGER: " + _arena_why)
+    if _arena_new is not None:
+        os.environ["FLLIPER_HICACHE_ARENA_GIB"] = f"{_arena_new:g}"
+        # 29.09. (arena8 09291303): a group that names the arena overrides the
+        # launcher env in build_env, so the new size goes where the ranks and
+        # the ledger read it -- otherwise the ledger re-prices a number no rank gets.
+        arena_gib_into_groups(ns, _ledger_group_envs, _arena_new)
+        arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+        log("#1453 L2-ARENA FROM LEDGER: re-priced with arena %.2f GiB -> run_peak %s GiB"
+            % (_arena_new, _fmt_gib(_arm_run_peak_gib(arm))))
+    state.cgroup = dict(cg)
+    return arm, cg, lines, reap_headroom_gib
+
+
+
+def _main_step28_state_ledger_lines(*, arm, cg, cut, dry, lines, log, ns, reap_headroom_gib, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    state.ledger_lines = lines
+    # 29.09. (z30x2-yarn2): ONE pinned-host reserve for the ledger and the
+    # ranks. The ledger bounded its run peak by memory.max minus this number
+    # (PINNED WALL); the ranks' HiCache pools now read it too, through
+    # pinned_host_reserve(). An explicit FLLIPER_PINNED_HOST_RESERVE_GIB wins
+    # and is left untouched; without a finite cgroup nothing is exported.
+    _pin_gib, _pin_src = getattr(arm, "pinned_reserve", (None, ""))
+    from flliper.srt.mem_cache import pinned_host_budget as _phb
+    if _pin_gib is not None and not (os.environ.get(_phb.PINNED_HOST_RESERVE_ENV) or "").strip():
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_ENV] = f"{float(_pin_gib):.4f}"
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV] = str(_pin_src or "")
+    log(pinned_reserve_line(_pin_gib, _pin_src))
+    state.reap_headroom_gib = reap_headroom_gib
+
+    # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the
+    # cgroup snapshot the ledger just took, BEFORE any group process exists, so
+    # `cg["anon"]` is exactly the baseline W22's `flliper=/foreign=` split has to
+    # subtract. It was already measured and already returned here, and was being
+    # dropped -- sb5c's split was reconstructed by hand afterwards.
+    #
+    # ONE READ, CARRIED -- not a second `read_cgroup()` at front-launch time.
+    # A baseline taken after the groups start is not a baseline, and two reads
+    # are two quantities; the fix-2 lesson, on a measurement instead of a key.
+    anon_preboot_bytes = int(cg.get("anon") or 0)
+    log(f"PDFLIP-LAUNCH ANON-BASELINE preboot_anon={anon_preboot_bytes / 1073741824:.2f} GiB "
+        f"(cgroup memory.stat anon at PREFLIGHT, before any group process exists; "
+        f"handed to the front as --anon-preboot-bytes so W22 can split its reading into "
+        f"flliper= and foreign=. 0 = unreadable -> the front prints NO split rather than "
+        f"an invented one; sb5c had to be split by hand because this value was dropped)")
+
+    # 2b. host memory time series from BEFORE the first group, so the launch
+    # moment (P image resident, D loading) is measured this time, not only
+    # the run moment (record 1h: the ls1b2 sampler started after D READY).
+    if not dry:
+        start_memts(state, log)
+
+    # 3. store -- ON DISK, SIZED FROM THE P KV POOL (#1236).
+    #
+    # ORDERING, and why it is safe: `cut` (solve_p_cut) is already solved above,
+    # before the ring, so the pool this store must cover is known here without
+    # moving anything.  The ledger ran first only because the ARC line prices
+    # itself against the reap headroom the ledger computes.
+    _l3_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
+                                     getattr(ns, "form_kv", "") or "",
+                                     extra_p=getattr(ns, "extra_p", "") or "",
+                                     extra_d=getattr(ns, "extra_d", "") or "",
+                                     vision=str(getattr(ns, "pdflip_vision", "") or ""))
+                 if l3_persist_enabled() else None)
+    store_plan = plan_store(
+        ns.tag,
+        cut.pool_tokens,
+        cut.attn_counts,
+        cut.kv_mib_per_token_per_attn_layer,
+        sidecar_factor=ns.store_sidecar_factor,
+        store_max_gb=ns.store_max_gb,
+        min_free_gib=ns.store_disk_min_free_gib,
+        directory_name=(l3_persist_dir_name(_l3_ident) if _l3_ident else None),
+        dry=dry,
+    )
+    store_cfg = store_plan.extra_config()
+    log(store_plan.disk_line(
+        "WARN store on %s, not the told disk (dry run: not refused, the space check "
+        "is skipped)" % store_plan.fs_type if store_plan.fs_refused else "ok"))
+    return _l3_ident, anon_preboot_bytes, store_cfg, store_plan
+
+
+
+def _main_step29_log_f_pdfli(*, _l3_ident, dry, log, max_kv_per_request, ns, reap_headroom_gib, state, store_cfg, store_plan):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    log(
+        f"PDFLIP-STORE: dir={store_plan.directory} ON DISK (ZFS dataset, plain directory "
+        f"-- #1236 user ruling 2026-09-09: 'normales hicaching mit lvl2 und lvl3', the "
+        f"upstream HiCacheFile backend, no new tier and no overflow mechanism; the "
+        f"tmpfs form and its mount/umount are DELETED, not flagged off). "
+        f"max_size={store_plan.max_size_bytes} B "
+        f"({store_plan.max_size_bytes / host_ledger.GIB:.2f} GiB, scope=shared over the "
+        f"writer ranks) = P POOL {store_plan.p_pool_tokens} tokens x "
+        f"{store_plan.cell_bytes} B/token = "
+        f"{store_plan.p_pool_bytes / host_ledger.GIB:.2f} GiB x sidecar factor "
+        f"{store_plan.sidecar_factor:.2f} ({STORE_CENSUS_PROVENANCE}: kv={STORE_CENSUS_KV_PAGES} "
+        f"pages x {STORE_CENSUS_KV_PAGE_BYTES} B, mamba={STORE_CENSUS_MAMBA_BLOBS} blobs x "
+        f"{STORE_MAMBA_BLOB_BYTES} B measured on /spinning/hicache-l3, "
+        f"draft={STORE_CENSUS_DRAFT_PAGES} pages x {host_ledger.DRAFT_PAGE_BYTES} B). "
+        f"min_free={store_plan.min_free_bytes} B "
+        f"({store_plan.min_free_bytes / host_ledger.GIB:.2f} GiB) AGAINST THIS DISK, "
+        f"which has {store_plan.fs_free_bytes / host_ledger.GIB:.2f} GiB free of "
+        f"{store_plan.fs_total_bytes / host_ledger.GIB:.2f} GiB -- not the old 1 GiB on a "
+        f"6 GiB tmpfs that latched HiCacheFile's write stop after 5 GiB and refused 1,324 "
+        f"group-P writes on boot weg2sb5g. "
+        f"#1236 LAW CHECK: max_size >= P pool is "
+        f"{'HELD' if store_plan.max_size_bytes >= store_plan.p_pool_bytes else 'VIOLATED'} "
+        f"({store_plan.max_size_bytes / max(1, store_plan.p_pool_bytes):.2f}x; weg2sb5g ran "
+        f"at 0.54x). extra_config={store_cfg}"
+    )
+    log(
+        f"PDFLIP-STORE LEDGER DELTA: {store_plan.max_size_bytes / host_ledger.GIB:.2f} GiB of "
+        f"store budget left the HOST RAM ledger entirely (max_size; min_free is free "
+        f"space the store never writes into and was never a RAM post), because "
+        f"this store is a directory on disk and its host cost is page cache plus the ZFS "
+        f"ARC -- both reclaimable, neither in cgroup anon, neither what the reaper kills "
+        f"for. The reap headroom the ledger now reports is "
+        + ("unreadable (no cgroup sample)" if reap_headroom_gib is None
+           else f"{reap_headroom_gib:.2f} GiB")
+        + ", and it is larger than the pre-#1236 form's by exactly the store term that "
+        "form charged (6 GiB on boot weg2sb5g). NOT a claim that the box gained RAM: the "
+        "bytes moved to a device, they did not disappear."
+    )
+    log(arc_preflight_line(read_arc_state(), store_plan, reap_headroom_gib))
+    log(store_read_cost_line(store_plan, max_kv_per_request))
+    sweep_store_residue(log, store_plan.directory, dry)
+    if _l3_ident:
+        # identity FIRST: a store of another identity is refused before this
+        # boot touches a single file in it.
+        l3_persist_check_rope(getattr(ns, "extra_p", "") or "", getattr(ns, "extra_d", "") or "")
+        _l3_state = l3_persist_check_identity(store_plan.directory, _l3_ident, dry)
+        log(f"L3-PERSIST identity={_l3_state} dir={store_plan.directory} "
+            f"{json.dumps(_l3_ident, sort_keys=True)}")
+        _l3_files, _l3_bytes, _ = l3_persist_attach(log, store_plan.directory, dry)
+        l3_persist_disk_sum(log, os.path.dirname(store_plan.directory), store_plan.directory,
+                            store_plan.max_size_bytes, store_plan.min_free_bytes, _l3_bytes, dry)
+    store_dir = prepare_store(log, store_plan, dry)
+    state.store_dir = store_dir
+    state.store_max_size_bytes = store_plan.max_size_bytes
+    state.store_min_free_bytes = store_plan.min_free_bytes
+    return store_dir
+
+
+
+def _main_step30__dp(*, _p_dormant_recs, cards, chunk_layers, dc_expect_d, log, ns, p_split, state, user_reserve_by_card, xchg_env):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # 4. group P
+    # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
+    # ring (block 1b- above); only ``env_p`` stays here, because it is the
+    # one thing in this step that genuinely needs the armed ring.
+    # #239 rc12z29c: a form the D solve sets itself (owned / joint / maxmin cut)
+    # is solved HERE, from the expectation budgets, before the map is built --
+    # the map's D windows and P's common prefix are functions of it, and P
+    # loads the map before D's measured budgets exist.
+    # R2 (28.09.): so is a P1c FR-D ceiling (d_fr_ceiling_before_map) -- its
+    # FR_D is published here, the map and STORE-GEOMETRY read exactly it.
+    if ((d_form_solved_by_planner(ns) or d_fr_ceiling_before_map(ns))
+            and not getattr(ns, "_d_map_form", None)):
+        # only the form's vectors outlive this pass; its env writes (scratch
+        # cap, seat rows, stage form, waves, trims) come from the real budgets
+        _env_d_before = str(getattr(ns, "env_d", "") or "")
+        _map_terms: List[Dict[str, object]] = []
+        _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.pdflip_weight_source, ns.profile)
+        ns._d_expect_other = (_map_other if not _map_other_why.startswith("legacy") else None)
+        log("D-EXPECT DORMANT-OTHER D(Karte, Erwartung): " + ", ".join(f"nvml{c.nvml_index} {_map_other[c.uuid]}" for c in cards) + f" MiB -- {_map_other_why}")
+        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)), terms_out=_map_terms)
+        log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
+                              p_split=p_split, chunk_layers=chunk_layers,
+                              card_terms=(_map_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
+        _pin = pin_d_form_for_map(ns, log)
+        ns.env_d = _env_d_before
+        ns._d_kv_stage_written = None
+        _lru_scratch = getattr(ns, "_d_kv_stage_lru_scratch", None)
+        if _lru_scratch:
+            # (3) 29.09.: FR_D of the pinned form was solved with this scratch
+            ns.env_d = set_group_env(ns.env_d, "FLLIPER_MOE_SCRATCH_SLOTS",
+                                     ",".join(str(int(x)) for x in _lru_scratch))
+            log(f"{D_RANK_SOLVE_MARKER} D(Karte, Erwartung) {D_KV_STAGE_LRU_FLOOR_MARKER}: "
+                f"FLLIPER_MOE_SCRATCH_SLOTS={','.join(str(int(x)) for x in _lru_scratch)} "
+                f"gehoert zur gepinnten Form (FR_D mit ihm geloest) -- gilt fuer alle "
+                f"weiteren Passes")
+        if _pin:
+            from flliper.srt.pdflip import draft_post as _dp
+
+            ns.env_d = _dp.replace_env_vector(ns.env_d, "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION",
+                                              [float(x) for x in _pin["fractions"]])
+            repoint_store_geometry_at_pinned_form(
+                xchg_env, _pin,
+                int((_argv_vector(getattr(ns, "extra_d", ""), "--num-experts") or [512])[0]), log)
+
+    # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
+    _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
+                               p_stage_layers=getattr(state, "p_stage_layers", None),
+                               chunk_layers=chunk_layers)
+    # rc12z30b: the map read FR_D from --extra-d now; a later D solve must not move it
+    ns._expert_map_path = _emap
+    return _emap
+
+
+
+def _main_step31_ns__host_census(*, _census_key, _census_record, _emap, budgets_p, cards, chunk_count, chunk_layers, chunk_tokens, cvd, log, ns, ring_plan, store_dir, tms_so, tree, user_reserve_by_card, xchg_env):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # 29.09.: the front samples the census live (widths known once the arena
+    # term has run inside the pricing above)
+    ns._host_census = {"record": _census_record, "key": _census_key,
+                       "store_dir": expert_store_dir_of(ns),
+                       "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
+    _estore_id = publish_store_identity(ns.model, _emap, log)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), **rank_reserve_kwargs("P", ns, cards, user_reserve_by_card, log), expert_map_path=_emap, expert_store_identity=_estore_id)
+    # H125: the host-RAM price of `--pdflip-vision-source ram`, named where the
+    # P env is built (the line is empty, and nothing is logged, for `disk`).
+    # VISION-GGUF: only a transient boot resolves the tower's directory (a GGUF reads it from --tokenizer-path)
+    _vis_line = vision_source_host_line(
+        vision_tower_dir(ns), str(getattr(ns, "pdflip_vision_source", VISION_SOURCE_DISK))
+    ) if str(getattr(ns, "pdflip_vision", VISION_OFF)) == VISION_TRANSIENT else ""
+    if _vis_line:
+        log(_vis_line)
+    # #1269 PUBLICATION: build_env's own comment says the decision is
+    # "published explicitly so the boot log names the decision" -- but it only
+    # SET the variables and logged nothing, so no boot log ever carried them.
+    # A knob that shapes host memory and is never named is exactly the
+    # instrument-that-does-not-report shape; the value is a CEILING derived
+    # from the reset path's thread names, not a live count, and
+    # PDFLIP-IDLE-CENSUS `threads=` is what confirms or corrects it.
+    log(f"PDFLIP MALLOC-ARENAS MALLOC_ARENA_MAX={env_p.get('MALLOC_ARENA_MAX')} "
+        f"FLLIPER_IDLE_BLOCKING_POLL={env_p.get('FLLIPER_IDLE_BLOCKING_POLL')} "
+        f"(both groups) -- provenance: glibc defaults to 8 x ncores arenas and this "
+        f"box reports affinity 0-31, so the default ceiling is 256; measured growth was "
+        f"64 MiB-aligned [anon] arenas extended in place plus NEW arenas appearing "
+        f"(+5.4 MiB/min on P PP0/PP1, +2.8 on each D rank, +19.0 MiB/min over six ranks "
+        f"against an independently observed +21.3). 4 = the scheduler thread plus the "
+        f"three the reset path names (prefetch, backup, prefetch_io_aux), each with its "
+        f"own arena. A CEILING, not a target. DERIVED FROM THREAD NAMES, NOT A LIVE "
+        f"COUNT -- the rank thread census was never captured before the host OOM took "
+        f"the base down; PDFLIP-IDLE-CENSUS threads= confirms or corrects it (#1269).")
+    # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
+    # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
+    # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
+    # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
+    env_p["FLLIPER_PDFLIP_END_ANCHOR"] = "1"
+    # P-TRIM-END-ANCHOR (pdflip/p_trim_end_anchor.py): {} when off, so the
+    # default env stays byte-identical; on, P takes a leg-1 prompt as N-1 and
+    # the 1-token END-ANCHOR forward above never runs for it.
+    _p_trim_env = p_trim_end_anchor_env(bool(getattr(ns, "p_trim_end_anchor", False)))
+    env_p.update(_p_trim_env)
+    # FORK ANCHOR (pdflip/fork_anchor.py): {} when off; the same env goes to D.
+    _fork_env = fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                bool(getattr(ns, "p_trim_end_anchor", False)))
+    env_p.update(_fork_env)
+    # TURN ANCHOR (pdflip/turn_anchor.py): {} when off; group P only.
+    _turn_env = turn_anchor_env(getattr(ns, "turn_anchor_token", None))
+    env_p.update(_turn_env)
+    if _turn_env:
+        log("PDFLIP TURN-ANCHOR: on (--turn-anchor-token %s) -- group P snapshots the "
+            "recurrent state where a prompt's last message starts as a second extend "
+            "track and inserts it as its own anchor (rank lines 'PDFLIP TURN-ANCHOR "
+            "TRACK', 'PDFLIP TURN-ANCHOR INSERT')" % ns.turn_anchor_token)
+    if _fork_env:
+        log("PDFLIP FORK-ANCHOR: on (--fork-anchor-token %s) -- group P cuts a leg-1 "
+            "prompt before its generation prompt, group D reads the store up to the "
+            "same cut and keeps its prefill anchor at or below it (rank lines 'PDFLIP "
+            "P-TRIM-END-ANCHOR ... fork', 'PDFLIP FORK-ANCHOR TRACK')"
+            % ns.fork_anchor_token)
+    if _p_trim_env:
+        log("PDFLIP P-TRIM-END-ANCHOR: on (--p-trim-end-anchor) -- group P takes every "
+            "front leg-1 prompt of N tokens as N-1 (token level, at its intake): the "
+            "last regular chunk ends at N-1, the finish insert is the N-1 anchor D "
+            "claims, no 1-token END-ANCHOR forward; prompt_tokens and the #1442 "
+            "hand-off still carry N; N<2, read outputs, sessions, embeds and "
+            "multimodal prompts stay on the split path (rank line 'PDFLIP "
+            "P-TRIM-END-ANCHOR kept(<reason>)')")
+    # --p-attn-head-split: {} when off (env byte-identical). Same builder and
+    # inputs as the pool model's post in solve_p_cut.
+    _ah_cfg = p_attn_head_split_cfg(ns, len(budgets_p), chunk_tokens, ns.model)
+    env_p.update(p_attn_head_split_env(_ah_cfg))
+    if _ah_cfg is not None:
+        log(p_attn_head_split_line(_ah_cfg, len(budgets_p)))
+    # H92 --p-chunk-policy: ({}, []) under 'fixed' -- env and front log
+    # byte-identical. FR_P is read from THIS env_p (the vector that ships).
+    _pcp_env, _pcp_lines = p_chunk_policy_install(env_p)
+    env_p.update(_pcp_env)
+    return _estore_id, _pcp_lines, env_p
+
+
+
+def _main_step32_env_p_setdefault_fl(*, env_p, log, ns):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1465: group P's write-through copy kernels at high stream priority, so
+    # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
+    # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
+    # prefill that never idles.  P only; D keeps the default (decode graphs).
+    env_p.setdefault("FLLIPER_HICACHE_WRITE_STREAM_PRIORITY", "-1")
+    # P-HOST-OVERLAP / #PGAP (managers/pdflip_p_overlap.py): group P only; both
+    # default ON (S43 / rc14), --no-p-host-overlap / --no-p-hostgap add nothing.
+    # 27B port 20.10. (user 20.10.: the dual layout stays as it was): the #PGAP instrument is default ON only
+    # on the flip form -- the 27B dual ran without it (its profile drops --p-hostgap, 27B code default off)
+    _pgap = bool(getattr(ns, "p_hostgap", False)) and not getattr(ns, "dual_layout", False)
+    env_p.update(p_host_overlap_env(getattr(ns, "p_host_overlap", False), _pgap))
+    for _pline in p_host_overlap_lines(getattr(ns, "p_host_overlap", False), _pgap):
+        log(_pline)
+    # P-RECV-STREAM (managers/pdflip_p_overlap.py): group P only, default off --
+    # off adds nothing, so argv and env stay byte-identical.
+    env_p.update(p_recv_stream_env(getattr(ns, "p_recv_stream", False)))
+    for _pline in p_recv_stream_lines(getattr(ns, "p_recv_stream", False)):
+        log(_pline)
+    # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
+    # the SAME call the cut's pool model was built from (solve_p_cut).
+    _pg_pool = p_prefill_graph_pool_mib(ns)
+    env_p.update(p_prefill_graph_env(
+        _pg_pool, max_prefix=getattr(ns, "p_prefill_graph_max_prefix", None)))
+    # --p-prefill-graph-split: {} when off (env byte-identical).
+    _gs_env = p_graph_split_env(ns)
+    env_p.update(_gs_env)
+    if _gs_env:
+        log(
+            "PDFLIP P-GRAPH-SPLIT: on, up to %s KV chunks inside the prefill graph "
+            "-- group P gets %s; the captured grid is q_tiles x N, every replay "
+            "writes its own work-item arrays (rank lines 'FI-GRAPH-SPLIT')"
+            % (int(getattr(ns, "p_prefill_graph_split", 0)),
+               " ".join("%s=%s" % kv for kv in sorted(_gs_env.items())))
+        )
+    elif int(getattr(ns, "p_prefill_graph_split", 0) or 0):
+        log("PDFLIP P-GRAPH-SPLIT: requested but INERT -- --p-prefill-graph is off, "
+            "there is no captured prefill graph to split inside")
+    # --p-deep-split-from: {} when off (env byte-identical).
+    _ds_env = p_deep_split_env(ns)
+    env_p.update(_ds_env)
+    if _ds_env:
+        log(
+            "PDFLIP P-DEEP-SPLIT: on from prefix %s tokens -- group P gets %s: an "
+            "eager chunk that deep plans a wave-aware flashinfer KV split (rank "
+            "line 'FI-WAVE-SPLIT')%s"
+            % (
+                int(getattr(ns, "p_deep_split_from", 0)),
+                " ".join("%s=%s" % kv for kv in sorted(_ds_env.items())),
+                "; the prefill graph is ON, so only the chunks its own depth "
+                "threshold hands to eager (--p-prefill-graph-max-prefix, census "
+                "reason 'deep_split') reach the split -- set it to the same N"
+                if p_prefill_graph_bucket() else "",
+            )
+        )
+    env_p.update(p_gc_env(ns))  # --p-gc-freeze: {} under 'off'
+    # --p-chunk-policy: {} under 'fixed' (env byte-identical).
+    env_p.update(p_chunk_policy_env())
+    # --p-layer-split: {} under 'static' (env byte-identical).
+    env_p.update(p_layer_split_env())
+    if _pg_pool:
+        log(
+            "PDFLIP P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "
+            "(%s; booked by the ranks via FLLIPER_KV_BUDGET_PREFILL_GRAPH_MIB and "
+            "by the cut's pool model; full-CG split-kv workspace shared with the "
+            "float workspace via FLLIPER_FULL_CG_PREFILL_SHARED_WORKSPACE=1)"
+            % (
+                ",".join("%.1f" % v for v in _pg_pool),
+                "operator value"
+                if str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
+                else "DESK ESTIMATE, replace by the measured capture_mib",
+            )
+        )
+
+
+
+def _main_step33_chunk_tokens_armed(*, arm, calib_log_accept, chunk_tokens, cut, env_p, hicache_disabled, log, max_kv_per_request, ns, store_cfg):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
+    # re-read here against the arm this boot actually chose.  The hoist above
+    # rests on --chunked-prefill-size being a CONSTANT of common_flags rather
+    # than a function of the ledger arm; this line proves that premise on every
+    # boot instead of assuming it, and a divergence is named rather than
+    # silently shipping a cut solved for a chunk size the argv does not carry.
+    chunk_tokens_armed = chunked_prefill_size_of(
+        common_flags(ns.model, arm.s_gb, arm.m_mib, store_cfg, max_kv_per_request,
+                     ns.p_hicache_write_policy, "P", ns.random_seed,
+                     ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
+                     hicache_disabled=hicache_disabled)
+    )
+    if chunk_tokens_armed != chunk_tokens:
+        raise PdFlipLaunchRefused(
+            f"W40 PdFlipPPCutRefused: the PP cut was solved for "
+            f"--chunked-prefill-size {chunk_tokens}, read before the host-ledger "
+            f"arm existed, but the argv this boot ships carries "
+            f"{chunk_tokens_armed}. The cut solve has to run BEFORE the ring "
+            f"(the ring must be sized for the form that ships, and the cut is "
+            f"part of that form), which is sound only while the chunk size does "
+            f"not depend on the arm. It now does. Refusing rather than shipping "
+            f"a cut solved against the wrong chunk."
+        )
+    # #1254 W46: THE MAP AND THE ARGV MUST BE THE SAME SPLIT.  The PDFLIP-FLIP-
+    # ORDER MAP above is derived from the incumbent score constants
+    # (p_stage_layers); argv_p ships whatever solve_p_cut returned.  While the
+    # solver's winner differs from the incumbent those two halves describe
+    # DIFFERENT layouts, and the map is then complete but WRONG PER CARD -- a
+    # weights tag charged to one card while its bytes straddle two, which is
+    # the accounting class that killed boot weg2dk4.  Neither half can see the
+    # other, and interleave_pause_order refuses only an INCOMPLETE map, so a
+    # confident wrong pause order is exactly what a silent divergence buys.
+    # Checked here, by name, before either group starts.
+    # #1240 THE LAUNCHER IS THE ONLY WRITER. The solved (or pinned) map is
+    # published here, into the environment group P will actually get -- the
+    # flag is the interface, the variable is the wire. A GAPPED map also arms
+    # the #753 mid-loop crossing wire, because that is the executor: without
+    # it a stage runs its own layers back to back and silently skips its
+    # peer's, and get_pp_layer_set refuses a gapped set with the wire off.
+    if cut.layer_set:
+        env_p[PP_LAYER_SET_ENV] = cut.layer_set
+        if cut.gapped:
+            env_p[PP_CROSSING_WIRE_ENV] = "1"
+        log(
+            "PDFLIP LAYER-SET published for group P: %s=%s%s (source: %s). The "
+            "#753 mid-loop crossing wire is the executor; nothing is "
+            "duplicated here."
+            % (
+                PP_LAYER_SET_ENV,
+                cut.layer_set,
+                " " + PP_CROSSING_WIRE_ENV + "=1" if cut.gapped else "",
+                "--pp-layer-set (PINNED)" if ns.pp_layer_set else "the solver",
+            )
+        )
+    # #692 MICROBATCH DEPTH. The share is READ from a previous boot's own
+    # PP-BUBBLE line, never written here: an operator-supplied path wins, else
+    # the newest log in EVIDENCE_DIR that actually carries the instrument, else
+    # no measurement at all and the depth is today's 0 -- printed, so the
+    # absence is visible rather than inferred from a missing line.
+    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(
+        EVIDENCE_DIR, accept=calib_log_accept)
+    if ns.p_bubble_measured_from and read_pp_bubble(ns.p_bubble_measured_from) is None:
+        raise PdFlipLaunchRefused(
+            f"W42 PdFlipDepthUnfunded: --p-bubble-measured-from "
+            f"{ns.p_bubble_measured_from} carries no PP-BUBBLE line, so it "
+            f"states nothing about the bubble. An explicitly named measurement "
+            f"file that turns out to be empty is refused rather than silently "
+            f"treated as 'no measurement' -- that would read as depth 0 for a "
+            f"reason the operator did not intend."
+        )
+    return bubble_src
+
+
+
+def _main_step34_depth_decision(*, bubble_src, chunk_tokens, cut, d_bs, dry, env_p, log, ns, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    depth_decision = solve_p_depth(
+        measured=read_pp_bubble(bubble_src) if bubble_src else None,
+        pool_tokens=cut.pool_tokens,
+        attn_counts=cut.attn_counts,
+        kv_mib_per_token_per_attn_layer=cut.kv_mib_per_token_per_attn_layer,
+        hidden_size=cut.hidden_size,
+        chunk_tokens=chunk_tokens,
+        cap_tokens=cut.cap_tokens,
+        # Read from the environment group P will actually get -- which since
+        # #1240 this launcher is the only writer of (W44 refuses an inherited
+        # one), so it is the solver's own decision arriving here rather than
+        # an operator's export sneaking past the flags.
+        gapped_layer_set=env_p.get(PP_LAYER_SET_ENV, "") if cut.gapped else "",
+        pinned_depth=ns.p_microbatch_depth,
+    )
+    log(depth_decision.line())
+    state.p_depth = depth_decision.depth
+    if ns.d_disable_cuda_graph:
+        log(
+            "W66 PdFlipEagerDecodeArm: --d-disable-cuda-graph was passed, so "
+            "group D runs --disable-cuda-graph. THIS IS A CONTROL ARM: the "
+            "decode form under measurement is now eager, not the graphed "
+            "full-perf form, and boot weg2dec1_0909 measured the eager mean "
+            "round at 16.6x the graphed one. Every ms/round, compute/wait and "
+            "throughput figure from this boot carries that scope; none of "
+            "them is a statement about the shipped form."
+        )
+    if ns.d_disable_overlap_schedule:
+        log(
+            "W41 PdFlipOverlapRefused: --d-disable-overlap-schedule was passed, "
+            "so group D keeps --disable-overlap-schedule. The gate that "
+            "refused must be named in this boot's record; the flag is not a "
+            "tuning knob and no server_args gate is to be weakened to avoid it. "
+            + d_overlap_cost_line(ns.model, True, d_bs)
+        )
+    else:
+        log(
+            "SCHEDULER: --disable-overlap-schedule is group P's flag only "
+            "(pp_size=3, server_args.py:19507). Group D runs pp_size=1 with "
+            "the overlap scheduler ON; every forcing gate was checked against "
+            "D's argv (pdmux off, device cuda, no sparse-head/dllm, and the "
+            "hybrid-mamba resolution picks extra_buffer for "
+            "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
+            f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
+            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS}). "
+            + D_DECODE_STEPS_PROVENANCE
+            + " "
+            + d_overlap_cost_line(ns.model, False, d_bs)
+        )
+    if ns.p_hicache_write_policy != "write_back":
+        log(
+            f"MEASUREMENT ARM: group P --hicache-write-policy "
+            f"{ns.p_hicache_write_policy} (shipped default is write_back since 2026-09-15; "
+            f"#1016 measured the write_through store tax at +3.9 % @50k / "
+            f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
+            f"arm exists to, and changes nothing else). Group D is unchanged."
+        )
+    # #1275: mint THIS boot's admin key and write it 0600 before either group's
+    # argv is built, so both carry the same one and the front has a path to read
+    # it from. The key never appears in a log line -- only its PATH does (see
+    # admin_key.redact) -- and it is excluded from the P form key by name, or a
+    # fresh random value per boot would give every boot its own form.
+    admin_api_key = admin_key_mod.mint()
+    admin_key_file = admin_key_mod.key_path(GPU_ARB, ns.tag)
+    # A DRY RUN WRITES NOTHING, and that line is a promise this must not break:
+    # `--dry-run` prints "nothing started, mounted, armed or written" a few
+    # dozen lines below. The key is still MINTED so the printed argv is faithful
+    # in shape (and so a reader sees where the flag lands), but it is not
+    # persisted and the log says which of the two happened.
+    if not dry:
+        admin_key_mod.write(admin_key_file, admin_api_key)
+    # #1275 FIX 2: ARM THE LAUNCHER'S OWN RPCs. This is the line whose absence
+    # killed weg2sb5 -- the groups demanded the key and this process, their
+    # FIRST client, never sent it. Armed in a dry run too, so the auth line
+    # below reports the real state rather than a special case.
+    set_admin_key(admin_api_key, admin_key_file)
+    state.admin_key_file = admin_key_file
+    return admin_api_key, admin_key_file, depth_decision
+
+
+
+def _main_step35_log_f_pdflip_launch(*, admin_key_file, dry, log):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    log(f"PDFLIP-LAUNCH RPC auth=bearer sites={rpc_site_count()} "
+        f"(every launcher->group HTTP call goes through one door, `http()`, which "
+        f"attaches the admin bearer; sites counted from this module's own AST, not "
+        f"a hand-kept list. weg2sb5 died with sites=2 and auth on NEITHER: the "
+        f"front authenticated, the launcher's own startup sleep(P) did not, and "
+        f"/release_memory_occupation is ADMIN_OPTIONAL -> 401 at 39 s. #1275 fix 2)")
+    log(f"PDFLIP ADMIN-KEY {'minted (DRY: not written)' if dry else 'minted'} for this boot -> {admin_key_file} (mode 0600); "
+        f"both groups get --admin-api-key, the front authenticates its flip RPCs "
+        f"with it, and /hicache/storage-backend/resize is LIVE (#1275). "
+        f"Direct call: curl -s -X POST http://127.0.0.1:{PORT_D}/hicache/storage-backend/resize "
+        f"-H \"Authorization: Bearer $(cat {admin_key_file})\" "
+        f"-H 'Content-Type: application/json' -d '{{\"max_size_gb\": 8, \"min_free_gb\": 20}}'")
+
+
+
+def _main_step36_shipped_key(*, chunk_count, dry, env_p, form_key, form_norm, log, max_kv_per_request, ns, shipped_argv_p, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
+    # gated the ring table was hashed over an argv built with sentinel ledger
+    # terms, which is sound only while every flag those sentinels reach is
+    # excluded from the key by name.  Here the REAL argv exists, so the key is
+    # re-derived from it and any difference is a refusal -- the alternative is a
+    # ring gated on a form that is not the one launched, which is a subtler
+    # version of the very defect this gate exists to catch.
+    # #1325c: THE SAME TRANSFORM ON BOTH SIDES OF THE COMPARISON.  `form_key`
+    # above was hashed over `xchg_form_argv(...)`, which APPENDS the SYNTHETIC
+    # `ring_table.XCHG_FORM_TOKEN` when the arm is armed (B4e).  That token is
+    # a marker, never a flag `argv_p` emits, so a shipped argv can never carry
+    # it and it is not in FORM_KEY_EXCLUDED_FLAGS either: comparing the raw
+    # shipped key against the gated key refuses EVERY armed boot by
+    # construction, and equals for every unarmed one -- which is why it was
+    # invisible until the #1325b netting correction let an armed boot past the
+    # host ledger for the first time (weg2xsn21, 2026-09-12: W21 at the ledger
+    # on the head, W48 here the moment the ledger funded).  A check that
+    # compares a TRANSFORMED value against an UNTRANSFORMED one tests the
+    # transform, not its subject.  TRAIN FIX 5's subject -- "are the sentinel
+    # ledger terms inert?" -- is untouched: the token is appended identically
+    # to both sides and cancels, and a REAL form drift still refuses.
+    shipped_key, shipped_norm = ring_table.p_form_key(
+        xchg_form_argv(shipped_argv_p, ns.pdflip_weight_source)
+    )
+    if shipped_key != form_key:
+        mine, theirs = set(shipped_norm.split(" ")), set(form_norm.split(" "))
+        raise ring_table.PdFlipRingFormMismatch(
+            f"W48 PdFlipRingFormMismatch: the host ring was gated on group-P form "
+            f"key {form_key}, but the argv this boot ships hashes to "
+            f"{shipped_key}. The gate ran against a form that is not the one "
+            f"being launched, so the ring's size is not a statement about this "
+            f"boot. Shipped-only: {sorted(mine - theirs)}; gated-only: "
+            f"{sorted(theirs - mine)}. Either a flag reached by the sentinel "
+            f"ledger terms is NOT in ring_table.FORM_KEY_EXCLUDED_FLAGS "
+            f"({', '.join(ring_table.FORM_KEY_EXCLUDED_FLAGS)}), or a "
+            f"form-changing flag is added to argv_p after the ring is armed. "
+            f"Refusing before either group starts."
+        )
+    log(f"PDFLIP-P-FORM CONFIRMED key={shipped_key} on the argv actually shipped "
+        f"(the ring was gated on this same key before the host-ledger arm "
+        f"existed; the sentinel terms are proven inert, not assumed to be)")
+    # P-COVERS-D-SESSION (law 02.10.): a named refusal, never a D prefill
+    _cov_ok, _cov_line = p_covers_d_session(
+        shipped_argv_p, d_session_tokens(ns.extra_d, max_kv_per_request))
+    log(_cov_line)
+    if not _cov_ok:
+        raise PdFlipLaunchRefused(_cov_line)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(shipped_argv_p, ns.transport), state.logs["P"], env_p)
+    state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
+    log(w38_armed_line(spec_p.argv))
+    # fnFL2 H37: how many requests one P forward may carry, off the SHIPPED argv.
+    log(p_micro_batch_line(spec_p.argv))
+    state.deviations = [
+        "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
+        "= 208 of 224 usable, measured Used 224/256 incl. RM carve-out; #1234 C1 raised dcp:0 from 24 so the 96-MiB dcp all_reduce plans to 10 rounds "
+        "instead of 17 and stops falling to the host-staged plane)",
+        "FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION=0 on both groups (K2); /health_generate only via the front to the awake group",
+        "group deadmen tier 1 only (TIER2=0 keeps every synthetic generate off the group ports; PROBE_S spaced past the boot as a second guard); tier 2 on the front's deadman",
+        "no disk tier for the store (file backend has no second tier); tmpfs sized by the ledger",
+        "the epoch is carried in the front's ledger only (no group echo/checksum on the RPC)",
+        "torch_memory_saver 0.0.9.post1 preload hook rebuilt from the vendored csrc with ONE patch (cpu backup freed after resume, "
+        "python/flliper/srt/pdflip/tms_csrc/PATCH.md); the stock wheel is untouched and used when FLLIPER_PDFLIP_TMS_PRELOAD_SO is unset",
+        f"weights paused/resumed as {chunk_count} weights_<k> chunk tags + the base tag (#1233 one-backup flip); cuda_graph stays resident (not in the sleep tag set, as in round 1)",
+        "zero-remainder: group P holds the last token of every prefill back into its own chunk (FLLIPER_PDFLIP_END_ANCHOR=1) so the GDN anchor D resumes from sits at N-1; "
+        "costs P one 1-token pass per request and serialises whole-fit prompts behind the one chunked request per pass",
+        "zero-remainder: /flush_cache publishes un-backed nodes before the idle witness on both groups (FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP=1); the quiesce then waits for those backups",
+        # y7d (9bdfe50185) still declared the deleted CARRIER-EXCEEDS route here
+        # ("served by ONE prefill on D, no leg 1"); 9bdfe50185 removed it.
+        "zero-remainder: no D single-prefill route -- every BATCH prompt takes P's leg 1 (CARRIER-EXCEEDS deleted, P-COVERS-D-SESSION law 02.10.); "
+        "a boot whose P prefill stages do not cover D's session is refused by name above, never served by a D prefill",
+        "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
+    ]
+    log(early_read_provenance())
+    for d in state.deviations:
+        log(f"DEVIATION (declared): {d}")
+    # #1361a: ARM BEFORE THE FIRST GROUP STARTS. Everything after this line --
+    # P's load, its first sleep, D's load, D's dormant-image write -- is the
+    # window the front cannot see, because the front is started further down.
+    _launch_guard = None if dry else LaunchGuard(
+        log, host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / host_ledger.GIB).start()
+    return _launch_guard, spec_p
+
+
+
+def _main_step37_apply_dual_p_sleep_n(*, _d_spec_from, cards, dry, log, ns, spec_p, state, tree, user_reserve_by_card):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    apply_dual_p_sleep(ns, spec_p, log)  # D PRIORITY stage 2 (dual unified KV only)
+    spec_p.env.update(dual_alloc_cache_book_env(ns, cards, log))  # item 170: D's cache growth, booked at P's join
+    spec_p.env.update(dual_outside_free_env(ns, cards, user_reserve_by_card, log))  # user rule 24.10.: the reserve, booked at P's join
+    ns._dual_mps_env = start_dual_mps(ns, log, dry)
+    if ns._dual_mps_env and not dry:
+        # persisted AT ONCE: every exit path (cli() early exits, teardown() in a fresh process) reads it
+        state.dual_mps_root = dual_mps_root(ns.tag)
+        _write_state(state)
+    spec_p.env.update(ns._dual_mps_env)
+    spec_p.env.update(dual_p_sm_env(ns))
+    spec_p.env.update(dual_duty_env(ns))
+    spec_p.env.update(dual_share_env(ns, "P"))
+    spec_p.env.update(dual_priority_env(ns, "P", log))  # DUAL-SHARE: {} unless a switch is on
+    launch_group(spec_p, tree, log, dry)
+    ns._s7b_spec_path = write_p_respawn_spec(spec_p, ns, log, dry, p_planned_need(cards, state.budgets.get("P"), ns, log))
+    ns._dual_spec_d = None
+    if getattr(ns, "dual_share", False):
+        # DUAL-TP3PP3 1b: D boots NOW as the union owner; P holds before its
+        # load until D's image (and D's installed vectors) are published.
+        _dual_dc = dual_share_planned_dc(cards, state.budgets["P"], getattr(ns, "extra_p", ""),
+                                         int(getattr(ns, "dual_p_overhead_mib", 1500)))
+        log("PDFLIP-DUAL-SHARE D sized from P's PLAN (budget + overhead, MiB): " + ", ".join(
+            f"nvml{c.nvml_index} {_dual_dc[c.uuid]}" for c in cards))
+        _denv = dual_share_env(ns, "D")
+        _pcut = dual_p_cut_from_argv(spec_p.argv)
+        if _pcut:
+            # D's union image then holds only what the P stage on each card binds;
+            # D's other weights stay in their TMS tags (sleepable, stage 2).
+            _denv["FLLIPER_PDFLIP_DUAL_P_CUT"] = _pcut
+        log(f"PDFLIP-DUAL-SHARE P cut for D's image filter: {_pcut or '(none -> whole image)'}")
+        _sd, _ = _d_spec_from(_dual_dc, "D(dual-share, P-Plan)", _denv)
+        _sd.env.update(ns._dual_mps_env)
+        _sd.env.update(dual_priority_env(ns, "D", log))  # DUAL-SHARE: {} unless a switch is on
+        state.argv["D"] = " ".join(shlex.quote(a) for a in _sd.argv)
+        launch_group(_sd, tree, log, dry)
+        ns._dual_spec_d = _sd
+        if not dry:
+            # D must be READY -- its KV sized, its graphs captured -- before P
+            # loads a byte: D sizes its KV off the card's free memory, and a P
+            # load running alongside would move that reading under it. P
+            # waits for this marker next to D's union socket.
+            state.t_ready["D"] = wait_ready(PORT_D, _sd.pid, ns.ready_deadline_s, log, "D", _sd.proc)
+            _udir = dual_share_env(ns, "D")["FLLIPER_PDFLIP_UNION_DIR"]
+            os.makedirs(_udir, exist_ok=True)
+            with open(os.path.join(_udir, DUAL_D_READY_FILE), "w") as _f:
+                _f.write(f"{time.time():.3f}\n")
+            log(f"PDFLIP-DUAL-SHARE D READY -> {_udir}/{DUAL_D_READY_FILE}: P may load now")
+
+
+
+def _main_step38__d_early_verdict(*, cards, hicache_disabled, log, ns, spec_p, state, user_reserve_by_card):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    def _d_early_verdict(early, dc_measured):
+        """go -> the running early D; refuse -> None (it exits, the caller starts D serially)."""
+        from flliper.srt.pdflip import d_early_start as _des
+
+        spec, planned, gate, snap, stage0 = early
+        _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
+        _rest, _rest_prov = d_awake_rest(cards, ns.profile)
+        _over, _over_prov = d_overshoot_record(ns.profile)
+        measured = budgets_from_dc(
+            cards, dc_measured, log, "D(gemessen, Gate)", overshoot_mib=_over,
+            overshoot_provenance=_over_prov,
+            corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+            user_reserve_by_card=user_reserve_by_card,
+            dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
+            charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
+            awake_rest_mib=_rest, awake_rest_provenance=_rest_prov,
+            **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)),
+        )
+        uuids = [c.uuid for c in cards]
+        names = {c.uuid: f"nvml{c.nvml_index}" for c in cards}
+        ok, lines = _des.budget_verdict(dict(zip(uuids, planned)), dict(zip(uuids, measured)), names)
+        rc = spec.proc.poll() if spec.proc is not None else None
+        if rc is not None:
+            ok, lines = False, lines + [f"early D exited before the gate rc={rc}"]
+        if stage0.get("verdict") != _des.VERDICT_GO:
+            ok, lines = False, lines + [f"stage 0 not go ({stage0.get('verdict', 'no verdict yet')})"]
+        for _ln in lines:
+            log(f"{_des.MARKER} {_ln}")
+        if ok:
+            _des.write_gate(gate, _des.VERDICT_GO, "planned <= measured on every card",
+                            dict(zip(uuids, planned)), dict(zip(uuids, measured)))
+            state.budgets["D"] = planned
+            log(f"{_des.MARKER} GO -- D loads now with the plan it was started with")
+            return spec
+        _des.write_gate(gate, _des.VERDICT_REFUSE, "; ".join(lines),
+                        dict(zip(uuids, planned)), dict(zip(uuids, measured)))
+        log(f"{_des.MARKER} REFUSE -- early D exits, D starts serially from the measured budgets")
+        try:
+            spec.proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            spec.proc.kill()
+            spec.proc.wait(timeout=30)
+        # the group leads its own session (launch_group): its scheduler ranks
+        # must not outlive it on the cards the serial D is about to take
+        try:
+            os.killpg(spec.proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        ns.env_d, ns._d_kv_stage_written, ns._d_owner_solve = snap
+        return None
+
+    state.pids["P"] = spec_p.pid
+    _write_state(state)
+    register_boot_group(ns.tag, "P", spec_p.pid, log)  # H135b
+    state.t_ready["P"] = wait_ready(PORT_P, spec_p.pid, ns.ready_deadline_s, log, "P", spec_p.proc)
+    # #1386 FOLLOW-UP 2 (xsn31/7 Versuch 2 wall): both markers this gate greps
+    # for are printed by managers/cache_controller.py's HiCacheController
+    # alone (lines ~1411/1608, grep-verified: no other emitter in the tree),
+    # and that class is instantiated ONLY under `enable_hierarchical_cache`
+    # (mem_cache/registry.py's create_tree_cache: `if
+    # ctx.enable_hierarchical_cache: ... init_hicache ...`; this hybrid-SSM
+    # model falls through to plain MambaRadixCache otherwise, which carries
+    # no cache_controller at all). Under
+    # `hicache_disabled` there is therefore NO EMITTER for either marker --
+    # P booted clean to READY (health 200, no exception, no refusal inside
+    # the rank) and was torn down ONLY by this unconditional launcher-side
+    # check never having been taught the switch exists, the exact same class
+    # the draft-KV-producer gate above was fixed for. SKIPPED with a named
+    # line, never silently -- the mirror of "W10/W11 SKIPPED" below.
+    if hicache_disabled:
+        log("W7/W10 SKIPPED (--pdflip-disable-hicache): group P's cache_controller "
+            "never builds (enable_hierarchical_cache is False), so there is no "
+            "canonical-page/GDN-blob emitter to grade -- the plain MambaRadixCache "
+            "this arm runs under prints neither marker. P's own health check "
+            "already confirmed it booted clean to READY.")
+    else:
+        canonical_state_gate(spec_p, group_rank_count(spec_p.argv), log)
+    return _d_early_verdict
+
+
+
+def _main_step39_shmem_before(*, _early_d, cards, log, ns, spec_p, state, tip, weights_tags):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
+    # This is the one sleep on this box that is NOT interleaved: group D does
+    # not exist yet, so nothing is resuming and freeing an image while P writes
+    # its own.  The cgroup shmem delta and the per-rank RssShmem sum are
+    # therefore comparable here, and the pair is what the next boot's ledger
+    # prices its image term from (BOOT_weg2dk7_0907.md: the weight-tag census
+    # under-charged the measured image by +9.80 GiB).
+    shmem_before = host_ledger.read_cgroup_shmem_bytes()
+    if getattr(ns, "dual_layout", False):
+        # DUAL-TP3PP3: P stays awake. What is measured below is P's AWAKE
+        # footprint, and D is sized from it exactly as it would be from the
+        # dormant residue. No dormant image is sampled or recorded -- an awake
+        # footprint in the dormant-image record would poison the next boot's
+        # ledger.
+        state.sleep_p_ms = 0.0
+        log("PDFLIP-DUAL P stays AWAKE (--dual-layout): no sleep leg, no dormant image; "
+            "the per-PID reading below is P's awake footprint and sizes D")
+        time.sleep(2)
+        pids_p = session_pids(spec_p.pid)
+    else:
+        state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
+        time.sleep(2)
+        pids_p = session_pids(spec_p.pid)
+    image_rec = None if getattr(ns, "dual_layout", False) else host_ledger.dormant_image_sample(
+        group="P",
+        shmem_before_bytes=shmem_before,
+        shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
+        pids=sorted(pids_p),
+        weight_tags_gib=host_ledger.WEIGHT_TAGS_P_BYTES / host_ledger.GIB,
+        interleaved=False,
+        boot_tag=ns.tag,
+        commit=tip,
+        # #1362: stamp the model. Without it the next boot cannot tell whether
+        # this image is its own model's or the previous tenant's, and the
+        # measured 27B numbers walk straight into a 4B boot.
+        # #1362 [22-fix2]: the CONTENT digest, the same identity the readers
+        # compare against. [22] stamped the PATH form here, which no reader
+        # keys on -- so every record this boot wrote would have stayed legacy
+        # forever and the transition path below would never retire.
+        model_digest_=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
+    )
+    if image_rec is not None:
+        log(host_ledger.format_dormant_image(image_rec))
+        host_ledger.append_measured_record(measured_record_path(), image_rec)
+    state.dormant_image_p = image_rec or {}
+    dc_p = nvml_process_mib(pids_p)
+    for c in cards:
+        dc_p.setdefault(c.uuid, 0)
+    mem = nvml_memory(cards)
+    for c in cards:
+        exp = dc_expect_mib(c)
+        _exp_txt = (f"expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
+                    f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; "
+                    if exp is not None else
+                    f"expectation UNCALIBRATED ({card_identity.card_key(c)}: no spec-1.6 class; ")
+        log(
+            f"PDFLIP-DC group=P nvml{c.nvml_index} {c.name}: measured {dc_p[c.uuid]} MiB per-process "
+            f"(pids {sorted(pids_p)}) card used {mem[c.uuid].tenant_used_mib} MiB by processes "
+            f"(instrument {mem[c.uuid].tenant_used_instrument}; card free {mem[c.uuid].free_mib} MiB allocatable, "
+            f"{mem[c.uuid].reserved_mib} MiB driver-reserved); " + _exp_txt
+            + "the launcher derives D from the MEASUREMENT, record 1f B6)"
+        )
+    state.dc_measured_p = dc_p
+    # BOOTZEIT 3: the free-read journal's cut (P's first sleep is over here) and,
+    # with an early D, D's bytes on each card measured per PID -- the known term
+    # a deviating P reader would have to carry (never an estimate).
+    _p_sleep_evt: Dict[str, object] = {"t": time.time(), "dc_p_mib": dict(dc_p)}
+    if _early_d is not None:
+        try:
+            _p_sleep_evt["d_early_foreign_mib"] = nvml_process_mib(session_pids(_early_d[0].pid))
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            _p_sleep_evt["d_early_foreign_mib"] = f"unmeasured ({type(e).__name__}: {e})"
+        log(f"BZ3 D-EARLY-FOREIGN after sleep(P): D per-PID MiB {_p_sleep_evt['d_early_foreign_mib']}")
+    boot_state_write(log, event=("p_first_sleep_done", _p_sleep_evt))
+    return dc_p
+
+
+
+def _main_step40_spec_d(*, _d_early_verdict, _d_spec_from, _early_d, dc_p, dry, hicache_disabled, log, ns, spec_p, state, tree):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # 5. group D
+    spec_d = getattr(ns, "_dual_spec_d", None)  # DUAL-TP3PP3 1b: launched right after P
+    if spec_d is None and _early_d is not None:
+        spec_d = _d_early_verdict(_early_d, dc_p)
+    if spec_d is None:
+        spec_d, _ = _d_spec_from(dc_p, "D")
+        state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
+        spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})
+        spec_d.env.update(dual_priority_env(ns, "D", log))  # DUAL-SHARE: {} unless a switch is on
+        launch_group(spec_d, tree, log, dry)
+    state.pids["D"] = spec_d.pid
+    _write_state(state)
+    register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
+    state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
+    if not dry:
+        release_shared_cache(spec_d, log)  # W98 (z30u): 2b's kept ranges, after D's take-over
+    # #1386 FOLLOW-UP 2: the mirror of group P's same skip above -- D's
+    # cache_controller never builds under `hicache_disabled` either (D is a
+    # plain MambaRadixCache then, same as P), so it prints neither marker.
+    if hicache_disabled:
+        log("W7/W10 SKIPPED (--pdflip-disable-hicache): group D's cache_controller "
+            "never builds either (enable_hierarchical_cache is False) -- no "
+            "canonical-page/GDN-blob emitter to grade, same as group P above.")
+    else:
+        canonical_state_gate(spec_d, group_rank_count(spec_d.argv), log,
+                             kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
+        # VRAM-Vertrag M2 (display only): P's blocks again, now carrying its
+        # first sleep leg -- the per-PID source of the plan's asleep.P
+        rank_vram_display(spec_p, log)
+    # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
+    # store is one carrier; a spec-less group keys pages by unigram unless
+    # FLLIPER_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
+    # group keys by bigram natively. Divergent schemes wrote disjoint chains
+    # for the same prompt once (boots weg2ls3b1-b3); the identity-suffix
+    # check in the front cannot see it. Refuse the boot before any traffic.
+    #
+    # #1386 FOLLOW-UP 3 (xsn31/7 Versuch 3 wall): "the store is one carrier"
+    # is the premise this whole gate stands on, and under `hicache_disabled`
+    # there IS no carrier for either group -- both fall through to plain
+    # MambaRadixCache (no cache_controller, no canonical page store at all,
+    # same fact the W7/W10 skip above already established). The mismatch
+    # this gate exists to catch (P and D writing the SAME store under
+    # DIFFERENT hash schemes) cannot occur when neither group writes a store.
+    # P is unigram here for an unrelated, correct reason (dropping the WHOLE
+    # P_DRAFT_KV_FLAGS bundle drops P's OWN --speculative-algorithm too, not
+    # just --speculative-draft-kv-only -- see the fold-in above); D stays
+    # bigram because D keeps its own, independent NEXTN head. That is a
+    # real divergence in each group's OWN spec config, not a shared-carrier
+    # hazard, so it is not this gate's concern once the carrier is gone.
+    if hicache_disabled:
+        log("W9 SKIPPED (--pdflip-disable-hicache): no shared carrier exists for "
+            "either group to key mismatched (same fact as the W7/W10 skip) -- "
+            "P/D's own --speculative-algorithm divergence is expected here "
+            "(P dropped the whole producer bundle, D keeps its independent "
+            "NEXTN head) and immaterial without a store to key.")
+    else:
+        _forced = "#1233 HICACHE BIGRAM KEYS FORCED"
+        # IPC-LOG-EXCEPTION: W9 still reads the forced-bigram LINE (Phase 2 rest, producer
+        # side: RankState schema 2 `store_key_scheme`, IPC-STATE-PLAN §2.1).
+        _p_bigram = ("--speculative-algorithm" in spec_p.argv) or count_marker(spec_p.log, _forced) >= 1
+        _d_bigram = ("--speculative-algorithm" in spec_d.argv) or count_marker(spec_d.log, _forced) >= 1
+        log(f"W9 launch-time key-scheme gate: P bigram={_p_bigram} (forced lines {count_marker(spec_p.log, _forced)}) "
+            f"D bigram={_d_bigram} (forced lines {count_marker(spec_d.log, _forced)})")
+        if _p_bigram != _d_bigram:
+            raise PdFlipLaunchRefused(f"W9 PdFlipStoreIdentityMismatch (launch-time key scheme): P bigram={_p_bigram} D bigram={_d_bigram} -- "
+                                    f"the two groups would key the sole carrier by different page-hash schemes")
+    return spec_d
+
+
+
+def _main_step41__cc():
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1246 CARRIER CENSUS.  The bound the front routes by is READ from group D's
+    # own prefetch-limit instrument ('#915 PREFETCH LIMIT ... site=<one of the two
+    # launch-time cache-init sites>', carrier_census.CENSUS_SITES),
+    # which names its component and carries the number the runtime ENFORCES.  It
+    # is no longer re-derived as 0.9 x min(<a warning that fires for any host
+    # pool below its device pool, mamba included>) -- that census had no named
+    # population, duplicated the runtime's own fraction, and went silent when the
+    # warning did not fire.  Boot weg2rg5 read 19 mamba slots as the KV carrier
+    # and shipped a bound of 17: every request took CARRIER-EXCEEDS, group P ran
+    # zero prefill passes, exit 0.  Full derivation, provenance and the two
+    # rejected alternatives: flliper/srt/pdflip/carrier_census.py module docstring.
+    #
+    # THE LAUNCHER NEVER SHIPS 0, and no flag makes it.  0 is not an off switch
+    # for the round trip: the front's two carrier guards read
+    # `carrier_max_tokens > 0` (Front.handle_generate CARRIER-EXCEEDS, Front.leg1
+    # the post-leg-1 correction), so 0 removes the BYPASS and routes every prompt
+    # above the SHORT grant through leg 1 + a leg-2 store read with NO bound on
+    # what the store is asked to carry -- the '#915 PREFETCH REFUSED' / W16
+    # shape of boot weg2ls4b2 (84,027 tokens against a 30,518-token host pool).
+    # front.main's own help says it in one line.  Fix 1 shipped a
+    # --no-carrier-route flag whose help, log line and refusal-remedy sentence
+    # all asserted the opposite of that; it is gone.  What replaces it is
+    # --carrier-max-tokens N, and FIX 3 gives it the second guard it was missing:
+    # N may only LOWER a measured bound (floor < N <= measured), never raise one.
+    # Checked against the floor ALONE it could ship a bound ABOVE what D's
+    # carrier can read -- 262144, this rig's --max-model-len, was accepted while
+    # the launcher held the measured 27466 on the line above -- which is the same
+    # W16 the bound exists to prevent, reached through the flag a W45 recommends.
+    # With a missing/disagree census there is no measured number to lower, so the
+    # override is refused there too: an operator who wants a boot whose census
+    # cannot be read fixes the census, not the number.  ONE MECHANISM, in
+    # carrier_census.decide_bound, so the two sources of the number cannot drift
+    # apart again; every way of failing to MEASURE the bound stays a W45 refusal
+    # by name, never a silent zero.
+    from flliper.srt.pdflip import carrier_census as _cc
+    return _cc
+
+
+
+def _main_step42_if_hicache_disabled(*, _draft_kv_on_p_requested, cards, chunk_count, chunk_layers, chunk_tag_cards, hicache_disabled, log, ns, p_split, shipped_argv_p, spec_d, spec_p):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    # #1233 draft KV across the flip: W10 DRAFTER-IDENTITY GATE. Both groups
+    # register a drafter (P: the producer on its last stage, D: the NEXTN
+    # worker on every rank); the identity in their `HiCache draft KV
+    # registered` lines and the canonical draft layout in their `#706
+    # canonical DRAFT page active` lines must agree, or D fetches
+    # `{hash}.draft-<Pid>` pages P never wrote (the weg2zr2 shape, 194,088
+    # failed draft fetches). Refused before the front opens.
+    # #1264: BOTH GATES GRADE A PRODUCER, so both are asked of THE ONE
+    # PREDICATE first -- read off the argv this boot actually shipped, not off
+    # ns.draft_kv_on_p, so a future change to argv_p carries the gates with it.
+    # Under `off` group P registers no drafter and emits no DRAFT-KV-PRODUCER
+    # line at all, which is the pre-#1233 shape these two gates were written to
+    # refuse; running them there would refuse the rg6 baseline for being the
+    # rg6 baseline. They are SKIPPED with a named line, never silently.
+    # THE ROUTE CONSEQUENCE IS STATED IN THE SAME BREATH: D keeps its own NEXTN
+    # head under `off`, so it still ASKS the carrier for `{hash}.draft-<id>`
+    # pages -- and P writes none, so every one of those reads misses and D's
+    # draft state is cold after each flip. That is the cost of this arm; it is
+    # not a defect of the store and must not be triaged as one.
+    # fnFL2x48b: under --pdflip-disable-hicache no carrier exists, so NEITHER
+    # group prints a `HiCache draft KV registered` or `#706 canonical DRAFT
+    # page` line -- the gate read P=None D=None and refused a boot whose D was
+    # already READY, although the route it guards (draft pages through the
+    # carrier) is absent by construction. Same fact as the W7/W9/W45 skips.
+    if hicache_disabled:
+        log("W10/W11 SKIPPED (--pdflip-disable-hicache): no HiCache carrier exists, so neither group registers "
+            "a drafter identity or a canonical draft layout to match, and no draft pages cross a flip -- the "
+            "#1233 route these gates grade is absent by construction (same fact as the W7/W9/W45 skips).")
+    elif not ring_table.p_carries_drafter(shipped_argv_p):
+        log(w10_skip_no_producer_line())
+    else:
+        # UNIFY S6 (27B c60a5d387f): under p_draft=cold P builds the producer
+        # but writes NO draft pages -- W10 is skipped by name (identities still
+        # logged); W11 still grades the cold-resident draft bytes.
+        # IPC-LOG-EXCEPTION: W10-drafter / W11 still read drafter identity and draft-build
+        # lines (Phase 2 rest: RankState schema 2 `drafter`, `draft_build`).
+        gate_w10(spec_p.log, spec_d.log, log,
+                 p_produces_draft_pages=p_produces_draft_pages())
+        # #1233 fix 2: W11 DRAFT-RESIDENT gate. The last stage's pool is priced
+        # against a budgeted draft residue (P_DRAFT_RESIDENT_BUDGET_MIB); the L2
+        # line carries the MEASURED one. Over budget = the corridor derivation is refuted by this
+        # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
+        # IPC-LOG-EXCEPTION: W11 (see W10 above).
+        gate_w11(spec_p.log, log, rope_ctx_mib=p_rope_draft_delta_mib(ns))
+    # IPC-LOG-EXCEPTION: display only (class A), decides nothing; metric bar1_window_clip_total later.
+    clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
+    log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
+
+    # 6. front
+    # #1233 boot weg2dk4 -- WHICH CARD DOES A CHUNK TAG LIVE ON.  Group P is
+    # PP: a weights_<k> tag is a layer band and sits on ONE stage's card (two
+    # when the band straddles a stage boundary).  Group D is TP: every card
+    # holds a shard of every layer, so D has NO map and pauses in the natural
+    # order, exactly as before.  Derived here from the SAME stage ratio argv_p
+    # passes and the SAME chunk geometry both groups were built with; the front
+    # picks the pause order from it per flip, against a live NVML free sample.
+    # fix 5: from the DERIVED layer split (section 1b'), never from the score
+    # vector.  FIX 2: and from the SOLVED cut's split, never from the
+    # incumbent's -- the two are the same vector only when the solve happens
+    # to land back on the incumbent, and on this tip they do not.  No split ->
+    # no map -> the front pauses in the identity order and prints why, which is
+    # the honest degradation; a complete-but-wrong map is not, because
+    # interleave_pause_order only refuses an INCOMPLETE one.
+    p_chunk_cards = chunk_tag_cards(
+        p_split, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
+    ) if p_split else {}
+    src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
+    # 23.09. (fnFL2x30): THE DRAFT TAG IS A BAND OF THE LAST STAGE'S CARD.
+    # With --draft-kv-on-p the MTP head lives on P's last stage only (W11
+    # DRAFT-RESIDENT prices exactly that pool), so its pause refunds that
+    # card -- 2770 MiB on the Next-Flash 3080. Absent from this map it sat
+    # in the front's `rest` behind every chunk, which was harmless while
+    # lane p4 was a SEQ host buffer (x22) and a deadlock over a BAR1 ring:
+    # the collector reaches the draft last, D TP2 ran dry at weights_4.
+    # `front.orderable_band` places it with its card; the base tag still
+    # closes the sleep.
+    if p_split and _draft_kv_on_p_requested and cards:
+        src_chunk_cards["P"]["weights_draft"] = [int(cards[-1].nvml_index)]
+    return src_chunk_cards
+
+
+
+def _main_step43_log_f_pdflip_flip_or(*, _launch_guard, cards, chunk_layers, cut, log, n_layers, p_split, p_split_note, src_chunk_cards):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    log(f"PDFLIP-FLIP-ORDER MAP group=P (SOLVED cut {cut.stage_ratio or '(gapped)'}/"
+        f"{cut.attn_stage_ratio or '(gapped)'} -> REALIZED layer split "
+        f"{p_split if p_split else 'REFUSED (' + p_split_note + ') -> NO MAP, identity order'} "
+        f"over {n_layers} layers, {chunk_layers} layers per chunk, "
+        f"nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
+        f"group=D TP -> no map (uniform across cards). Boot weg2dk4 died because the interleave paused P's tag k "
+        f"against D's tag k while P's bytes for k=0..5 were on OTHER cards than the one D was allocating on.")
+    # #1361a: the front is up from here on and carries the same latch on the
+    # same terms, so the launcher-side guard hands over rather than doubling.
+    if _launch_guard is not None:
+        # 12.10.2026 (NF W98 HOST-WARN): hand over only. The guard WARNS (marker
+        # HOST-RAM-WARN W98) and never returns a verdict that stops the boot, so
+        # the old `PdFlipLaunchHostLatched` raise that stood here is gone (the class
+        # stays defined: it is part of the refusal tuple and of old test imports).
+        _launch_guard.stop("front takes over")
+
+
+
+def _main_step44_fenv(*, d_bs, env_p, front_argv, front_log, log, ns, ring_plan, tree, user_reserve_by_card):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    fenv = dict(os.environ)
+    # #227 FORCED-RECORDS: the front is the record writer and spawns LAST, after every refusal site of main --
+    # the verdict is final here. Held records (the launcher's own P image) are written or dropped by it, and the
+    # front gets it in its environment (no seal = no records in a forced child, as before).
+    refusals.seal_records()
+    if refusals.forced_boot():
+        log(refusals.records_verdict_line())
+    host_ledger.flush_held_records(log)
+    refusals.export_records_verdict(fenv)
+    if refusals.forced_boot():
+        boot_state_write(log, event=("forced_records", {"allow": refusals.records_allowed(),
+                                                        "line": refusals.records_verdict_line()}))
+    fenv["PYTHONPATH"] = f"{tree}/python"
+    # L3-INDEX PRICE (02.10.): the front asks the shared L3 stem index with the
+    # groups' own page-key scheme and arena dir (group_env's values, so the
+    # credit is what P/D read).
+    if ns.hicache_bigram_keys:
+        fenv["FLLIPER_HICACHE_BIGRAM_KEYS"] = "1"
+    else:
+        fenv.pop("FLLIPER_HICACHE_BIGRAM_KEYS", None)
+    fenv.setdefault("FLLIPER_HICACHE_ARENA_DIR", f"/dev/shm/pdflip-arena-{ns.tag}")
+    # D PRIORITY stage 2: the front's capability + D's look-ahead (one extend
+    # chunk + one decode round of every seat with the draft's tokens)
+    fenv.update(dual_p_sleep_front_env(ns, dual_d_air_tokens(d_bs)))
+    fenv.update(dual_front_kv_tag_env(ns))
+    # FORK-TAIL on the front (W16, boot ...10271342): the leg-2 price needs the same fork token the groups cut at ({} when off).
+    fenv.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None), bool(getattr(ns, "p_trim_end_anchor", False))))
+    # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
+    # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
+    #
+    # Gemessen: v96 erreichte beide Gruppen READY (P 159,0 s, D 222,1 s, W11b
+    # gruen), dann verweigerte der Launcher mit "group front not READY on
+    # :30030 after 120 s (Connection refused)" -- und der front.log enthielt
+    # keine einzige Zeile der Front selbst, nur die des Launchers. Nicht weil
+    # sie nichts tat, sondern weil stdout hier ein FILE ist (`stdout=ffh`
+    # unten) und nicht ein TTY: Python schaltet dann von zeilen- auf
+    # blockgepuffert (8 KiB), und was im Puffer steht, wenn der Prozess
+    # abgeraeumt wird, ist verloren.
+    #
+    # Ein Prozess, dessen letzte 120 s unsichtbar sind, ist nicht
+    # diagnostizierbar -- und das ist bei dem Prozess, der den Flip fuehrt,
+    # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
+    # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
+    fenv["PYTHONUNBUFFERED"] = "1"
+    if getattr(ns, "_s7b_spec_path", ""):
+        from flliper.srt.pdflip import dual_p_restart as _s7b
+
+        fenv[_s7b.SPEC_ENV] = ns._s7b_spec_path  # S7b: the front's P restart reads P's exec record here
+    # FH (b1): the front's health poller finds a held rank (#1223) by its dump;
+    # hand it the dir the groups write to (read only by front_health).
+    if env_p.get("FLLIPER_DEBUG_HOLD_DIR") and not fenv.get("FLLIPER_DEBUG_HOLD_DIR"):
+        fenv["FLLIPER_DEBUG_HOLD_DIR"] = env_p["FLLIPER_DEBUG_HOLD_DIR"]
+    # RG (operator 26.09.): the prefix switches the ranks got from build_env,
+    # the same call on the front's env (FLLIPER_PDFLIP_FRONT_SPAN_INFLIGHT is the
+    # front's own; all five as on metal: ENV-IM-RANG front = 1).
+    if getattr(ns, "pdflip_boot_form", None) is not None:
+        pdflip_form.publish_prefix_switches(fenv, ns.pdflip_boot_form.profile)
+    # C14 / FIX 2 round 2: the BOOT half of the VRAM credit epoch.  Launcher
+    # OUTPUT in exactly the class of TMS_HOST_RING_MAP (R19), never an operator
+    # knob: it is this boot's ring epoch, the same nonce every rank already got
+    # from build_env, so the front's composed <boot>.<flip> token and the ranks'
+    # ring identity name ONE boot.  Absent (no armed ring) the front falls back
+    # to its own start time, which is boot-unique for the same reason.
+    if ring_plan is not None and ring_plan.armed:
+        fenv["TMS_HOST_RING_EPOCH"] = str(ring_plan.epoch)
+    # #1257c: DELIVERABLE 6 -- the front's corridor sampler and this launcher
+    # read THE SAME derived floor. The measured half already comes from one
+    # store (the activation footprint cache, keyed by the digest the boot
+    # publishes); the operator half is a launcher argument, so the front is
+    # TOLD it here rather than re-deriving it. The front then prints
+    # `floor=/source=/reserve=` per card on every PDFLIP-CORRIDOR line, and the
+    # boot's corridor VERDICT (`corridor_arm.arm_report`) grades against THAT
+    # LINE -- which is the shared surface, in one direction only, so the two
+    # cannot disagree.
+    if user_reserve_by_card:
+        fenv[corridor_guard.USER_RESERVE_ENV] = user_reserve_env_value(user_reserve_by_card)
+    log("front argv: " + " ".join(shlex.quote(a) for a in front_argv))
+    ffh = open(front_log, "ab")
+    _front_cwd = core_cwd_for(front_log, tree, log)
+    log(f"front cwd {_front_cwd} (ops #164: crash cores land here, not in the tree)")
+    return _front_cwd, fenv, ffh
+
+
+
+def _main_step45_fp(*, _front_cwd, dry, fenv, ffh, front_argv, front_log, log, ns, spec_d, spec_p, state):
+    """Step of :func:`main` (split behaviour-neutrally, refactor 28.10.)."""
+    fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=_front_cwd, start_new_session=True)
+    state.pids["front"] = fp.pid
+    boot_state_write(log, fields=front_launch_fields(front_argv, fenv))
+    # H135b: the front into the state json AND the registry at once -- until the
+    # LAUNCHED write below (behind wait_ready and the deadmen) a guard-run
+    # `--teardown` would not know the front by pid.
+    _write_state(state)
+    register_boot_group(ns.tag, "front", fp.pid, log)
+    # PUBLISH THE LOG BEFORE WAITING, NOT AFTER.  This used to sit after the
+    # LAUNCHED line, i.e. behind `wait_ready` below -- so a boot that never
+    # reached a ready front never updated the symlink, and every reader
+    # (`resolve_pin`, the deadman, a seat looking for "the current boot") was
+    # pointed at the last boot that SUCCEEDED.  Measured 2026-09-21: seven
+    # fnFL2 attempts in 2.5 h all ended `PDFLIP-LAUNCH REFUSED`, and
+    # /root/current_boot.log still named the 07:26 boot.  The pointer is needed
+    # MOST while a boot is failing, which is exactly when it was not written.
+    os.system(f"ln -sfn {shlex.quote(front_log)} /root/current_boot.log")
+    state.t_ready["front"] = wait_ready(PORT_FRONT, fp.pid, 120, log, "front", fp)
+
+    # 7. deadmen + helpers
+    huge = 10**7
+    state.helper_pids.append(arm_deadman(log, spec_p.log, PORT_P, f"launch_server.*--port {PORT_P}", huge, ns.tag, "P", dry))
+    state.helper_pids.append(arm_deadman(log, spec_d.log, PORT_D, f"launch_server.*--port {PORT_D}", huge, ns.tag, "D", dry))
+    state.helper_pids.append(arm_deadman(log, front_log, PORT_FRONT, "flliper.srt.pdflip.front", 120, ns.tag, "front", dry))
+    with open(_operator_dir(GPU_ARB, f"boot_{ns.tag}.logpath"), "w") as f:
+        f.write(front_log + "\n")
+    _write_state(state)
+    log(f"LAUNCHED: P pid {spec_p.pid} (asleep) D pid {spec_d.pid} (awake) front pid {fp.pid}; state {state_path(state)}; /root/current_boot.log -> {front_log}")
+
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    global _ACTIVE_BOOT_STATE
+    # #1248: unclaimed until a BootState exists below -- a stale pointer from
+    # a PREVIOUS boot in the same process (there is none today; guards the
+    # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
+    _ACTIVE_BOOT_STATE = None
+    boot_form, ns = _main_step01_ns(argv=argv)
+    _h87_alias_line, boot_form, calib_identity, calib_log_accept, calib_sample_accept, hicache_disabled, tokenizer_line = _main_step02__pad_line(argv=argv, boot_form=boot_form, ns=ns)
+    # #1369: user order 2026-09-14. ONE resolution, here, before the form-key
+    # build and the shipped argvs both need it. Every later reader (the
+    # form-key build, the shipped `argv_p`/`argv_d`, `choose_host_ledger`)
+    # takes this ONE local.
+    #
+    # NOT a bare call to `weight_exchange.weights_cpu_backup_armed()` for the
+    # `auto` case: that function's `auto` branch reads `exchange_armed()` and
+    # `inject_authoritative()`, NEITHER of which take an `explicit` this
+    # process could hand them (`exchange_armed()` has no such parameter at
+    # all) -- exactly the S6 fix E trap `inject_mode()`'s own docstring
+    # warns about, one predicate over: the LAUNCHER's own process never has
+    # `WEIGHT_SOURCE_ENV`/`INJECT_ENV` in its bare environment, only the
+    # ranks do (`prepare_xchg_env`/`build_env` publish them there, never
+    # here). `ring_absent_by_design` already solves exactly this -- it takes
+    # `weight_source`/`inject_mode` as plain VALUES, never through the
+    # env-reading functions -- so `auto` here is that ONE authority's
+    # negation rather than a second, launcher-unsafe spelling of the same
+    # conjunction. `on`/`off` need none of this: both short-circuit inside
+    # `weights_cpu_backup_armed()` before either sub-predicate is touched.
+    if str(ns.pdflip_weights_cpu_backup) == weight_exchange.WEIGHTS_CPU_BACKUP_AUTO:
+        weights_cpu_backup_armed = not ring_absent_by_design(
+            str(ns.pdflip_weight_source), str(ns.pdflip_xchg_inject))
+    else:
+        weights_cpu_backup_armed = weight_exchange.weights_cpu_backup_armed(
+            explicit=ns.pdflip_weights_cpu_backup)
+    resolve_dual_layout(ns)
+    if getattr(ns, "flip_weights", "family") == "resident":
+        # Task #47 Scheibe 6a: the weights never sleep -> no host ring, no cpu
+        # backup, no exchange; the ring planner takes the ABSENT-BY-DESIGN path.
+        weights_cpu_backup_armed = False
+        print("PDFLIP-LAUNCH --flip-weights resident: weights of BOTH groups stay mapped, "
+              "only kv_cache flips; host ring / cpu backup ABSENT-BY-DESIGN", flush=True)
+    # #1348: both coverage instruments armed at once is a burnt window, and
+    # the cheapest place to say so is here -- before anything is started.
+    refuse_double_coverage_arm(os.environ, xchg_coverage_diff=getattr(
+        ns, "xchg_coverage_diff", False))
+    if ns.teardown:
+        # AFTER the teardown branch (review N-6): arming before it meant a
+        # `--teardown ... --xchg-coverage-diff` wrote an L-dump into the
+        # evidence dir that a LATER boot's ingest would pick up -- the stale
+        # dump problem, manufactured by the instrument itself.
+        return teardown(ns.teardown)
+    _lane_cov_dir = _main_step03__vis_place_dual(argv=argv, ns=ns)
+    if _lane_cov_dir:
+        from flliper.srt.pdflip import lane_coverage as _wlc
+
+        _wlc.arm_launcher(_lane_cov_dir, boot_token=lane_coverage_boot_token(ns))
+    _resolved_draft_on_p = _main_step04_refuse_inherited_lay(ns=ns)
+    if _resolved_draft_on_p is not None:
+        draft_on_p, draft_on_p_prov = _resolved_draft_on_p
+    else:
+        draft_on_p, draft_on_p_prov = resolve_draft_on_p(
+            ns.draft_kv_on_p,
+            bs_source("--draft-kv-on-p", argv) == "flag",
+            envs.FLLIPER_PDFLIP_DRAFT_ON_P.is_set(),
+            envs.FLLIPER_PDFLIP_DRAFT_ON_P.get(),
+        )
+    ns.draft_kv_on_p = "on" if draft_on_p else "off"
+    envs.FLLIPER_PDFLIP_DRAFT_ON_P.set(draft_on_p)
+    # H25 (C): what D's parked draft holds in pinned host RAM -- a desk fact,
+    # refused (W128) before any sweep or launch when it cannot be priced.
+    d_draft_host_mib, d_draft_host_prov = d_draft_park_term(ns, draft_on_p)
+    base, d_tokvec, dirty, dry, stamp, tip, tree, vision_victim_host_mib, vision_victim_host_prov = _main_step05_vision_victim_host_mib(ns=ns)
+    global _ANCHOR_INDEX_MODE
+    _ANCHOR_INDEX_MODE = "ro" if dry else "rw"  # S68 review: a dry run reads the W65 index, never writes it
+    d_overhead_mib, front_log, log, py, state = _main_step06_os_makedirs_evidence(_h87_alias_line=_h87_alias_line, base=base, boot_form=boot_form, calib_identity=calib_identity, dirty=dirty, dry=dry, ns=ns, stamp=stamp, tip=tip, tree=tree)
+    # #1248: from here on, cli()'s refusal handler can see this boot's pids
+    # the instant main() mutates state.pids -- no group has spawned yet
+    # (launch_group(spec_p, ...) is still ~500 lines below), so a refusal
+    # between here and there still takes today's unchanged fast exit.
+    _ACTIVE_BOOT_STATE = state
+    cards, cvd = _main_step07_state_logs_front(base=base, dry=dry, front_log=front_log, log=log, ns=ns, stamp=stamp, state=state)
+    # #1348 (review MF-1): THE BOOT DECLARES WHO MUST REPORT, here, where the
+    # rank count is first known. A report derived from the dumps it FOUND can
+    # never notice a rank that wrote nothing -- which is the #1329 shape and
+    # the whole reason the instrument exists. Both groups run one rank per
+    # card; the launcher itself is the single `L` rank.
+    if _lane_cov_dir:
+        from flliper.srt.pdflip import lane_coverage as _wlc
+
+        _expect_path = _wlc.write_expect_manifest(
+            _lane_cov_dir,
+            lane_coverage_boot_token(ns),
+            {"P": len(cards), "D": len(cards), _wlc.LAUNCHER_GROUP: 1},
+        )
+        log(f"PDFLIP-COVERAGE ARMED timings=CONFOUNDED token={lane_coverage_boot_token(ns)} "
+            f"expect=P={len(cards)},D={len(cards)},L=1 manifest={_expect_path} -- "
+            f"coverage.py line tracing is ON inside every exchange leg of this "
+            f"boot; it costs 2.6x-4x on EVERY Python call in the traced process "
+            f"while a leg is open, so NO ms/round, prefill, decode or flip "
+            f"duration from this boot is quotable as a measurement.")
+    _l2_lines, _l2_terms, d_bs, max_kv_per_request, p_bs, power_reading, s_gb_d = _main_step08_log_nvml_cuda_or(cards=cards, log=log, ns=ns, state=state)
+    for _ln in _l2_lines:
+        log(_ln)
+    _quant, d_x_tokens, flip_min_work_tokens, front_x_ceiling, idle_layout_front, x_mode_launch, x_seed, x_tokens = _main_step09_x_seed(argv=argv, cards=cards, d_bs=d_bs, log=log, max_kv_per_request=max_kv_per_request, ns=ns, p_bs=p_bs)
+    chunk_count, chunk_layers, chunk_tag_cards, n_layers, slack_mib, tms_so, weights_tags = _main_step10__fp8_env(_quant=_quant, dry=dry, log=log, ns=ns, state=state, tokenizer_line=tokenizer_line, tree=tree)
+    _dc_accept, _dc_from_record, _p_dormant_recs, _xchg_form, dc_expect_d = _main_step11__dc_accept(boot_form=boot_form, calib_identity=calib_identity, calib_sample_accept=calib_sample_accept, cards=cards, d_bs=d_bs, log=log, ns=ns, slack_mib=slack_mib, state=state)
+    dc_expect_d = _main_step12_if__dc_from_record_i(_dc_accept=_dc_accept, _dc_from_record=_dc_from_record, _xchg_form=_xchg_form, cards=cards, dc_expect_d=dc_expect_d, log=log, ns=ns, slack_mib=slack_mib, state=state)
+    _l15_pa4b, l15_posts, user_reserve_by_card = _main_step13_os_environ_corridor(cards=cards, d_bs=d_bs, dc_expect_d=dc_expect_d, hicache_disabled=hicache_disabled, log=log, ns=ns, p_bs=p_bs)
+
+    for _ln in _l15_pa4b.s4b_boot_lines(os.environ):
+        log(_ln)
+    _pooldep = l15_plan.refuse_pool_with_deposit(os.environ)
+    if _pooldep is not None:
+        raise PdFlipLaunchRefused(_pooldep)
+    if l15_plan.master_on(os.environ):
+        if ns.profile == pdflip_form.PROFILE_QWEN27B:
+            l15_base = budgets_from_dc(
+                cards, dc_expect_d, log, "P",
+                overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
+                overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
+                user_reserve_by_card=user_reserve_by_card,
+            )
+            try:
+                l15_peaks = list(_pconst("P_AWAKE_PEAK_MIB", ns.profile))
+            except KeyError:
+                # UNMEASURED: the pure layer prices a missing peak as a 0 post,
+                # never an estimate.
+                l15_peaks = [None] * len(cards)
+            # L15-POOL S1b: the measured per-card record as the planner input,
+            # behind FLLIPER_PDFLIP_L15_POOL_PEAK_RECORD (default off: peaks and
+            # log untouched). On: a card without a record gets None = no share.
+            l15_peaks, _l15_peak_lines = l15_pool_peak.planner_peaks(
+                ns.profile, cards, l15_peaks, os.environ)
+            for _ln in _l15_peak_lines:
+                log(_ln)
+            l15_posts = l15_plan.resolve_posts(
+                ns.profile, l15_base, l15_peaks, os.environ)
+            for post in l15_posts:
+                log(l15_plan.post_line(post))
+            # L15-POOL S1 (log only): the per-card posts seen as ONE pool.
+            from flliper.srt.pdflip import l15_keep_split, l15_pool, l15_pool_anchor
+
+            if l15_pool.pool_on(os.environ):
+                log(l15_pool.boot_line(
+                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
+                    l15_keep_split.anchor_cap(os.environ),
+                    mode=l15_pool.POOL_MODE if not l15_pool.pool_s3_on(os.environ)
+                    else l15_pool.S3_MODE))
+                if l15_pool_anchor.pool_s4_on(os.environ):
+                    # S4: the anchors are part of the whole request (second line,
+                    # the S3 boot line above stays as it was)
+                    log("L15-POOL-S4 mode=%s anchor_cap=%d" % (
+                        l15_pool_anchor.S4_MODE, l15_keep_split.anchor_cap(os.environ)))
+            elif l15_pool.pool_shadow_on(os.environ):
+                log(l15_pool.boot_line(
+                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
+                    l15_keep_split.anchor_cap(os.environ)))
+            # L15-NOCAP (N3f): armed with nothing to hold is a launch error,
+            # not a boot window spent on cap=0 (N3c/N3e).
+            _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ, cards)
+            if _nocap is not None:
+                raise PdFlipLaunchRefused(_nocap)
+        else:
+            log(f"L15-POST skipped profile={ns.profile}")
+    attn_stage_ratio, budgets_p, chunk_tokens, cut, p_split, p_split_note, stage_ratio = _main_step14_budgets_p(cards=cards, dc_expect_d=dc_expect_d, hicache_disabled=hicache_disabled, l15_posts=l15_posts, log=log, max_kv_per_request=max_kv_per_request, n_layers=n_layers, ns=ns, power_reading=power_reading, state=state, user_reserve_by_card=user_reserve_by_card)
+    _main_step15_shipped_split(attn_stage_ratio=attn_stage_ratio, budgets_p=budgets_p, cut=cut, log=log, ns=ns, p_split=p_split, stage_ratio=stage_ratio)
+    _draft_kv_on_p_requested, draft_kv_on_p = _main_step16__draft_kv_on_p_requested(argv=argv, hicache_disabled=hicache_disabled, ns=ns)
+    # HICACHE-DRAFT-TIER: p_group_has_draft_producer reads the RESOLVED value.
+    _SPEC_FORM["draft_kv_on_p"] = bool(draft_kv_on_p)
+    if not draft_kv_on_p:
+        log(draft_kv_off_line())
+    elif spec_form_is_dflash():
+        # --dflash-produce-on-p (27B 2026-09-24): P carries the DFlash producer
+        # flags; whether it COMPUTES rides P's environment (spec_form_env).
+        log(dflash_produce_line())
+    log(draft_on_p_line(
+        draft_kv_on_p, draft_on_p_prov,
+        [] if draft_kv_on_p else strip_speculative_flags(shlex.split(ns.extra_p))[1]))
+    _main_step17_log_f_pdflip_host_d(d_draft_host_mib=d_draft_host_mib, d_draft_host_prov=d_draft_host_prov, log=log, vision_victim_host_mib=vision_victim_host_mib, vision_victim_host_prov=vision_victim_host_prov)
+    # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
+    for _pcl in p_chunk_policy_lines():
+        log(_pcl)
+    _main_step18__pwl(hicache_disabled=hicache_disabled, log=log)
+    # B4e: ONE form argv, built with the xchg token when the arm is armed, and
+    # used for BOTH the key this line prints and the argv `solve` is handed --
+    # so the printed provenance IS the form that was selected on, token
+    # included, and the two cannot drift.
+    # #1356 [fix] BY KEYWORD. This call and :10620 were the two that shifted
+    # when `vision` was inserted mid-signature; naming each term is what makes
+    # the next insert a no-op here instead of a silent re-binding.
+    form_argv_p = xchg_form_argv(argv_p(
+        py, ns.model, budgets_p, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
+        RING_FORM_SENTINEL_STORE_CFG, shlex.split(ns.extra_p),
+        p_bs=p_bs, max_kv_per_request=max_kv_per_request,
+        stage_ratio=stage_ratio, attn_stage_ratio=attn_stage_ratio,
+        write_policy=ns.p_hicache_write_policy,
+        depth=RING_FORM_SENTINEL_DEPTH,
+        window_mib=ns.p_barlink_bar1_window_mib,
+        random_seed=ns.random_seed,
+        barlink_cap_cycles=ns.barlink_bar1_cap_cycles,
+        census_interval=ns.collective_census_interval,
+        draft_kv_on_p=draft_kv_on_p,
+        spec_flags=p_draft_kv_flags(shlex.split(ns.extra_d)),
+        vision=ns.pdflip_vision,
+        profile=ns.profile,
+        p_max_total_tokens=int(cut.pool_tokens),
+        hicache_disabled=hicache_disabled,
+        # #1369: form-key must reflect the ring's real presence/absence --
+        # the same reasoning `vision` is threaded here for ("a tower that is
+        # absent IS a different weight statement").
+        weights_cpu_backup=weights_cpu_backup_armed,
+    ), ns.pdflip_weight_source)
+    form_key, form_norm = _main_step19_form_key(form_argv_p=form_argv_p, log=log)
+
+    # 1b. C20: the R5 corridor inequality per card per direction, and C18: the
+    # per-card region, both BEFORE either group starts.  The table it is solved
+    # from also carries the ledger's host weights term, so this runs first.
+    ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
+                                  ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe,
+                                  tree=tree, py=py, p_argv=form_argv_p,
+                                  # #1369 CLOSEOUT: the SAME resolved local
+                                  # `form_argv_p`/`choose_host_ledger` already
+                                  # read above and below -- never re-derived
+                                  # here, which is the #1358 defect class this
+                                  # order named by name.
+                                  weights_cpu_backup_armed=weights_cpu_backup_armed)
+    _main_step20_bootstrap_w48(log=log, ns=ns, ring_plan=ring_plan, state=state)
+    # A1-3: an un-armed ring has no fallback form to name.  The predecessor
+    # named the pre-ring form here instead, which told the reader of a state
+    # file that a form the launcher refuses to start had started.  The claim is
+    # retracted rather than re-quoted -- reprinting it would hand the guard test
+    # a false positive and the next reader a true one.
+    state.ring_form = (
+        ring_plan.form if ring_plan.armed else
+        # #1369 CLOSEOUT: an intentional off-switch is not a refusal -- the
+        # A1-3 text below describes a boot that COULD NOT get the ring it
+        # needed; this describes one that deliberately does not need one.
+        # Conflating the two would make a state file lie about a boot that
+        # ran exactly as asked.
+        "none -- ABSENT BY DESIGN (--pdflip-weights-cpu-backup resolved to "
+        "off for this boot; not a refusal, not a fallback)"
+        if not weights_cpu_backup_armed else
+        "none -- NOT ARMED (A1-3: no fallback form exists on "
+        "this host budget; this boot refuses by name)")
+    _band_credit, _lanes_concurrent, bounce_terms_for_ranks, xchg_res = _main_step21_state_ring_dir_rin(cards=cards, log=log, ns=ns, ring_plan=ring_plan, state=state)
+    bounce_terms_for_ranks = _main_step22__xchg_armed(_band_credit=_band_credit, _lanes_concurrent=_lanes_concurrent, bounce_terms_for_ranks=bounce_terms_for_ranks, log=log, ns=ns, ring_plan=ring_plan, stage_ratio=stage_ratio)
+    _geom_fracs, _geom_ratios, xchg_env = _main_step23_xchg_env(boot_form=boot_form, bounce_terms_for_ranks=bounce_terms_for_ranks, dry=dry, log=log, ns=ns, ring_plan=ring_plan, xchg_res=xchg_res)
+    _moe_skips = _main_step24__adopt(boot_form=boot_form, log=log, ns=ns, xchg_env=xchg_env)
+    _main_step25__bands_on(_geom_fracs=_geom_fracs, _geom_ratios=_geom_ratios, _moe_skips=_moe_skips, log=log, ns=ns, xchg_env=xchg_env)
+    _census_key, _cold_tier_shm_gib, _form_key_matches, _hc, _l3_index_gib, _ledger_group_envs, _memhist_gib, _memhist_run_only = _main_step26_xchg_env_weight_exch(hicache_disabled=hicache_disabled, log=log, ns=ns, ring_plan=ring_plan, state=state, xchg_env=xchg_env)
     _census_record = f"{EVIDENCE_DIR}/{_hc.RECORD_NAME}"
     _census_entry, _bf_line = census_entry_for_pricing(
         _census_record, _census_key, model=ns.model, evidence_dir=EVIDENCE_DIR)
@@ -11529,200 +13126,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # H87: the D-ONLY branch below starts group D alone -- the ledger
             # prices exactly that, not a flip boot.
             d_only=bool(getattr(ns, "d_only", False)))
-
-    arm, reap_headroom_gib, lines, cg = _price_host_ledger()
-    # #1453 (user 16.09.: 'L2-Groesse aus Ledger-Spielraum'): the arena is the
-    # largest host term (33.6 GiB with draft+mamba); when the priced run peak
-    # sits ABOVE the riegel, the KV arena gives that excess back and the
-    # ledger prices once more -- the boot then funds itself without the
-    # --host-ledger-deviation it needed before (weg2xsn207: 93.15 vs 93.00).
-    _arena_new, _arena_why = arena_from_ledger(
-        float(_group_env_value("FLLIPER_HICACHE_ARENA_GIB", _ledger_group_envs, "22")),
-        # 29.09.: the latch the ledger derived (a flag only tightens it)
-        _arm_run_peak_gib(arm), getattr(arm, "riegel_effective", getattr(ns, "host_riegel_gib", None)),
-        enabled=(os.environ.get("FLLIPER_PDFLIP_ARENA_FROM_LEDGER", "1") == "1" and not hicache_disabled))
-    log("#1453 L2-ARENA FROM LEDGER: " + _arena_why)
-    if _arena_new is not None:
-        os.environ["FLLIPER_HICACHE_ARENA_GIB"] = f"{_arena_new:g}"
-        # 29.09. (arena8 09291303): a group that names the arena overrides the
-        # launcher env in build_env, so the new size goes where the ranks and
-        # the ledger read it -- otherwise the ledger re-prices a number no rank gets.
-        arena_gib_into_groups(ns, _ledger_group_envs, _arena_new)
-        arm, reap_headroom_gib, lines, cg = _price_host_ledger()
-        log("#1453 L2-ARENA FROM LEDGER: re-priced with arena %.2f GiB -> run_peak %s GiB"
-            % (_arena_new, _fmt_gib(_arm_run_peak_gib(arm))))
-    state.cgroup = dict(cg)
+    arm, cg, lines, reap_headroom_gib = _main_step27_arm(_ledger_group_envs=_ledger_group_envs, _price_host_ledger=_price_host_ledger, hicache_disabled=hicache_disabled, log=log, ns=ns, state=state)
     for ln in lines:
         log(ln)
-    state.ledger_lines = lines
-    # 29.09. (z30x2-yarn2): ONE pinned-host reserve for the ledger and the
-    # ranks. The ledger bounded its run peak by memory.max minus this number
-    # (PINNED WALL); the ranks' HiCache pools now read it too, through
-    # pinned_host_reserve(). An explicit FLLIPER_PINNED_HOST_RESERVE_GIB wins
-    # and is left untouched; without a finite cgroup nothing is exported.
-    _pin_gib, _pin_src = getattr(arm, "pinned_reserve", (None, ""))
-    from flliper.srt.mem_cache import pinned_host_budget as _phb
-    if _pin_gib is not None and not (os.environ.get(_phb.PINNED_HOST_RESERVE_ENV) or "").strip():
-        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_ENV] = f"{float(_pin_gib):.4f}"
-        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV] = str(_pin_src or "")
-    log(pinned_reserve_line(_pin_gib, _pin_src))
-    state.reap_headroom_gib = reap_headroom_gib
-
-    # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the
-    # cgroup snapshot the ledger just took, BEFORE any group process exists, so
-    # `cg["anon"]` is exactly the baseline W22's `flliper=/foreign=` split has to
-    # subtract. It was already measured and already returned here, and was being
-    # dropped -- sb5c's split was reconstructed by hand afterwards.
-    #
-    # ONE READ, CARRIED -- not a second `read_cgroup()` at front-launch time.
-    # A baseline taken after the groups start is not a baseline, and two reads
-    # are two quantities; the fix-2 lesson, on a measurement instead of a key.
-    anon_preboot_bytes = int(cg.get("anon") or 0)
-    log(f"PDFLIP-LAUNCH ANON-BASELINE preboot_anon={anon_preboot_bytes / 1073741824:.2f} GiB "
-        f"(cgroup memory.stat anon at PREFLIGHT, before any group process exists; "
-        f"handed to the front as --anon-preboot-bytes so W22 can split its reading into "
-        f"flliper= and foreign=. 0 = unreadable -> the front prints NO split rather than "
-        f"an invented one; sb5c had to be split by hand because this value was dropped)")
-
-    # 2b. host memory time series from BEFORE the first group, so the launch
-    # moment (P image resident, D loading) is measured this time, not only
-    # the run moment (record 1h: the ls1b2 sampler started after D READY).
-    if not dry:
-        start_memts(state, log)
-
-    # 3. store -- ON DISK, SIZED FROM THE P KV POOL (#1236).
-    #
-    # ORDERING, and why it is safe: `cut` (solve_p_cut) is already solved above,
-    # before the ring, so the pool this store must cover is known here without
-    # moving anything.  The ledger ran first only because the ARC line prices
-    # itself against the reap headroom the ledger computes.
-    _l3_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
-                                     getattr(ns, "form_kv", "") or "",
-                                     extra_p=getattr(ns, "extra_p", "") or "",
-                                     extra_d=getattr(ns, "extra_d", "") or "",
-                                     vision=str(getattr(ns, "pdflip_vision", "") or ""))
-                 if l3_persist_enabled() else None)
-    store_plan = plan_store(
-        ns.tag,
-        cut.pool_tokens,
-        cut.attn_counts,
-        cut.kv_mib_per_token_per_attn_layer,
-        sidecar_factor=ns.store_sidecar_factor,
-        store_max_gb=ns.store_max_gb,
-        min_free_gib=ns.store_disk_min_free_gib,
-        directory_name=(l3_persist_dir_name(_l3_ident) if _l3_ident else None),
-        dry=dry,
-    )
-    store_cfg = store_plan.extra_config()
-    log(store_plan.disk_line(
-        "WARN store on %s, not the told disk (dry run: not refused, the space check "
-        "is skipped)" % store_plan.fs_type if store_plan.fs_refused else "ok"))
-    log(
-        f"PDFLIP-STORE: dir={store_plan.directory} ON DISK (ZFS dataset, plain directory "
-        f"-- #1236 user ruling 2026-09-09: 'normales hicaching mit lvl2 und lvl3', the "
-        f"upstream HiCacheFile backend, no new tier and no overflow mechanism; the "
-        f"tmpfs form and its mount/umount are DELETED, not flagged off). "
-        f"max_size={store_plan.max_size_bytes} B "
-        f"({store_plan.max_size_bytes / host_ledger.GIB:.2f} GiB, scope=shared over the "
-        f"writer ranks) = P POOL {store_plan.p_pool_tokens} tokens x "
-        f"{store_plan.cell_bytes} B/token = "
-        f"{store_plan.p_pool_bytes / host_ledger.GIB:.2f} GiB x sidecar factor "
-        f"{store_plan.sidecar_factor:.2f} ({STORE_CENSUS_PROVENANCE}: kv={STORE_CENSUS_KV_PAGES} "
-        f"pages x {STORE_CENSUS_KV_PAGE_BYTES} B, mamba={STORE_CENSUS_MAMBA_BLOBS} blobs x "
-        f"{STORE_MAMBA_BLOB_BYTES} B measured on /spinning/hicache-l3, "
-        f"draft={STORE_CENSUS_DRAFT_PAGES} pages x {host_ledger.DRAFT_PAGE_BYTES} B). "
-        f"min_free={store_plan.min_free_bytes} B "
-        f"({store_plan.min_free_bytes / host_ledger.GIB:.2f} GiB) AGAINST THIS DISK, "
-        f"which has {store_plan.fs_free_bytes / host_ledger.GIB:.2f} GiB free of "
-        f"{store_plan.fs_total_bytes / host_ledger.GIB:.2f} GiB -- not the old 1 GiB on a "
-        f"6 GiB tmpfs that latched HiCacheFile's write stop after 5 GiB and refused 1,324 "
-        f"group-P writes on boot weg2sb5g. "
-        f"#1236 LAW CHECK: max_size >= P pool is "
-        f"{'HELD' if store_plan.max_size_bytes >= store_plan.p_pool_bytes else 'VIOLATED'} "
-        f"({store_plan.max_size_bytes / max(1, store_plan.p_pool_bytes):.2f}x; weg2sb5g ran "
-        f"at 0.54x). extra_config={store_cfg}"
-    )
-    log(
-        f"PDFLIP-STORE LEDGER DELTA: {store_plan.max_size_bytes / host_ledger.GIB:.2f} GiB of "
-        f"store budget left the HOST RAM ledger entirely (max_size; min_free is free "
-        f"space the store never writes into and was never a RAM post), because "
-        f"this store is a directory on disk and its host cost is page cache plus the ZFS "
-        f"ARC -- both reclaimable, neither in cgroup anon, neither what the reaper kills "
-        f"for. The reap headroom the ledger now reports is "
-        + ("unreadable (no cgroup sample)" if reap_headroom_gib is None
-           else f"{reap_headroom_gib:.2f} GiB")
-        + ", and it is larger than the pre-#1236 form's by exactly the store term that "
-        "form charged (6 GiB on boot weg2sb5g). NOT a claim that the box gained RAM: the "
-        "bytes moved to a device, they did not disappear."
-    )
-    log(arc_preflight_line(read_arc_state(), store_plan, reap_headroom_gib))
-    log(store_read_cost_line(store_plan, max_kv_per_request))
-    sweep_store_residue(log, store_plan.directory, dry)
-    if _l3_ident:
-        # identity FIRST: a store of another identity is refused before this
-        # boot touches a single file in it.
-        l3_persist_check_rope(getattr(ns, "extra_p", "") or "", getattr(ns, "extra_d", "") or "")
-        _l3_state = l3_persist_check_identity(store_plan.directory, _l3_ident, dry)
-        log(f"L3-PERSIST identity={_l3_state} dir={store_plan.directory} "
-            f"{json.dumps(_l3_ident, sort_keys=True)}")
-        _l3_files, _l3_bytes, _ = l3_persist_attach(log, store_plan.directory, dry)
-        l3_persist_disk_sum(log, os.path.dirname(store_plan.directory), store_plan.directory,
-                            store_plan.max_size_bytes, store_plan.min_free_bytes, _l3_bytes, dry)
-    store_dir = prepare_store(log, store_plan, dry)
-    state.store_dir = store_dir
-    state.store_max_size_bytes = store_plan.max_size_bytes
-    state.store_min_free_bytes = store_plan.min_free_bytes
-
-    # 4. group P
-    # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
-    # ring (block 1b- above); only ``env_p`` stays here, because it is the
-    # one thing in this step that genuinely needs the armed ring.
-    # #239 rc12z29c: a form the D solve sets itself (owned / joint / maxmin cut)
-    # is solved HERE, from the expectation budgets, before the map is built --
-    # the map's D windows and P's common prefix are functions of it, and P
-    # loads the map before D's measured budgets exist.
-    # R2 (28.09.): so is a P1c FR-D ceiling (d_fr_ceiling_before_map) -- its
-    # FR_D is published here, the map and STORE-GEOMETRY read exactly it.
-    if ((d_form_solved_by_planner(ns) or d_fr_ceiling_before_map(ns))
-            and not getattr(ns, "_d_map_form", None)):
-        # only the form's vectors outlive this pass; its env writes (scratch
-        # cap, seat rows, stage form, waves, trims) come from the real budgets
-        _env_d_before = str(getattr(ns, "env_d", "") or "")
-        _map_terms: List[Dict[str, object]] = []
-        _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.pdflip_weight_source, ns.profile)
-        ns._d_expect_other = (_map_other if not _map_other_why.startswith("legacy") else None)
-        log("D-EXPECT DORMANT-OTHER D(Karte, Erwartung): " + ", ".join(f"nvml{c.nvml_index} {_map_other[c.uuid]}" for c in cards) + f" MiB -- {_map_other_why}")
-        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)), terms_out=_map_terms)
-        log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
-                              p_split=p_split, chunk_layers=chunk_layers,
-                              card_terms=(_map_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
-        _pin = pin_d_form_for_map(ns, log)
-        ns.env_d = _env_d_before
-        ns._d_kv_stage_written = None
-        _lru_scratch = getattr(ns, "_d_kv_stage_lru_scratch", None)
-        if _lru_scratch:
-            # (3) 29.09.: FR_D of the pinned form was solved with this scratch
-            ns.env_d = set_group_env(ns.env_d, "FLLIPER_MOE_SCRATCH_SLOTS",
-                                     ",".join(str(int(x)) for x in _lru_scratch))
-            log(f"{D_RANK_SOLVE_MARKER} D(Karte, Erwartung) {D_KV_STAGE_LRU_FLOOR_MARKER}: "
-                f"FLLIPER_MOE_SCRATCH_SLOTS={','.join(str(int(x)) for x in _lru_scratch)} "
-                f"gehoert zur gepinnten Form (FR_D mit ihm geloest) -- gilt fuer alle "
-                f"weiteren Passes")
-        if _pin:
-            from flliper.srt.pdflip import draft_post as _dp
-
-            ns.env_d = _dp.replace_env_vector(ns.env_d, "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION",
-                                              [float(x) for x in _pin["fractions"]])
-            repoint_store_geometry_at_pinned_form(
-                xchg_env, _pin,
-                int((_argv_vector(getattr(ns, "extra_d", ""), "--num-experts") or [512])[0]), log)
-
-    # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
-    _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
-                               p_stage_layers=getattr(state, "p_stage_layers", None),
-                               chunk_layers=chunk_layers)
-    # rc12z30b: the map read FR_D from --extra-d now; a later D solve must not move it
-    ns._expert_map_path = _emap
+    _l3_ident, anon_preboot_bytes, store_cfg, store_plan = _main_step28_state_ledger_lines(arm=arm, cg=cg, cut=cut, dry=dry, lines=lines, log=log, ns=ns, reap_headroom_gib=reap_headroom_gib, state=state)
+    store_dir = _main_step29_log_f_pdfli(_l3_ident=_l3_ident, dry=dry, log=log, max_kv_per_request=max_kv_per_request, ns=ns, reap_headroom_gib=reap_headroom_gib, state=state, store_cfg=store_cfg, store_plan=store_plan)
+    _emap = _main_step30__dp(_p_dormant_recs=_p_dormant_recs, cards=cards, chunk_layers=chunk_layers, dc_expect_d=dc_expect_d, log=log, ns=ns, p_split=p_split, state=state, user_reserve_by_card=user_reserve_by_card, xchg_env=xchg_env)
     # 29.09.: the map is written -- the store post from the map as the ranks
     # load it. The D form pinned for the map (#239) moves the store (z30w:
     # ratios 183,137,168 -> 191,153,144); a move re-prices the ledger here,
@@ -11741,318 +13150,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 log(ln)
             state.ledger_lines = lines
             state.reap_headroom_gib = reap_headroom_gib
-    # 29.09.: the front samples the census live (widths known once the arena
-    # term has run inside the pricing above)
-    ns._host_census = {"record": _census_record, "key": _census_key,
-                       "store_dir": expert_store_dir_of(ns),
-                       "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
-    _estore_id = publish_store_identity(ns.model, _emap, log)
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), **rank_reserve_kwargs("P", ns, cards, user_reserve_by_card, log), expert_map_path=_emap, expert_store_identity=_estore_id)
-    # H125: the host-RAM price of `--pdflip-vision-source ram`, named where the
-    # P env is built (the line is empty, and nothing is logged, for `disk`).
-    # VISION-GGUF: only a transient boot resolves the tower's directory (a GGUF reads it from --tokenizer-path)
-    _vis_line = vision_source_host_line(
-        vision_tower_dir(ns), str(getattr(ns, "pdflip_vision_source", VISION_SOURCE_DISK))
-    ) if str(getattr(ns, "pdflip_vision", VISION_OFF)) == VISION_TRANSIENT else ""
-    if _vis_line:
-        log(_vis_line)
-    # #1269 PUBLICATION: build_env's own comment says the decision is
-    # "published explicitly so the boot log names the decision" -- but it only
-    # SET the variables and logged nothing, so no boot log ever carried them.
-    # A knob that shapes host memory and is never named is exactly the
-    # instrument-that-does-not-report shape; the value is a CEILING derived
-    # from the reset path's thread names, not a live count, and
-    # PDFLIP-IDLE-CENSUS `threads=` is what confirms or corrects it.
-    log(f"PDFLIP MALLOC-ARENAS MALLOC_ARENA_MAX={env_p.get('MALLOC_ARENA_MAX')} "
-        f"FLLIPER_IDLE_BLOCKING_POLL={env_p.get('FLLIPER_IDLE_BLOCKING_POLL')} "
-        f"(both groups) -- provenance: glibc defaults to 8 x ncores arenas and this "
-        f"box reports affinity 0-31, so the default ceiling is 256; measured growth was "
-        f"64 MiB-aligned [anon] arenas extended in place plus NEW arenas appearing "
-        f"(+5.4 MiB/min on P PP0/PP1, +2.8 on each D rank, +19.0 MiB/min over six ranks "
-        f"against an independently observed +21.3). 4 = the scheduler thread plus the "
-        f"three the reset path names (prefetch, backup, prefetch_io_aux), each with its "
-        f"own arena. A CEILING, not a target. DERIVED FROM THREAD NAMES, NOT A LIVE "
-        f"COUNT -- the rank thread census was never captured before the host OOM took "
-        f"the base down; PDFLIP-IDLE-CENSUS threads= confirms or corrects it (#1269).")
-    # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
-    # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
-    # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
-    # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
-    env_p["FLLIPER_PDFLIP_END_ANCHOR"] = "1"
-    # P-TRIM-END-ANCHOR (pdflip/p_trim_end_anchor.py): {} when off, so the
-    # default env stays byte-identical; on, P takes a leg-1 prompt as N-1 and
-    # the 1-token END-ANCHOR forward above never runs for it.
-    _p_trim_env = p_trim_end_anchor_env(bool(getattr(ns, "p_trim_end_anchor", False)))
-    env_p.update(_p_trim_env)
-    # FORK ANCHOR (pdflip/fork_anchor.py): {} when off; the same env goes to D.
-    _fork_env = fork_anchor_env(getattr(ns, "fork_anchor_token", None),
-                                bool(getattr(ns, "p_trim_end_anchor", False)))
-    env_p.update(_fork_env)
-    # TURN ANCHOR (pdflip/turn_anchor.py): {} when off; group P only.
-    _turn_env = turn_anchor_env(getattr(ns, "turn_anchor_token", None))
-    env_p.update(_turn_env)
-    if _turn_env:
-        log("PDFLIP TURN-ANCHOR: on (--turn-anchor-token %s) -- group P snapshots the "
-            "recurrent state where a prompt's last message starts as a second extend "
-            "track and inserts it as its own anchor (rank lines 'PDFLIP TURN-ANCHOR "
-            "TRACK', 'PDFLIP TURN-ANCHOR INSERT')" % ns.turn_anchor_token)
-    if _fork_env:
-        log("PDFLIP FORK-ANCHOR: on (--fork-anchor-token %s) -- group P cuts a leg-1 "
-            "prompt before its generation prompt, group D reads the store up to the "
-            "same cut and keeps its prefill anchor at or below it (rank lines 'PDFLIP "
-            "P-TRIM-END-ANCHOR ... fork', 'PDFLIP FORK-ANCHOR TRACK')"
-            % ns.fork_anchor_token)
-    if _p_trim_env:
-        log("PDFLIP P-TRIM-END-ANCHOR: on (--p-trim-end-anchor) -- group P takes every "
-            "front leg-1 prompt of N tokens as N-1 (token level, at its intake): the "
-            "last regular chunk ends at N-1, the finish insert is the N-1 anchor D "
-            "claims, no 1-token END-ANCHOR forward; prompt_tokens and the #1442 "
-            "hand-off still carry N; N<2, read outputs, sessions, embeds and "
-            "multimodal prompts stay on the split path (rank line 'PDFLIP "
-            "P-TRIM-END-ANCHOR kept(<reason>)')")
-    # --p-attn-head-split: {} when off (env byte-identical). Same builder and
-    # inputs as the pool model's post in solve_p_cut.
-    _ah_cfg = p_attn_head_split_cfg(ns, len(budgets_p), chunk_tokens, ns.model)
-    env_p.update(p_attn_head_split_env(_ah_cfg))
-    if _ah_cfg is not None:
-        log(p_attn_head_split_line(_ah_cfg, len(budgets_p)))
-    # H92 --p-chunk-policy: ({}, []) under 'fixed' -- env and front log
-    # byte-identical. FR_P is read from THIS env_p (the vector that ships).
-    _pcp_env, _pcp_lines = p_chunk_policy_install(env_p)
-    env_p.update(_pcp_env)
+    _estore_id, _pcp_lines, env_p = _main_step31_ns__host_census(_census_key=_census_key, _census_record=_census_record, _emap=_emap, budgets_p=budgets_p, cards=cards, chunk_count=chunk_count, chunk_layers=chunk_layers, chunk_tokens=chunk_tokens, cvd=cvd, log=log, ns=ns, ring_plan=ring_plan, store_dir=store_dir, tms_so=tms_so, tree=tree, user_reserve_by_card=user_reserve_by_card, xchg_env=xchg_env)
     for _pcl in _pcp_lines:
         log(_pcl)
-    # #1465: group P's write-through copy kernels at high stream priority, so
-    # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
-    # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
-    # prefill that never idles.  P only; D keeps the default (decode graphs).
-    env_p.setdefault("FLLIPER_HICACHE_WRITE_STREAM_PRIORITY", "-1")
-    # P-HOST-OVERLAP / #PGAP (managers/pdflip_p_overlap.py): group P only; both
-    # default ON (S43 / rc14), --no-p-host-overlap / --no-p-hostgap add nothing.
-    # 27B port 20.10. (user 20.10.: the dual layout stays as it was): the #PGAP instrument is default ON only
-    # on the flip form -- the 27B dual ran without it (its profile drops --p-hostgap, 27B code default off)
-    _pgap = bool(getattr(ns, "p_hostgap", False)) and not getattr(ns, "dual_layout", False)
-    env_p.update(p_host_overlap_env(getattr(ns, "p_host_overlap", False), _pgap))
-    for _pline in p_host_overlap_lines(getattr(ns, "p_host_overlap", False), _pgap):
-        log(_pline)
-    # P-RECV-STREAM (managers/pdflip_p_overlap.py): group P only, default off --
-    # off adds nothing, so argv and env stay byte-identical.
-    env_p.update(p_recv_stream_env(getattr(ns, "p_recv_stream", False)))
-    for _pline in p_recv_stream_lines(getattr(ns, "p_recv_stream", False)):
-        log(_pline)
-    # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
-    # the SAME call the cut's pool model was built from (solve_p_cut).
-    _pg_pool = p_prefill_graph_pool_mib(ns)
-    env_p.update(p_prefill_graph_env(
-        _pg_pool, max_prefix=getattr(ns, "p_prefill_graph_max_prefix", None)))
-    # --p-prefill-graph-split: {} when off (env byte-identical).
-    _gs_env = p_graph_split_env(ns)
-    env_p.update(_gs_env)
-    if _gs_env:
-        log(
-            "PDFLIP P-GRAPH-SPLIT: on, up to %s KV chunks inside the prefill graph "
-            "-- group P gets %s; the captured grid is q_tiles x N, every replay "
-            "writes its own work-item arrays (rank lines 'FI-GRAPH-SPLIT')"
-            % (int(getattr(ns, "p_prefill_graph_split", 0)),
-               " ".join("%s=%s" % kv for kv in sorted(_gs_env.items())))
-        )
-    elif int(getattr(ns, "p_prefill_graph_split", 0) or 0):
-        log("PDFLIP P-GRAPH-SPLIT: requested but INERT -- --p-prefill-graph is off, "
-            "there is no captured prefill graph to split inside")
-    # --p-deep-split-from: {} when off (env byte-identical).
-    _ds_env = p_deep_split_env(ns)
-    env_p.update(_ds_env)
-    if _ds_env:
-        log(
-            "PDFLIP P-DEEP-SPLIT: on from prefix %s tokens -- group P gets %s: an "
-            "eager chunk that deep plans a wave-aware flashinfer KV split (rank "
-            "line 'FI-WAVE-SPLIT')%s"
-            % (
-                int(getattr(ns, "p_deep_split_from", 0)),
-                " ".join("%s=%s" % kv for kv in sorted(_ds_env.items())),
-                "; the prefill graph is ON, so only the chunks its own depth "
-                "threshold hands to eager (--p-prefill-graph-max-prefix, census "
-                "reason 'deep_split') reach the split -- set it to the same N"
-                if p_prefill_graph_bucket() else "",
-            )
-        )
-    env_p.update(p_gc_env(ns))  # --p-gc-freeze: {} under 'off'
-    # --p-chunk-policy: {} under 'fixed' (env byte-identical).
-    env_p.update(p_chunk_policy_env())
-    # --p-layer-split: {} under 'static' (env byte-identical).
-    env_p.update(p_layer_split_env())
-    if _pg_pool:
-        log(
-            "PDFLIP P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "
-            "(%s; booked by the ranks via FLLIPER_KV_BUDGET_PREFILL_GRAPH_MIB and "
-            "by the cut's pool model; full-CG split-kv workspace shared with the "
-            "float workspace via FLLIPER_FULL_CG_PREFILL_SHARED_WORKSPACE=1)"
-            % (
-                ",".join("%.1f" % v for v in _pg_pool),
-                "operator value"
-                if str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
-                else "DESK ESTIMATE, replace by the measured capture_mib",
-            )
-        )
-    # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
-    # re-read here against the arm this boot actually chose.  The hoist above
-    # rests on --chunked-prefill-size being a CONSTANT of common_flags rather
-    # than a function of the ledger arm; this line proves that premise on every
-    # boot instead of assuming it, and a divergence is named rather than
-    # silently shipping a cut solved for a chunk size the argv does not carry.
-    chunk_tokens_armed = chunked_prefill_size_of(
-        common_flags(ns.model, arm.s_gb, arm.m_mib, store_cfg, max_kv_per_request,
-                     ns.p_hicache_write_policy, "P", ns.random_seed,
-                     ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
-                     hicache_disabled=hicache_disabled)
-    )
-    if chunk_tokens_armed != chunk_tokens:
-        raise PdFlipLaunchRefused(
-            f"W40 PdFlipPPCutRefused: the PP cut was solved for "
-            f"--chunked-prefill-size {chunk_tokens}, read before the host-ledger "
-            f"arm existed, but the argv this boot ships carries "
-            f"{chunk_tokens_armed}. The cut solve has to run BEFORE the ring "
-            f"(the ring must be sized for the form that ships, and the cut is "
-            f"part of that form), which is sound only while the chunk size does "
-            f"not depend on the arm. It now does. Refusing rather than shipping "
-            f"a cut solved against the wrong chunk."
-        )
-    # #1254 W46: THE MAP AND THE ARGV MUST BE THE SAME SPLIT.  The PDFLIP-FLIP-
-    # ORDER MAP above is derived from the incumbent score constants
-    # (p_stage_layers); argv_p ships whatever solve_p_cut returned.  While the
-    # solver's winner differs from the incumbent those two halves describe
-    # DIFFERENT layouts, and the map is then complete but WRONG PER CARD -- a
-    # weights tag charged to one card while its bytes straddle two, which is
-    # the accounting class that killed boot weg2dk4.  Neither half can see the
-    # other, and interleave_pause_order refuses only an INCOMPLETE map, so a
-    # confident wrong pause order is exactly what a silent divergence buys.
-    # Checked here, by name, before either group starts.
-    # #1240 THE LAUNCHER IS THE ONLY WRITER. The solved (or pinned) map is
-    # published here, into the environment group P will actually get -- the
-    # flag is the interface, the variable is the wire. A GAPPED map also arms
-    # the #753 mid-loop crossing wire, because that is the executor: without
-    # it a stage runs its own layers back to back and silently skips its
-    # peer's, and get_pp_layer_set refuses a gapped set with the wire off.
-    if cut.layer_set:
-        env_p[PP_LAYER_SET_ENV] = cut.layer_set
-        if cut.gapped:
-            env_p[PP_CROSSING_WIRE_ENV] = "1"
-        log(
-            "PDFLIP LAYER-SET published for group P: %s=%s%s (source: %s). The "
-            "#753 mid-loop crossing wire is the executor; nothing is "
-            "duplicated here."
-            % (
-                PP_LAYER_SET_ENV,
-                cut.layer_set,
-                " " + PP_CROSSING_WIRE_ENV + "=1" if cut.gapped else "",
-                "--pp-layer-set (PINNED)" if ns.pp_layer_set else "the solver",
-            )
-        )
-    # #692 MICROBATCH DEPTH. The share is READ from a previous boot's own
-    # PP-BUBBLE line, never written here: an operator-supplied path wins, else
-    # the newest log in EVIDENCE_DIR that actually carries the instrument, else
-    # no measurement at all and the depth is today's 0 -- printed, so the
-    # absence is visible rather than inferred from a missing line.
-    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(
-        EVIDENCE_DIR, accept=calib_log_accept)
-    if ns.p_bubble_measured_from and read_pp_bubble(ns.p_bubble_measured_from) is None:
-        raise PdFlipLaunchRefused(
-            f"W42 PdFlipDepthUnfunded: --p-bubble-measured-from "
-            f"{ns.p_bubble_measured_from} carries no PP-BUBBLE line, so it "
-            f"states nothing about the bubble. An explicitly named measurement "
-            f"file that turns out to be empty is refused rather than silently "
-            f"treated as 'no measurement' -- that would read as depth 0 for a "
-            f"reason the operator did not intend."
-        )
-    depth_decision = solve_p_depth(
-        measured=read_pp_bubble(bubble_src) if bubble_src else None,
-        pool_tokens=cut.pool_tokens,
-        attn_counts=cut.attn_counts,
-        kv_mib_per_token_per_attn_layer=cut.kv_mib_per_token_per_attn_layer,
-        hidden_size=cut.hidden_size,
-        chunk_tokens=chunk_tokens,
-        cap_tokens=cut.cap_tokens,
-        # Read from the environment group P will actually get -- which since
-        # #1240 this launcher is the only writer of (W44 refuses an inherited
-        # one), so it is the solver's own decision arriving here rather than
-        # an operator's export sneaking past the flags.
-        gapped_layer_set=env_p.get(PP_LAYER_SET_ENV, "") if cut.gapped else "",
-        pinned_depth=ns.p_microbatch_depth,
-    )
-    log(depth_decision.line())
-    state.p_depth = depth_decision.depth
-    if ns.d_disable_cuda_graph:
-        log(
-            "W66 PdFlipEagerDecodeArm: --d-disable-cuda-graph was passed, so "
-            "group D runs --disable-cuda-graph. THIS IS A CONTROL ARM: the "
-            "decode form under measurement is now eager, not the graphed "
-            "full-perf form, and boot weg2dec1_0909 measured the eager mean "
-            "round at 16.6x the graphed one. Every ms/round, compute/wait and "
-            "throughput figure from this boot carries that scope; none of "
-            "them is a statement about the shipped form."
-        )
-    if ns.d_disable_overlap_schedule:
-        log(
-            "W41 PdFlipOverlapRefused: --d-disable-overlap-schedule was passed, "
-            "so group D keeps --disable-overlap-schedule. The gate that "
-            "refused must be named in this boot's record; the flag is not a "
-            "tuning knob and no server_args gate is to be weakened to avoid it. "
-            + d_overlap_cost_line(ns.model, True, d_bs)
-        )
-    else:
-        log(
-            "SCHEDULER: --disable-overlap-schedule is group P's flag only "
-            "(pp_size=3, server_args.py:19507). Group D runs pp_size=1 with "
-            "the overlap scheduler ON; every forcing gate was checked against "
-            "D's argv (pdmux off, device cuda, no sparse-head/dllm, and the "
-            "hybrid-mamba resolution picks extra_buffer for "
-            "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
-            f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
-            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS}). "
-            + D_DECODE_STEPS_PROVENANCE
-            + " "
-            + d_overlap_cost_line(ns.model, False, d_bs)
-        )
-    if ns.p_hicache_write_policy != "write_back":
-        log(
-            f"MEASUREMENT ARM: group P --hicache-write-policy "
-            f"{ns.p_hicache_write_policy} (shipped default is write_back since 2026-09-15; "
-            f"#1016 measured the write_through store tax at +3.9 % @50k / "
-            f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
-            f"arm exists to, and changes nothing else). Group D is unchanged."
-        )
-    # #1275: mint THIS boot's admin key and write it 0600 before either group's
-    # argv is built, so both carry the same one and the front has a path to read
-    # it from. The key never appears in a log line -- only its PATH does (see
-    # admin_key.redact) -- and it is excluded from the P form key by name, or a
-    # fresh random value per boot would give every boot its own form.
-    admin_api_key = admin_key_mod.mint()
-    admin_key_file = admin_key_mod.key_path(GPU_ARB, ns.tag)
-    # A DRY RUN WRITES NOTHING, and that line is a promise this must not break:
-    # `--dry-run` prints "nothing started, mounted, armed or written" a few
-    # dozen lines below. The key is still MINTED so the printed argv is faithful
-    # in shape (and so a reader sees where the flag lands), but it is not
-    # persisted and the log says which of the two happened.
-    if not dry:
-        admin_key_mod.write(admin_key_file, admin_api_key)
-    # #1275 FIX 2: ARM THE LAUNCHER'S OWN RPCs. This is the line whose absence
-    # killed weg2sb5 -- the groups demanded the key and this process, their
-    # FIRST client, never sent it. Armed in a dry run too, so the auth line
-    # below reports the real state rather than a special case.
-    set_admin_key(admin_api_key, admin_key_file)
-    state.admin_key_file = admin_key_file
-    log(f"PDFLIP-LAUNCH RPC auth=bearer sites={rpc_site_count()} "
-        f"(every launcher->group HTTP call goes through one door, `http()`, which "
-        f"attaches the admin bearer; sites counted from this module's own AST, not "
-        f"a hand-kept list. weg2sb5 died with sites=2 and auth on NEITHER: the "
-        f"front authenticated, the launcher's own startup sleep(P) did not, and "
-        f"/release_memory_occupation is ADMIN_OPTIONAL -> 401 at 39 s. #1275 fix 2)")
-    log(f"PDFLIP ADMIN-KEY {'minted (DRY: not written)' if dry else 'minted'} for this boot -> {admin_key_file} (mode 0600); "
-        f"both groups get --admin-api-key, the front authenticates its flip RPCs "
-        f"with it, and /hicache/storage-backend/resize is LIVE (#1275). "
-        f"Direct call: curl -s -X POST http://127.0.0.1:{PORT_D}/hicache/storage-backend/resize "
-        f"-H \"Authorization: Bearer $(cat {admin_key_file})\" "
-        f"-H 'Content-Type: application/json' -d '{{\"max_size_gb\": 8, \"min_free_gb\": 20}}'")
+    _main_step32_env_p_setdefault_fl(env_p=env_p, log=log, ns=ns)
+    bubble_src = _main_step33_chunk_tokens_armed(arm=arm, calib_log_accept=calib_log_accept, chunk_tokens=chunk_tokens, cut=cut, env_p=env_p, hicache_disabled=hicache_disabled, log=log, max_kv_per_request=max_kv_per_request, ns=ns, store_cfg=store_cfg)
+    admin_api_key, admin_key_file, depth_decision = _main_step34_depth_decision(bubble_src=bubble_src, chunk_tokens=chunk_tokens, cut=cut, d_bs=d_bs, dry=dry, env_p=env_p, log=log, ns=ns, state=state)
+    _main_step35_log_f_pdflip_launch(admin_key_file=admin_key_file, dry=dry, log=log)
     # #1356 [fix] BY KEYWORD -- see :10189. This is the argv the ranks RUN, so
     # a silent re-binding here ships a boot with a swapped seed and window.
     shipped_argv_p = argv_p(
@@ -12074,86 +13178,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p_max_total_tokens=int(cut.pool_tokens),
         hicache_disabled=hicache_disabled,
         weights_cpu_backup=weights_cpu_backup_armed)
-    # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
-    # gated the ring table was hashed over an argv built with sentinel ledger
-    # terms, which is sound only while every flag those sentinels reach is
-    # excluded from the key by name.  Here the REAL argv exists, so the key is
-    # re-derived from it and any difference is a refusal -- the alternative is a
-    # ring gated on a form that is not the one launched, which is a subtler
-    # version of the very defect this gate exists to catch.
-    # #1325c: THE SAME TRANSFORM ON BOTH SIDES OF THE COMPARISON.  `form_key`
-    # above was hashed over `xchg_form_argv(...)`, which APPENDS the SYNTHETIC
-    # `ring_table.XCHG_FORM_TOKEN` when the arm is armed (B4e).  That token is
-    # a marker, never a flag `argv_p` emits, so a shipped argv can never carry
-    # it and it is not in FORM_KEY_EXCLUDED_FLAGS either: comparing the raw
-    # shipped key against the gated key refuses EVERY armed boot by
-    # construction, and equals for every unarmed one -- which is why it was
-    # invisible until the #1325b netting correction let an armed boot past the
-    # host ledger for the first time (weg2xsn21, 2026-09-12: W21 at the ledger
-    # on the head, W48 here the moment the ledger funded).  A check that
-    # compares a TRANSFORMED value against an UNTRANSFORMED one tests the
-    # transform, not its subject.  TRAIN FIX 5's subject -- "are the sentinel
-    # ledger terms inert?" -- is untouched: the token is appended identically
-    # to both sides and cancels, and a REAL form drift still refuses.
-    shipped_key, shipped_norm = ring_table.p_form_key(
-        xchg_form_argv(shipped_argv_p, ns.pdflip_weight_source)
-    )
-    if shipped_key != form_key:
-        mine, theirs = set(shipped_norm.split(" ")), set(form_norm.split(" "))
-        raise ring_table.PdFlipRingFormMismatch(
-            f"W48 PdFlipRingFormMismatch: the host ring was gated on group-P form "
-            f"key {form_key}, but the argv this boot ships hashes to "
-            f"{shipped_key}. The gate ran against a form that is not the one "
-            f"being launched, so the ring's size is not a statement about this "
-            f"boot. Shipped-only: {sorted(mine - theirs)}; gated-only: "
-            f"{sorted(theirs - mine)}. Either a flag reached by the sentinel "
-            f"ledger terms is NOT in ring_table.FORM_KEY_EXCLUDED_FLAGS "
-            f"({', '.join(ring_table.FORM_KEY_EXCLUDED_FLAGS)}), or a "
-            f"form-changing flag is added to argv_p after the ring is armed. "
-            f"Refusing before either group starts."
-        )
-    log(f"PDFLIP-P-FORM CONFIRMED key={shipped_key} on the argv actually shipped "
-        f"(the ring was gated on this same key before the host-ledger arm "
-        f"existed; the sentinel terms are proven inert, not assumed to be)")
-    # P-COVERS-D-SESSION (law 02.10.): a named refusal, never a D prefill
-    _cov_ok, _cov_line = p_covers_d_session(
-        shipped_argv_p, d_session_tokens(ns.extra_d, max_kv_per_request))
-    log(_cov_line)
-    if not _cov_ok:
-        raise PdFlipLaunchRefused(_cov_line)
-    spec_p = GroupSpec("P", PORT_P, transport_argv(shipped_argv_p, ns.transport), state.logs["P"], env_p)
-    state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
-    log(w38_armed_line(spec_p.argv))
-    # fnFL2 H37: how many requests one P forward may carry, off the SHIPPED argv.
-    log(p_micro_batch_line(spec_p.argv))
-    state.deviations = [
-        "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
-        "= 208 of 224 usable, measured Used 224/256 incl. RM carve-out; #1234 C1 raised dcp:0 from 24 so the 96-MiB dcp all_reduce plans to 10 rounds "
-        "instead of 17 and stops falling to the host-staged plane)",
-        "FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION=0 on both groups (K2); /health_generate only via the front to the awake group",
-        "group deadmen tier 1 only (TIER2=0 keeps every synthetic generate off the group ports; PROBE_S spaced past the boot as a second guard); tier 2 on the front's deadman",
-        "no disk tier for the store (file backend has no second tier); tmpfs sized by the ledger",
-        "the epoch is carried in the front's ledger only (no group echo/checksum on the RPC)",
-        "torch_memory_saver 0.0.9.post1 preload hook rebuilt from the vendored csrc with ONE patch (cpu backup freed after resume, "
-        "python/flliper/srt/pdflip/tms_csrc/PATCH.md); the stock wheel is untouched and used when FLLIPER_PDFLIP_TMS_PRELOAD_SO is unset",
-        f"weights paused/resumed as {chunk_count} weights_<k> chunk tags + the base tag (#1233 one-backup flip); cuda_graph stays resident (not in the sleep tag set, as in round 1)",
-        "zero-remainder: group P holds the last token of every prefill back into its own chunk (FLLIPER_PDFLIP_END_ANCHOR=1) so the GDN anchor D resumes from sits at N-1; "
-        "costs P one 1-token pass per request and serialises whole-fit prompts behind the one chunked request per pass",
-        "zero-remainder: /flush_cache publishes un-backed nodes before the idle witness on both groups (FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP=1); the quiesce then waits for those backups",
-        # y7d (9bdfe50185) still declared the deleted CARRIER-EXCEEDS route here
-        # ("served by ONE prefill on D, no leg 1"); 9bdfe50185 removed it.
-        "zero-remainder: no D single-prefill route -- every BATCH prompt takes P's leg 1 (CARRIER-EXCEEDS deleted, P-COVERS-D-SESSION law 02.10.); "
-        "a boot whose P prefill stages do not cover D's session is refused by name above, never served by a D prefill",
-        "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
-    ]
-    log(early_read_provenance())
-    for d in state.deviations:
-        log(f"DEVIATION (declared): {d}")
-    # #1361a: ARM BEFORE THE FIRST GROUP STARTS. Everything after this line --
-    # P's load, its first sleep, D's load, D's dormant-image write -- is the
-    # window the front cannot see, because the front is started further down.
-    _launch_guard = None if dry else LaunchGuard(
-        log, host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / host_ledger.GIB).start()
+    _launch_guard, spec_p = _main_step36_shipped_key(chunk_count=chunk_count, dry=dry, env_p=env_p, form_key=form_key, form_norm=form_norm, log=log, max_kv_per_request=max_kv_per_request, ns=ns, shipped_argv_p=shipped_argv_p, state=state)
     if ns.d_only:
         # D-ONLY (Nutzer 25.09., NVFP4 im Container: der Host traegt den Flip nicht). Nur Gruppe D,
         # gebaut wie im Dry-Run aus der Erwartung -- P's Ruherest bleibt eingeplant, also exakt die
@@ -12272,53 +13297,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     f"p_free_reads_{ns.tag}")
         spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
-    apply_dual_p_sleep(ns, spec_p, log)  # D PRIORITY stage 2 (dual unified KV only)
-    spec_p.env.update(dual_alloc_cache_book_env(ns, cards, log))  # item 170: D's cache growth, booked at P's join
-    spec_p.env.update(dual_outside_free_env(ns, cards, user_reserve_by_card, log))  # user rule 24.10.: the reserve, booked at P's join
-    ns._dual_mps_env = start_dual_mps(ns, log, dry)
-    if ns._dual_mps_env and not dry:
-        # persisted AT ONCE: every exit path (cli() early exits, teardown() in a fresh process) reads it
-        state.dual_mps_root = dual_mps_root(ns.tag)
-        _write_state(state)
-    spec_p.env.update(ns._dual_mps_env)
-    spec_p.env.update(dual_p_sm_env(ns))
-    spec_p.env.update(dual_duty_env(ns))
-    spec_p.env.update(dual_share_env(ns, "P"))
-    spec_p.env.update(dual_priority_env(ns, "P", log))  # DUAL-SHARE: {} unless a switch is on
-    launch_group(spec_p, tree, log, dry)
-    ns._s7b_spec_path = write_p_respawn_spec(spec_p, ns, log, dry, p_planned_need(cards, state.budgets.get("P"), ns, log))
-    ns._dual_spec_d = None
-    if getattr(ns, "dual_share", False):
-        # DUAL-TP3PP3 1b: D boots NOW as the union owner; P holds before its
-        # load until D's image (and D's installed vectors) are published.
-        _dual_dc = dual_share_planned_dc(cards, state.budgets["P"], getattr(ns, "extra_p", ""),
-                                         int(getattr(ns, "dual_p_overhead_mib", 1500)))
-        log("PDFLIP-DUAL-SHARE D sized from P's PLAN (budget + overhead, MiB): " + ", ".join(
-            f"nvml{c.nvml_index} {_dual_dc[c.uuid]}" for c in cards))
-        _denv = dual_share_env(ns, "D")
-        _pcut = dual_p_cut_from_argv(spec_p.argv)
-        if _pcut:
-            # D's union image then holds only what the P stage on each card binds;
-            # D's other weights stay in their TMS tags (sleepable, stage 2).
-            _denv["FLLIPER_PDFLIP_DUAL_P_CUT"] = _pcut
-        log(f"PDFLIP-DUAL-SHARE P cut for D's image filter: {_pcut or '(none -> whole image)'}")
-        _sd, _ = _d_spec_from(_dual_dc, "D(dual-share, P-Plan)", _denv)
-        _sd.env.update(ns._dual_mps_env)
-        _sd.env.update(dual_priority_env(ns, "D", log))  # DUAL-SHARE: {} unless a switch is on
-        state.argv["D"] = " ".join(shlex.quote(a) for a in _sd.argv)
-        launch_group(_sd, tree, log, dry)
-        ns._dual_spec_d = _sd
-        if not dry:
-            # D must be READY -- its KV sized, its graphs captured -- before P
-            # loads a byte: D sizes its KV off the card's free memory, and a P
-            # load running alongside would move that reading under it. P
-            # waits for this marker next to D's union socket.
-            state.t_ready["D"] = wait_ready(PORT_D, _sd.pid, ns.ready_deadline_s, log, "D", _sd.proc)
-            _udir = dual_share_env(ns, "D")["FLLIPER_PDFLIP_UNION_DIR"]
-            os.makedirs(_udir, exist_ok=True)
-            with open(os.path.join(_udir, DUAL_D_READY_FILE), "w") as _f:
-                _f.write(f"{time.time():.3f}\n")
-            log(f"PDFLIP-DUAL-SHARE D READY -> {_udir}/{DUAL_D_READY_FILE}: P may load now")
+    _main_step37_apply_dual_p_sleep_n(_d_spec_from=_d_spec_from, cards=cards, dry=dry, log=log, ns=ns, spec_p=spec_p, state=state, tree=tree, user_reserve_by_card=user_reserve_by_card)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
         _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.pdflip_weight_source, ns.profile)
@@ -12416,263 +13395,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   {c.uuid: f"nvml{c.nvml_index}" for c in cards}, _early_stage0_result, log),
         ).start()
         _early_d = (_early_spec, _early_budgets, _early_gate, _early_snap, _early_stage0_result)
-
-    def _d_early_verdict(early, dc_measured):
-        """go -> the running early D; refuse -> None (it exits, the caller starts D serially)."""
-        from flliper.srt.pdflip import d_early_start as _des
-
-        spec, planned, gate, snap, stage0 = early
-        _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
-        _rest, _rest_prov = d_awake_rest(cards, ns.profile)
-        _over, _over_prov = d_overshoot_record(ns.profile)
-        measured = budgets_from_dc(
-            cards, dc_measured, log, "D(gemessen, Gate)", overshoot_mib=_over,
-            overshoot_provenance=_over_prov,
-            corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
-            user_reserve_by_card=user_reserve_by_card,
-            dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
-            charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
-            awake_rest_mib=_rest, awake_rest_provenance=_rest_prov,
-            **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)),
-        )
-        uuids = [c.uuid for c in cards]
-        names = {c.uuid: f"nvml{c.nvml_index}" for c in cards}
-        ok, lines = _des.budget_verdict(dict(zip(uuids, planned)), dict(zip(uuids, measured)), names)
-        rc = spec.proc.poll() if spec.proc is not None else None
-        if rc is not None:
-            ok, lines = False, lines + [f"early D exited before the gate rc={rc}"]
-        if stage0.get("verdict") != _des.VERDICT_GO:
-            ok, lines = False, lines + [f"stage 0 not go ({stage0.get('verdict', 'no verdict yet')})"]
-        for _ln in lines:
-            log(f"{_des.MARKER} {_ln}")
-        if ok:
-            _des.write_gate(gate, _des.VERDICT_GO, "planned <= measured on every card",
-                            dict(zip(uuids, planned)), dict(zip(uuids, measured)))
-            state.budgets["D"] = planned
-            log(f"{_des.MARKER} GO -- D loads now with the plan it was started with")
-            return spec
-        _des.write_gate(gate, _des.VERDICT_REFUSE, "; ".join(lines),
-                        dict(zip(uuids, planned)), dict(zip(uuids, measured)))
-        log(f"{_des.MARKER} REFUSE -- early D exits, D starts serially from the measured budgets")
-        try:
-            spec.proc.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            spec.proc.kill()
-            spec.proc.wait(timeout=30)
-        # the group leads its own session (launch_group): its scheduler ranks
-        # must not outlive it on the cards the serial D is about to take
-        try:
-            os.killpg(spec.proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        ns.env_d, ns._d_kv_stage_written, ns._d_owner_solve = snap
-        return None
-
-    state.pids["P"] = spec_p.pid
-    _write_state(state)
-    register_boot_group(ns.tag, "P", spec_p.pid, log)  # H135b
-    state.t_ready["P"] = wait_ready(PORT_P, spec_p.pid, ns.ready_deadline_s, log, "P", spec_p.proc)
-    # #1386 FOLLOW-UP 2 (xsn31/7 Versuch 2 wall): both markers this gate greps
-    # for are printed by managers/cache_controller.py's HiCacheController
-    # alone (lines ~1411/1608, grep-verified: no other emitter in the tree),
-    # and that class is instantiated ONLY under `enable_hierarchical_cache`
-    # (mem_cache/registry.py's create_tree_cache: `if
-    # ctx.enable_hierarchical_cache: ... init_hicache ...`; this hybrid-SSM
-    # model falls through to plain MambaRadixCache otherwise, which carries
-    # no cache_controller at all). Under
-    # `hicache_disabled` there is therefore NO EMITTER for either marker --
-    # P booted clean to READY (health 200, no exception, no refusal inside
-    # the rank) and was torn down ONLY by this unconditional launcher-side
-    # check never having been taught the switch exists, the exact same class
-    # the draft-KV-producer gate above was fixed for. SKIPPED with a named
-    # line, never silently -- the mirror of "W10/W11 SKIPPED" below.
-    if hicache_disabled:
-        log("W7/W10 SKIPPED (--pdflip-disable-hicache): group P's cache_controller "
-            "never builds (enable_hierarchical_cache is False), so there is no "
-            "canonical-page/GDN-blob emitter to grade -- the plain MambaRadixCache "
-            "this arm runs under prints neither marker. P's own health check "
-            "already confirmed it booted clean to READY.")
-    else:
-        canonical_state_gate(spec_p, group_rank_count(spec_p.argv), log)
-
-    # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
-    # This is the one sleep on this box that is NOT interleaved: group D does
-    # not exist yet, so nothing is resuming and freeing an image while P writes
-    # its own.  The cgroup shmem delta and the per-rank RssShmem sum are
-    # therefore comparable here, and the pair is what the next boot's ledger
-    # prices its image term from (BOOT_weg2dk7_0907.md: the weight-tag census
-    # under-charged the measured image by +9.80 GiB).
-    shmem_before = host_ledger.read_cgroup_shmem_bytes()
-    if getattr(ns, "dual_layout", False):
-        # DUAL-TP3PP3: P stays awake. What is measured below is P's AWAKE
-        # footprint, and D is sized from it exactly as it would be from the
-        # dormant residue. No dormant image is sampled or recorded -- an awake
-        # footprint in the dormant-image record would poison the next boot's
-        # ledger.
-        state.sleep_p_ms = 0.0
-        log("PDFLIP-DUAL P stays AWAKE (--dual-layout): no sleep leg, no dormant image; "
-            "the per-PID reading below is P's awake footprint and sizes D")
-        time.sleep(2)
-        pids_p = session_pids(spec_p.pid)
-    else:
-        state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
-        time.sleep(2)
-        pids_p = session_pids(spec_p.pid)
-    image_rec = None if getattr(ns, "dual_layout", False) else host_ledger.dormant_image_sample(
-        group="P",
-        shmem_before_bytes=shmem_before,
-        shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
-        pids=sorted(pids_p),
-        weight_tags_gib=host_ledger.WEIGHT_TAGS_P_BYTES / host_ledger.GIB,
-        interleaved=False,
-        boot_tag=ns.tag,
-        commit=tip,
-        # #1362: stamp the model. Without it the next boot cannot tell whether
-        # this image is its own model's or the previous tenant's, and the
-        # measured 27B numbers walk straight into a 4B boot.
-        # #1362 [22-fix2]: the CONTENT digest, the same identity the readers
-        # compare against. [22] stamped the PATH form here, which no reader
-        # keys on -- so every record this boot wrote would have stayed legacy
-        # forever and the transition path below would never retire.
-        model_digest_=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
-    )
-    if image_rec is not None:
-        log(host_ledger.format_dormant_image(image_rec))
-        host_ledger.append_measured_record(measured_record_path(), image_rec)
-    state.dormant_image_p = image_rec or {}
-    dc_p = nvml_process_mib(pids_p)
-    for c in cards:
-        dc_p.setdefault(c.uuid, 0)
-    mem = nvml_memory(cards)
-    for c in cards:
-        exp = dc_expect_mib(c)
-        _exp_txt = (f"expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
-                    f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; "
-                    if exp is not None else
-                    f"expectation UNCALIBRATED ({card_identity.card_key(c)}: no spec-1.6 class; ")
-        log(
-            f"PDFLIP-DC group=P nvml{c.nvml_index} {c.name}: measured {dc_p[c.uuid]} MiB per-process "
-            f"(pids {sorted(pids_p)}) card used {mem[c.uuid].tenant_used_mib} MiB by processes "
-            f"(instrument {mem[c.uuid].tenant_used_instrument}; card free {mem[c.uuid].free_mib} MiB allocatable, "
-            f"{mem[c.uuid].reserved_mib} MiB driver-reserved); " + _exp_txt
-            + "the launcher derives D from the MEASUREMENT, record 1f B6)"
-        )
-    state.dc_measured_p = dc_p
-    # BOOTZEIT 3: the free-read journal's cut (P's first sleep is over here) and,
-    # with an early D, D's bytes on each card measured per PID -- the known term
-    # a deviating P reader would have to carry (never an estimate).
-    _p_sleep_evt: Dict[str, object] = {"t": time.time(), "dc_p_mib": dict(dc_p)}
-    if _early_d is not None:
-        try:
-            _p_sleep_evt["d_early_foreign_mib"] = nvml_process_mib(session_pids(_early_d[0].pid))
-        except (OSError, subprocess.SubprocessError, ValueError) as e:
-            _p_sleep_evt["d_early_foreign_mib"] = f"unmeasured ({type(e).__name__}: {e})"
-        log(f"BZ3 D-EARLY-FOREIGN after sleep(P): D per-PID MiB {_p_sleep_evt['d_early_foreign_mib']}")
-    boot_state_write(log, event=("p_first_sleep_done", _p_sleep_evt))
+    _d_early_verdict = _main_step38__d_early_verdict(cards=cards, hicache_disabled=hicache_disabled, log=log, ns=ns, spec_p=spec_p, state=state, user_reserve_by_card=user_reserve_by_card)
+    dc_p = _main_step39_shmem_before(_early_d=_early_d, cards=cards, log=log, ns=ns, spec_p=spec_p, state=state, tip=tip, weights_tags=weights_tags)
     for _ln in d_expect_check_lines(cards, getattr(ns, "_d_expect_other", None), dc_p):
         log(_ln)
-
-    # 5. group D
-    spec_d = getattr(ns, "_dual_spec_d", None)  # DUAL-TP3PP3 1b: launched right after P
-    if spec_d is None and _early_d is not None:
-        spec_d = _d_early_verdict(_early_d, dc_p)
-    if spec_d is None:
-        spec_d, _ = _d_spec_from(dc_p, "D")
-        state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
-        spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})
-        spec_d.env.update(dual_priority_env(ns, "D", log))  # DUAL-SHARE: {} unless a switch is on
-        launch_group(spec_d, tree, log, dry)
-    state.pids["D"] = spec_d.pid
-    _write_state(state)
-    register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
-    state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
-    if not dry:
-        release_shared_cache(spec_d, log)  # W98 (z30u): 2b's kept ranges, after D's take-over
-    # #1386 FOLLOW-UP 2: the mirror of group P's same skip above -- D's
-    # cache_controller never builds under `hicache_disabled` either (D is a
-    # plain MambaRadixCache then, same as P), so it prints neither marker.
-    if hicache_disabled:
-        log("W7/W10 SKIPPED (--pdflip-disable-hicache): group D's cache_controller "
-            "never builds either (enable_hierarchical_cache is False) -- no "
-            "canonical-page/GDN-blob emitter to grade, same as group P above.")
-    else:
-        canonical_state_gate(spec_d, group_rank_count(spec_d.argv), log,
-                             kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
-        # VRAM-Vertrag M2 (display only): P's blocks again, now carrying its
-        # first sleep leg -- the per-PID source of the plan's asleep.P
-        rank_vram_display(spec_p, log)
-    # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
-    # store is one carrier; a spec-less group keys pages by unigram unless
-    # FLLIPER_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
-    # group keys by bigram natively. Divergent schemes wrote disjoint chains
-    # for the same prompt once (boots weg2ls3b1-b3); the identity-suffix
-    # check in the front cannot see it. Refuse the boot before any traffic.
-    #
-    # #1386 FOLLOW-UP 3 (xsn31/7 Versuch 3 wall): "the store is one carrier"
-    # is the premise this whole gate stands on, and under `hicache_disabled`
-    # there IS no carrier for either group -- both fall through to plain
-    # MambaRadixCache (no cache_controller, no canonical page store at all,
-    # same fact the W7/W10 skip above already established). The mismatch
-    # this gate exists to catch (P and D writing the SAME store under
-    # DIFFERENT hash schemes) cannot occur when neither group writes a store.
-    # P is unigram here for an unrelated, correct reason (dropping the WHOLE
-    # P_DRAFT_KV_FLAGS bundle drops P's OWN --speculative-algorithm too, not
-    # just --speculative-draft-kv-only -- see the fold-in above); D stays
-    # bigram because D keeps its own, independent NEXTN head. That is a
-    # real divergence in each group's OWN spec config, not a shared-carrier
-    # hazard, so it is not this gate's concern once the carrier is gone.
-    if hicache_disabled:
-        log("W9 SKIPPED (--pdflip-disable-hicache): no shared carrier exists for "
-            "either group to key mismatched (same fact as the W7/W10 skip) -- "
-            "P/D's own --speculative-algorithm divergence is expected here "
-            "(P dropped the whole producer bundle, D keeps its independent "
-            "NEXTN head) and immaterial without a store to key.")
-    else:
-        _forced = "#1233 HICACHE BIGRAM KEYS FORCED"
-        # IPC-LOG-EXCEPTION: W9 still reads the forced-bigram LINE (Phase 2 rest, producer
-        # side: RankState schema 2 `store_key_scheme`, IPC-STATE-PLAN §2.1).
-        _p_bigram = ("--speculative-algorithm" in spec_p.argv) or count_marker(spec_p.log, _forced) >= 1
-        _d_bigram = ("--speculative-algorithm" in spec_d.argv) or count_marker(spec_d.log, _forced) >= 1
-        log(f"W9 launch-time key-scheme gate: P bigram={_p_bigram} (forced lines {count_marker(spec_p.log, _forced)}) "
-            f"D bigram={_d_bigram} (forced lines {count_marker(spec_d.log, _forced)})")
-        if _p_bigram != _d_bigram:
-            raise PdFlipLaunchRefused(f"W9 PdFlipStoreIdentityMismatch (launch-time key scheme): P bigram={_p_bigram} D bigram={_d_bigram} -- "
-                                    f"the two groups would key the sole carrier by different page-hash schemes")
-    # #1246 CARRIER CENSUS.  The bound the front routes by is READ from group D's
-    # own prefetch-limit instrument ('#915 PREFETCH LIMIT ... site=<one of the two
-    # launch-time cache-init sites>', carrier_census.CENSUS_SITES),
-    # which names its component and carries the number the runtime ENFORCES.  It
-    # is no longer re-derived as 0.9 x min(<a warning that fires for any host
-    # pool below its device pool, mamba included>) -- that census had no named
-    # population, duplicated the runtime's own fraction, and went silent when the
-    # warning did not fire.  Boot weg2rg5 read 19 mamba slots as the KV carrier
-    # and shipped a bound of 17: every request took CARRIER-EXCEEDS, group P ran
-    # zero prefill passes, exit 0.  Full derivation, provenance and the two
-    # rejected alternatives: flliper/srt/pdflip/carrier_census.py module docstring.
-    #
-    # THE LAUNCHER NEVER SHIPS 0, and no flag makes it.  0 is not an off switch
-    # for the round trip: the front's two carrier guards read
-    # `carrier_max_tokens > 0` (Front.handle_generate CARRIER-EXCEEDS, Front.leg1
-    # the post-leg-1 correction), so 0 removes the BYPASS and routes every prompt
-    # above the SHORT grant through leg 1 + a leg-2 store read with NO bound on
-    # what the store is asked to carry -- the '#915 PREFETCH REFUSED' / W16
-    # shape of boot weg2ls4b2 (84,027 tokens against a 30,518-token host pool).
-    # front.main's own help says it in one line.  Fix 1 shipped a
-    # --no-carrier-route flag whose help, log line and refusal-remedy sentence
-    # all asserted the opposite of that; it is gone.  What replaces it is
-    # --carrier-max-tokens N, and FIX 3 gives it the second guard it was missing:
-    # N may only LOWER a measured bound (floor < N <= measured), never raise one.
-    # Checked against the floor ALONE it could ship a bound ABOVE what D's
-    # carrier can read -- 262144, this rig's --max-model-len, was accepted while
-    # the launcher held the measured 27466 on the line above -- which is the same
-    # W16 the bound exists to prevent, reached through the flag a W45 recommends.
-    # With a missing/disagree census there is no measured number to lower, so the
-    # override is refused there too: an operator who wants a boot whose census
-    # cannot be read fixes the census, not the number.  ONE MECHANISM, in
-    # carrier_census.decide_bound, so the two sources of the number cannot drift
-    # apart again; every way of failing to MEASURE the bound stays a W45 refusal
-    # by name, never a silent zero.
-    from flliper.srt.pdflip import carrier_census as _cc
+    spec_d = _main_step40_spec_d(_d_early_verdict=_d_early_verdict, _d_spec_from=_d_spec_from, _early_d=_early_d, dc_p=dc_p, dry=dry, hicache_disabled=hicache_disabled, log=log, ns=ns, spec_p=spec_p, state=state, tree=tree)
+    _cc = _main_step41__cc()
 
     # #1386 FOLLOW-UP 4 (xsn31/7 Versuch 4 wall): the census this whole block
     # runs greps group D's log for cache_controller's OWN '#915 PREFETCH
@@ -12752,99 +13480,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"nothing bounded it, and --d-bs {d_bs} seats opened at once overcommitted it on boot "
         f"weg2sc1 (D read available=5418 occupied=25100 limit=27466 -> #915 vote_negative while "
         f"the round-1 front-local tally read 27466 free -- the quantity, not the bound, was wrong)")
-    # #1233 draft KV across the flip: W10 DRAFTER-IDENTITY GATE. Both groups
-    # register a drafter (P: the producer on its last stage, D: the NEXTN
-    # worker on every rank); the identity in their `HiCache draft KV
-    # registered` lines and the canonical draft layout in their `#706
-    # canonical DRAFT page active` lines must agree, or D fetches
-    # `{hash}.draft-<Pid>` pages P never wrote (the weg2zr2 shape, 194,088
-    # failed draft fetches). Refused before the front opens.
-    # #1264: BOTH GATES GRADE A PRODUCER, so both are asked of THE ONE
-    # PREDICATE first -- read off the argv this boot actually shipped, not off
-    # ns.draft_kv_on_p, so a future change to argv_p carries the gates with it.
-    # Under `off` group P registers no drafter and emits no DRAFT-KV-PRODUCER
-    # line at all, which is the pre-#1233 shape these two gates were written to
-    # refuse; running them there would refuse the rg6 baseline for being the
-    # rg6 baseline. They are SKIPPED with a named line, never silently.
-    # THE ROUTE CONSEQUENCE IS STATED IN THE SAME BREATH: D keeps its own NEXTN
-    # head under `off`, so it still ASKS the carrier for `{hash}.draft-<id>`
-    # pages -- and P writes none, so every one of those reads misses and D's
-    # draft state is cold after each flip. That is the cost of this arm; it is
-    # not a defect of the store and must not be triaged as one.
-    # fnFL2x48b: under --pdflip-disable-hicache no carrier exists, so NEITHER
-    # group prints a `HiCache draft KV registered` or `#706 canonical DRAFT
-    # page` line -- the gate read P=None D=None and refused a boot whose D was
-    # already READY, although the route it guards (draft pages through the
-    # carrier) is absent by construction. Same fact as the W7/W9/W45 skips.
-    if hicache_disabled:
-        log("W10/W11 SKIPPED (--pdflip-disable-hicache): no HiCache carrier exists, so neither group registers "
-            "a drafter identity or a canonical draft layout to match, and no draft pages cross a flip -- the "
-            "#1233 route these gates grade is absent by construction (same fact as the W7/W9/W45 skips).")
-    elif not ring_table.p_carries_drafter(shipped_argv_p):
-        log(w10_skip_no_producer_line())
-    else:
-        # UNIFY S6 (27B c60a5d387f): under p_draft=cold P builds the producer
-        # but writes NO draft pages -- W10 is skipped by name (identities still
-        # logged); W11 still grades the cold-resident draft bytes.
-        # IPC-LOG-EXCEPTION: W10-drafter / W11 still read drafter identity and draft-build
-        # lines (Phase 2 rest: RankState schema 2 `drafter`, `draft_build`).
-        gate_w10(spec_p.log, spec_d.log, log,
-                 p_produces_draft_pages=p_produces_draft_pages())
-        # #1233 fix 2: W11 DRAFT-RESIDENT gate. The last stage's pool is priced
-        # against a budgeted draft residue (P_DRAFT_RESIDENT_BUDGET_MIB); the L2
-        # line carries the MEASURED one. Over budget = the corridor derivation is refuted by this
-        # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
-        # IPC-LOG-EXCEPTION: W11 (see W10 above).
-        gate_w11(spec_p.log, log, rope_ctx_mib=p_rope_draft_delta_mib(ns))
-    # IPC-LOG-EXCEPTION: display only (class A), decides nothing; metric bar1_window_clip_total later.
-    clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
-    log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
-
-    # 6. front
-    # #1233 boot weg2dk4 -- WHICH CARD DOES A CHUNK TAG LIVE ON.  Group P is
-    # PP: a weights_<k> tag is a layer band and sits on ONE stage's card (two
-    # when the band straddles a stage boundary).  Group D is TP: every card
-    # holds a shard of every layer, so D has NO map and pauses in the natural
-    # order, exactly as before.  Derived here from the SAME stage ratio argv_p
-    # passes and the SAME chunk geometry both groups were built with; the front
-    # picks the pause order from it per flip, against a live NVML free sample.
-    # fix 5: from the DERIVED layer split (section 1b'), never from the score
-    # vector.  FIX 2: and from the SOLVED cut's split, never from the
-    # incumbent's -- the two are the same vector only when the solve happens
-    # to land back on the incumbent, and on this tip they do not.  No split ->
-    # no map -> the front pauses in the identity order and prints why, which is
-    # the honest degradation; a complete-but-wrong map is not, because
-    # interleave_pause_order only refuses an INCOMPLETE one.
-    p_chunk_cards = chunk_tag_cards(
-        p_split, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
-    ) if p_split else {}
-    src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
-    # 23.09. (fnFL2x30): THE DRAFT TAG IS A BAND OF THE LAST STAGE'S CARD.
-    # With --draft-kv-on-p the MTP head lives on P's last stage only (W11
-    # DRAFT-RESIDENT prices exactly that pool), so its pause refunds that
-    # card -- 2770 MiB on the Next-Flash 3080. Absent from this map it sat
-    # in the front's `rest` behind every chunk, which was harmless while
-    # lane p4 was a SEQ host buffer (x22) and a deadlock over a BAR1 ring:
-    # the collector reaches the draft last, D TP2 ran dry at weights_4.
-    # `front.orderable_band` places it with its card; the base tag still
-    # closes the sleep.
-    if p_split and _draft_kv_on_p_requested and cards:
-        src_chunk_cards["P"]["weights_draft"] = [int(cards[-1].nvml_index)]
-    log(f"PDFLIP-FLIP-ORDER MAP group=P (SOLVED cut {cut.stage_ratio or '(gapped)'}/"
-        f"{cut.attn_stage_ratio or '(gapped)'} -> REALIZED layer split "
-        f"{p_split if p_split else 'REFUSED (' + p_split_note + ') -> NO MAP, identity order'} "
-        f"over {n_layers} layers, {chunk_layers} layers per chunk, "
-        f"nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
-        f"group=D TP -> no map (uniform across cards). Boot weg2dk4 died because the interleave paused P's tag k "
-        f"against D's tag k while P's bytes for k=0..5 were on OTHER cards than the one D was allocating on.")
-    # #1361a: the front is up from here on and carries the same latch on the
-    # same terms, so the launcher-side guard hands over rather than doubling.
-    if _launch_guard is not None:
-        # 12.10.2026 (NF W98 HOST-WARN): hand over only. The guard WARNS (marker
-        # HOST-RAM-WARN W98) and never returns a verdict that stops the boot, so
-        # the old `PdFlipLaunchHostLatched` raise that stood here is gone (the class
-        # stays defined: it is part of the refusal tuple and of old test imports).
-        _launch_guard.stop("front takes over")
+    src_chunk_cards = _main_step42_if_hicache_disabled(_draft_kv_on_p_requested=_draft_kv_on_p_requested, cards=cards, chunk_count=chunk_count, chunk_layers=chunk_layers, chunk_tag_cards=chunk_tag_cards, hicache_disabled=hicache_disabled, log=log, ns=ns, p_split=p_split, shipped_argv_p=shipped_argv_p, spec_d=spec_d, spec_p=spec_p)
+    _main_step43_log_f_pdflip_flip_or(_launch_guard=_launch_guard, cards=cards, chunk_layers=chunk_layers, cut=cut, log=log, n_layers=n_layers, p_split=p_split, p_split_note=p_split_note, src_chunk_cards=src_chunk_cards)
     front_argv = front_argv_for(
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
@@ -12864,114 +13501,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         x_ceiling_tokens=front_x_ceiling,
         x_mode_argv=x_mode_launch.front_argv,
     )
-    fenv = dict(os.environ)
-    # #227 FORCED-RECORDS: the front is the record writer and spawns LAST, after every refusal site of main --
-    # the verdict is final here. Held records (the launcher's own P image) are written or dropped by it, and the
-    # front gets it in its environment (no seal = no records in a forced child, as before).
-    refusals.seal_records()
-    if refusals.forced_boot():
-        log(refusals.records_verdict_line())
-    host_ledger.flush_held_records(log)
-    refusals.export_records_verdict(fenv)
-    if refusals.forced_boot():
-        boot_state_write(log, event=("forced_records", {"allow": refusals.records_allowed(),
-                                                        "line": refusals.records_verdict_line()}))
-    fenv["PYTHONPATH"] = f"{tree}/python"
-    # L3-INDEX PRICE (02.10.): the front asks the shared L3 stem index with the
-    # groups' own page-key scheme and arena dir (group_env's values, so the
-    # credit is what P/D read).
-    if ns.hicache_bigram_keys:
-        fenv["FLLIPER_HICACHE_BIGRAM_KEYS"] = "1"
-    else:
-        fenv.pop("FLLIPER_HICACHE_BIGRAM_KEYS", None)
-    fenv.setdefault("FLLIPER_HICACHE_ARENA_DIR", f"/dev/shm/pdflip-arena-{ns.tag}")
-    # D PRIORITY stage 2: the front's capability + D's look-ahead (one extend
-    # chunk + one decode round of every seat with the draft's tokens)
-    fenv.update(dual_p_sleep_front_env(ns, dual_d_air_tokens(d_bs)))
-    fenv.update(dual_front_kv_tag_env(ns))
-    # FORK-TAIL on the front (W16, boot ...10271342): the leg-2 price needs the same fork token the groups cut at ({} when off).
-    fenv.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None), bool(getattr(ns, "p_trim_end_anchor", False))))
-    # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
-    # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
-    #
-    # Gemessen: v96 erreichte beide Gruppen READY (P 159,0 s, D 222,1 s, W11b
-    # gruen), dann verweigerte der Launcher mit "group front not READY on
-    # :30030 after 120 s (Connection refused)" -- und der front.log enthielt
-    # keine einzige Zeile der Front selbst, nur die des Launchers. Nicht weil
-    # sie nichts tat, sondern weil stdout hier ein FILE ist (`stdout=ffh`
-    # unten) und nicht ein TTY: Python schaltet dann von zeilen- auf
-    # blockgepuffert (8 KiB), und was im Puffer steht, wenn der Prozess
-    # abgeraeumt wird, ist verloren.
-    #
-    # Ein Prozess, dessen letzte 120 s unsichtbar sind, ist nicht
-    # diagnostizierbar -- und das ist bei dem Prozess, der den Flip fuehrt,
-    # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
-    # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
-    fenv["PYTHONUNBUFFERED"] = "1"
-    if getattr(ns, "_s7b_spec_path", ""):
-        from flliper.srt.pdflip import dual_p_restart as _s7b
-
-        fenv[_s7b.SPEC_ENV] = ns._s7b_spec_path  # S7b: the front's P restart reads P's exec record here
-    # FH (b1): the front's health poller finds a held rank (#1223) by its dump;
-    # hand it the dir the groups write to (read only by front_health).
-    if env_p.get("FLLIPER_DEBUG_HOLD_DIR") and not fenv.get("FLLIPER_DEBUG_HOLD_DIR"):
-        fenv["FLLIPER_DEBUG_HOLD_DIR"] = env_p["FLLIPER_DEBUG_HOLD_DIR"]
-    # RG (operator 26.09.): the prefix switches the ranks got from build_env,
-    # the same call on the front's env (FLLIPER_PDFLIP_FRONT_SPAN_INFLIGHT is the
-    # front's own; all five as on metal: ENV-IM-RANG front = 1).
-    if getattr(ns, "pdflip_boot_form", None) is not None:
-        pdflip_form.publish_prefix_switches(fenv, ns.pdflip_boot_form.profile)
-    # C14 / FIX 2 round 2: the BOOT half of the VRAM credit epoch.  Launcher
-    # OUTPUT in exactly the class of TMS_HOST_RING_MAP (R19), never an operator
-    # knob: it is this boot's ring epoch, the same nonce every rank already got
-    # from build_env, so the front's composed <boot>.<flip> token and the ranks'
-    # ring identity name ONE boot.  Absent (no armed ring) the front falls back
-    # to its own start time, which is boot-unique for the same reason.
-    if ring_plan is not None and ring_plan.armed:
-        fenv["TMS_HOST_RING_EPOCH"] = str(ring_plan.epoch)
-    # #1257c: DELIVERABLE 6 -- the front's corridor sampler and this launcher
-    # read THE SAME derived floor. The measured half already comes from one
-    # store (the activation footprint cache, keyed by the digest the boot
-    # publishes); the operator half is a launcher argument, so the front is
-    # TOLD it here rather than re-deriving it. The front then prints
-    # `floor=/source=/reserve=` per card on every PDFLIP-CORRIDOR line, and the
-    # boot's corridor VERDICT (`corridor_arm.arm_report`) grades against THAT
-    # LINE -- which is the shared surface, in one direction only, so the two
-    # cannot disagree.
-    if user_reserve_by_card:
-        fenv[corridor_guard.USER_RESERVE_ENV] = user_reserve_env_value(user_reserve_by_card)
-    log("front argv: " + " ".join(shlex.quote(a) for a in front_argv))
-    ffh = open(front_log, "ab")
-    _front_cwd = core_cwd_for(front_log, tree, log)
-    log(f"front cwd {_front_cwd} (ops #164: crash cores land here, not in the tree)")
-    fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=_front_cwd, start_new_session=True)
-    state.pids["front"] = fp.pid
-    boot_state_write(log, fields=front_launch_fields(front_argv, fenv))
-    # H135b: the front into the state json AND the registry at once -- until the
-    # LAUNCHED write below (behind wait_ready and the deadmen) a guard-run
-    # `--teardown` would not know the front by pid.
-    _write_state(state)
-    register_boot_group(ns.tag, "front", fp.pid, log)
-    # PUBLISH THE LOG BEFORE WAITING, NOT AFTER.  This used to sit after the
-    # LAUNCHED line, i.e. behind `wait_ready` below -- so a boot that never
-    # reached a ready front never updated the symlink, and every reader
-    # (`resolve_pin`, the deadman, a seat looking for "the current boot") was
-    # pointed at the last boot that SUCCEEDED.  Measured 2026-09-21: seven
-    # fnFL2 attempts in 2.5 h all ended `PDFLIP-LAUNCH REFUSED`, and
-    # /root/current_boot.log still named the 07:26 boot.  The pointer is needed
-    # MOST while a boot is failing, which is exactly when it was not written.
-    os.system(f"ln -sfn {shlex.quote(front_log)} /root/current_boot.log")
-    state.t_ready["front"] = wait_ready(PORT_FRONT, fp.pid, 120, log, "front", fp)
-
-    # 7. deadmen + helpers
-    huge = 10**7
-    state.helper_pids.append(arm_deadman(log, spec_p.log, PORT_P, f"launch_server.*--port {PORT_P}", huge, ns.tag, "P", dry))
-    state.helper_pids.append(arm_deadman(log, spec_d.log, PORT_D, f"launch_server.*--port {PORT_D}", huge, ns.tag, "D", dry))
-    state.helper_pids.append(arm_deadman(log, front_log, PORT_FRONT, "flliper.srt.pdflip.front", 120, ns.tag, "front", dry))
-    with open(_operator_dir(GPU_ARB, f"boot_{ns.tag}.logpath"), "w") as f:
-        f.write(front_log + "\n")
-    _write_state(state)
-    log(f"LAUNCHED: P pid {spec_p.pid} (asleep) D pid {spec_d.pid} (awake) front pid {fp.pid}; state {state_path(state)}; /root/current_boot.log -> {front_log}")
+    _front_cwd, fenv, ffh = _main_step44_fenv(d_bs=d_bs, env_p=env_p, front_argv=front_argv, front_log=front_log, log=log, ns=ns, ring_plan=ring_plan, tree=tree, user_reserve_by_card=user_reserve_by_card)
+    _main_step45_fp(_front_cwd=_front_cwd, dry=dry, fenv=fenv, ffh=ffh, front_argv=front_argv, front_log=front_log, log=log, ns=ns, spec_d=spec_d, spec_p=spec_p, state=state)
     return 0
 
 

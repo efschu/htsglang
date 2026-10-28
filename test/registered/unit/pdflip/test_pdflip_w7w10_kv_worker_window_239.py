@@ -43,6 +43,18 @@ NO_WINDOW = ("[2026-09-21 TP{r}] #706 canonical KV page: this rank is a Form A e
 EXTRA_D_CUT = "--rank-tp-ratio 1,0,0 --rank-moe-ratio 215,113,160 --uneven-token-vector 0,48,16"
 
 
+def _main_text() -> str:
+    """``launcher.main`` as it read before the split into ``_main_stepNN_*`` functions: every step call replaced by the step body, in call order
+    (behaviour-neutral refactor, 28.10.; see ``_launcher_source.expanded_main_source``)."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+    ls = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ls)
+    return ls.expanded_main_source()
+
+
 def _log(tmp_path, lines):
     p = tmp_path / "d.log"
     p.write_text("\n".join(lines) + "\n")
@@ -92,7 +104,7 @@ def test_the_d_gate_checks_the_row_owning_workers():
 
     # rc12z30f: the D half is the RankState gate (IPC Phase 1); the row-owning
     # workers from the launcher's argv are handed to it
-    src = inspect.getsource(L.main)
+    src = _main_text()
     i = src.index("canonical_state_gate(spec_d")
     assert "kv_owner_ranks=d_kv_worker_ranks(" in src[i:i + 200]
 
