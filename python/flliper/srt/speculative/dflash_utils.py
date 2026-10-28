@@ -625,7 +625,15 @@ def _triton_interpreter_usable() -> bool:
 def _qguard_fused_on(draft_probs: torch.Tensor, candidate_ids: torch.Tensor, q_rows: torch.Tensor,
                      draft_tokens: torch.Tensor, stats: Optional[torch.Tensor]) -> bool:
     """formhp-qguard-1028: the fused guard applies (switch on, a device Triton runs on -- CUDA, or the CPU under
-    TRITON_INTERPRET=1 --, the layouts it addresses)."""
+    TRITON_INTERPRET=1 --, the layouts it addresses).
+
+    Rank-uniformity (27b-rank-uniform-1028, TP2/TP3): this gate is evaluated per rank and per call (the env read is
+    rank-local) and is deliberately NOT synchronised: both bodies are eager (called from _selector_sampling_accept after the
+    verify, outside any captured graph), contain no collective and no host sync, and their result only feeds the accept,
+    whose accept_len / bonus every caller broadcasts from rank 0 right after (SpecTpSyncSite.DFLASH_SELECTOR). A rank on the
+    other body (or on the last fp32 bit of the sum check) can therefore change neither the collective sequence nor the
+    committed tokens. Caveat: FLLIPER_SPEC_TP_SYNC without dflash-selector removes that broadcast for the sampled accept
+    altogether -- then the accept is rank-local whatever the guard does."""
     import os
 
     from flliper.srt.environ import envs
