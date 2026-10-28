@@ -192,7 +192,8 @@ def test_verify_path_is_wired():
     i_mask = mod.index("self._dflash_grammar_vocab_mask(", i_fwd)
     i_adj = mod.index("apply_dflash_verify_logits_adjustments(", i_mask)
     i_apply = mod.index("verify_input.grammar.apply_vocab_mask(", i_adj)
-    i_accept = mod.index("candidates = draft_tokens", i_apply)
+    # FLLIPER_ADAPTIVE_K (28.10.): the accept reads the verify-width view
+    i_accept = mod.index("candidates = vv.candidates", i_apply)
     i_lp = mod.index("self._dflash_verify_logprobs(", i_accept)
     i_mamba = mod.index("if self._need_mamba_verify_commit:", i_lp)
     assert i_cpu < i_fwd < i_mask < i_adj < i_apply < i_accept < i_lp < i_mamba
