@@ -644,10 +644,16 @@ class TestTheLauncherSeam(CustomTestCase):
         return build_parser()
 
     def _launcher_source(self):
-        import flliper.srt.pdflip.launcher as mod
+        # the launcher is split over launcher*.py and its big functions into steps (behaviour-neutral refactor, 28.10.):
+        # read the text with every step call expanded back in call order
+        import importlib.util
+        import pathlib
 
-        with open(mod.__file__, "r", encoding="utf-8") as fh:
-            return fh.read()
+        path = pathlib.Path(__file__).resolve().parents[1] / "pdflip" / "_launcher_source.py"
+        spec = importlib.util.spec_from_file_location("_launcher_source", path)
+        ls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ls)
+        return ls.expanded_launcher_text()
 
     def test_the_flag_exists_and_defaults_to_no_floor(self):
         ns = self._parser().parse_args(["--tree", "/t", "--tag", "x"])

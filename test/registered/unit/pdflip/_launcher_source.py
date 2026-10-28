@@ -47,44 +47,56 @@ def _is_step_def(node) -> bool:
     return isinstance(node, ast.FunctionDef) and any(node.name.startswith(_step_prefix_of(f)) for f in SPLIT_FUNCTIONS)
 
 
+def _parse(path):
+    text = path.read_text(encoding="utf-8")
+    return text, text.split("\n"), ast.parse(text)
+
+
 def expanded_source(name: str, decorators: bool = False) -> str:
     """``launcher.<name>`` as it read before it was split into ``_<name>_stepNN_*`` functions (behaviour-neutral refactor, 28.10.).
 
-    Every line of the function that calls a step function (``[names = ]_<name>_stepNN_x(...)``) is replaced by that step's body, in call
-    order, so a source pin that asserts "A comes before B" or "calls X" reads the statements of the original function. The ``return`` a
-    step got for the names later code reads is dropped; the one-line docstring is dropped. ``decorators=True`` starts at the first
-    decorator line."""
+    Every line of the function that calls a step function (``[names = |return ]_<name>_stepNN_x(...)``) is replaced by that step's body, in
+    call order (the steps may live in any ``launcher*.py``), so a source pin that asserts "A comes before B" or "calls X" reads the
+    statements of the original function. The ``return`` a step got for the names later code reads is dropped; the docstring is dropped.
+    ``decorators=True`` starts at the first decorator line."""
     import re
 
-    call = re.compile(r"^(\s+)(?:[\w, ]+ = |return )?(%s\d+_\w+)\(" % re.escape(_step_prefix_of(name)))
-    text = LAUNCHER_PY.read_text(encoding="utf-8")
-    tree = ast.parse(text)
-    lines = text.split("\n")
-    steps, fn_node = {}, None
-    for n in tree.body:
-        if isinstance(n, ast.FunctionDef) and n.name.startswith(_step_prefix_of(name)):
-            body = n.body[1:]                                   # without the docstring
-            last = body[-1] if body else None
-            if isinstance(last, ast.Return) and isinstance(last.value, (ast.Name, ast.Tuple)):
-                body = body[:-1]                                # the tool-added return of the names later code reads (a genuine ``return f(...)`` stays)
-            # keep comments/blank lines between the docstring and the first statement
-            first = n.body[0].end_lineno
-            steps[n.name] = lines[first: body[-1].end_lineno] if body else []
-        elif isinstance(n, ast.FunctionDef) and n.name == name:
-            fn_node = n
+    prefix = _step_prefix_of(name)
+    call = re.compile(r"^(\s+)(?:[\w, ]+ = |return )?(%s\d+_\w+)\(" % re.escape(prefix))
+    steps, fn_node, fn_lines = {}, None, None
+    for path in source_files():
+        _, lines, tree = _parse(path)
+        for n in tree.body:
+            if isinstance(n, ast.FunctionDef) and n.name.startswith(prefix):
+                body = n.body[1:]                               # without the docstring
+                last = body[-1] if body else None
+                if isinstance(last, ast.Return) and isinstance(last.value, (ast.Name, ast.Tuple)):
+                    body = body[:-1]                            # the tool-added return of the names later code reads (a genuine ``return f(...)`` stays)
+                first = n.body[0].end_lineno                    # keep comments/blank lines between the docstring and the first statement
+                steps[n.name] = (lines[first: body[-1].end_lineno] if body else [], n.body[1].col_offset if len(n.body) > 1 else 4)
+            elif isinstance(n, ast.FunctionDef) and n.name == name:
+                fn_node, fn_lines = n, lines
     first_line = min([fn_node.lineno] + [d.lineno for d in fn_node.decorator_list]) if decorators else fn_node.lineno
+
     def expand(block):
         out = []
         for line in block:
             m = call.match(line)
             if m and m.group(2) in steps:
-                shift = " " * (len(m.group(1)) - 4)             # a step lifted out of a nested block (``if ...: return step(...)``) sat deeper
-                out.extend((shift + x if x.strip() else x) for x in expand(steps[m.group(2)]))   # a later round may call steps of an earlier one
+                body, body_indent = steps[m.group(2)]
+                delta = len(m.group(1)) - body_indent           # a step lifted out of a nested block (or one hoisted by hand) sat at another depth
+                for x in expand(body):                          # a later round may call steps of an earlier one
+                    if not x.strip():
+                        out.append(x)
+                    elif delta >= 0:
+                        out.append(" " * delta + x)
+                    else:
+                        out.append(x[-delta:])
             else:
                 out.append(line)
         return out
 
-    return "\n".join(expand(lines[first_line - 1: fn_node.end_lineno]))
+    return "\n".join(expand(fn_lines[first_line - 1: fn_node.end_lineno]))
 
 
 def expanded_main_source() -> str:
@@ -94,30 +106,29 @@ def expanded_main_source() -> str:
 
 def expanded_launcher_text() -> str:
     """The whole launcher source (``launcher.py`` + ``launcher_*.py``) with the split functions (:data:`SPLIT_FUNCTIONS`) expanded as in
-    :func:`expanded_source` and the ``_<name>_stepNN_*`` definitions removed, so text order inside them is the original order and nothing
+    :func:`expanded_source` and every ``_<name>_stepNN_*`` definition removed, so text order inside them is the original order and nothing
     is counted twice."""
-    text = LAUNCHER_PY.read_text(encoding="utf-8")
-    tree = ast.parse(text)
-    lines = text.split("\n")
-    drop = []
-    fn_nodes = {}
-    for n in tree.body:
-        if _is_step_def(n):
-            drop.append((n.lineno, n.end_lineno))
-        elif isinstance(n, ast.FunctionDef) and n.name in SPLIT_FUNCTIONS:
-            fn_nodes[n.lineno] = n
-    out, i = [], 1
-    drop = sorted(drop)
-    while i <= len(lines):
-        if i in fn_nodes:
-            out.append(expanded_source(fn_nodes[i].name))
-            i = fn_nodes[i].end_lineno + 1
-            continue
-        hit = next(((a, b) for a, b in drop if a == i), None)
-        if hit:
-            i = hit[1] + 1
-            continue
-        out.append(lines[i - 1])
-        i += 1
-    rest = [q.read_text(encoding="utf-8") for q in SPLIT_FILES]
-    return "\n".join(["\n".join(out)] + rest)
+    parts = []
+    for path in source_files():
+        text, lines, tree = _parse(path)
+        drop, fn_nodes = [], {}
+        for n in tree.body:
+            if _is_step_def(n):
+                drop.append((n.lineno, n.end_lineno))
+            elif isinstance(n, ast.FunctionDef) and n.name in SPLIT_FUNCTIONS:
+                fn_nodes[n.lineno] = n
+        drop = sorted(drop)
+        out, i = [], 1
+        while i <= len(lines):
+            if i in fn_nodes:
+                out.append(expanded_source(fn_nodes[i].name))
+                i = fn_nodes[i].end_lineno + 1
+                continue
+            hit = next(((a, b) for a, b in drop if a == i), None)
+            if hit:
+                i = hit[1] + 1
+                continue
+            out.append(lines[i - 1])
+            i += 1
+        parts.append("\n".join(out))
+    return "\n".join(parts)
