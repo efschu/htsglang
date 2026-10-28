@@ -172,6 +172,7 @@ class TestSwaHybridCapModeCeiling(CustomTestCase):
             speculative_eagle_topk=None,
             disable_overlap_schedule=True,
             disaggregation_mode="null",
+            page_size=1,  # 27b-r2tbound-1028: the row headroom counts the page rounding (a ServerArgs field, always set)
         )
         mr = SimpleNamespace(
             is_hybrid_swa=True,
