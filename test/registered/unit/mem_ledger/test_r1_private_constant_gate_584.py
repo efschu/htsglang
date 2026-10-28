@@ -209,7 +209,7 @@ KNOWN = {
         "via FLLIPER_PHASE_FLIP_ARMING_MARGIN_MIB, so it is at least not a "
         "silent constant."
     ),
-    "pdflip/launcher.py::D_AWAKE_OVERSHOOT_MIB": (
+    "pdflip/launcher_d_p_r2_L6.py::D_AWAKE_OVERSHOOT_MIB": (
         "NOT A DEMAND DECISION, a MEASUREMENT of this form (#1257c). Group D's "
         "awake consumption that sits OUTSIDE the --rank-gpu-memory-mib "
         "fraction -- CUDA context and BAR1 windows -- measured at 404 MiB on "
@@ -245,7 +245,7 @@ KNOWN = {
         "already expressed on. Pinned here because the name ends in _MIB and "
         "the gate reads names, not roles."
     ),
-    "pdflip/launcher.py::P_PREFILL_ACTIVATION_RESERVE_MIB": (
+    "pdflip/launcher_p_d_r2_L3.py::P_PREFILL_ACTIVATION_RESERVE_MIB": (
         "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
         "made (#1286). It is the boot's own 'prefill activation reserve' "
         "post, from the same emitted line, measured at 1.000 GiB on every "

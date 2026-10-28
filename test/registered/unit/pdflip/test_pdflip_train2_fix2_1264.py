@@ -60,6 +60,16 @@ from flliper.test.test_utils import CustomTestCase
 # ======================================================================
 # (A) the killer, and the class it belongs to
 # ======================================================================
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 class TestCardFreeReader(CustomTestCase):
     """front.py:2330 -- the weg2t2b boot killer, reproduced and closed."""
 
@@ -285,7 +295,7 @@ class TestSolveNamesAndOrdersItsSource(CustomTestCase):
 
         from flliper.srt.pdflip import launcher
 
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         self.assertIn('plan.lines.append("PDFLIP-HOST-RING SOURCE "', src)
         self.assertIn("_reason_lines[1:]", src)
 

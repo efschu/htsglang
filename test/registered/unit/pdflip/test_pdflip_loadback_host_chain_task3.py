@@ -27,6 +27,16 @@ import torch  # noqa: E402
 from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def test_a_pre_pinned_arena_answers_pin_slots_without_a_tensor_walk():
     """`_all_pinned` short-circuits: no unique, no index, no cudart."""
     calls = {"n": 0}
@@ -74,7 +84,7 @@ def test_storage_batch_is_env_tunable_and_defaults_to_the_upstream_128(monkeypat
 
 def test_the_launcher_ships_the_larger_batch_but_an_operator_value_wins(monkeypatch):
     from flliper.srt.pdflip import launcher
-    src = open(launcher.__file__).read()
+    src = _launcher_text()
     assert 'env.setdefault("FLLIPER_HICACHE_STORAGE_BATCH", "1024")' in src
 
 

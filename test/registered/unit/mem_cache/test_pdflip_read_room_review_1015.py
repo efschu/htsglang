@@ -42,6 +42,16 @@ from test_pdflip_read_room_1015 import _armed, _fill_arena_with_tree_pages, _ov,
 FULL = ComponentType.FULL
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 @pytest.fixture(autouse=True)
 def _clean():
     _rr().reset_for_tests()
@@ -374,7 +384,7 @@ def test_the_room_file_lies_in_the_arena_directory_and_a_rebind_closes_old_maps(
     assert os.path.dirname(rr._path(arena)) == os.path.dirname(arena.path)
     # the boot's arena directory goes with the launcher's shm sweep (SHM_OWN_PREFIXES) -- read as text, the module is
     # the whole launcher
-    src = open(importlib.util.find_spec("flliper.srt.pdflip.launcher").origin).read()
+    src = _launcher_text()
     assert '    "pdflip-arena-",\n)' in src
     _armed(arena)
     assert rr.post(arena, 2)

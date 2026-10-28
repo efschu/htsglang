@@ -31,6 +31,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER_SRC = os.path.join(HERE, "..", "..", "..", "..", "python", "flliper", "srt", "pdflip", "launcher.py")
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def card(i, name, mib, cc, uuid=None):
     return L.Card(i, uuid or f"GPU-{i:04d}", name, mib, reserved_mib=0, cc=cc)
 
@@ -75,8 +85,7 @@ class Register(Base):
         self.assertEqual(R.by_code("HOST-MEM").klass, R.CLASS_WARN)
 
     def test_the_register_does_not_claim_more_than_the_launcher_does(self):
-        with open(LAUNCHER_SRC, encoding="utf-8") as fh:
-            src = fh.read()
+        src = _launcher_text()
         wired = R.wired_codes(src)
         self.assertTrue(wired)
         for c in wired:
@@ -125,8 +134,7 @@ class EntrypointWiring(Base):
         self.assertEqual(R.entrypoint_wired_codes("echo nothing"), [])
 
     def test_register_says_where_force_lifts_each_code(self):
-        with open(LAUNCHER_SRC, encoding="utf-8") as fh:
-            wired = R.wired_codes(fh.read())
+        wired = R.wired_codes(_launcher_text())
         pub = {r["code"]: r for r in R.public_register(wired)}
         for c in ("PROFIL-STATUS", "SHM", "STORE", "MEMAVAIL"):
             r = pub[c]

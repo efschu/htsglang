@@ -39,6 +39,16 @@ from flliper.srt.constants import (
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 @pytest.fixture(autouse=True)
 def _no_env_leaks_out_of_this_file():
     """`_saver` writes the process env on purpose -- it is testing the PARSER.
@@ -262,7 +272,7 @@ def test_every_launcher_call_site_names_its_group():
     """
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     calls = [ln for ln in src.splitlines() if "= build_env(" in ln]
     assert len(calls) == 3, f"launcher has {len(calls)} build_env call sites, expected 3"
     for ln in calls:
@@ -1233,7 +1243,7 @@ def test_launcher_publishes_the_group_beside_that_family_on_both_groups(pdflip_e
     from flliper.srt.managers import pdflip_memory_saver as ms
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     family = set(re.findall(r'"(FLLIPER_PDFLIP_[A-Z_]+)"', src)) - {ms.PDFLIP_GROUP_ENV}
     assert family, "no corroborating FLLIPER_PDFLIP_* variable exists in the launcher"
 

@@ -109,6 +109,16 @@ REPO_ROOT = os.path.abspath(
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _mod():
     """The module under test, imported LATE so each test reds by its own name."""
     return importlib.import_module("flliper.srt.pdflip.seam_digest")
@@ -514,7 +524,7 @@ def test_the_launcher_publishes_the_arm_only_when_the_flag_is_set():
     never arm a grader this boot did not ask for."""
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     assert "--pdflip-seam-digest" in src
     # POPPED, not merely unset: the pop list is what makes an inherited value
     # harmless, and it is the half that is easy to forget.

@@ -54,6 +54,16 @@ _KW = dict(
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _choose(**extra):
     return hl.choose(
         int(123.78 * GIB), int(110.0 * GIB), arms=[(1, 150)],
@@ -333,7 +343,7 @@ def test_host_mem_is_a_warn_code_not_a_refusal():
 
 
 def test_the_launcher_no_longer_consults_the_switch_for_host_mem():
-    src = open(launcher.__file__, encoding="utf-8").read()
+    src = _launcher_text()
     wired = refusals.wired_codes(src)
     assert "HOST-MEM" not in wired
     assert "HOST-DISK" in wired
@@ -343,7 +353,7 @@ def test_the_launcher_no_longer_consults_the_switch_for_host_mem():
 
 
 def test_the_force_help_says_host_ram_is_not_refused():
-    src = open(launcher.__file__, encoding="utf-8").read()
+    src = _launcher_text()
     i = src.index('"--force", action="store_true"')
     h = src[i:i + 2500]
     assert "HOST RAM is not refused at all any more" in h  # 27B line: the --force list of wired codes is longer than the NF tree's
@@ -478,7 +488,7 @@ def test_vram_and_card_codes_keep_their_classes():
 
 def test_vram_refusal_sites_of_the_launcher_are_untouched():
     # counted on 2c8db9c8e5 (the base of this work): the launcher's refuse_value sites per VRAM / card code
-    src = open(launcher.__file__, encoding="utf-8").read()
+    src = _launcher_text()
     counts = {c: len(re.findall(r'refuse_value\(\s*"%s"' % re.escape(c), src))
               for c in ("D-BUDGET", "P-CARD", "WAKE-CREDIT", "HW-COUNT", "HW-UNCALIBRATED", "HW-BORROWED")}
     # 27B line: counted on the RC3 head 524a880606 (the base of this port); all of them stay as they were.

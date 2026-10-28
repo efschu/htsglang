@@ -57,6 +57,16 @@ from .test_pdflip_xchg_transport_1273 import (  # noqa: E402 -- after the env gu
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 @pytest.fixture()
 def boot():
     return _fresh_boot()
@@ -2518,7 +2528,7 @@ def test_the_hop_bound_is_a_launcher_flag_and_is_published_to_the_ranks():
     """
     from flliper.srt.pdflip import launcher as ln
 
-    src = inspect.getsource(ln)
+    src = _launcher_text()
     assert "--pdflip-shadow-hop-bound-ms" in src
     assert "ns.pdflip_shadow_hop_bound_ms" in src
     assert "weight_exchange_shadow.ENV_HOP_BOUND_MS" in src
@@ -5316,9 +5326,7 @@ def test_the_launcher_publishes_the_ceiling_to_both_groups_and_pops_it():
     """
     root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-    path = os.path.join(root, "python", "flliper", "srt", "pdflip", "launcher.py")
-    with open(path, encoding="utf-8") as fh:
-        src = fh.read()
+    src = _launcher_text()          # the launcher is split over launcher*.py (behaviour-neutral refactor, 28.10.)
     assert "--pdflip-xchg-oncard-slot-mib" in src
     assert "ENV_ONCARD_SLOT_MIB] = str(slot_mib)" in src
     # Popped in build_env's launcher-OUTPUT loop and published by

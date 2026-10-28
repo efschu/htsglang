@@ -24,6 +24,16 @@ OLD, NEW = cs.ROUTE_PREFIXES
 PKG_OLD, PKG_NEW = "sg" + "lang", "fl" + "liper"
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 class TestCounterpart(CustomTestCase):
     def test_both_directions(self):
         self.assertEqual(cs.counterpart(OLD + "state"), NEW + "state")
@@ -218,7 +228,7 @@ class TestLegacyFlags(CustomTestCase):
         self.assertGreaterEqual(len(mine), 10)
         for o in mine:
             self.assertIn(cs.canonical_flags(["--" + other + o[len(run) + 2:]])[0], opts, o)
-        self.assertIn("_canonical_flags(", open(launcher.__file__, encoding="utf-8").read())
+        self.assertIn("_canonical_flags(", _launcher_text())
 
 
 def _fake_proc(root, pid, argv, env=None, nvidia=False, ppid=1):

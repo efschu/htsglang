@@ -56,6 +56,16 @@ _BENIGN = SimpleNamespace(
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _args(*, enable_memory_saver: bool):
     """A ServerArgs carrying only what the BCG rule list reads, so the test
     exercises the WHOLE list (not just the rule under test) without a model."""
@@ -257,7 +267,7 @@ class TheLauncherKeepsItsLever(CustomTestCase):
         var off would disable R4, which is what the line exists for."""
         from flliper.srt.pdflip import launcher
 
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         self.assertIn('env["FLLIPER_MEMORY_SAVER_CUDA_GRAPH"] = env.get(', src)
 
 

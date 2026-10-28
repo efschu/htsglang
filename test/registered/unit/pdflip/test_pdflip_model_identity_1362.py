@@ -36,6 +36,16 @@ M27 = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8"
 M4B = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.5-4B-FP8-dynamic"
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _calib(d, digest, **over):
     rec = {
         "schema": hl.CALIB_SCHEMA, "model_digest": digest,
@@ -137,7 +147,7 @@ class TheServedNameFollowsTheModel1362(CustomTestCase):
     def test_the_literal_is_gone_from_the_argv_builder(self):
         """RATCHET: red before this commit, where the string was hard-coded."""
         import inspect
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         i = src.index('"--served-model-name"')
         self.assertIn("served_model_name(model)", src[i:i + 120])
 
@@ -175,7 +185,7 @@ class TheDormantImageIsNeverSpentOnAnotherModel1362(CustomTestCase):
     def test_the_launcher_stamps_the_digest_into_the_record(self):
         """RATCHET on reachability: red before this commit (0 occurrences)."""
         import inspect
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         i = src.index("host_ledger.dormant_image_sample(")
         call = src[i:src.index("log(host_ledger.format_dormant_image", i)]
         # #1362 [22-fix2] TIGHTENED: [22] pinned the PATH digest here, which no
@@ -275,7 +285,7 @@ class TheReadersAreREACHEDFromProduction1362(CustomTestCase):
     def _prod_src(self):
         import inspect
         from flliper.srt.pdflip import launcher as lc2
-        return inspect.getsource(lc2)
+        return _launcher_text()
 
     def test_the_calibration_reader_is_called_on_the_p_cut_path(self):
         src = self._prod_src()
@@ -396,7 +406,7 @@ class LegacyRecordTransition(CustomTestCase):
         """
         import inspect
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         self.assertIn("model_digest_=(host_ledger.checkpoint_digest(ns.model)[0]", src)
         self.assertNotIn("model_digest_=host_ledger.model_digest(ns.model)", src)
 
@@ -413,7 +423,7 @@ class LegacyRecordTransition(CustomTestCase):
         """
         import inspect
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         self.assertNotIn('getattr(ring_plan, "form_same"', src)
         self.assertIn('_rt = getattr(ring_plan, "table", None)', src)
         self.assertIn("form_key_matches=_form_key_matches", src)

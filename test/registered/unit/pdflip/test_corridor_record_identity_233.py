@@ -96,6 +96,16 @@ ARGV_NF_D = [
 ]
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _form_env(arch, experts, draft, p_draft, kv, profile, model) -> str:
     return pdflip_form.PdFlipForm(
         arch=arch, experts=experts, draft=draft, p_draft=p_draft, kv=kv,
@@ -544,7 +554,7 @@ class OnePointerStatePerBoot(_Base):
         the recipe and freeze -- all before the first ``budgets_from_dc``."""
         here = os.path.dirname(os.path.abspath(__file__))
         root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-        src = open(os.path.join(root, "python", "flliper", "srt", "pdflip", "launcher.py")).read()
+        src = _launcher_text()
         tree = ast.parse(src)
         main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
 

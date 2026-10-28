@@ -48,6 +48,16 @@ CARD_5090 = "NVIDIA GeForce RTX 5090"
 CARD_3080 = "NVIDIA GeForce RTX 3080"
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def ref_cards():
     return [L.Card(1, BIG, CARD_5090, 32607, cc=(12, 0)),
             L.Card(0, SM1, CARD_3080, 20480, cc=(8, 6)),
@@ -218,7 +228,7 @@ class UnknownUuid(Base):
         r = R.by_code("HW-BORROWED")
         self.assertIsNotNone(r)
         self.assertTrue(r.forcebar)
-        self.assertIn("HW-BORROWED", R.wired_codes(open(LAUNCHER_SRC, encoding="utf-8").read()))
+        self.assertIn("HW-BORROWED", R.wired_codes(_launcher_text()))
         with self.assertRaises(X.PdFlipXchgResidencyUnarmable) as cm:
             L.load_xchg_census_for_cards(self.census_path, self.cards(), self.log)
         self.assertIn("GPU-cccc-unknown", str(cm.exception))
@@ -323,7 +333,7 @@ class FlagAndRegister(Base):
         self.assertEqual(ns.pdflip_xchg_census_map, "nvml2=%s" % SM2)
 
     def test_main_arms_the_map_next_to_force(self):
-        src = open(LAUNCHER_SRC, encoding="utf-8").read()
+        src = _launcher_text()
         self.assertIn('set_xchg_census_map(getattr(ns, "pdflip_xchg_census_map", ""))', src)
         # all three census readers go through the one resolver
         self.assertEqual(src.count("xchg_residency.load_census("), 1)   # only inside load_xchg_census_for_cards

@@ -48,6 +48,16 @@ CKPT = "model-00001-of-00001.safetensors"
 # (the shapes of test_pdflip_vision_rank_runner, kept local on purpose)
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 class _Alloc:
     def __init__(self, kv, num_pages=NUM_PAGES, page_size=1):
         self.num_pages = num_pages
@@ -538,7 +548,7 @@ def test_the_parser_knows_both_knobs():
     from flliper.srt.pdflip import launcher as lz
     import inspect
 
-    src = inspect.getsource(lz)
+    src = _launcher_text()
     assert '"--pdflip-vision-source", choices=list(VISION_SOURCES), default=VISION_SOURCE_DISK' in src
     assert '"--pdflip-vision-place", choices=list(VISION_PLACES), default=VISION_PLACE_AUTO' in src
     assert "_vision_knob(ns, \"pdflip_vision_source\"" in src
