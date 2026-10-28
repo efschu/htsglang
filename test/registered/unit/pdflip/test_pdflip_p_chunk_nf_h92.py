@@ -20,9 +20,11 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from flliper.srt.pdflip import p_chunk_nf as NF
-from flliper.srt.pdflip import p_chunk_policy as P
-from flliper.test.ci.ci_register import register_cpu_ci
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # the P-CHUNK-MEM-GUARD reads mem_get_info: no GPU, no flake
+
+from flliper.srt.pdflip import p_chunk_nf as NF  # noqa: E402
+from flliper.srt.pdflip import p_chunk_policy as P  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
