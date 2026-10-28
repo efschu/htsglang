@@ -147,13 +147,19 @@ class TestNeverFromTheRoundPath(CustomTestCase):
     def test_only_the_process_start_and_the_post_wake_census_name_rankstats(self):
         """AST: in scheduler.py only run_scheduler_process (start) and the
         post-wake census (one assignment) touch rankstats -- no round function."""
-        with open(SCHED_PY) as f:
-            tree = ast.parse(f.read())
+        import importlib.util
+        import pathlib
+
+        spec = importlib.util.spec_from_file_location("_scheduler_source", pathlib.Path(__file__).with_name("_scheduler_source.py"))
+        ss = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ss)
         users = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if "rankstats" in ast.dump(node):
-                    users.add(node.name)
+        for path in ss.source_files():          # scheduler.py plus the files its methods moved to (refactor waves)
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if "rankstats" in ast.dump(node):
+                        users.add(node.name)
         self.assertEqual(users, {"run_scheduler_process", "_pdflip_post_wake_pass_log"})
 
 

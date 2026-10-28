@@ -246,7 +246,13 @@ def test_the_scheduler_calls_the_pass_step_only_with_a_floor_after_the_park_tick
     head = head[:head.index("        _pdflip_resume_warm_tick(self)")]
     assert head.index("self._pdflip_d_park_tick()  # H91b") < head.index("self._pdflip_d_lane_hold_queued()")
     assert 'if getattr(self, "pdflip_lane_floor", 0):\n' in head       # floor 0 / switch off: one attribute read
-    body = src[src.index("    def _pdflip_d_lane_hold_queued("):]
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_scheduler_source", pathlib.Path(__file__).with_name("_scheduler_source.py"))
+    ss = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ss)
+    body = ss.method_source("_pdflip_d_lane_hold_queued")         # moved to the d_park mixin (refactor wave 4)
     assert "d_park_runtime.hold_queued(self)" in body[:400]
 
 

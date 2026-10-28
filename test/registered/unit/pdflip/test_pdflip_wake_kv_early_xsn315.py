@@ -46,5 +46,11 @@ def test_handler_plans_and_the_post_wake_pass_timer_is_armed():
         assert w in blk, w
     assert "(GPU_MEMORY_TYPE_KV_CACHE in tags or self._pdflip_kv_deferred) and not _pdflip_kv_done" in src
     assert "scheduler._pdflip_post_wake_pass_n = 0" in src
-    s2 = open(sch.__file__).read()
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location("_scheduler_source", pathlib.Path(__file__).with_name("_scheduler_source.py"))
+    ss = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ss)
+    s2 = "\n".join(p.read_text(encoding="utf-8") for p in ss.source_files())    # scheduler.py + the mixins/helpers its methods moved to
     assert "PDFLIP-POST-WAKE-PASS n=%d" in s2 and "self._pdflip_post_wake_pass_log(batch)" in s2
