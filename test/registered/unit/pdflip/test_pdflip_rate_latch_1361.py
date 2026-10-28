@@ -431,8 +431,13 @@ class TheGuardRunsFromLAUNCHNotFromREADY1361a(CustomTestCase):
                         src.index("front_argv = front_argv_for("))
 
     def test_it_feeds_the_cushion_from_one_reading_like_the_front_does(self):
-        src = self._launcher_src()
-        body = src[src.index("class LaunchGuard"):src.index("def measured_record_path")]
+        import importlib.util
+        import pathlib
+
+        spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+        ls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ls)
+        body = ls.definition_source("LaunchGuard")        # moved to launcher_types.py (refactor, 28.10.)
         self.assertEqual(body.count("read_cgroup_pressure()"), 1)
         self.assertIn("cushion_gib=", body)
         self.assertIn("shmem_gib=", body)

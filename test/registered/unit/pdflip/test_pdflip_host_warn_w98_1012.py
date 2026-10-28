@@ -300,7 +300,13 @@ class TheLaunchGuardWarns(CustomTestCase):
         hand = src[src.index("_launch_guard.stop("):src.index("front_argv = front_argv_for(")]
         self.assertNotIn("raise", hand)
         self.assertNotIn("PdFlipLaunchHostLatched", hand)
-        g = src[src.index("class LaunchGuard"):src.index("def served_model_name")]
+        import importlib.util
+        import pathlib
+
+        spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+        ls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ls)
+        g = ls.definition_source("LaunchGuard")          # moved to launcher_types.py (refactor, 28.10.)
         self.assertIn("warn_only=True", g)
         self.assertNotIn("self.verdict = line", g)
 
