@@ -12,6 +12,7 @@ never idle) is kept; a stall is trimmed; the default solver path is unchanged.
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from flliper.srt.planner import pgap_stage_fit as F
 from flliper.srt.planner import pp_cut as PC
@@ -216,6 +217,25 @@ class TestAutoScan(CustomTestCase):
         path, seen = F.newest_pgap_log(self.dir, CHUNK, 3)
         self.assertIsNone(path)
         self.assertIn("%d more skipped" % 3, " ".join(seen))
+
+    def test_a_log_gone_between_listing_and_sort_is_skipped_not_raised(self):
+        """TOCTOU: ``getmtime`` in the sort key sat outside the try; a P log deleted after ``listdir`` raised a raw
+        FileNotFoundError out of the boot CLI instead of a clean scan."""
+        with open(_write_log(), "r") as fh:
+            good_text = fh.read()
+        good = self._put("good.P.log", good_text, age_s=10)
+        real_listdir = os.listdir
+        with mock.patch.object(F.os, "listdir", lambda d: real_listdir(d) + ["ghost.P.log"]):
+            path, _ = F.newest_pgap_log(self.dir, CHUNK, 3)
+        self.assertEqual(path, good)  # the ghost sorts last, behind the log that qualifies
+
+    def test_accept_filtered_logs_are_counted_in_the_provenance(self):
+        """A shared evidence dir full of other checkpoints used the scan window up silently: the refusal named no log."""
+        for i in range(3):
+            self._put("other_%d.P.log" % i, _pass(0, 0, 512, "r", 50.0), age_s=100 + i)
+        path, seen = F.newest_pgap_log(self.dir, CHUNK, 3, accept=lambda p: False)
+        self.assertIsNone(path)
+        self.assertEqual(seen, ["3 logs not of this checkpoint/line (accept filter)"])
 
 
 class TestDepthProfile(CustomTestCase):

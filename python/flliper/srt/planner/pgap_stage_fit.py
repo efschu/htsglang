@@ -531,12 +531,14 @@ def newest_pgap_log(
         return None, ["%s: %s" % (evidence_dir, exc)]
     paths = sorted(
         (os.path.join(evidence_dir, n) for n in names),
-        key=lambda p: os.path.getmtime(p),
+        key=_mtime_or_oldest,
         reverse=True,
     )
     skipped = 0
+    rejected = 0
     for path in paths[:AUTO_SCAN_MAX_LOGS]:
         if accept is not None and not accept(path):
+            rejected += 1
             continue
         try:
             log = read_pgap_log(path)
@@ -551,10 +553,27 @@ def newest_pgap_log(
                 seen.append("%s: skipped (%s)" % (os.path.basename(path), exc))
             continue
         _note_unnamed_skips(seen, skipped)
+        _note_rejected(seen, rejected)
         seen.append("%s: taken" % os.path.basename(path))
         return path, seen
     _note_unnamed_skips(seen, skipped)
+    _note_rejected(seen, rejected)
     return None, seen
+
+
+def _mtime_or_oldest(path: str) -> float:
+    """A log that vanished between the listing and the sort sorts last (the read then names it as skipped)."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return float("-inf")
+
+
+def _note_rejected(seen: List[str], rejected: int) -> None:
+    """One count line for the logs the accept filter passed over (another checkpoint or line) -- they use up the
+    scan window, so a refusal with no other line would otherwise name nothing."""
+    if rejected:
+        seen.append("%d logs not of this checkpoint/line (accept filter)" % rejected)
 
 
 def _note_unnamed_skips(seen: List[str], skipped: int) -> None:
