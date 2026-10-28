@@ -241,14 +241,19 @@ class PoolLend(_pk.PKvStage):
             raise _pk.PdFlipDualKvCapBreach(
                 "%s release under a live row: id %d is live above T=%d although the group floor was below it"
                 % (MARK, live, int(tokens)))
+        t_sync = time.perf_counter()
         self._sync()
+        t_move = time.perf_counter()
         self._move(int(tokens))
+        t_done = time.perf_counter()
         was, self.mapped_tokens = int(self.mapped_tokens), int(tokens)
         if self.pre_free is None:
             self.pre_free = int(before)
         after = self.free_fn()
-        logger.info("%s rank=%d release T=%d (from %d) bytes=%d ms=%.1f card_free_mib before=%d after=%d %s",
+        logger.info("%s rank=%d release T=%d (from %d) bytes=%d ms=%.1f (sync_ms=%.1f move_ms=%.1f) "
+                    "card_free_mib before=%d after=%d %s",
                     MARK, self.rank, int(tokens), was, nbytes, 1000.0 * (time.perf_counter() - t0),
+                    1000.0 * (t_move - t_sync), 1000.0 * (t_done - t_move),
                     int(before) // MIB, int(after) // MIB, note)
 
     def grow_to(self, tokens: int, *, why: str) -> bool:
@@ -257,11 +262,16 @@ class PoolLend(_pk.PKvStage):
         tokens = min(int(self.top), int(tokens))
         before, t0 = self.free_fn(), time.perf_counter()
         nbytes = self.bytes_for(tokens) - self.bytes_for(self.mapped_tokens)
+        t_pre = time.perf_counter()
         if int(before) < nbytes:
             self._sync()
             self.trim_fn()                  # the extends' cache sits on the freed bytes: give it back first
+        t_move = time.perf_counter()
         short = self._try_move(tokens)
-        if int(self.gmin([0 if short is not None else 1])[0]) != 1:
+        t_gmin = time.perf_counter()
+        verdict = int(self.gmin([0 if short is not None else 1])[0])
+        t_done = time.perf_counter()
+        if verdict != 1:
             self._move(int(self.mapped_tokens))          # unmap what this rank got; rows and cap back
             self.next_round = self.rounds + GROW_SHORT_BACKOFF_ROUNDS
             logger.warning("%s rank=%d GROW-SHORT T=%d (from %d) need=%d card_free_mib=%d: %s -- rolled back on "
@@ -273,7 +283,9 @@ class PoolLend(_pk.PKvStage):
         was, self.mapped_tokens = int(self.mapped_tokens), tokens
         if tokens >= int(self.top):
             self._unbound_rows()
-        self._log_return(tokens, was, nbytes, before, t0, why)
+        phases = "pre_ms=%.1f move_ms=%.1f gmin_ms=%.1f" % (
+            1000.0 * (t_move - t_pre), 1000.0 * (t_gmin - t_move), 1000.0 * (t_done - t_gmin))
+        self._log_return(tokens, was, nbytes, before, t0, why, phases=phases)
         return True
 
     def _try_move(self, tokens: int) -> Optional[Exception]:
@@ -289,12 +301,13 @@ class PoolLend(_pk.PKvStage):
         for pool in self.pools:
             pool.set_stage_backed_rows(None)
 
-    def _log_return(self, tokens: int, was: int, nbytes: int, before: int, t0: float, why: str) -> None:
+    def _log_return(self, tokens: int, was: int, nbytes: int, before: int, t0: float, why: str,
+                    phases: str = "") -> None:
         after = self.free_fn()
         full = tokens >= int(self.top)
         pre = self.pre_free if full else None
-        logger.info("%s rank=%d return T=%d (from %d) bytes=%d ms=%.1f card_free_mib before=%d after=%d%s (%s)",
-                    MARK, self.rank, tokens, was, nbytes, 1000.0 * (time.perf_counter() - t0),
+        logger.info("%s rank=%d return T=%d (from %d) bytes=%d ms=%.1f (%s) card_free_mib before=%d after=%d%s (%s)",
+                    MARK, self.rank, tokens, was, nbytes, 1000.0 * (time.perf_counter() - t0), phases,
                     int(before) // MIB, int(after) // MIB,
                     "" if pre is None else " pre_lend_free_mib=%d delta_mib=%d" % (int(pre) // MIB,
                                                                                     (int(after) - int(pre)) // MIB),
