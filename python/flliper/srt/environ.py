@@ -332,6 +332,10 @@ class Envs:
     # exact for any proposal. Off (0) = the unchecked scatter (A/B only): a
     # NaN row then drops every selector candidate from the output.
     FLLIPER_DFLASH_Q_GUARD = EnvBool(True)
+    # 27b-gdn-form-1028: one census line per rank after the model is built (27B-GDN-FORM): the form of the GDN layers on this rank
+    # (class, quant method per projection, local heads, TP cut, reduce/gather, bias, norm variant) and whether NF's GDN fusions
+    # (FORMHP-GDN-IN / -OUT, detection rule of 14a71cc5e) would apply here, with the first reason they do not. Census only.
+    FLLIPER_GDN_FORM_CENSUS = EnvBool(True)
     # DFLASH window pool (FLLIPER_DFLASH_WINDOW_POOL=1): run the draft-slot
     # mapper and the per-round window rebuild without host reads, so the host
     # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
