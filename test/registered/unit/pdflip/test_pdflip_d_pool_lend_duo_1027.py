@@ -29,7 +29,7 @@ TOP = 536576                    # global tokens (boot log)
 S = 64                          # token blocks of the uneven DCP (vector sum 37 + 27)
 RATIOS = {"TP0 (5090)": 37, "TP1 (3080)": 27}
 LOG_ROWS = {37: 310245, 27: 226395}          # "#tokens" of the K buffers in the boot log
-STEP = L.knobs_from_env().step               # the lend's lattice step (default 32768)
+STEP = L.resolve_step(L.knobs_from_env().step, TOP)   # the lend's lattice step (0 = auto: follows the pool size)
 
 
 def _geom(ratio: int):
