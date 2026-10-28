@@ -5733,6 +5733,43 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     FLLIPER_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Adaptive verify width for the DFlash path (dense 27B), 28.10.: the draft
+    # still proposes B tokens, the target verifies only k <= B of them, with
+    # k = argmax E[tokens](k) / step_ms(k) (Basalt Controller::choose; pure
+    # logic in speculative/adaptive_verify_width.py, worker glue in
+    # dflash_verify_width.py). Default ON (Nutzerorder 14.10.); inert -- k
+    # stays B, no extra graphs -- until a measured curve file exists. Same
+    # semantics as NF's FLLIPER_FORMHP_ADAPTIVE_K: k = B is today's round.
+    FLLIPER_ADAPTIVE_K = EnvBool(True)
+    # Cost curve + tiers: JSON (or Markdown with a ```json block) holding
+    # {"widths": [5, 8], "linear": {"a_ms", "c_ms_per_row"} | "sps": DSpark
+    # SpsAdditiveCostTable, "prior_survival": [...]}. Only the listed widths
+    # get a pre-captured verify state. "" = the bundled 27B curve
+    # speculative/adaptive_k_curves/qwen38_27b_dflash2.json (A1, 28.10.;
+    # c is an upper bound until the 8-vs-5 A/B on metal).
+    FLLIPER_ADAPTIVE_K_CURVE = EnvStr("")
+    # Boot-time planning check (not a runtime gate): the k<B ladder is only
+    # captured when the TP-group minimum of free VRAM after the boot captures
+    # is at least this many MiB per extra width state on top of the 1-GB
+    # corridor. Estimate per state: fresh flashinfer workspace 384 MiB +
+    # verify graph pool/buffers; replace by the value the capture logs.
+    FLLIPER_ADAPTIVE_K_STATE_MIB = EnvInt(640)
+    # Self-test arm: force one verify width (B = bit-identical to the
+    # pre-adaptive round, no extra state). 0 = adaptive.
+    FLLIPER_ADAPTIVE_K_FORCE = EnvInt(0)
+    FLLIPER_ADAPTIVE_K_MIN_WIDTH = EnvInt(2)
+    # Hysteresis: a width must beat the incumbent's tokens/ms by this percent.
+    FLLIPER_ADAPTIVE_K_MARGIN_PCT = EnvFloat(2.0)
+    # Rounds a width is held before it is re-decided.
+    FLLIPER_ADAPTIVE_K_MIN_DWELL = EnvInt(8)
+    # Rounds at k = B before the first decision (learn every position).
+    FLLIPER_ADAPTIVE_K_WARMUP = EnvInt(64)
+    # Every N-th round verifies all B slots (fresh evidence for the slots a
+    # short width never tests). 0 = never.
+    FLLIPER_ADAPTIVE_K_PROBE_EVERY = EnvInt(32)
+    FLLIPER_ADAPTIVE_K_EMA_ALPHA = EnvFloat(0.1)
+    # "ADAPTIVE-K census" line + TP rank digest check every N decode rounds.
+    FLLIPER_ADAPTIVE_K_CENSUS_EVERY = EnvInt(256)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

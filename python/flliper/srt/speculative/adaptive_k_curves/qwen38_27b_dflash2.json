@@ -1,0 +1,8 @@
+{
+  "_what": "FLLIPER_ADAPTIVE_K default curve, Qwen3.8-27B + DFlash2 (block 8), tiers {5, 8}. Replace via FLLIPER_ADAPTIVE_K_CURVE=<file> (same format).",
+  "_source": "A1 /spinning/gpu-arb/deskq/bl/a1_verify_kurve_27b_1028.md (28.10.): T = A + c * rows fitted on 421 D-logs (rows = 8 x bs, rank 0 gpu-ms draft+verify); int8 median A ~ 21-22 ms, c ~ 0.93 ms/row. c is bs-confounded and therefore an UPPER bound of the per-row cost; no DFlash boot with k < 8 exists. prior_survival = S_j over 18804 requests / 5.94 M rounds (SPEC-ACCEPT-PROFILE), all 27B boots.",
+  "_status": "BERECHNET, Metall offen: c_row to be fixed by an A/B speculative_num_draft_tokens 8 vs 5 on the same image (bs1/bs3/bs6).",
+  "widths": [5, 8],
+  "linear": {"a_ms": 21.5, "c_ms_per_row": 0.93},
+  "prior_survival": [0.7411, 0.5243, 0.3653, 0.2646, 0.1989, 0.1544, 0.1233]
+}

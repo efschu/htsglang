@@ -40,6 +40,11 @@ from flliper.srt.server_args import ServerArgs
 from flliper.srt.speculative.base_spec_worker import BaseSpecWorker
 from flliper.srt.speculative.dflash_info import DFlashVerifyInput
 from flliper.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from flliper.srt.speculative.dflash_verify_width import (
+    DFlashVerifyWidth,
+    pad_out_tokens,
+    verify_views,
+)
 from flliper.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
@@ -769,6 +774,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # #31468 host-sync census (env-gated, default off): an instance
         # attribute shadows the class method only when armed.
+        # FLLIPER_ADAPTIVE_K (28.10.): verify width k <= block_size per round;
+        # inert (k = block_size, no extra state) until a curve file exists.
+        self._adaptive_k = DFlashVerifyWidth(
+            block_size=int(self.block_size), tp_rank=int(self.tp_rank)
+        )
+
         _sync_trace_rounds = int(envs.FLLIPER_DEBUG_DFLASH_SYNC_TRACE.get())
         if _sync_trace_rounds > 0:
             self.forward_batch_generation = _dflash_sync_traced(
@@ -1322,6 +1333,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
+        # Before the shadow return: shadows run the target verify too, and the
+        # per-width target captures are TP collectives on every rank.
+        self._build_adaptive_k_states()
         if self._solo_is_shadow:
             # Shadow rank: capture NO draft graphs (the draft forward never
             # runs here).
@@ -1375,6 +1389,35 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+
+    def _build_adaptive_k_states(self) -> None:
+        """FLLIPER_ADAPTIVE_K: target verify states for widths k < block_size."""
+        if self.draft_kv_only or not self._adaptive_k.enabled:
+            return
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from flliper.srt.speculative.eagle_worker_v2 import (
+            adaptive_target_attn_backend,
+        )
+
+        from flliper.srt.utils import get_available_gpu_memory
+
+        free_mib = 1024.0 * get_available_gpu_memory(
+            self.device, self.gpu_id, distributed=False
+        )
+        if not self._adaptive_k.plan_ladder(
+            cpu_group=get_tp_group().cpu_group,
+            free_mib=free_mib,
+            user_reserve_mib=self.server_args.user_reserve_mib_scalar(),
+        ):
+            return
+        self._adaptive_k.build_states(
+            target_model_runner=self.target_worker.model_runner,
+            server_args=self.server_args,
+            build_attn_backend=adaptive_target_attn_backend,
+            runner_cls=DecodeCudaGraphRunner,
         )
 
     def _maybe_build_draft_sampler(self):
@@ -3281,6 +3324,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # compute_spec_v2_logprobs, see _dflash_verify_logprobs); the refusal
         # that stood here is gone. The target prefill computes its own.
         self._validate_phase1_sampling_support(batch)
+        # FLLIPER_ADAPTIVE_K belt: a round that raised after its width swap
+        # must not leave the next forward (prefill, flip) on a k-state.
+        self._adaptive_k.restore(target_model_runner=self.target_worker.model_runner)
         # seq_lens_cpu_ready (FLLIPER_PDFLIP_D_DEFER_SEQ_LENS_CPU): the scheduler
         # deferred the host half of this batch's length read; batch.seq_lens_cpu
         # / seq_lens_sum are None until it is called. Idempotent. The decode
@@ -3351,6 +3397,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        # FLLIPER_ADAPTIVE_K: this round's verify width (rank-uniform), and
+        # its pre-captured target state swapped in BEFORE the DCP prebuild
+        # below writes into the active backend. block_size = today's round.
+        verify_width = self._adaptive_k.begin_round(
+            target_model_runner=self.target_worker.model_runner,
+            batch_size=bs,
+            eligible=not (batch.has_grammar or batch.return_logprob),
+        )
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -3889,17 +3943,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         # writes KV for -- syncing after the verify left ranks 1/2 with
         # target/draft KV of a block they then discarded.
         self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, draft_tokens)
-        verify_input_ids = draft_tokens.reshape(-1)
+        # FLLIPER_ADAPTIVE_K: the verify-side slices of the B-wide block (the
+        # exact pre-adaptive tensors when verify_width == block_size).
+        vv = verify_views(
+            draft_tokens=draft_tokens,
+            positions_2d=positions_2d,
+            cache_loc_2d=verify_out_cache_loc_2d,
+            width=verify_width,
+        )
+        verify_input_ids = vv.input_ids
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
+            positions=vv.positions,
+            draft_token_num=int(verify_width),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             dcp_verify_prebuilt=dcp_verify_prebuilt,
         )
 
-        batch.out_cache_loc = verify_out_cache_loc
+        batch.out_cache_loc = vv.cache_loc
         sampling_info = batch.sampling_info
 
         # upstream 44fd17b696 (the hunk the fork had not ported; the
@@ -3920,7 +3982,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
             # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            verify_host_seq_lens = seq_lens_cpu_backup + int(verify_width)
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
@@ -3940,7 +4002,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # not ported): the block's rank-synced draft tokens on the host, taken
         # before the verify launch. Only a grammar batch pays this D2H.
         grammar_draft_tokens_cpu = (
-            draft_tokens.cpu() if getattr(batch, "has_grammar", False) else None
+            vv.candidates.cpu() if getattr(batch, "has_grammar", False) else None
         )
 
         target_out = self.target_worker.forward_batch_generation(
@@ -3970,7 +4032,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     int(_shard.num_org_elements),
                     int(_shard.org_vocab_start_index),
                     lambda t: _tp.all_gather(t, dim=0),
-                ).view(bs, int(self.block_size))
+                ).view(bs, int(verify_width))
                 _verify_vocab_round_note(self, "argmax")
             else:
                 logits_output.next_token_logits = _vlp.finish_local_verify_logits(
@@ -3991,7 +4053,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                draft_token_num=int(verify_width),
             )
 
         # upstream #30096: constrain every chain position before accept picks
@@ -4002,7 +4064,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logits=logits_output.next_token_logits, vocab_mask=grammar_vocab_mask
             )
 
-        candidates = draft_tokens
+        candidates = vv.candidates
         new_seq_lens = None
         target_predict = None  # DFLASH AUDIT (env-gated dump below)
         # #1485b (df2l6/df2l7): the ranks left a 1024-token greedy decode one
@@ -4041,7 +4103,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 target_predict = torch.argmax(
                     logits_output.next_token_logits, dim=-1
-                ).view(bs, int(self.block_size))
+                ).view(bs, int(verify_width))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             # #1488 instrument: per-slot draft quality.  candidates[:, i] is the
             # draft's proposal for slot i (slot 0 = the verified anchor);
@@ -4142,7 +4204,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logits_output=logits_output,
                 out_tokens=out_tokens,
                 bs=bs,
-                block_size=int(self.block_size),
+                block_size=int(verify_width),
             )
 
         if self._need_mamba_verify_commit:
@@ -4162,6 +4224,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        # FLLIPER_ADAPTIVE_K: rank-synced commit lens of this width, folded in
+        # two rounds later (rank-uniform learning, no sync here).
+        self._adaptive_k.record(commit_lens=commit_lens, width=verify_width)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
@@ -4175,12 +4240,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH verify requires target hidden states, but got None."
             )
         if not self._solo_is_shadow:
-            hidden = hidden.view(bs, int(self.block_size), -1)
+            hidden = hidden.view(bs, int(verify_width), -1)
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-                cache_loc=verify_out_cache_loc,
-                cache_loc_2d=verify_out_cache_loc_2d,
-                positions=positions,
+                cache_loc=vv.cache_loc,
+                cache_loc_2d=vv.cache_loc_2d,
+                positions=vv.positions,
                 commit_lens=commit_lens,
             )
 
@@ -4198,6 +4263,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+        # FLLIPER_ADAPTIVE_K: back to the boot verify state; the result keeps
+        # stride block_size (scheduler + cross-algo attribution unchanged),
+        # accept_lens <= verify_width never reach the filler columns.
+        self._adaptive_k.restore(target_model_runner=self.target_worker.model_runner)
+        out_tokens = pad_out_tokens(out_tokens=out_tokens, draft_tokens=draft_tokens)
 
         return GenerationBatchResult(
             logits_output=logits_output,
