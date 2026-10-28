@@ -9,6 +9,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import functools
 import logging
 import os
 import weakref
@@ -756,6 +757,17 @@ def _p_nosync_plan_ok(*wrappers) -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def _fa2_plan_tail_args() -> tuple:
+    """Trailing arguments of FlashInfer's fa2 ``_cached_module.plan`` after ``num_colocated_ctas``: FlashInfer >= 0.7.0
+    appends ``uniform_q_len`` (0 = not uniform; verified in flashinfer/prefill.py of 0.7.0 vs 0.6.12), earlier releases end at
+    ``num_colocated_ctas``. A call with the old 19 arguments fails on 0.7.0 at the first fast_prefill_plan replay."""
+    from importlib.metadata import version
+
+    major, minor = (int(x) for x in version("flashinfer-python").split(".")[:2])
+    return (0,) if (major, minor) >= (0, 7) else ()
+
+
 def fast_prefill_plan(
     self,
     qo_indptr: torch.Tensor,
@@ -865,6 +877,7 @@ def fast_prefill_plan(
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
         0,  # num_colocated_ctas
+        *_fa2_plan_tail_args(),
     ]
     self._plan_info = self._cached_module.plan(*args)
 
