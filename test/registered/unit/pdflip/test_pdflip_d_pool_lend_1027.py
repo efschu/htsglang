@@ -491,6 +491,47 @@ class Round(CustomTestCase):
         self.assertEqual(actor.refusals, 1)
         self.assertEqual(actor.next_round, actor.rounds + actor.knobs.recheck)
 
+    def test_a_refused_compaction_backs_off_doubling_up_to_the_cap_and_resets(self):
+        """A card that refuses every compaction must not be hammered every recheck round: the wait doubles per
+        refusal (recheck x 1, 2, 4 ... 64) and stays at the cap; a compaction that works clears it."""
+        drv, _pool, alloc, actor, _, _ = make(live=[TOP - 3], step=8192)
+        s = sched(waiting=[req(5000)])
+        at = []
+        with mock.patch.dict(os.environ, {DC.SWITCH_ENV: "1"}), mock.patch.object(DC, "run", return_value=None) as run:
+            for _ in range(600):
+                before = run.call_count
+                L.round_start(s)
+                if run.call_count > before:
+                    at.append(actor.rounds)
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        r = actor.knobs.recheck
+        self.assertEqual(gaps[:8], [r * f for f in (1, 2, 4, 8, 16, 32, 64, 64)])
+        self.assertEqual(actor.refusals, L.COMPACT_BACKOFF_MAX)
+        def moved(*_a, **_k):                       # a compaction that works: the live row goes down to id 1
+            alloc.free_pages = torch.cat([alloc.free_pages[alloc.free_pages != 1], torch.tensor([TOP - 3])])
+            return 1
+
+        with mock.patch.dict(os.environ, {DC.SWITCH_ENV: "1"}), mock.patch.object(DC, "run", side_effect=moved):
+            actor.next_round = 0
+            L.round_start(s)
+        self.assertEqual(actor.refusals, 0)
+
+    def test_a_refused_quiesce_keeps_the_lend_tracked(self):
+        """The plan-only move back to the full lattice is refused (rc != 0): quiesce raises and changes nothing --
+        ignoring the rc would let D sleep lent (the old LENT plan) while the actor believes the pool is full."""
+        drv, pool, alloc, actor, _, _ = make()
+        actor.release_to(2 * STEP, note="test")
+        caps, rows, pre = list(alloc.caps), list(pool.stage_rows), actor.pre_free
+        real = drv.set_spans
+        drv.set_spans = lambda ptr, plan, now: real(ptr, plan, now) if now else 2
+        try:
+            with self.assertRaisesRegex(RuntimeError, r"tms_set_spans\(full plan, now=False\) rc=2 for k0"):
+                actor.quiesce()
+        finally:
+            drv.set_spans = real
+        self.assertEqual(actor.mapped_tokens, 2 * STEP)                         # still lent
+        self.assertEqual((actor.pre_free, alloc.caps, pool.stage_rows), (pre, caps, rows))
+
     def test_no_compaction_when_even_the_used_ids_leave_no_cell(self):
         drv, _pool, _alloc, actor, _, _ = make(live=[TOP - 3])                      # 20000 rows + one cell of room
         with mock.patch.dict(os.environ, {DC.SWITCH_ENV: "1"}), mock.patch.object(DC, "run") as run:
