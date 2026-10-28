@@ -37,6 +37,16 @@ from flliper.srt.pdflip import launcher as lc
 from flliper.test.test_utils import CustomTestCase
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 class TheCutReachesTheLedger(CustomTestCase):
     def test_the_only_caller_passes_stage_ratio(self):
         """SOURCE PIN at the production call site, not at a keyword test.
@@ -44,7 +54,7 @@ class TheCutReachesTheLedger(CustomTestCase):
         A behavioural test that passes `stage_ratio=` itself cannot see this;
         that is precisely how it shipped.
         """
-        src = "\n".join(ln for ln in inspect.getsource(lc).splitlines()
+        src = "\n".join(ln for ln in _launcher_text().splitlines()
                         if not ln.strip().startswith("#"))
         i = src.index("arm, reap_headroom_gib, lines, cg = choose_host_ledger(")
         window = src[i:i + 2500]
@@ -84,7 +94,7 @@ class LanesAreResolvedOnlyWhereTheyExist(CustomTestCase):
         """
         import ast
 
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         tree = ast.parse(src)
         lines = src.splitlines()
         sites = [n.lineno for n in ast.walk(tree)
@@ -102,7 +112,7 @@ class LanesAreResolvedOnlyWhereTheyExist(CustomTestCase):
         """And the helper is the only way to it, so the two consumers cannot
         build two different cut keys for one boot (#1368)."""
         self.assertEqual(
-            inspect.getsource(lc).count("host_ledger.resolve_xchg_lanes("), 1)
+            _launcher_text().count("host_ledger.resolve_xchg_lanes("), 1)
 
     def test_a_default_arm_pins_nothing_and_must_not_be_refused(self):
         """THE BOOTSTRAP: the arm that would MAKE the record must be bootable."""
@@ -111,7 +121,7 @@ class LanesAreResolvedOnlyWhereTheyExist(CustomTestCase):
         self.assertTrue(lc.xchg_bounce_arm_pins_host("exchange", "host"))
 
     def test_the_unarmed_line_says_n_a_rather_than_a_number(self):
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         i = src.index("lanes=n/a (no exchange)")
         self.assertIn("weight_source=", src[i:i + 200],
                       "the n/a line must name the arm it is reporting about")

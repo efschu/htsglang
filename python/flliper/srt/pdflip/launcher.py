@@ -106,18 +106,230 @@ try:
 except ImportError:  # NF line: no L1.5 planner module
     l15_plan = None
 
-#: UNIFY S3: the 27B row of the model-profile registry (pdflip/form.py PROFILES).
-#: The module-level measured constants below are ALIASES of this row -- the
-#: launcher's default ``--profile`` -- kept for their readers and pins; every
-#: boot-time reader goes through :func:`_pconst` (the published form's profile),
-#: so a Next-Flash boot reads the nextflash row.
-_PROFILE_27B = pdflip_form.PROFILES[pdflip_form.PROFILE_QWEN27B]
+from flliper.srt.pdflip.launcher_refuse_proc_leaf import (  # noqa: F401 -- re-export, behaviour-neutral move
+    BOOT_TOKEN_ENV_KEYS,
+    DC_RESERVE_SLACK_MIB,
+    DC_RESERVE_SLACK_NCCL_MIB,
+    DRAFT_ON_P_CONFLICT,
+    DRAFT_ON_P_ENV,
+    DUPLEX_GATE,
+    D_TOKEN_CUT_FLAGS,
+    D_TOKEN_CUT_PROVENANCE,
+    MM_SKIP_HASH_ENV,
+    PP_LAYER_SET_ENV,
+    PROFILE_QWEN27B,
+    PdFlipXchgFormSourceMissing,
+    SHORT_DRAIN_ABOVE_X_NAME,
+    VISION_TRANSIENT_OVERRIDE,
+    WEIGHT_SOURCE_ARMED,
+    WEIGHT_SOURCE_CHOICES,
+    WEIGHT_SOURCE_DEFAULT,
+    X_BUSY_NEGATIVE_NAME,
+    _BUBBLE_RE,
+    _CARD_POWER_RE,
+    _KEY_PROBE,
+    _PREFILL_RE,
+    _PROFILE_27B,
+    _XCHG_CENSUS_MAP,
+    _proc_argv,
+    _proc_boot_tag,
+    _proc_cmdline,
+    _proc_has_cuda_context,
+    _proc_ppid,
+    _proc_start_ticks,
+    _profile_early_read,
+    _profile_row_or_27b,
+    _published_profile,
+    _rank_vec,
+    _read_driver_text,
+    _refuse_if_extra_drops_transient_lmo,
+    _refuse_if_extra_raises_budget,
+    _refuse_if_transient_mm_hash_unstable,
+    _refuse_unbuilt_platztausch_buffers,
+    _refuse_value_once,
+    _resolve_keys_in_rank_tree,
+    _rope_cache_cols,
+    _row_format_default,
+    _running_power_by_class,
+    _same_vector,
+    _split_decisions,
+    _split_fraction_text,
+    pick_d_residue_record,
+    pinned_reserve_line,
+    pool_floor_line,
+    pp_cut_chunk_mix,
+    profile_arg_defaults_line,
+    publish_d_token_cut,
+    publish_p_fractions,
+    publish_store_identity,
+    rank_wave_floor,
+    read_arc_state,
+    read_card_power_record,
+    read_mean_prefill_prefix,
+    read_pp_bubble,
+    record_card_power,
+    records_inventory,
+    refuse_double_coverage_arm,
+    refuse_inherited_layer_set,
+    refuse_short_drain_above_x,
+    refuse_unless_same_form_source,
+    refuse_unwired_token_cut,
+    repoint_store_geometry_at_pinned_form,
+    reserve_slack_mib,
+    resolve_draft_on_p,
+    resolve_pool_floor,
+    resolve_x_ceiling,
+    resolve_x_mode_launch,
+    ring_absent_by_design,
+    select_cards,
+    served_model_name,
+    session_pids,
+    set_group_env,
+    set_xchg_census_map,
+    shipped_line,
+    shm_holder_pids,
+    spec_form_is_dflash,
+    split_preflight_refusals,
+    standard_form_resolved,
+    store_extra_config,
+)
 
 
-def _pconst(name: str, profile: Optional[str] = None):
-    """A measured constant of ``profile`` (default: the published PDFLIP-FORM's
-    profile, else the launcher's default profile) -- pdflip_form.profile_constant."""
-    return pdflip_form.profile_constant(name, profile)
+from flliper.srt.pdflip.launcher_p_l3_leaf import (  # noqa: F401 -- re-export, behaviour-neutral move
+    CHUNKED_PREFILL_TOKENS,
+    CODE_CARDS,
+    D_KV_STAGE_KEYS,
+    D_KV_STAGE_LRU_FLOOR_MARKER,
+    EXPERT_MAP_DIR_ENV,
+    FP4_NATIVE_MIXED_ARGV,
+    FP4_UNIFORM_MARLIN_ARGV,
+    FP8_UNIFORM_MARLIN_ENV,
+    L3_IDENTITY_FILE,
+    L3_PERSIST_PREFIX,
+    L3_REVOKED_FILE,
+    L3_REVOKED_SUFFIX,
+    L3_SUFFIX_REGISTRY,
+    LAUNCH_SERVER_MODULE,
+    LAUNCH_SERVER_MODULES,
+    P_CHUNK_BUILTIN_FP8,
+    P_CHUNK_BUILTIN_INT8,
+    P_CHUNK_BUILTIN_SOURCES,
+    P_CHUNK_MAX_DEFAULT,
+    P_CHUNK_MODEL_DEFAULT,
+    P_CHUNK_NF_MODEL_DEFAULT,
+    P_CHUNK_POLICY_DEFAULT,
+    P_DEEP_SPLIT_FROM_DEFAULT,
+    P_GC_FREEZE_DEFAULT,
+    P_LAYER_SPLIT_DEFAULT,
+    P_MAMBA_FLOOR_SLOTS_PER_SEAT,
+    P_PREFILL_GRAPH_DEFAULT,
+    P_PREFILL_GRAPH_POLICY_DEFAULT,
+    P_PREFILL_TRANSIENT_CALIBRATION_MODELS,
+    P_STAGE_CARD_CLASSES,
+    UNIFORM_MARLIN_QUANT_METHODS,
+    WEIGHT_SOURCE_EXCHANGE,
+    _CALIBRATION_FOOTPRINT_ALIAS,
+    _P_CHUNK,
+    _P_CHUNK_BUILTIN_RECORD,
+    _P_CHUNK_BUILTIN_RECORD_FP8,
+    _P_LAYER_SPLIT,
+    _P_LOG_MODEL_RE,
+    _P_PREFILL_GRAPH,
+    _fmt_gib,
+    _forced_record_borrow,
+    _free_instrument,
+    _front_leg_form,
+    _gcd_reduce,
+    _gib,
+    _group_env_value,
+    _group_fact_value,
+    _import_duplex_gate,
+    _infeasible_breakdown,
+    _int_list,
+    _l3_extra_flag,
+    _l3_move_revoked,
+    _l3_revoked_path,
+    _l3_rope_view,
+    _last_flag_value,
+    _live_stage_support,
+    _median,
+    _mps_pids_on_pipe,
+    _now,
+    _owned_miss_min_paired,
+    _p_chunk_dynamic_runnable,
+    _p_chunk_interp,
+    _p_chunk_nf_args,
+    _pconst,
+    _pconst_boots,
+    expert_map_dir,
+    flip_order_split,
+    flip_weights_tags,
+    floor_source_for_shipped_line,
+    forced_lane_borrow,
+    fork_anchor_env,
+    fp4_native_mixed_env,
+    fp4_native_mixed_refusal,
+    fp8_layout_decision,
+    front_launch_fields,
+    fs_of,
+    gguf_backbone_depth,
+    group_form_block,
+    group_rank_count,
+    hicache_disabled_line,
+    incumbent_candidate,
+    is_launch_server_argv,
+    kv_stage_cut_workers,
+    kv_stage_lru_floor,
+    kv_stage_wave_cap,
+    l3_persist_check_identity,
+    l3_persist_dir_name,
+    l3_persist_enabled,
+    l3_persistent_store,
+    l3_registered_suffixes,
+    l3_weights_fingerprint,
+    log_power_limits,
+    memts_owner_pattern,
+    model_config_path,
+    model_is_gguf_file,
+    n_stage_incumbent,
+    note_calibration_footprint_alias,
+    nvml_memory,
+    nvml_process_mib,
+    operator_kv_stage_max,
+    order_cards,
+    p_attn_head_split_env,
+    p_attn_head_split_line,
+    p_card_fr_cap,
+    p_chunk_model_cut,
+    p_chunk_model_power_limits,
+    p_chunk_policy_spec,
+    p_chunk_power_lines,
+    p_corridor_holdback_default_mib,
+    p_deep_split_env,
+    p_gc_env,
+    p_host_overlap_env,
+    p_layer_split_env,
+    p_layer_split_slab_lines,
+    p_layer_split_swing_by_stage,
+    p_log_model_path,
+    p_mamba_floor_text,
+    p_mamba_mib_per_slot_by_stage,
+    p_pool_posts_as_booked,
+    p_prefill_graph_bucket,
+    p_prefill_graph_calibration_of,
+    p_prefill_graph_captured,
+    p_prefill_graph_policy_lines,
+    p_prefill_graph_tiny_of,
+    p_recv_stream_env,
+    p_trim_end_anchor_env,
+    parse_card_selection,
+    parse_group_env,
+    parse_user_reserve,
+    pcie_lanes,
+    pdflip_boot_token,
+    pdflip_weights_cpu_backup_ring_kw,
+    per_pair_crossing_ms,
+)
 # Task #58: the arming variable's name comes from the module that READS it, so
 # the publisher and the reader cannot drift into two spellings of one key.
 from flliper.srt.pdflip.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
@@ -282,23 +494,142 @@ D_AWAKE_OVERSHOOT_MIB = 404
 #: Kept as the name the pre-#1257c budget line printed, and as the value the
 #: fallback still produces. NEVER read as a floor: the floor is per card now.
 CORRIDOR_MIB = 1024 + D_AWAKE_OVERSHOOT_MIB
-#: Spec section 1.6 V1 (arm B, graphs resident) derived upper bounds for the
-#: dormant residue of a rank: 5090 1,848 MiB, 3080 1,442 MiB -- EXPECTATIONS
-#: (record 1d/1f B6), printed beside the measurement, used only for group P's
-#: budget (D has not slept yet when P is sized) and graded by W19 at D's
-#: first sleep by the front.  Plus D's open BAR1 windows (deviation above).
-DC_EXPECT_5090_MIB = 1848
-DC_EXPECT_3080_MIB = 1442
-#: HW-GENERIC 1002: the two expectations above BY CALIBRATION CLASS
-#: (pdflip/card_identity.py) -- the selector, so no reader picks one by a name
-#: substring. A class absent here has no expectation: printed UNCALIBRATED.
-DC_EXPECT_MIB_BY_CLASS = {"RTX5090": DC_EXPECT_5090_MIB, "RTX3080": DC_EXPECT_3080_MIB}
+from flliper.srt.pdflip.launcher_d_leaf import (  # noqa: F401 -- re-export, behaviour-neutral move
+    ARENA_FROM_LEDGER_FLOOR_GIB,
+    CARD_POWER_MARKER,
+    DC_EXPECT_3080_MIB,
+    DC_EXPECT_5090_MIB,
+    DC_EXPECT_MIB_BY_CLASS,
+    DC_MAX_MIN_SLEEPS,
+    DC_ONE_SLEEP_MARK,
+    DC_RECORD_ENV,
+    DC_RECORD_MARGIN_MIB,
+    DFLASH_BLOCK_DEFAULT,
+    DFLASH_DRAFT_PATH_DEFAULT,
+    DFLASH_PRODUCE_ON_P_DEFAULT,
+    DFLASH_WINDOW_DEFAULT,
+    DUAL_P_BARLINK_BAR1_WINDOW_MIB,
+    D_BARLINK_BAR1_WINDOW_MIB,
+    D_GC_FREEZE_DEFAULT,
+    D_KV_EVICT_DEFAULT,
+    D_KV_STAGE_BY_DEMAND_KEY,
+    D_KV_STAGE_FLOOR_KEY,
+    D_REPLAYSSM_SPEC_DEFAULT,
+    D_RESERVE_RECORD_ENV,
+    D_RESHARD_DEFAULT,
+    D_TP_OBJECTIVE_DEFAULT,
+    EARLY_READ_FACTS,
+    ENV_DFLASH_PLACEMENT,
+    FR_D_CAP_ENV,
+    FR_D_CEILING_ENV,
+    FR_D_CEILING_MARKER,
+    KV_TOKEN_CUT_MARKER,
+    P_BARLINK_BAR1_WINDOW_MIB,
+    P_COVERS_D_SESSION_MARK,
+    P_DORMANT_EXPECT_N,
+    RATE_UNIT_GROUP_THROUGHPUT,
+    RETRACTED_SEED_VECTOR_1032,
+    SPEC_FORM_DEFAULT,
+    TORCH_CACHE_CAP_ENV,
+    VISION_CHOICES,
+    VISION_DEFAULT_MARKER,
+    VISION_OFF,
+    VISION_RESIDENT,
+    VISION_TRANSIENT,
+    _DRAFTER_RE,
+    _D_KV_EVICT,
+    _D_RESHARD,
+    _D_TOKEN_PLACEMENT,
+    _LAYOUT_RE,
+    _SPEC_FORM,
+    _adopt_load_format_flag,
+    _alive,
+    _argv_int_list,
+    _argv_scalar,
+    _argv_vector,
+    _arm_run_peak_gib,
+    _attn_axis_for,
+    _axis_floor_ranks,
+    _cards_empty,
+    _credit_counter_rows,
+    _csv,
+    _csv_floats,
+    _csv_ints,
+    _d_adopt_armed,
+    _d_argv_of_front_log,
+    _d_reshard_seg_placement,
+    _derive_csv,
+    _drop_group_env,
+    admin_key_flag,
+    apply_bar1_windows,
+    apply_d_kv_evict,
+    apply_profile_vision_default,
+    arena_from_ledger,
+    boot_state_dir,
+    bs_source,
+    budget_charges_driver_carve,
+    budget_rest_from_records,
+    build_expert_karte,
+    card_power_limits_w,
+    card_power_line,
+    carrier_covers_d_session,
+    census_entry_for_pricing,
+    check_drafter_identity,
+    chunked_prefill_size_of,
+    configure_xchg_region,
+    count_marker,
+    d_card_ledger,
+    d_card_vote_lines,
+    d_expect_check_lines,
+    d_expect_from_p_records,
+    d_extend_trim_env,
+    d_fr_ceiling_adopt,
+    d_gc_env,
+    d_hold_active,
+    d_kv_evict_env,
+    d_kv_stage_by_demand,
+    d_kv_stage_floor_tokens,
+    d_kv_token_cut,
+    d_lend_floor_env,
+    d_only_bind_argv,
+    d_operating_point_line,
+    d_owned_extend_h2d,
+    d_owned_heat_records,
+    d_owned_miss_ms_rank,
+    d_replayssm_spec,
+    d_reserve_from_records_or_census,
+    d_reshard_argv,
+    d_reshard_depth,
+    d_reshard_env,
+    d_reshard_lines,
+    d_residue_capture_bs,
+    d_row_attn_units,
+    d_scratch_cap,
+    d_seat_graph_mib,
+    d_seat_table_form,
+    d_seat_vram_armed,
+    d_token_cut_vector,
+    d_token_placement_env,
+    d_token_vector_decision,
+    d_verdict_measured_terms,
+    dc_expect_mib,
+    dc_residue_from_record,
+    dc_residue_max_from_records,
+    derive_x_star,
+    dflash_placement,
+    dflash_produce_on_p,
+    dormant_max_from_records,
+    draft_kv_off_line,
+    draft_on_p_line,
+    driver_carve_charged,
+    driver_carve_min_total_mib,
+    early_read_flags,
+    early_read_provenance,
+    effective_reserve_by_card,
+    er_trim_cell,
+)
 
 
-def dc_expect_mib(card) -> Optional[int]:
-    """The spec-1.6 dormant-residue EXPECTATION of ``card``'s calibration
-    class, or None (uncalibrated class: no expectation, never the 3080's)."""
-    return DC_EXPECT_MIB_BY_CLASS.get(card_identity.calibration_class(card) or "")
 #: MEASURED on boot weg2ls1b2 (2026-09-07 07:11:55-58Z, NVML per-process at
 #: group D's first sleep, tags kv_cache+weights, NEXTN draft + TP decode
 #: graphs resident): D_c(D) = 2228 MiB on the 5090, 1922 MiB on each 3080 --
@@ -316,24 +647,6 @@ def dc_expect_mib(card) -> Optional[int]:
 #: live residue rather than these expectations.
 DC_MEASURED_D_5090_MIB = _PROFILE_27B.constant("DC_MEASURED_D_5090_MIB")
 DC_MEASURED_D_3080_MIB = _PROFILE_27B.constant("DC_MEASURED_D_3080_MIB")
-DC_RESERVE_SLACK_MIB = 64
-#: #1234 C6 -- the DEVELOPMENT transport switch, and the one number it moves.
-#:
-#: The user's order of 2026-09-07 put development on NCCL until barlink
-#: covers the Weg-2 message classes again. NCCL is a LAUNCHER-level mode, not
-#: a tier inside barlink: a barlink-owned group never constructs a PyNccl
-#: communicator (parallel_state.should_build_pynccl), and building one would
-#: change the flip path, which is out of bounds. Dropping --barlink instead
-#: leaves the stock flliper dispatch in place, which does build one.
-#:
-#: MEASURED (A/B boot weg2ab0, ARM 0): D's dormant residue on the 5090 rises
-#: 2230 -> 2310 MiB under NCCL, because libnccl's buffers are not
-#: memory-saver-tagged and therefore survive the sleep. That tripped W19
-#: DormantResidueRefused against DC_MEASURED_D_5090_MIB 2228 +
-#: DC_RESERVE_SLACK_MIB 64 = 2292 and killed the run. The extra slack lives
-#: HERE, behind the switch, and not in the constant -- under 'bar1' nothing
-#: about the flip path changes, which is the entire point.
-DC_RESERVE_SLACK_NCCL_MIB = 192
 #: #1273 B4h -- THE EXCHANGE FORM'S OWN DORMANT RESIDUE, behind the switch and
 #: not in the constant above, which is exactly the precedent the NCCL slack set
 #: twelve lines up ("The extra slack lives HERE, behind the switch, and not in
@@ -404,229 +717,86 @@ DC_MEASURED_D_XCHG_3080_MIB = DC_MEASURED_D_XCHG_MIB[0]
 DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
 
 
-#: #1444: margin on top of a RECORDED residue.  The front measured group D's
-#: residue on this form at 1616-1686 MiB (5090) and 1256-1356 MiB (3080) across
-#: the flips of one boot (weg2xsn203), a 100 MiB spread; 256 covers it twice.
-#: The constant it replaces over-reserved 1300-1400 MiB per card, because it
-#: was read at boot weg2xsn14 when the weights_draft tag was still RESIDENT --
-#: the tag has travelled with the exchange since, and P's budget paid for
-#: bytes that are no longer there.
-DC_RECORD_MARGIN_MIB = 256
-#: #227 R1: the named log marker of a boot whose D maximum rests on fewer than this many D sleeps.
-DC_MAX_MIN_SLEEPS = 2
-DC_ONE_SLEEP_MARK = "DC-ONE-SLEEP-BOOT"
-#: ``=0`` prices the xsn14 constant again (the pre-#1444 form).
-DC_RECORD_ENV = "FLLIPER_PDFLIP_DC_D_RECORD"
 
 
-def d_residue_capture_bs(sample: Dict[str, object], line_id) -> Optional[int]:
-    """The capture set (group D's ``--max-running-requests``) a D dormant
-    sample was measured under: the sample's own field, or -- a sample written
-    before the field existed -- the ``group D argv:`` line of its boot's
-    front log (the log the line identity already judges it by)."""
-    v = sample.get("vram_residue_capture_bs")
-    if v is not None:
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-    reader = getattr(line_id, "d_max_running_requests", None)
-    return reader(sample.get("boot_tag")) if callable(reader) else None
 
 
-def d_residue_record_accept(line_id, d_bs: int) -> Callable[[dict], bool]:
-    """#1444 + RC1 (24.09.): which measured-record samples may price THIS
-    boot's group-D dormant residue. The line's own samples (line identity),
-    and for group D only those of the SAME capture set: D's residue is
-    mostly the CUDA graphs that stay resident through its sleep, and their
-    set follows --max-running-requests. Measured: xsn439 at 32 left
-    3206/2742/2740 MiB, xsn438 and RC1 at 6 left 2096/1512/1512 and
-    2072/1490/1490. xsn439's was the newest sample when RC1 (6) launched,
-    priced dormant_other 3526/3062/3060, took 1112-1232 MiB off every P rank
-    and pushed the 42,11,11 pool from 269,805 to 212,871 tokens, under the
-    262,656 floor -- the cut fell to 39,13,12 (ranked #57). A sample whose
-    capture set cannot be proven is not this boot's residue either."""
-    want = int(d_bs)
-
-    def _accept(sample: dict) -> bool:
-        if not line_id.accepts_sample(sample):
-            return False
-        if str((sample or {}).get("group", "")).upper() != "D":
-            return True
-        return d_residue_capture_bs(sample, line_id) == want
-
-    return _accept
-
-
-def dc_residue_from_record(
-    rec: Optional[Dict[str, object]], cards: Sequence[Card], weight_source: str
-) -> Tuple[Optional[Dict[str, int]], str]:
-    """Group D's dormant residue per card from the PREVIOUS boot's record.
-
-    ``(per-uuid MiB incl. :data:`DC_RECORD_MARGIN_MIB`, provenance)`` when the
-    newest group-D dormant-image record carries a ``vram_residue_mib`` for
-    EVERY card of this boot and was measured under the SAME weight form;
-    ``(None, why)`` otherwise, and the caller prices the constant.  A record
-    from another form is not this form's residue (the whole reason the xsn14
-    constant went stale), so the form gate is exact, not fuzzy.
-    """
-    if os.environ.get(DC_RECORD_ENV, "1").strip() == "0":
-        return None, f"{DC_RECORD_ENV}=0 -> constant"
-    if not isinstance(rec, dict):
-        return None, "no group-D dormant-image record in the sidecar -> constant"
-    tag = str(rec.get("boot_tag", "?"))
-    form = str(rec.get("vram_residue_form", "") or "")
-    if form != str(weight_source):
-        return None, (f"record of boot {tag} measured form {form!r}, this boot is "
-                      f"{str(weight_source)!r} -> constant")
-    vals = rec.get("vram_residue_mib") or {}
-    if not isinstance(vals, dict):
-        return None, f"record of boot {tag} carries no vram_residue_mib -> constant"
-    out: Dict[str, int] = {}
-    parts = []
-    for c in cards:
-        v = vals.get(c.uuid)
-        if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
-            return None, (f"record of boot {tag} carries no residue for card "
-                          f"{c.uuid} ({c.name}) -> constant")
-        out[c.uuid] = int(v) + DC_RECORD_MARGIN_MIB
-        parts.append(f"nvml{c.nvml_index} {c.name} {int(v)}+{DC_RECORD_MARGIN_MIB}={out[c.uuid]}")
-    return out, (f"boot {tag} at {rec.get('at', '?')} form {form!r}: "
-                 + ", ".join(parts) + " MiB")
-
-
-def pick_d_residue_record(rows: Sequence[Dict[str, object]], cards: Sequence[Card]
-                          ) -> Tuple[Optional[Dict[str, object]], str]:
-    """#227: which group-D dormant-image sample prices THIS boot's D residue (``rows`` oldest first, already
-    through the calibration identity). The newest whose ``vram_residue_mib`` names EXACTLY this boot's cards
-    (same card set = same D topology); else the newest that covers every card (the pre-#227 answer: a sample
-    of a bigger card set); else the newest at all, so :func:`dc_residue_from_record` names what is missing.
-    ``(None, why)`` without any sample."""
-    want = {c.uuid for c in cards}
-    if not rows:
-        return None, "no sample"
-
-    def _keys(r):
-        v = r.get("vram_residue_mib")
-        return set(v) if isinstance(v, dict) else set()
-
-    for how, ok in (("exact card set", lambda k: k == want), ("covering card set", lambda k: want <= k)):
-        hit = [r for r in rows if ok(_keys(r))]
-        if hit:
-            r = max(hit, key=lambda e: str(e.get("at", "")))
-            return r, f"{how}: boot {r.get('boot_tag', '?')}"
-    r = max(rows, key=lambda e: str(e.get("at", "")))
-    return r, f"newest, no sample covers this card set: boot {r.get('boot_tag', '?')}"
+from flliper.srt.pdflip.launcher_d_mid import (  # noqa: F401 -- re-export, behaviour-neutral move
+    ATTN_ANCHOR_CARD_CLASS,
+    ATTN_ANCHOR_MS,
+    CONTEXT_LENGTH_TOKENS,
+    DFLASH_PRODUCE_ENV,
+    D_RANK_SOLVE_MARKER,
+    D_TOKEN_PLACEMENT_DEFAULT,
+    EXTEND_CAP_FLOOR_ENV,
+    EXTEND_CAP_FLOOR_MARKER,
+    EXTEND_RATE_MARKER,
+    EXTEND_RATE_MEASURE_ENV,
+    EXTEND_RATE_MEASURE_RANKS_ENV,
+    FORM_A_KV_WORKER_CANONICAL_MARKER,
+    FORM_A_WORKER_CANONICAL_MARKER,
+    GROUP_SWITCH_DEFAULTS_MARKER,
+    ONCARD_MODE_DEFAULT,
+    W10_SKIPPED_NO_DRAFT_PAGES,
+    _CENSUS_SOURCE_BOOT_RE,
+    _axis_renormalisation,
+    _d_extend_cap_floor_env,
+    _d_extend_rate_measure_env,
+    _d_layout_is_tp_symmetric,
+    _group_rank_count,
+    apply_d_seat_expert_rows,
+    apply_d_token_placement,
+    apply_p_draft_post,
+    apply_p_gc_warn_default,
+    apply_profile_group_switch_defaults,
+    apply_profile_torch_cache_cap_default,
+    apply_spec_form,
+    arena_gib_into_groups,
+    attn_anchor_stage,
+    calib_power_limits,
+    calibrated_inventory,
+    canonical_marker_counts,
+    census_checkpoint,
+    checkpoint_quant_method,
+    d_draft_share_embed,
+    d_early_start_proven,
+    d_effective_seats,
+    d_extend_rate_measure_ranks_env,
+    d_flip_trim_lines,
+    d_form_solved_by_planner,
+    d_kv_dtype_bytes,
+    d_kv_stage_tokens_named,
+    d_kv_worker_ranks,
+    d_moe_residency,
+    d_park_split_refusal,
+    d_residue_record_accept,
+    d_residue_record_for,
+    d_seat_vram_plan_form,
+    d_session_tokens,
+    dc_residue_for,
+    dflash_produce_line,
+    expert_map_vectors,
+    expert_store_dir_of,
+    gate_w10,
+    group_context_tokens,
+    host_price_is_region_form,
+    host_priced_pick,
+    kv_stage_wave_floor,
+    l15_mib_by_card_identity,
+)
 
 
-def d_residue_record_for(path: str, accept: Optional[Callable[[dict], bool]], cards: Sequence[Card]
-                         ) -> Tuple[Optional[Dict[str, object]], str]:
-    """#227: the group-D dormant-image sample of the sidecar at ``path`` that prices this boot's D residue
-    (:func:`pick_d_residue_record` over every D sample through ``accept``), and the provenance note -- empty
-    when the pick is the plain newest sample, so the pre-#227 DC-RESIDUE line stays byte-identical."""
-    rows = host_ledger.read_measured_records(path, "D", accept=accept)
-    rec, how = pick_d_residue_record(rows, cards)
-    if rec is None or rec is max(rows, key=lambda e: str(e.get("at", ""))):
-        return rec, ""
-    return rec, f" [#227 card-set pick, {how}]"
 
 
-def dc_residue_max_from_records(rows: Sequence[Dict[str, object]], cards: Sequence[Card], weight_source: str,
-                                n: Optional[int] = None) -> Tuple[Optional[Dict[str, int]], str]:
-    """#227 MUSS-1: group D's dormant residue per card = the MAXIMUM over ALL D sleeps of the newest ``n``
-    (default :data:`P_DORMANT_EXPECT_N`) boots whose samples name EXACTLY this boot's cards under the same
-    weight form -- bare, no margin ("a maximum of measurements, not a reserve"; the caller adds the slack).
-
-    A boot measured on the #227 rule stamps ``vram_residue_kind`` (``first_sleep`` + one
-    ``max_over_sleeps`` sample per new maximum, front ``_note_d_residue_reading``); its value is the maximum
-    over its samples. A LEGACY boot (first sleep only, no kind) contributes first sleep +
-    :data:`DC_RECORD_MARGIN_MIB` (the #1444 form: its later sleeps were never recorded -- measured growth
-    +244..+484 MiB, so the bare first sleep would book too little). ``(None, why)`` when no exact-card-set
-    boot exists, or when none of the selected boots carries the kind (all legacy: the caller keeps the
-    pre-#227 newest-sample form, byte for byte).
-
-    R1: a measured boot's samples carry ``vram_residue_sleeps`` (how many D sleeps they rest on). A boot with
-    FEWER than :data:`DC_MAX_MIN_SLEEPS` has not reached its maximum yet (it ended early; the growth after the
-    first sleep was measured up to +484 MiB), so it contributes first sleep + :data:`DC_RECORD_MARGIN_MIB` like a
-    legacy boot, named :data:`DC_ONE_SLEEP_MARK`. A measured boot WITHOUT the counter (written by a build
-    between the first #227 head and R1 -- none ran on metal) keeps the kind-based rule: bare."""
-    n = P_DORMANT_EXPECT_N if n is None else int(n)
-    want = {c.uuid for c in cards}
-    by_boot: Dict[str, List[Dict[str, object]]] = {}
-    for r in rows or ():
-        if not isinstance(r, dict):
-            continue
-        vals = r.get("vram_residue_mib")
-        if not isinstance(vals, dict) or set(vals) != want:
-            continue
-        if str(r.get("vram_residue_form", "") or "") != str(weight_source):
-            continue
-        if any(not isinstance(vals[u], (int, float)) or isinstance(vals[u], bool) or vals[u] <= 0 for u in want):
-            continue
-        by_boot.setdefault(str(r.get("boot_tag", "?")), []).append(r)
-    if not by_boot:
-        return None, f"no group-D sample of exactly this card set under form {str(weight_source)!r}"
-    boots = sorted(by_boot.items(), key=lambda kv: max(str(x.get("at", "")) for x in kv[1]), reverse=True)[:n]
-    if not any(x.get("vram_residue_kind") for _t, rs in boots for x in rs):
-        return None, "only legacy first-sleep samples (no vram_residue_kind) -> pre-#227 newest-sample form"
-    out: Dict[str, int] = {}
-    parts = []
-    for tag, rs in boots:
-        measured = any(x.get("vram_residue_kind") for x in rs)
-        counted = [int(x["vram_residue_sleeps"]) for x in rs
-                   if isinstance(x.get("vram_residue_sleeps"), int) and not isinstance(x.get("vram_residue_sleeps"), bool)]
-        one_sleep = bool(measured and counted and max(counted) < DC_MAX_MIN_SLEEPS)
-        add = DC_RECORD_MARGIN_MIB if (not measured or one_sleep) else 0
-        for u in want:
-            v = max(int(x["vram_residue_mib"][u]) for x in rs) + add
-            out[u] = max(out.get(u, 0), v)
-        kind = ("max_over_sleeps" if any(x.get("vram_residue_kind") == "max_over_sleeps" for x in rs)
-                else f"{DC_ONE_SLEEP_MARK} first sleep +{DC_RECORD_MARGIN_MIB}: {max(counted)} D sleep seen, "
-                     f"the maximum is not reached yet" if one_sleep
-                else "first_sleep" if measured else f"LEGACY first sleep +{DC_RECORD_MARGIN_MIB}")
-        parts.append(f"{tag} [{kind}]")
-    return out, (f"MAX over all D sleeps of the newest {len(boots)} of {len(by_boot)} boot(s) of exactly this "
-                 f"card set, form {str(weight_source)!r}, bare: "
-                 + ", ".join(f"nvml{c.nvml_index} {c.name} {out[c.uuid]}" for c in cards)
-                 + " MiB; boots " + ", ".join(parts))
 
 
-def dc_residue_for(path: str, accept: Optional[Callable[[dict], bool]], cards: Sequence[Card],
-                   weight_source: str) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, int]], str, str]:
-    """#227: ``(sample for the RoPE context term, per-uuid residue or None, provenance, pick note)`` of the
-    sidecar at ``path`` for this boot's group-D reserve. Order: (1) the measured maximum of exact-card-set
-    boots (:func:`dc_residue_max_from_records`); (2) otherwise the pre-#227 form -- newest sample of exactly
-    this card set, else of a COVERING card set (another D topology: named, keeps the #1444 margin), through
-    :func:`dc_residue_from_record`."""
-    rows = host_ledger.read_measured_records(path, "D", accept=accept)
-    if os.environ.get(DC_RECORD_ENV, "1").strip() != "0":
-        vals, prov = dc_residue_max_from_records(rows, cards, weight_source)
-        if vals is not None:
-            want = {c.uuid for c in cards}
-            exact = [r for r in rows if isinstance(r.get("vram_residue_mib"), dict) and set(r["vram_residue_mib"]) == want]
-            return max(exact, key=lambda e: str(e.get("at", ""))), vals, prov, ""
-    rec, how = pick_d_residue_record(rows, cards)
-    vals, prov = dc_residue_from_record(rec, cards, weight_source)
-    note = ("" if rec is None or rec is max(rows, key=lambda e: str(e.get("at", "")))
-            else f" [#227 card-set pick, {how}]")
-    if vals is not None and how.startswith("covering"):
-        prov = (f"COVERING card set (a sample of another D topology, pre-#227 form with the "
-                f"{DC_RECORD_MARGIN_MIB} MiB margin; this card set has no sample of its own yet): " + prov)
-    return rec, vals, prov, note
+
+
+
+
 
 
 P_DORMANT_EXPECT_ENV = "FLLIPER_PDFLIP_D_EXPECT_P_RECORD"
-#: How many of the newest group-P boots (same calibration identity, same weight
-#: form, every card measured) the expectation takes the per-card MAXIMUM over.
-#: Measured scatter of this record under ONE P form (Next Flash, 28./29.09.,
-#: profile family -st/-st-cut/-odx, 30 boots): nvml1 1286-1414, nvml0 680-764,
-#: nvml2 666-1012 MiB; about one boot in four carries a +250..+350 MiB outlier
-#: on one card (09281447 nvml2 1012, 09290450/0500 nvml2 924). Eight boots are
-#: the last ~2-6 h of the serving loop: an outlier is inside the window with
-#: ~90 % (1 - 0.75^8), and the window stays within today's P form (the older
-#: form of 27.09., 1850/1130/1120, is a different P and ages out). A maximum
-#: of measurements, not a reserve: no margin is added on top.
-P_DORMANT_EXPECT_N = 8
 
 
 def p_dormant_records(profile: Optional[str],
@@ -645,114 +815,67 @@ def p_dormant_records(profile: Optional[str],
     return host_ledger.read_measured_records(measured_record_path(), "P", accept=accept)
 
 
-def dormant_max_from_records(
-    recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
-    n: int = P_DORMANT_EXPECT_N, group: str = "P",
-) -> Tuple[Optional[Dict[str, int]], str]:
-    """A group's MEASURED dormant VRAM residue per card (``group`` names it in
-    the provenance; the caller reads that group's records): the per-card MAXIMUM
-    over the newest ``n`` group-P dormant-image records (one per boot) that
-    the front stamped at P's first sleep (``vram_residue_mib``, the same
-    field #1444 reads for group D), measured under the SAME weight form and
-    carrying a positive value for EVERY card of this boot.
-
-    ``(per-uuid MiB, provenance naming n, the boots and the maximum)``;
-    ``(None, why)`` when no such record exists (UNMEASURED -- the caller names
-    its fallback). A record of another form or missing a card is skipped by
-    name, never merged partially. Priced BARE, no margin: the real D pass
-    after P's sleep charges the launcher's own reading of the same residue
-    bare too (``budgets_from_dc(cards, dc_p, ...)``), and the served growth of
-    P's dormant image has its own term (``served_dormant_growth``). This is
-    the one reader for "D's budget after P's sleep" before P has slept -- the
-    expectation passes and an early D start read it here, not from a second
-    source."""
-    if not recs:
-        return None, f"no group-{group} dormant-image record in the sidecar"
-    by_boot: Dict[str, Dict[str, object]] = {}
-    skipped = []
-    for rec in sorted((r for r in recs if isinstance(r, dict)),
-                      key=lambda r: str(r.get("at", "")), reverse=True):
-        tag = str(rec.get("boot_tag", "?"))
-        if tag in by_boot:
-            continue
-        form = str(rec.get("vram_residue_form", "") or "")
-        vals = rec.get("vram_residue_mib") or {}
-        if form != str(weight_source) or not isinstance(vals, dict):
-            skipped.append(f"{tag} (form {form!r})")
-            continue
-        miss = [c for c in cards if not isinstance(vals.get(c.uuid), (int, float))
-                or isinstance(vals.get(c.uuid), bool) or vals.get(c.uuid) <= 0]
-        if miss:
-            skipped.append(f"{tag} (no residue for nvml{miss[0].nvml_index})")
-            continue
-        by_boot[tag] = rec
-        if len(by_boot) >= int(n):
-            break
-    if not by_boot:
-        return None, (f"no group-{group} record measured under form {str(weight_source)!r} on "
-                      f"every card (skipped: {', '.join(skipped[:4]) or 'none'})")
-    out: Dict[str, int] = {}
-    parts = []
-    for c in cards:
-        vals = [int(r["vram_residue_mib"][c.uuid]) for r in by_boot.values()]
-        out[c.uuid] = max(vals)
-        parts.append(f"nvml{c.nvml_index} {out[c.uuid]} (min {min(vals)})")
-    return out, (f"MAX over the newest {len(by_boot)} of N={int(n)} group-{group} records form "
-                 f"{str(weight_source)!r}: " + ", ".join(parts) + " MiB; boots "
-                 + ", ".join(by_boot))
 
 
-def p_dormant_from_records(
-    recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
-    n: int = P_DORMANT_EXPECT_N,
-) -> Tuple[Optional[Dict[str, int]], str]:
-    """Group P's measured dormant residue for D's expectation budget
-    (:func:`dormant_max_from_records` over group-P records)."""
-    return dormant_max_from_records(recs, cards, weight_source, n, group="P")
+from flliper.srt.pdflip.launcher_p_mid import (  # noqa: F401 -- re-export, behaviour-neutral move
+    D_FR_ENV,
+    D_OWNER_MARKER,
+    GGUF_DENSE_VOCAB_ENV,
+    KV_CACHE_DTYPE,
+    L3_ANCHOR_KEYING_PROFILES,
+    L3_PERSIST_GENERATION,
+    L3_ROPE_APPLY,
+    MAMBA_ARENA_SLOTS_PER_REQUEST_UPPER,
+    P_CHUNK_CUT_TAG,
+    P_CHUNK_DRY_RUN_TOKENS,
+    P_CHUNK_GRAPH_FIXED_MS,
+    P_MAMBA_AUTO_SAFETY_MARGIN,
+    P_MICRO_BATCH_FLAG,
+    _CAUSE_RE,
+    _RE_DRAIN,
+    _RE_FLIP,
+    _RE_LEG1,
+    _RE_LEG2,
+    _model_config,
+    _p_chunk_stage,
+    _p_gguf_dense_vocab,
+    _proc_ancestors,
+    _restage_p_card_reference,
+    _serialised_cards,
+    l3_persist_check_rope,
+    l3_persist_identity,
+    l3_revoked_windows,
+    lane_coverage_boot_token,
+    mamba_arena_group_floor,
+    measure_x_inputs,
+    newest_bubble_log,
+    newest_prefill_census_log,
+    p_chunk_model_cut_check,
+    p_chunk_policy_env,
+    p_chunk_policy_lines,
+    p_covers_d_session,
+    p_dormant_from_records,
+    p_host_overlap_lines,
+    p_micro_batch_flags,
+    p_micro_batch_line,
+    p_prefill_graph_buckets,
+    p_recv_stream_lines,
+    p_seats,
+    pick_shipped_cut,
+    pin_d_form_for_map,
+    prefix_switches_announce,
+    profile_standard_form,
+    publish_d_owner_ratio,
+    refusal_cause,
+    refuse_d_early_start_unreviewed,
+    refuse_d_form_off_the_map,
+    region_form_lane_price_cap,
+    remove_vram_credit_counters,
+)
 
 
-D_RESERVE_RECORD_ENV = "FLLIPER_PDFLIP_D_RESERVE_RECORD_MAX"
 
 
-def d_reserve_from_records_or_census(
-    cards: Sequence[Card], dc_expect_d: Mapping[str, int], census_reserve: Mapping[str, int],
-    d_max: Optional[Mapping[str, int]], slack_mib: int, record_priced: bool,
-) -> Tuple[Dict[str, int], List[str]]:
-    """Group D's dormant-residue RESERVE per card on the census-priced profile
-    (Next Flash): what P's budget subtracts, the front's ``--dc-reserve`` and
-    the W19 bolt at D's first sleep grade.
-
-    With D records of this identity and form (``d_max`` = per-card maximum over
-    the newest boots, :func:`dormant_max_from_records`): that maximum +
-    :data:`DC_RECORD_MARGIN_MIB` + slack -- the same margin the single #1444
-    record carried. The census is only reported. Before (still without
-    records): per card the larger of the newest record and the xchg census.
-    rc12z30r3: census 1140/1538 (nvml0/2) against D records 612-680, so P's
-    budget carried ~460/860 MiB per 3080 for a D residue that was never there
-    -- VRAM that belongs to P's resident experts. The fnFL2x111 lesson (an
-    OLDER census undercut a NEWER record -> W19) holds: a maximum of recent
-    same-form measurements, never a single low sample.
-    ``FLLIPER_PDFLIP_D_RESERVE_RECORD_MAX=0`` keeps the old rule."""
-    out = dict(dc_expect_d)
-    won: List[str] = []
-    use_max = (d_max is not None
-               and os.environ.get(D_RESERVE_RECORD_ENV, "1").strip() != "0")
-    for c in cards:
-        if c.uuid not in census_reserve:
-            continue
-        census = int(census_reserve[c.uuid])
-        if use_max:
-            out[c.uuid] = int(d_max[c.uuid]) + DC_RECORD_MARGIN_MIB + int(slack_mib)
-            won.append(f"nvml{c.nvml_index}=record-max({out[c.uuid]}; census {census} reported)")
-            continue
-        record = int(dc_expect_d[c.uuid]) if record_priced else 0
-        if record > census:
-            out[c.uuid] = record
-            won.append(f"nvml{c.nvml_index}=record({record})>census({census})")
-        else:
-            out[c.uuid] = census
-            won.append(f"nvml{c.nvml_index}=census({census})>=record({record})")
-    return out, won
 
 
 def d_expect_dormant_other(
@@ -803,20 +926,6 @@ def d_expect_dormant_other(
     return legacy, why
 
 
-def d_expect_check_lines(cards: Sequence[Card], expected: Optional[Mapping[str, int]],
-                         dc_p: Mapping[str, int]) -> List[str]:
-    """The real pass, after P's sleep: P's measured residue against what the
-    expectation priced, per card. ``[]`` when no expectation was priced here.
-    UNDER means the pinned D form gets less than it was solved for -- the
-    solve that follows caps the scratch or refuses (W122) by name."""
-    if not expected:
-        return []
-    parts = []
-    for c in cards:
-        e, m = int(expected.get(c.uuid, 0)), int(dc_p.get(c.uuid, 0))
-        parts.append(f"nvml{c.nvml_index} P real {m} vs expectation {e} MiB "
-                     f"({'UNDER by ' + str(m - e) if m > e else 'ok, ' + str(e - m) + ' spare'})")
-    return ["D-EXPECT CHECK (after P's sleep): " + "; ".join(parts)]
 
 
 def dc_measured_d_mib(card: Card, weight_source: str) -> int:
@@ -871,15 +980,6 @@ def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     return _pconst("DC_MEASURED_D_XCHG_MIB")[xchg_index] if xchg else _pconst(const_name)
 
 
-def _refuse_value_once(code: str, text: str, log: Optional["Log"] = None) -> None:
-    """AP1 1006: ``refusals.refuse_value(code, text, PdFlipLaunchRefused)`` -- the
-    SAME (code, text) is remembered once per forced boot (the W19 selector is read
-    by several passes per card; AP4's ``load_xchg_census_for_cards`` dedups the
-    same way). Without ``--force`` it raises every time, exactly as before."""
-    if refusals.forced_boot() and (code, text) in {
-            (d["code"], d["text"]) for d in refusals.forced_list()}:
-        return
-    refusals.refuse_value(code, text, PdFlipLaunchRefused, log=log)
 
 
 #: HW-GENERIC 1002: calibration class -> (the record constant of the serving
@@ -890,59 +990,67 @@ DC_MEASURED_D_BY_CLASS = {
     "RTX5090": ("DC_MEASURED_D_5090_MIB", 1),
     "RTX3080": ("DC_MEASURED_D_3080_MIB", 0),
 }
-#: Flags that only make sense while barlink owns the group's collectives.
-#: Each takes a value except the bare --barlink itself.
-BARLINK_FLAGS_WITH_VALUE = (
-    "--barlink-transport",
-    "--barlink-bar1-window-mib",
-    "--barlink-bar1-cap-cycles",
-    "--barlink-uncovered-class",
+from flliper.srt.pdflip.launcher_xchg_vision_leaf import (  # noqa: F401 -- re-export, behaviour-neutral move
+    BARLINK_FLAGS_BARE,
+    BARLINK_FLAGS_WITH_VALUE,
+    STORE_SHORT_TAIL_X_ENV,
+    VISION_PLACE_AUTO,
+    VISION_SOURCE_DISK,
+    VISION_SOURCE_PINNED,
+    VISION_SOURCE_RAM,
+    XCHG_D_VECTOR_DEFAULT,
+    _TOKENIZER_PATH,
+    _W_CODE_RE,
+    _tree_bytes,
+    _vector_len,
+    _w_code_of,
+    _without_budget_flag,
+    store_short_tail_env,
+    strip_barlink_flags,
+    strip_speculative_flags,
+    tokenizer_path_flags,
+    turn_anchor_env,
+    uniform_marlin_argv,
+    user_reserve_env_value,
+    vision_model_flags,
+    vision_on_d_of,
+    vision_source_host_line,
+    vision_stage_knobs_refusal,
+    vote_fixed_live_root,
+    w38_armed_line,
+    with_uniform_marlin_argv,
+    xchg_bounce_arm_pins_host,
+    xchg_census_is_reserve,
+    xchg_form_argv,
+    xchg_lane_count,
+    xchg_region_pairs,
+    yarn_context_tokens,
 )
-BARLINK_FLAGS_BARE = ("--barlink",)
 #: Environment keys the bar1 build path owns; dropped with the flags so the
 #: NCCL arm is not half-configured for a transport it does not run.
 BARLINK_ENV_KEYS = ("FLLIPER_BARLINK_BUILD_WINDOW_CAP_S",)
 
 
-def transport_argv(argv: List[str], transport: str) -> List[str]:
-    """``argv`` as the chosen transport needs it. One seam, both groups."""
-    return argv if str(transport) != "nccl" else strip_barlink_flags(argv)
+from flliper.srt.pdflip.launcher_vision_spec_mid import (  # noqa: F401 -- re-export, behaviour-neutral move
+    VISION_ASYNC_SWITCHES,
+    VISION_PLACES_BROKEN_IN_DUAL,
+    VISION_SYNC_LAW,
+    W111_VISION_PLACE_DUAL,
+    _vision_knob,
+    _weights_from_scores,
+    shipped_layer_split,
+    tokenizer_path_decision,
+    torch_cache_cap_armed,
+    transport_argv,
+    user_reserve_rank_env,
+    vision_async_refusal,
+    vision_place_dual_refusal,
+    vision_tower_dir,
+)
 
 
-def reserve_slack_mib(transport: str) -> int:
-    """Dormant-residue slack for group D under this transport, in MiB.
-
-    ONE definition, so the NCCL arm's +128 MiB cannot drift away from the
-    reason it exists. Under 'bar1' this is the unchanged
-    :data:`DC_RESERVE_SLACK_MIB`, and the flip path's arithmetic is exactly
-    what it was.
-    """
-    return (DC_RESERVE_SLACK_NCCL_MIB if str(transport) == "nccl"
-            else DC_RESERVE_SLACK_MIB)
 
 
-def strip_barlink_flags(argv: List[str]) -> List[str]:
-    """``argv`` without the barlink family -- the NCCL development mode.
-
-    Removal, not substitution: without --barlink the group takes the stock
-    flliper dispatch, which builds the PyNccl communicator barlink suppresses.
-    Written as a filter over the ONE argv builder rather than as a second
-    argv builder, so the two arms cannot drift apart in anything except the
-    transport.
-    """
-    out: List[str] = []
-    skip = False
-    for token in argv:
-        if skip:
-            skip = False
-            continue
-        if token in BARLINK_FLAGS_WITH_VALUE:
-            skip = True
-            continue
-        if token in BARLINK_FLAGS_BARE:
-            continue
-        out.append(token)
-    return out
 #: #1233 boot weg2ls2b2 (2026-09-07 08:58Z, front corridor sampler with group
 #: P awake, epoch 1, idle after the wake): NVML free 785 / 1806 / 990 MiB on
 #: the 5090 (PP0) / nvml0 (PP1) / nvml2 (PP2) against the budget line's own
@@ -1094,16 +1202,6 @@ CALIBRATION_LAYERS = _PROFILE_27B.constant("CALIBRATION_LAYERS")
 P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
 
 
-def _csv(values: Sequence[int]) -> str:
-    """One vector, one rendering: the CSV form the two count flags take.
-
-    FIX 2.  ``argv_p`` used to carry ``"32,18,14"`` / ``"8,4,4"`` as bare
-    default arguments -- a THIRD statement of the constants above, which the
-    #1233 fix 5 one-definition property had already closed once and which
-    ``test_neither_score_vector_survives_anywhere_as_a_bare_literal`` was
-    written to catch.  It caught it; the reading was wrong, not the guard.
-    """
-    return ",".join(str(int(v)) for v in values)
 
 
 #: The incumbent cut RENDERED for help text, DERIVED from the one definition
@@ -1155,7 +1253,6 @@ SPEC_ALGORITHM = "NEXTN"
 SPEC_NUM_STEPS = 2
 SPEC_EAGLE_TOPK = 1
 SPEC_NUM_DRAFT_TOKENS = 3
-KV_CACHE_DTYPE = "fp8_e4m3"
 
 P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
     "--speculative-algorithm", SPEC_ALGORITHM,
@@ -1214,113 +1311,10 @@ def p_draft_kv_flags(extra_d: Sequence[str]) -> Tuple[str, ...]:
 #: never silent -- see :func:`draft_kv_off_line`.
 DRAFT_KV_ON_P_DEFAULT = "on"
 
-#: --spec-form (PLAN_DFLASH2_P_0917). THE SPECULATIVE FORM OF THE BOOT, ONE
-#: WRITER (the same MF-6 argument as SPEC_ALGORITHM above): argv_p, argv_d,
-#: d_plan_inputs and the D environment all read it here. ``NEXTN`` is the
-#: shipping form (the constants above, byte-identical); ``DFLASH`` puts the
-#: external DFlash2 draft on both groups -- P as the draft-KV producer
-#: (dflash_draft_kv_producer), D as the proposer with the compact draft
-#: cache and the window pool.
-SPEC_FORM_DEFAULT = "NEXTN"
-DFLASH_DRAFT_PATH_DEFAULT = (
-    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued"
-)
-DFLASH_BLOCK_DEFAULT = 8
-DFLASH_WINDOW_DEFAULT = 2048
-#: --dflash-produce-on-p (27B user decision 2026-09-24, verbatim: "ne wir lassen
-#: den draft produzenten auf P weg. wir lassen seine layer kalt dort liegen im
-#: vram, oder im systemram. entscheidung ist gefallen. P ohne draft rechnen").
-#: ``off`` = the standard form under --spec-form DFLASH: group P still loads
-#: the DFlash2 draft on its last PP stage (cold-resident bytes: same VRAM, same
-#: planner cut, same exchange census and flip) but computes nothing with it.
-#: ``on`` is the old producer form, A/B only. Measured reason (boot xsn410, P
-#: log): DRAFT-KV-PRODUCE took 19.5 s of a 21 s prefill span per 98k prompt.
-#: The switch rides group P's ENVIRONMENT only (spec_form_env("P")) -- argv_p,
-#: the P FORM key, the census and the ledger are byte-identical under both.
-#: UNIFY S6: it is the ``cold|compute`` half of the ``p_draft`` axis
-#: (pdflip/form.py, the one writer); only read under DFLASH.
-DFLASH_PRODUCE_ON_P_DEFAULT = "off"
-DFLASH_PRODUCE_ENV = "FLLIPER_PDFLIP_DFLASH_PRODUCE"
-#: --d-replayssm-spec (27B ReplaySSM package, S6). ``on`` gives group D
-#: ``--enable-linear-replayssm-spec``: its GDN target verify runs the compact
-#: spec ring instead of per-draft intermediate states, and the freed
-#: "speculative intermediate state" post goes to D's KV pool (27B desk, not an
-#: NF value: -0.41 GiB post / +0.41 GiB KV per rank at 18/6 heads, mrr 2). The
-#: CODE default (no registry row) is off -- off leaves argv_d and the D pricing
-#: byte-identical; the booted profile's row (``ModelProfile.replayssm``, both
-#: rows True since the metal: 27B xsn436, NF x172/x174) sets it for an unset
-#: flag (apply_profile_arg_defaults, 29.09.). P never gets it: P runs no
-#: target verify.
-D_REPLAYSSM_SPEC_DEFAULT = "off"
-_SPEC_FORM: Dict[str, object] = {
-    "form": SPEC_FORM_DEFAULT,
-    "draft_path": DFLASH_DRAFT_PATH_DEFAULT,
-    "block": DFLASH_BLOCK_DEFAULT,
-    "window": DFLASH_WINDOW_DEFAULT,
-    "produce_on_p": DFLASH_PRODUCE_ON_P_DEFAULT == "on",
-    # HICACHE-DRAFT-TIER (NF pick of the 27B line's 9eef037e8d): "does group
-    # P carry the draft-KV producer" as RESOLVED by main (H25 resolve_draft_on_p,
-    # and HiCache enabled). None until then: p_group_has_draft_producer reads
-    # FLLIPER_PDFLIP_DRAFT_ON_P (the H25 authority, default 0), never the CLI
-    # default of --draft-kv-on-p (on, overruled by the order since H25).
-    "draft_kv_on_p": None,
-    "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT == "on",
-    # NF line (H64): --extra-d's --speculative-num-draft-tokens (d_verify_window).
-    "d_extra_draft_tokens": None,
-}
 
 
-def apply_spec_form(ns) -> None:
-    """Install the CLI's speculative form once, before any argv is built."""
-    _SPEC_FORM["form"] = str(getattr(ns, "spec_form", SPEC_FORM_DEFAULT) or SPEC_FORM_DEFAULT).upper()
-    _SPEC_FORM["draft_path"] = str(getattr(ns, "dflash_draft_path", DFLASH_DRAFT_PATH_DEFAULT) or DFLASH_DRAFT_PATH_DEFAULT)
-    _SPEC_FORM["block"] = int(getattr(ns, "dflash_block", DFLASH_BLOCK_DEFAULT) or DFLASH_BLOCK_DEFAULT)
-    _SPEC_FORM["window"] = int(getattr(ns, "dflash_window", DFLASH_WINDOW_DEFAULT) or DFLASH_WINDOW_DEFAULT)
-    _SPEC_FORM["produce_on_p"] = (
-        str(getattr(ns, "dflash_produce_on_p", DFLASH_PRODUCE_ON_P_DEFAULT) or DFLASH_PRODUCE_ON_P_DEFAULT).lower()
-        == "on"
-    )
-    # NF: the CLI value of --draft-kv-on-p is not the answer (H25 overrules
-    # it); main installs the resolved value beside resolve_draft_on_p.
-    _SPEC_FORM["draft_kv_on_p"] = None
-    _SPEC_FORM["d_replayssm_spec"] = (
-        str(getattr(ns, "d_replayssm_spec", D_REPLAYSSM_SPEC_DEFAULT) or D_REPLAYSSM_SPEC_DEFAULT).lower()
-        == "on"
-    )
-    # NF line (H64): group D's MTP depth as --extra-d ships it (read by
-    # d_verify_window; the last value wins, as in argparse). None when --extra-d
-    # names none -- the constants' depth then stands.
-    _SPEC_FORM["d_extra_draft_tokens"] = _argv_scalar(
-        str(getattr(ns, "extra_d", "") or ""), "--speculative-num-draft-tokens"
-    )
-    if _SPEC_FORM["form"] == "DFLASH" and not os.path.isdir(_SPEC_FORM["draft_path"]):
-        raise SystemExit(
-            f"--spec-form DFLASH: draft checkpoint {_SPEC_FORM['draft_path']} is not a directory"
-        )
 
 
-#: --p-prefill-graph (27B line, 2026-09-24; user: P on 512-token chunks, and
-#: for the fixed chunk a prefill CUDA graph -- "ja unbedingt"). 0 = off, the
-#: default: argv_p, the P form key and every ledger input are byte-identical
-#: to a tree without the switch. N > 0 = group P captures ONE full prefill
-#: graph of N tokens (backend 'full', the only prefill backend that can put
-#: its capture pool in the memory saver's cuda_graph tag -- the same
-#: sleep/wake the decode graphs on D ride) and runs its chunks at N tokens,
-#: because a bucket below the chunk size would replay only the rest chunk.
-#: Measured motive (xsn422 #PGAP): the host launch of one P forward is
-#: 63/42/74 ms per stage, ~24 ms fixed + ~0.9 ms per layer, independent of the
-#: token count, against ~48-71 ms of compute for a 512-token chunk.
-P_PREFILL_GRAPH_DEFAULT = 0
-#: --p-prefill-graph-policy (27B line, user order 26.09. ~05:15Z: "cuda graphen
-#: im prefill nur anschalten wenn es was bringt, wenn es negativ ist,
-#: ausschalten"). The rule is pdflip/p_graph_policy.py; 'auto' without a
-#: calibration table captures exactly the pre-switch set (argv byte-identical).
-P_PREFILL_GRAPH_POLICY_DEFAULT = "auto"
-_P_PREFILL_GRAPH: Dict[str, object] = {
-    "bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": (), "captured": (), "legacy": (),
-    "policy": P_PREFILL_GRAPH_POLICY_DEFAULT, "verdicts": (), "calibration": None, "lines": (),
-    "extras": (), "min_gain": None, "cut_check": None,
-}
 
 
 def apply_p_prefill_graph(ns) -> None:
@@ -1404,34 +1398,10 @@ def p_prefill_graph_cut_check(ns, cut, log) -> bool:
     return True
 
 
-def p_prefill_graph_calibration_of(ns):
-    """The graph calibration table: --p-prefill-graph-calibration PATH, else the
-    'graph_calibration' key of a --p-chunk-model JSON file, else None."""
-    from flliper.srt.pdflip import p_graph_policy as _pgp
-
-    path = str(getattr(ns, "p_prefill_graph_calibration", "") or "").strip()
-    try:
-        if path:
-            return _pgp.load_calibration(path)
-        src = str(getattr(ns, "p_chunk_model", "") or "").strip()
-        if src and src.endswith(".json") and os.path.isfile(src):
-            with open(src) as fh:
-                data = json.load(fh)
-            if isinstance(data, dict) and isinstance(data.get("graph_calibration"), dict):
-                return _pgp.Calibration.from_json(data["graph_calibration"])
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f"--p-prefill-graph-calibration {path or src}: {exc}")
-    return None
 
 
-def p_prefill_graph_captured() -> List[int]:
-    """The buckets group P really captures (the policy's answer), ascending;
-    [] = no graph (switch off, or 'auto' found the graph slower everywhere)."""
-    return list(_P_PREFILL_GRAPH.get("captured", ()) or ())
 
 
-def p_prefill_graph_policy_lines() -> List[str]:
-    return list(_P_PREFILL_GRAPH.get("lines", ()) or ())
 
 
 def p_prefill_graph_vram_gate(ns, model_pool, pinned_layers, families, pool_floor, log):
@@ -1480,45 +1450,10 @@ def p_prefill_graph_vram_gate(ns, model_pool, pinned_layers, families, pool_floo
     return replace(model_pool, prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns))
 
 
-def p_prefill_graph_tiny_of(ns, bucket: int) -> Tuple[int, ...]:
-    """--p-prefill-graph-tiny as extra, SMALLER capture buckets (27B line,
-    24.09., default off = ()). Why: group P ends every prompt with the 1-token
-    END-OF-PREFILL ANCHOR chunk (schedule_policy._pdflip_end_anchor_split,
-    FLLIPER_PDFLIP_END_ANCHOR=1), and the runner pads every batch up to the
-    smallest captured bucket that holds it (base_cuda_graph_runner.
-    _pad_to_bucket) -- with bs [512] alone that one token replays a full
-    512-row graph: measured xsn430/xsn433 #PGAP tokens=1 gpu_fwd 37.1 / 35.0 /
-    38.0 ms (PP0/PP1/PP2) against ~41 / 34 / 38 ms for a real 512 chunk. A
-    16-token bucket is weight-bandwidth bound instead (~12 / 7 / 7 ms
-    estimated). Buckets must be positive and below the main bucket."""
-    raw = str(getattr(ns, "p_prefill_graph_tiny", "") or "").strip()
-    if not raw:
-        return ()
-    if not bucket:
-        raise SystemExit("--p-prefill-graph-tiny needs --p-prefill-graph N (the main bucket)")
-    try:
-        vals = sorted({int(x) for x in raw.split(",") if x.strip()})
-    except ValueError:
-        raise SystemExit(f"--p-prefill-graph-tiny {raw!r}: comma list of token counts expected")
-    bad = [v for v in vals if v <= 0 or v >= int(bucket)]
-    if bad:
-        raise SystemExit(
-            f"--p-prefill-graph-tiny {raw!r}: every bucket must be in (0, {int(bucket)}), got {bad}"
-        )
-    return tuple(vals)
 
 
-def p_prefill_graph_buckets() -> List[int]:
-    """Every captured prefill bucket, ascending; [] when no graph is captured
-    (the switch off, or --p-prefill-graph-policy auto dropped every bucket)."""
-    if not p_prefill_graph_bucket():
-        return []
-    return p_prefill_graph_captured()
 
 
-def p_prefill_graph_bucket() -> int:
-    """The P prefill graph's token bucket, 0 when the switch is off."""
-    return int(_P_PREFILL_GRAPH["bucket"])
 
 
 def p_chunked_prefill_tokens() -> int:
@@ -1537,36 +1472,17 @@ def p_chunked_prefill_tokens() -> int:
     return p_prefill_graph_bucket() or P_CHUNKED_PREFILL_TOKENS
 
 
-def p_prefill_graph_flags() -> List[str]:
-    """The ONE argv term of the P prefill graph ([] when off).
-
-    ``--cuda-graph-config`` JSON rather than the convenience flags because it
-    states all three keys in one token and wins over every other source
-    (server_args._parse_cuda_graph_config), and an EXPLICIT prefill backend is
-    also what skips the breakable-only auto-disable cascade (multimodal /
-    memory-saver rules) that turned P's prefill graph off until now:
-      * backend 'full' -- captures into the memory saver's cuda_graph tag
-        (full_cuda_graph_backend.py), released by P's sleep like D's graphs;
-      * bs [bucket]    -- one shape; a shorter rest chunk pads up to it;
-      * full_prefill_max_req 1 -- one request slot: a chunk holding two
-        requests runs eager (named by the runner's PREFILL-GRAPH eager line),
-        and the captured linear-attention metadata never sees a sentinel row.
-    """
-    if not p_prefill_graph_buckets():
-        return []
-    return [
-        "--cuda-graph-config",
-        json.dumps(
-            {
-                "prefill": {
-                    "backend": "full",
-                    "bs": p_prefill_graph_buckets(),
-                    "full_prefill_max_req": 1,
-                }
-            },
-            separators=(",", ":"),
-        ),
-    ]
+from flliper.srt.pdflip.launcher_resolve_stop import (  # noqa: F401 -- re-export, behaviour-neutral move
+    KV_TOKEN_CUT_FLIP_MARKER,
+    _rope_cols,
+    p_prefill_graph_env,
+    p_prefill_graph_flags,
+    planned_expert_store_bytes,
+    refuse_flip_stage_form_without_trim_cells,
+    refuse_flip_under_token_cut,
+    vision_gguf_tower_refusal,
+    vision_victim_host_term,
+)
 
 
 #: The `prefill graph pool` post, MiB per 512 graph tokens per P stage. AN
@@ -1630,8 +1546,6 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
     return (est,) * p_group_stages()
 
 
-#: --p-deep-split-from (27B line, 2026-09-24): 0 = off, the default.
-P_DEEP_SPLIT_FROM_DEFAULT = 0
 #: The crossover prefix read off the xsn426/xsn428 #PGAP fits: the graph's
 #: PP0 chunk costs 41.9 + 1.432 * (prefix + 256) / 1000 ms, the eager chunk is
 #: bounded below by the ~57 ms host launch of 42 layers, and the split lowers
@@ -1641,41 +1555,8 @@ P_DEEP_SPLIT_FROM_DEFAULT = 0
 P_DEEP_SPLIT_FROM_FIT = 10240
 
 
-def p_deep_split_env(ns) -> Dict[str, str]:
-    """Group P's environment for --p-deep-split-from; {} when off."""
-    from flliper.srt.layers.attention import fi_prefill_wave_split as _fiws
-
-    n = int(getattr(ns, "p_deep_split_from", P_DEEP_SPLIT_FROM_DEFAULT) or 0)
-    if n < 0:
-        raise SystemExit(f"--p-deep-split-from must be >= 0, got {n}")
-    return _fiws.launcher_env_p_deep_split(n)
 
 
-def p_prefill_graph_env(
-    pool_mib: Sequence[float], max_prefix: Optional[int] = None
-) -> Dict[str, str]:
-    """Group P's environment under --p-prefill-graph ({} when off, so the
-    default env stays byte-identical). ``max_prefix`` is
-    --p-prefill-graph-max-prefix: None (the default) sets nothing, i.e. no
-    depth threshold."""
-    if not p_prefill_graph_buckets():
-        return {}
-    env = {
-        # model_runner_kv_cache_mixin.PREFILL_GRAPH_POOL_ENV: the runtime
-        # books the same post the pool model priced.
-        "FLLIPER_KV_BUDGET_PREFILL_GRAPH_MIB": ",".join("%.1f" % v for v in pool_mib),
-        # flashinfer_backend._full_cg_prefill_float_workspace: P captures no
-        # decode graph (#1233 FIX 4), so the full-CG prefill wrappers may
-        # share the float workspace instead of a second split-kv buffer.
-        "FLLIPER_FULL_CG_PREFILL_SHARED_WORKSPACE": "1",
-    }
-    if max_prefix is not None:
-        if int(max_prefix) < 0:
-            raise SystemExit(f"--p-prefill-graph-max-prefix must be >= 0, got {max_prefix}")
-        # prefill_cuda_graph_runner.PREFILL_GRAPH_MAX_PREFIX_ENV: a chunk whose
-        # prefix exceeds it runs eager (census reason 'deep_split').
-        env["FLLIPER_PREFILL_GRAPH_MAX_PREFIX"] = str(int(max_prefix))
-    return env
 
 
 def p_prefill_graph_line() -> str:
@@ -1715,54 +1596,11 @@ def p_prefill_graph_line() -> str:
     )
 
 
-#: --p-chunk-policy (27B + NF line, user orders 25.09. ~21:40Z/21:41Z:
-#: "dynamische chunkgroesse brauchen wir. umsetzen"). The rule lives in
-#: pdflip/p_chunk_policy.py (pure; the NF line takes the same interface). This
-#: block only turns the launcher's flags into a PolicySpec, prices P's
-#: --chunked-prefill-size at the plan's CEILING and hands the spec to group P.
-#: 'fixed' (the default for this release candidate) changes NOTHING: no env,
-#: argv_p and the P form key byte-identical.
-P_CHUNK_POLICY_DEFAULT = "fixed"
-#: The plan's ceiling. 2048 = 4x the 512 graph chunk and half the 4096 P ran
-#: eager before the graph (so inside the envelope P's corridor already funded);
-#: the planner prices group P's activation corridor, frames and barlink
-#: buffers at it, because under 'dynamic' it IS P's --chunked-prefill-size.
-P_CHUNK_MAX_DEFAULT = 2048
-P_CHUNK_MODEL_DEFAULT = "builtin-int8"
 P_CHUNK_MSCALE_DEFAULT = "int8"
 #: Short-prompt bypass (rc9j metal 26.09., Operator): at 2k/8k the plan is
 #: 512xn anyway, yet B measured 10-30 ms slower than A. At or below this rest
 #: the cursor does not plan and every forward gets the fixed width.
 P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT = 8192
-#: BUILTIN INT8 stage model (desk, 25.09., MEASURED where stated):
-#: a_ms / b_ms_per_1k = pgap_stage_fit.fit_rank_lines over prefixes [0, 32768)
-#: of boot weg2rc7c (a54f21cda0, INT8, cut 42/11/11, 512 graph, 1076-1082
-#: device-bound chunks per rank, sd 2.1-2.5 ms): per 512 chunk,
-#: t = a + b * (prefix + 256) / 1000.
-#: fwd_overhead_ms = PP0's mean #PGAP gpu_gap_ms below 50 ms (3.73, n=2101):
-#: the bottleneck stage's per-forward idle, i.e. a per-CHUNK cost; PP1/PP2's
-#: gaps are pipeline waiting, which the flow shop produces itself.
-#: eager_floor_ms = the host launch of an EAGER P forward, xsn422 #PGAP
-#: (63/42/74 ms per stage, before the graph): a chunk above the largest graph
-#: bucket runs eager and is paced by it when its device time is shorter.
-#: UNIFY S9: a RECORD of the 27B profile (profile_records_data/qwen27b.json,
-#: P_CHUNK_BUILTIN fmt=int8) carrying its power limit (400/230 W, row 27) and
-#: the P cut it was fitted on (42,11,11: a per-stage table holds only for its
-#: cut, p_chunk_model_cut_check). Values unchanged.
-_P_CHUNK_BUILTIN_RECORD = pdflip_form.profile_record(
-    "P_CHUNK_BUILTIN", pdflip_form.PROFILE_QWEN27B, fmt="int8").record
-P_CHUNK_BUILTIN_INT8 = tuple(dict(row) for row in _P_CHUNK_BUILTIN_RECORD.value)
-#: FP8 (27.10., desk/fp8-optima-1027): the same record kind for the W8A16-Marlin checkpoint (``--fp8-uniform-marlin``),
-#: fitted from the 512-token #PGAP lines of boot dkr27bfp8bar1drei10271317 on cut 44/11/9. Its width curve is UNMEASURED
-#: (only 512-token forwards exist), so a profile uses it with ``--p-chunk-mscale flat`` until the P sweep measures it.
-_P_CHUNK_BUILTIN_RECORD_FP8 = pdflip_form.profile_record(
-    "P_CHUNK_BUILTIN", pdflip_form.PROFILE_QWEN27B, fmt="fp8").record
-P_CHUNK_BUILTIN_FP8 = tuple(dict(row) for row in _P_CHUNK_BUILTIN_RECORD_FP8.value)
-#: ``--p-chunk-model`` names that are a record of this module: name -> (rows, record, label of the fit)
-P_CHUNK_BUILTIN_SOURCES = {
-    "builtin-int8": (P_CHUNK_BUILTIN_INT8, _P_CHUNK_BUILTIN_RECORD, "weg2rc7c fit [0,32k)"),
-    "builtin-fp8": (P_CHUNK_BUILTIN_FP8, _P_CHUNK_BUILTIN_RECORD_FP8, "dkr27bfp8bar1drei10271317 fit [0,32k)"),
-}
 #: Per-token cost relative to M=512, per stage, as a function of the chunk.
 #: 'int8' PP0 (5090): kernel bench n4b_bench_0925_1239 -- the INT8 GEMMs
 #: (gate_up/down/qkvz/o) cost 12.3 % less per token at M=4096 than at 512
@@ -1785,24 +1623,10 @@ P_CHUNK_MSCALES = {
         {256: 1.10, 512: 1.0},
     ),
 }
-#: The fixed part of a GRAPH forward that does not scale with the chunk
-#: (replay launch, stage in/out), ms. Small by the #PGAP host lines (launch 3).
-P_CHUNK_GRAPH_FIXED_MS = 2.0
-#: The dry-run ladder the launcher prints its plan for (the Messplan rungs).
-P_CHUNK_DRY_RUN_TOKENS = (2048, 8192, 32768, 131072)
-_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None, "power_lines": (),
-                             "profile": None, "ns": None}
 #: --p-power-scale (release table row 27, pdflip/power_limit.py). 'off' = the
 #: model is used as calibrated (spec byte-identical); only warning lines added.
 P_POWER_SCALE_DEFAULT = "off"
 P_POWER_SCALE_LAWS = ("off", "linear", "power")
-#: The card class of each P stage OF THE CALIBRATION RIG the builtin chunk
-#: model was fitted on (PP0 on the 5090, PP1/PP2 on the 3080s) -- a property
-#: of that RECORD, not of the live rig. HW-GENERIC 1002: the live stages'
-#: classes come from :func:`p_stage_live_classes` (order_cards + card
-#: identity); a stage whose live class differs from its calibration class is
-#: named by :func:`p_stage_class_mismatch_lines`.
-P_STAGE_CARD_CLASSES = card_identity.REFERENCE_INVENTORY
 
 
 def p_stage_live_classes(stages: int) -> List[Optional[str]]:
@@ -1826,46 +1650,6 @@ def p_stage_class_mismatch_lines(stages: int, live: Optional[Sequence[Optional[s
             for r, (lv, cv) in enumerate(zip(live, cal)) if lv is not None and lv != cv]
 
 
-def p_chunk_model_power_limits(src: str, stages: int) -> Tuple[Optional[List[Optional[float]]], str]:
-    """(calibration power limit per P stage, where it came from) of a
-    --p-chunk-model source; ``None`` = the model does not know its limit (an
-    old JSON, or a fit log from before row 27): warned, never refused.
-
-    builtin-int8: the weg2rc7c fit (25.09.) ran under the rig limits of
-    24.09. (power_limit.RIG_POWER_LIMIT_W_0924, bracketing readings);
-    fit:<P.log>: that log's own ``POWER-LIMIT rank`` lines (PP<r>);
-    JSON: its ``power_limit_w`` field."""
-    from flliper.srt.pdflip import power_limit as _pl
-
-    src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
-    classes = list(P_STAGE_CARD_CLASSES[:stages]) + [P_STAGE_CARD_CLASSES[-1]] * max(0, stages - 3)
-    if src in P_CHUNK_BUILTIN_SOURCES:
-        # UNIFY S9: the record's own limit (int8: the rig limits of 24.09.; fp8: its own boot's POWER-LIMIT lines)
-        record = P_CHUNK_BUILTIN_SOURCES[src][1]
-        lim = record.power_limits() or {}
-        return ([lim.get(c) for c in classes],
-                f"builtin rig limits ({record.power_limit_source or 'record'})")
-    if src.startswith("fit:"):
-        path = src[4:]
-        try:
-            with open(path, "rb") as fh:
-                found = _pl.parse_boot_lines(
-                    raw.decode("utf-8", "replace") for raw in fh if b"POWER-LIMIT rank " in raw)
-        except OSError:
-            found = {}
-        vals = [found.get(f"PP{r}", {}).get("power_limit_w") for r in range(stages)]
-        if not any(v is not None for v in vals):
-            return None, f"fit log {os.path.basename(path)} has no POWER-LIMIT rank line (predates row 27)"
-        return [None if v is None else float(v) for v in vals], f"fit log {os.path.basename(path)} POWER-LIMIT lines"
-    try:
-        with open(src) as fh:
-            data = json.load(fh)
-        vals = _pl.stage_limits_from_json(data, stages)
-    except (OSError, ValueError, _pl.PowerLimitError) as exc:
-        return None, f"json:{os.path.basename(src)} power_limit_w unreadable ({exc})"
-    if vals is None:
-        return None, f"json:{os.path.basename(src)} has no power_limit_w (old JSON)"
-    return vals, f"json:{os.path.basename(src)} power_limit_w"
 
 
 def p_stage_power_current(stages: int) -> Tuple[List[Optional[float]], List[str]]:
@@ -1916,33 +1700,8 @@ def apply_p_power_check(ns, models, source: str, src: str):
     return models, f"{source} +powerscale:law={law},{tag} ({_pl.MODEL_LABEL})"
 
 
-def _p_chunk_stage(a_ms: float, b_ms_per_1k: float, fwd_overhead_ms: float,
-                   eager_floor_ms: float, mscale: Dict[int, float], name: str):
-    """One stage of the policy model from a 512-chunk line and a scale curve."""
-    from flliper.srt.pdflip import p_chunk_policy as _pcp
-
-    ref = 512
-    fixed = min(P_CHUNK_GRAPH_FIXED_MS, float(a_ms))
-    grid = sorted(set(mscale) | {256, 512, 1024, 2048, 4096})
-    pts = []
-    for m in grid:
-        r = _p_chunk_interp(mscale, m)
-        pts.append((m, float(fwd_overhead_ms) + fixed + (float(a_ms) - fixed) * (m / ref) * r))
-    return _pcp.StageModel(tuple(pts), float(b_ms_per_1k) / ref, float(eager_floor_ms), name)
 
 
-def _p_chunk_interp(curve: Dict[int, float], m: int) -> float:
-    """``curve`` in log2(M), flat beyond its ends (a missing point is no gain)."""
-    keys = sorted(curve)
-    if m <= keys[0]:
-        return float(curve[keys[0]])
-    if m >= keys[-1]:
-        return float(curve[keys[-1]])
-    for lo, hi in zip(keys, keys[1:]):
-        if lo <= m <= hi:
-            f = (math.log2(m) - math.log2(lo)) / (math.log2(hi) - math.log2(lo))
-            return float(curve[lo]) + f * (float(curve[hi]) - float(curve[lo]))
-    return 1.0
 
 
 def _p_chunk_by_class(items, key, stages: int, profile: Optional[str]):
@@ -2102,568 +1861,115 @@ def apply_p_chunk_policy(ns, boot_form=None, argv_words: Sequence[str] = ()) -> 
     _P_CHUNK["spec"] = _pcp.PolicySpec(tuple(models), limits, source)
 
 
-def p_chunk_policy_spec():
-    """The installed PolicySpec, None under 'fixed'."""
-    return _P_CHUNK.get("spec")
-
-
-P_CHUNK_CUT_TAG = "P-CHUNK-MODEL"
-
-
-def p_chunk_model_cut(src: str) -> Tuple[Tuple[int, ...], str]:
-    """(the P cut the --p-chunk-model table was measured/fitted on, where that
-    came from); () = the table does not say (an older JSON, a fit log)."""
-    from flliper.srt.pdflip import p_graph_policy as _pgp
-
-    src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
-    if src in P_CHUNK_BUILTIN_SOURCES:
-        return tuple(P_CHUNK_BUILTIN_SOURCES[src][1].pp_layer_ratio), "record P_CHUNK_BUILTIN"
-    if src.startswith("fit:"):
-        return (), f"fit:{os.path.basename(src[4:])} (the fit log's own cut, not stated)"
-    try:
-        with open(src) as fh:
-            data = json.load(fh)
-        return _pgp.parse_cut((data or {}).get("pp_layer_ratio")), f"json:{os.path.basename(src)}"
-    except (OSError, ValueError, AttributeError, _pgp.GraphPolicyError) as exc:
-        return (), f"json:{os.path.basename(src)} pp_layer_ratio unreadable ({exc})"
-
-
-def p_chunk_model_cut_check(ns, cut, log) -> str:
-    """UNIFY S9 (Agent PG: a per-stage table holds only for its P cut): the
-    --p-chunk-model table's cut against the cut this boot SHIPS, once, right
-    after the cut is final (after the graph table's own check). Nothing under
-    'fixed'. The table names no cut: a WARNING, used as before. A different
-    cut: a JSON table (an export for ONE cut) is REFUSED -- there is no
-    table-less dynamic plan to fall back to, and switching to 'fixed' would
-    change P's chunk ceiling behind the operator's back; re-export it for the
-    cut (p_stage_model --cut), pin --pp-stage-ratio to its cut, or run
-    --p-chunk-policy fixed. The builtin INT8 model (fitted at 42,11,11, a desk
-    model for every cut until now) only warns. Returns the verdict."""
-    if p_chunk_policy_spec() is None:
-        return ""
-    src = str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT).strip()
-    table, where = p_chunk_model_cut(src)
-    counts = tuple(int(x) for x in (getattr(cut, "layer_counts", ()) or ()))
-    gapped = bool(getattr(cut, "gapped", False))
-    boot = (f"gapped({getattr(cut, 'layer_set', '') or ','.join(map(str, counts))})" if gapped
-            else ",".join(map(str, counts)) or "?")
-    if not table:
-        log(f"PDFLIP {P_CHUNK_CUT_TAG} CUT-UNKNOWN WARNING table={where} names no pp_layer_ratio, "
-            f"boot={boot} -> used as before; a per-stage table is only valid for the cut it was "
-            f"measured on")
-        return "unknown"
-    tcut = ",".join(map(str, table))
-    if not gapped and counts == tuple(table):
-        log(f"PDFLIP {P_CHUNK_CUT_TAG} CUT-MATCH table={tcut} boot={boot} -> used ({where})")
-        return "match"
-    if src in P_CHUNK_BUILTIN_SOURCES:
-        log(f"PDFLIP {P_CHUNK_CUT_TAG} CUT-MISMATCH WARNING table={tcut} boot={boot} ({where}): the "
-            f"{src} model was fitted on {tcut}; its per-stage times do not describe this cut "
-            f"-- the plan is a HOCHRECHNUNG here (not refused: the builtin is the desk default); "
-            f"export a model for this cut (p_stage_model) to plan on a measurement")
-        return "mismatch"
-    msg = (f"{P_CHUNK_CUT_TAG} CUT-MISMATCH table={tcut} boot={boot} ({where}): the table was "
-           f"measured on another P cut and is not valid for this one -- re-export it for {boot} "
-           f"(p_stage_model), pin --pp-stage-ratio to {tcut}, or run --p-chunk-policy fixed")
-    log("PDFLIP " + msg + " -- REFUSED")
-    raise SystemExit(msg)
-
-
-def p_chunk_policy_env() -> Dict[str, str]:
-    """Group P's environment for the policy; {} under 'fixed' (byte-identical)."""
-    from flliper.srt.pdflip import p_chunk_policy as _pcp
-
-    spec = p_chunk_policy_spec()
-    if spec is None:
-        return {}
-    return {_pcp.POLICY_ENV: _pcp.POLICY_DYNAMIC, _pcp.SPEC_ENV: spec.to_json()}
-
-
-def p_chunk_power_lines() -> List[str]:
-    """Row 27: the chunk model's power-limit check (one line per P stage, loud
-    on a > 5 % mismatch, a warning for a model without power_limit_w) plus the
-    SCALE line when --p-power-scale rescaled it. [] under 'fixed'."""
-    return ["PDFLIP " + ln for ln in (_P_CHUNK.get("power_lines") or ())]
-
-
-def p_chunk_policy_lines() -> List[str]:
-    """The launcher's lines: the armed spec plus the plan it WOULD pick for the
-    dry-run rungs (a prediction on the model, printed so the metal ladder is
-    read against a stated expectation). [] under 'fixed'."""
-    from flliper.srt.pdflip import p_chunk_policy as _pcp
-
-    spec = p_chunk_policy_spec()
-    if spec is None:
-        return []
-    out = ["PDFLIP " + _pcp.armed_line(spec, "group=P")
-           + f" -- group P's --chunked-prefill-size is the ceiling {spec.limits.max_tokens}"]
-    for n in P_CHUNK_DRY_RUN_TOKENS:
-        if spec.limits.dynamic_min_tokens and n <= spec.limits.dynamic_min_tokens:
-            out.append(f"PDFLIP {_pcp.LOG_TAG} plan policy=dynamic key=dry-run-{n} tokens={n} "
-                       f"BYPASS (<= --p-chunk-dynamic-min-tokens {spec.limits.dynamic_min_tokens}): "
-                       f"fixed width {spec.limits.fixed_tokens}, no plan")
-            continue
-        res = _pcp.plan_detail(n, len(spec.stages), spec.stages, spec.limits)
-        out.append("PDFLIP " + _pcp.plan_line(res, key=f"dry-run-{n}", start=0, end=n)
-                   + " (HOCHRECHNUNG on the model, not a measurement)")
-    return out
-
-
-#: --p-layer-split (27B, user order 26.09. ~05:35Z: "dynamisches layersplit ...
-#: ohne neue ranks ... umsetzen"). The rule lives in pdflip/p_layer_split.py
-#: (pure); design and evidence /spinning/gpu-arb/docs/DYN_LAYER_SPLIT.md.
-#: 'static' (the default until the metal ladder) changes NOTHING: no env, no
-#: line, argv and the P form key byte-identical. 'dynamic' builds and prints
-#: the spec, the swing slab and its dry-run plans and hands group P the spec
-#: env; the rank-side executor is pdflip/p_layer_split_runtime.py (resident
-#: swing window under tag weights_swing, write-back on the proxy frame, the
-#: row on the #791 decision, prefix pull + weight refill upstream, graph
-#: bypass for non-home cuts). With PREFIX PULL by default (sec. 5: without
-#: pull there is no gain); --p-layer-split-pull-gbps 0 is the V1 frontier.
-P_LAYER_SPLIT_DEFAULT = "static"
-#: the measured x4-3080 BAR1 rate that bounds both 27B P edges (card probe
-#: 14.4 / 6.5 / 13.3 GB/s) -- the planner's price of a pull
-P_LAYER_SPLIT_PULL_GBPS_DEFAULT = 6.5
-P_LAYER_SPLIT_DRY_RUN_TOKENS = (32768, 131072)
-_P_LAYER_SPLIT: Dict[str, object] = {"policy": P_LAYER_SPLIT_DEFAULT, "spec": None, "lines": ()}
-
-
-def _int_list(raw: str, what: str) -> Tuple[int, ...]:
-    try:
-        return tuple(int(x) for x in str(raw).split(",") if x.strip() != "")
-    except ValueError:
-        raise SystemExit(f"{what} {raw!r}: expected comma-separated integers")
-
-
-def p_layer_split_spec_from_ns(ns):
-    """The SplitSpec a 'dynamic' boot would hand group P (no side effects).
-    The stage model is SG's per-layer-type model (pdflip/p_stage_model.py):
-    a JSON path or a name under p_stage_model_data/ (27b_int8_rc9j,
-    27b_nvfp4_rc9j)."""
-    from flliper.srt.pdflip import p_chunk_policy as _pcp
-    from flliper.srt.pdflip import p_layer_split as _pls
-    from flliper.srt.pdflip import p_stage_model as _psm
-
-    home = _int_list(getattr(ns, "p_layer_split_home", "") or "", "--p-layer-split-home")
-    window = _int_list(getattr(ns, "p_layer_split_window", "") or "", "--p-layer-split-window")
-    max_attn = _int_list(getattr(ns, "p_layer_split_max_attn", "") or "", "--p-layer-split-max-attn")
-    src = str(getattr(ns, "p_layer_split_model", "") or "")
-    if not home or not window or not src:
-        raise SystemExit("--p-layer-split dynamic needs --p-layer-split-home, "
-                         "--p-layer-split-window and --p-layer-split-model")
-    path = src if os.path.sep in src or src.endswith(".json") else os.path.join(
-        os.path.dirname(_psm.__file__), "p_stage_model_data", src + ".json")
-    try:
-        model = _psm.load_model(path)
-    except (OSError, ValueError, KeyError, _psm.StageModelError) as exc:
-        raise SystemExit(f"--p-layer-split-model {src}: {exc}")
-    floors = tuple(float(r["eager_floor_ms"]) / n for r, n in zip(P_CHUNK_BUILTIN_INT8, (42, 11, 11)))
-    try:
-        geom = _pls.SplitGeometry(_pls.hybrid_families(model.n_layers, 4), home, window, max_attn)
-        chunk = p_chunk_policy_spec()
-        limits = chunk.limits if chunk is not None else _pcp.ChunkLimits(
-            max_tokens=P_CHUNK_MAX_DEFAULT, min_tokens=p_prefill_graph_bucket() or 512,
-            fixed_tokens=p_prefill_graph_bucket() or 512, page=1,
-            graph_buckets=tuple(p_prefill_graph_buckets()), eager=True)
-        _pull_raw = getattr(ns, "p_layer_split_pull_gbps", None)
-        pull = P_LAYER_SPLIT_PULL_GBPS_DEFAULT if _pull_raw is None else float(_pull_raw)
-        extra = _pls.ExtraCosts(
-            _pls.WritebackPrice(2048, 1634304, tuple(6.5 for _ in home), True),
-            floors[: len(home) + 1], tuple(pull for _ in home) if pull > 0 else ())
-        spec = _pls.SplitSpec(geom, model, limits,
-                              float(getattr(ns, "p_layer_split_min_gain", _pls.DEFAULT_MIN_GAIN)),
-                              "every", os.path.basename(path), extra)
-        _pls.check_layout(geom, model)
-        return spec
-    except (_pls.LayerSplitError, _pcp.ChunkPolicyError) as exc:
-        raise SystemExit(f"--p-layer-split dynamic: {exc}")
-
-
-def apply_p_layer_split(ns) -> None:
-    """Install --p-layer-split once, after --p-chunk-policy (joint plan)."""
-    from flliper.srt.pdflip import p_layer_split as _pls
-
-    policy = str(getattr(ns, "p_layer_split", P_LAYER_SPLIT_DEFAULT) or P_LAYER_SPLIT_DEFAULT)
-    if policy not in _pls.POLICIES:
-        raise SystemExit(f"--p-layer-split {policy!r}: one of {list(_pls.POLICIES)}")
-    _P_LAYER_SPLIT["policy"] = policy
-    _P_LAYER_SPLIT["spec"] = None
-    _P_LAYER_SPLIT["lines"] = ()
-    if policy == _pls.POLICY_STATIC:
-        return
-    if os.environ.get(PP_LAYER_SET_ENV, "").strip() or getattr(ns, "pp_layer_set", None):
-        raise SystemExit("--p-layer-split dynamic: REFUSED -- a layer SET (FLLIPER_PP_LAYER_SET / "
-                         "--pp-layer-set) is not the contiguous home cut the split mirrors")
-    spec = p_layer_split_spec_from_ns(ns)
-    ratio = str(getattr(ns, "pp_stage_ratio", "") or "")
-    if ratio:
-        counts = _int_list(ratio, "--pp-stage-ratio")
-        ends = tuple(sum(counts[: i + 1]) for i in range(len(counts) - 1))
-        if ends != spec.geometry.home_cuts:
-            raise SystemExit(f"--p-layer-split dynamic: REFUSED -- --pp-stage-ratio {ratio} cuts at "
-                             f"{list(ends)} but --p-layer-split-home is {list(spec.geometry.home_cuts)}; "
-                             f"the home cut IS the P partition (one cut, one author)")
-    lines = ["PDFLIP " + _pls.armed_line(spec, "group=P")]
-    lines += ["PDFLIP " + x for x in p_layer_split_slab_lines(spec)]
-    for n in P_LAYER_SPLIT_DRY_RUN_TOKENS:
-        res = _pls.plan_split(n, spec.geometry, spec.model, spec.limits, min_gain=spec.min_gain,
-                              extra=spec.extra)
-        lines.append("PDFLIP " + _pls.plan_line(res, key=f"dry-run-{n}", end=n)
-                     + " (HOCHRECHNUNG on the model, not a measurement)")
-    _P_LAYER_SPLIT["spec"] = spec
-    _P_LAYER_SPLIT["lines"] = tuple(lines)
-    for line in lines:
-        print(line, flush=True)
-
-
-def p_layer_split_swing_by_stage(n_stages: int) -> Tuple[Tuple[int, int], ...]:
-    """The planner's swing post: (attention, linear) swing layers per P stage;
-    () under static or when the spec's stage count is not P's."""
-    from flliper.srt.pdflip import p_layer_split as _pls
-
-    spec = _P_LAYER_SPLIT.get("spec")
-    if spec is None or spec.geometry.stages != int(n_stages):
-        return ()
-    g = spec.geometry
-    out = []
-    for s in range(g.stages):
-        win = tuple(g.swing_window(s))
-        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
-        out.append((na, len(win) - na))
-    return tuple(out)
-
-
-def p_layer_split_slab_lines(spec) -> List[str]:
-    """The swing slab per stage as the planner's post (weights from the rc9
-    checkpoint census, DYN_LAYER_SPLIT.md sec. 2; the rank-side sizer prices
-    the mirrors exactly, pool_configurator swing_extra_layer_counts)."""
-    from flliper.srt.pdflip import p_layer_split as _pls
-
-    g = spec.geometry
-    out = []
-    for s in range(g.stages - 1):
-        win = tuple(g.swing_window(s))
-        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
-        out.append(f"{_pls.LOG_TAG} slab stage={s} window={list(win)} attention={na} gdn={len(win) - na} "
-                   f"(KV mirror = {na} x pool x 2048 B/token, state mirror = {len(win) - na} x mamba slots "
-                   f"x 1.56 MiB, weights resident under tag weights_swing)")
-    return out
-
-
-def p_layer_split_env() -> Dict[str, str]:
-    """Group P's environment for the layer split; {} under 'static'."""
-    from flliper.srt.pdflip import p_layer_split as _pls
-
-    spec = _P_LAYER_SPLIT.get("spec")
-    if spec is None:
-        return {}
-    return {_pls.POLICY_ENV: _pls.POLICY_DYNAMIC, _pls.SPEC_ENV: spec.to_json()}
-
-
-#: --d-reshard (27B, user order 26.09. ~08:40Z/08:45Z: dynamic D resharding per
-#: load class, "nur auf TP1<, nicht fuers nf"). Rule and model live in
-#: pdflip/d_reshard.py (pure); design/evidence /spinning/gpu-arb/docs/DYN_D_RESHARD.md.
-#: 'off' (default) changes NOTHING: no env, no line, D argv byte-identical.
-#: 'wake' with ONE preset is the static MLP family vector (--rank-mlp-ratio on
-#: group D; the flip plan reads the loaders' own widths, xchg_manifest.family_ratios)
-#: and needs no executor. 'wake' with >= 2 presets and 'live' print the spec and
-#: the desk plan, then REFUSE: the rank-side executor (per-preset MLP views, graph
-#: sets, per-preset manifest rows, the planner's spread posten) is not wired.
-#: Any profile other than qwen27b (NF Form A) is refused, never ignored.
-D_RESHARD_DEFAULT = "off"
-D_RESHARD_DRY_RUN_LOADS = (("decode", 1, 32768), ("decode", 4, 32768), ("decode", 1, 131072),
-                           ("prefill", 1, 4096))
-_D_RESHARD: Dict[str, object] = {"policy": D_RESHARD_DEFAULT, "spec": None, "lines": ()}
-
-
-def d_reshard_format(model_path: str) -> str:
-    """'int8' | 'nvfp4' | '' -- the checkpoint formats the D model is calibrated for."""
-    qm = checkpoint_quant_method(str(model_path))
-    if qm == "compressed-tensors":
-        return "int8"
-    if qm == "modelopt":
-        return "nvfp4"
-    return ""
-
-
-def apply_d_reshard(ns) -> None:
-    """Install --d-reshard once, before any argv is built."""
-    from flliper.srt.pdflip import d_reshard as _dr
-
-    policy = str(getattr(ns, "d_reshard", D_RESHARD_DEFAULT) or D_RESHARD_DEFAULT)
-    if policy not in _dr.POLICIES + (_dr.POLICY_WAKE_SEG,):
-        raise SystemExit(f"--d-reshard {policy!r}: one of {list(_dr.POLICIES) + [_dr.POLICY_WAKE_SEG]}")
-    _D_RESHARD.update(policy=policy, spec=None, lines=())
-    if policy == _dr.POLICY_OFF:
-        return
-    # 'wake-seg' (SB 26.09.): 'wake' whose preset minimises the SEGMENT round
-    # (sum over layer segments of the slowest rank, d_reshard sec. "Segment
-    # model"), not the per-rank sums -- rc9meas refuted the sum objective.
-    objective = _dr.OBJECTIVE_SUM
-    if policy == _dr.POLICY_WAKE_SEG:
-        policy, objective = _dr.POLICY_WAKE, _dr.OBJECTIVE_SEGMENT
-    model = str(getattr(ns, "model", "") or "")
-    try:
-        with open(model_config_path(model)) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f"--d-reshard {policy}: cannot read the model config of {model!r}: {exc}")
-    try:
-        _dr.check_profile(_dr.profile_of_config(cfg), policy)
-    except _dr.ReshardProfileRefused as exc:
-        raise SystemExit(str(exc))
-    fmt = d_reshard_format(model)
-    if fmt not in ("int8", "nvfp4"):
-        raise SystemExit(f"--d-reshard {policy}: REFUSED -- no D cost model for checkpoint format "
-                         f"{checkpoint_quant_method(model)!r} (calibrated: INT8 compressed-tensors, "
-                         f"NVFP4 modelopt; DYN_D_RESHARD.md sec. 1)")
-    raw_presets = str(getattr(ns, "d_reshard_presets", "auto") or "auto").strip()
-    seg_points, seg_place, seg_shares = (), "capacity", None
-    try:
-        if objective == _dr.OBJECTIVE_SEGMENT:
-            seg_points = _dr.seg_ladder(d_reshard_depth(getattr(ns, "d_reshard_depth", "robust")))
-            seg_place, seg_shares = _d_reshard_seg_placement(ns)
-        if objective == _dr.OBJECTIVE_SEGMENT and raw_presets == "auto":
-            vec, _worst, _reg = _dr.seg_choose(fmt, seg_points, _dr.rc9_geometry(fmt).mlp_units,
-                                               seg_place, seg_shares)
-            presets = (_dr.Preset("seg", tuple(vec)),)
-        else:
-            presets = _dr.parse_presets(raw_presets, fmt)
-        spec = _dr.ReshardSpec(policy, tuple(_dr.RC9_BASE), presets, presets[0].name,
-                               float(getattr(ns, "d_reshard_min_gain", _dr.DEFAULT_MIN_GAIN)), fmt,
-                               objective)
-        spec.validate(_dr.rc9_geometry(fmt))
-    except (_dr.ReshardError, ValueError) as exc:
-        raise SystemExit(f"--d-reshard {policy}: {exc}")
-    loads = [_dr.LoadClass(k, b, c) for k, b, c in D_RESHARD_DRY_RUN_LOADS]
-    lines = ["PDFLIP " + _dr.armed_line(spec, "group=D")]
-    if objective == _dr.OBJECTIVE_SEGMENT:
-        lines += ["PDFLIP " + x + " (HOCHRECHNUNG on the segment model, not a measurement)"
-                  for x in _dr.seg_plan_lines(fmt, spec.presets[0].mlp, seg_points, seg_place, seg_shares)]
-    else:
-        lines += ["PDFLIP " + x + " (HOCHRECHNUNG on the model, not a measurement)"
-                  for x in _dr.plan_lines(spec, fmt, loads)]
-    if policy == _dr.POLICY_LIVE:
-        raise SystemExit("\n".join(lines) + "\n--d-reshard live: REFUSED -- a live switch moves the "
-                         "MLP units over BAR1 (~0.2-0.3 s each way) for at most 33 ms (INT8) / 111 ms "
-                         "(NVFP4) per 4096-token D-prefill chunk, and D prefills at most 3 chunks under "
-                         "the X ceiling (DYN_D_RESHARD.md sec. 2.4).")
-    if len(spec.presets) > 1:
-        raise SystemExit("\n".join(lines) + "\n--d-reshard wake: REFUSED -- more than one preset "
-                         "needs the rank-side executor (per-preset MLP views, graph sets, manifest "
-                         "rows, spread posten), which is not wired (DYN_D_RESHARD.md sec. 7).")
-    _D_RESHARD.update(spec=spec, lines=tuple(lines))
-
-
-def d_reshard_depth(raw) -> Optional[int]:
-    """--d-reshard-depth: 'robust' -> None (the measured ladder 10k..240k, bs1/bs2),
-    else the expected per-request depth in tokens ('131072', '128k')."""
-    r = str(raw or "robust").strip().lower()
-    if r == "robust":
-        return None
-    mult = 1024 if r.endswith("k") else 1
-    n = int(float(r[:-1] if r.endswith("k") else r) * mult)
-    if n <= 0:
-        raise ValueError(f"--d-reshard-depth {raw!r}: expected 'robust' or a positive token count")
-    return n
-
-
-def _d_reshard_seg_placement(ns) -> Tuple[str, Optional[Tuple[float, ...]]]:
-    """The token placement the segment objective prices (the one this boot runs)."""
-    if str(getattr(ns, "d_token_placement", "capacity") or "capacity") != "bandwidth":
-        return "capacity", None
-    raw = str(getattr(ns, "d_token_shares", "auto") or "auto")
-    return "bandwidth", (None if raw == "auto" else tuple(float(x) for x in raw.split(",")))
-
-
-def d_reshard_lines() -> Tuple[str, ...]:
-    return tuple(_D_RESHARD.get("lines") or ())
-
-
-def d_reshard_argv(d_ratio_flags: Sequence[str], extra_d: Sequence[str]) -> List[str]:
-    """Group D's extra argv: [] under 'off'; under a single-preset 'wake' the MLP
-    family vector. Refuses a base vector the presets were not built for, and a
-    hand-written --rank-mlp-ratio next to it (two authors of one vector)."""
-    spec = _D_RESHARD.get("spec")
-    if spec is None:
-        return []
-    flags = list(d_ratio_flags)
-    base = ",".join(str(x) for x in spec.base)
-    if "--rank-tp-ratio" not in flags or flags[flags.index("--rank-tp-ratio") + 1] != base:
-        raise SystemExit(f"--d-reshard {spec.policy}: REFUSED -- group D's weight vector is "
-                         f"{flags} but the presets are built on --rank-tp-ratio {base}")
-    if any(str(a).startswith("--rank-mlp-ratio") for a in extra_d):
-        raise SystemExit("--d-reshard: REFUSED -- --extra-d already carries --rank-mlp-ratio")
-    return ["--rank-mlp-ratio", ",".join(str(u) for u in spec.presets[0].mlp)]
-
-
-def d_reshard_env() -> Dict[str, str]:
-    """Group D's environment for the reshard; {} under 'off'."""
-    from flliper.srt.pdflip import d_reshard as _dr
-
-    spec = _D_RESHARD.get("spec")
-    if spec is None:
-        return {}
-    env = {_dr.POLICY_ENV: spec.policy, _dr.SPEC_ENV: spec.to_json()}
-    if spec.objective != _dr.OBJECTIVE_SUM:
-        env[_dr.OBJECTIVE_ENV] = spec.objective  # the D-SPEED table on group D follows it
-    return env
-
-
-#: --d-gc-freeze (SB 26.09., agent FR: three single-rank D-round stalls of ~0.5 s,
-#: candidate a Python gen-2 collection).  'on' = group D's schedulers call
-#: gc.freeze() once every runner is up (after the CUDA-graph capture), so the
-#: boot-time objects leave the collector's generations.  'off' (default) = no env.
-D_GC_FREEZE_DEFAULT = "off"
-
-#: --p-gc-freeze (NF 13.10., boot b60520f01d: a gen-2 GC over the ~1.12 M never-frozen
-#: boot objects stood PP0/PP1 still 4.4-5.4 s inside a flip once the cold heap was
-#: swapped out; ``done/nf-flip-langsam-analyse-1013.md``).  'on' = every P scheduler
-#: calls gc.freeze() once after boot, as --d-gc-freeze does for D.  'off' (default) =
-#: no env from this flag.  The nextflash and qwen27b rows turn the switch on for BOTH
-#: groups by default (form.*_GROUP_SWITCH_DEFAULTS -> --env-p/--env-d
-#: FLLIPER_PDFLIP_GC_FREEZE=1; ``--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0`` = the old
-#: path; RC4 fix round 1, user order 14.10.: new features default ON).
-P_GC_FREEZE_DEFAULT = "off"
-
-
-def apply_p_gc_warn_default(ns) -> Optional[str]:
-    """30.09. (NF y3z ep52: PP0 stood still 5.4 s process-wide at the first
-    tag of P's sleep; a gen-2 GC is one candidate): group P's schedulers arm
-    the GC warning at 0.5 s by default -- ``FLLIPER_PDFLIP_GC_WARN_SECS`` into
-    ``ns.env_p`` unless --env-p states it (=0 turns it off). Returns the line
-    naming it, or None."""
-    from flliper.srt.pdflip import gc_instrument as _gci
-
-    env_p = str(getattr(ns, "env_p", "") or "")
-    if _gci.WARN_ENV in parse_group_env(env_p):
-        return None
-    ns.env_p = set_group_env(env_p, _gci.WARN_ENV, f"{_gci.P_GC_WARN_DEFAULT_S:g}")
-    return (f"PDFLIP-GC P warn: --env-p {_gci.WARN_ENV}={_gci.P_GC_WARN_DEFAULT_S:g} (every P "
-            f"scheduler logs a GC collection over {_gci.P_GC_WARN_DEFAULT_S:g} s after boot; "
-            f"--env-p {_gci.WARN_ENV}=0 = off)")
-
-
-def p_gc_env(ns) -> Dict[str, str]:
-    """Group P's environment for --p-gc-freeze; {} under 'off'."""
-    from flliper.srt.pdflip import gc_instrument as _gci
-
-    if str(getattr(ns, "p_gc_freeze", P_GC_FREEZE_DEFAULT) or P_GC_FREEZE_DEFAULT) != "on":
-        return {}
-    return {_gci.FREEZE_ENV: "1"}
-
-
-def d_gc_env(ns) -> Dict[str, str]:
-    from flliper.srt.pdflip import gc_instrument as _gci
-
-    if str(getattr(ns, "d_gc_freeze", D_GC_FREEZE_DEFAULT) or D_GC_FREEZE_DEFAULT) != "on":
-        return {}
-    return {_gci.FREEZE_ENV: "1"}
-
-
-#: --d-token-placement (27B, user 26.09. ~09:40Z/09:45Z: "es muss dynamisch
-#: sein ... den kv so zu verteilen wie er optimal schnell ist zur jeweiligen
-#: fuelle"). pdflip/d_token_placement.py: NEW D tokens pick the card through the
-#: allocator's slot id (weighted owner rule), by effective bandwidth while the
-#: pool has room, by capacity when it is tight; stored KV never moves.
-#: 'capacity' (default) = today: no env, argv byte-identical.
-D_TOKEN_PLACEMENT_DEFAULT = "capacity"
-_D_TOKEN_PLACEMENT: Dict[str, object] = {"spec": None}
-
-
-def apply_d_token_placement(ns) -> None:
-    from flliper.srt.pdflip import d_reshard as _dr
-    from flliper.srt.pdflip import d_token_placement as _dtp
-
-    policy = str(getattr(ns, "d_token_placement", D_TOKEN_PLACEMENT_DEFAULT) or D_TOKEN_PLACEMENT_DEFAULT)
-    _D_TOKEN_PLACEMENT["spec"] = None
-    if policy not in _dtp.POLICIES:
-        raise SystemExit(f"--d-token-placement {policy!r}: one of {list(_dtp.POLICIES)}")
-    if policy == _dtp.POLICY_CAPACITY:
-        return
-    model = str(getattr(ns, "model", "") or "")
-    try:
-        with open(model_config_path(model)) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f"--d-token-placement {policy}: cannot read the model config of {model!r}: {exc}")
-    try:
-        _dr.check_profile(_dr.profile_of_config(cfg), "live")
-    except _dr.ReshardProfileRefused as exc:
-        raise SystemExit(str(exc).replace("--d-reshard live", f"--d-token-placement {policy}"))
-    raw = str(getattr(ns, "d_token_shares", "auto") or "auto")
-    try:
-        shares = _dtp.RC9_EFF_BW_GBS if raw == "auto" else tuple(float(x) for x in raw.split(","))
-        spec = _dtp.PlacementSpec(policy, tuple(shares),
-                                  float(getattr(ns, "d_token_fill_switch", _dtp.DEFAULT_FILL_SWITCH)))
-        spec.validate()
-    except (ValueError, _dtp.PlacementError) as exc:
-        raise SystemExit(f"--d-token-placement {policy}: {exc}")
-    _D_TOKEN_PLACEMENT["spec"] = spec
-
-
-def d_token_placement_env() -> Dict[str, str]:
-    """Group D's env for the token placement; {} under 'capacity'."""
-    from flliper.srt.pdflip import d_token_placement as _dtp
-
-    spec = _D_TOKEN_PLACEMENT.get("spec")
-    return {} if spec is None else {_dtp.ENV: spec.to_json()}
-
-
-#: --d-kv-evict-for-placement (27B row 24c, user 26.09.: "fertige requests
-#: oder vorherige requests muessen dann natuerlich den vram kvcache frei machen
-#: um die bestverteilung zu ermoeglichen"). pdflip/d_kv_evict.py, DYN_D_RESHARD
-#: sec. 14: cold, L2-backed radix leaves are demoted copy-free (device free,
-#: node keeps its arena rows) so --d-token-placement bandwidth holds its
-#: shares at high fill; the group agrees in one fixed-shape MIN collective.
-#: 'off' (default) = no env, argv byte-identical.
-D_KV_EVICT_DEFAULT = "off"
-_D_KV_EVICT: Dict[str, object] = {"spec": None}
-
-
-def apply_d_kv_evict(ns) -> None:
-    from flliper.srt.pdflip import d_kv_evict as _dke
-
-    mode = str(getattr(ns, "d_kv_evict_for_placement", D_KV_EVICT_DEFAULT) or D_KV_EVICT_DEFAULT)
-    _D_KV_EVICT["spec"] = None
-    if mode not in ("off", "on"):
-        raise SystemExit(f"--d-kv-evict-for-placement {mode!r}: one of ['off', 'on']")
-    if mode == "off":
-        return
-    if _D_TOKEN_PLACEMENT.get("spec") is None:
-        raise SystemExit("--d-kv-evict-for-placement on: REFUSED without --d-token-placement bandwidth "
-                         "(it evicts FOR the bandwidth placement; under 'capacity' there is nothing to hold)")
-    try:
-        spec = _dke.EvictSpec(min_idle_s=float(getattr(ns, "d_kv_evict_min_idle_s", 20.0)),
-                              publish_max=int(getattr(ns, "d_kv_evict_publish_max", 8)))
-        spec.validate()
-    except (ValueError, _dke.EvictError) as exc:
-        raise SystemExit(f"--d-kv-evict-for-placement on: {exc}")
-    _D_KV_EVICT["spec"] = spec
-
-
-def d_kv_evict_env() -> Dict[str, str]:
-    """Group D's env for the placement eviction; {} under 'off'."""
-    from flliper.srt.pdflip import d_kv_evict as _dke
-
-    spec = _D_KV_EVICT.get("spec")
-    return {} if spec is None else {_dke.ENV: spec.to_json()}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from flliper.srt.pdflip.launcher_d_p_apply import (  # noqa: F401 -- re-export, behaviour-neutral move
+    DRAFT_PARK_UNPRICED,
+    EXTEND_TRIM_ENV,
+    EXTEND_TRIM_FLIP_MARKER,
+    MAMBA_ARENA_ENV,
+    P_ATTN_HEAD_SPLIT_DEFAULT,
+    P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT,
+    P_LAYER_SPLIT_PULL_GBPS_DEFAULT,
+    P_PREFILL_GRAPH_SPLIT_DEFAULT,
+    TRIM_LAW_MARKER,
+    _d_early_start_armed,
+    _d_extend_flip_trim_env,
+    apply_profile_d_kv_token_cut_default,
+    apply_tokenizer_path,
+    census_checkpoint_decision,
+    d_draft_park_term,
+    d_fr_ceiling_before_map,
+    d_reshard_format,
+    d_seat_lines,
+    d_stated_seats,
+    group_kv_tokens,
+    live_launch_servers,
+    log_draft_swap,
+    mamba_arena_slots_into_groups,
+    model_num_layers,
+    p_attn_head_split_cfg,
+    p_graph_split_env,
+    p_layer_split_spec_from_ns,
+)
+from flliper.srt.pdflip.launcher_hicache_calib import (  # noqa: F401 -- re-export, behaviour-neutral move
+    D_RESHARD_DRY_RUN_LOADS,
+    P_LAYER_SPLIT_DRY_RUN_TOKENS,
+    _p_ah_post_vector,
+    _rope_context_terms,
+    apply_d_reshard,
+    apply_p_layer_split,
+    d_rope_context_delta_mib,
+    model_layer_kinds,
+    publish_expert_map,
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 #: PP-POSTEN (27B, 29.09.): the measured stage_fixed increment of the YaRN x2 context over the x1 record
 P_STAGE_FIXED_YARN2_DELTA_RECORD = "P_PP_STAGE_FIXED_YARN2_DELTA_MIB"
 
 
-def p_pool_posts_as_booked(ns) -> bool:
-    """PP-POSTEN (27B, 29.09.): does the profile's registry row price group P's pool with the posts the
-    P runtime BOOKS (``ModelProfile.p_pool_posts_as_booked``)? Then the corridor holdback is 0 (the P
-    budget line already subtracts corridor = reserve + awake overshoot; every P rank logs 'KV budget
-    holdback ... holdback=0.0') and the activation reserve is 0 unless pinned (the runtime books P's
-    prefill transient only for a checkpoint with measured slopes, p_prefill_transient_for; the 27B has
-    none -- boots 09291750/09291831/09292006: 'mamba state pool + speculative intermediate state + prefill
-    activation reserve' = 37.41 MiB x linear layers, the mamba pool alone). Off = byte-identical."""
-    row = pdflip_form.profile_row(getattr(ns, "profile", None))
-    return bool(row is not None and getattr(row, "p_pool_posts_as_booked", False))
 
 
 def p_stage_fixed_ctx_delta_record(ns, n_stages: int) -> Tuple[Optional[Tuple[float, ...]], str]:
@@ -2716,8 +2022,6 @@ def p_draft_kv_cell_bytes_by_stage(ns, n_stages: int, target_text_cfg: dict,
                       f"(its pool cell = attention layers x cell + this; pool_configurator cell_size_with_draft)")
 
 
-def spec_form_is_dflash() -> bool:
-    return str(_SPEC_FORM["form"]) == "DFLASH"
 
 
 def spec_flags(*, producer: bool) -> List[str]:
@@ -2749,25 +2053,10 @@ def spec_flags(*, producer: bool) -> List[str]:
     return flags
 
 
-#: 19.09. (xsn393, Punkt 5 D-Kapazitaet): the DFLASH draft on D runs SOLO by
-#: default -- the host rank holds it whole, the other ranks a meta shadow
-#: (measured: decode bs6 58 ms vs 61 ms replicated, KV 259k/193k/208k vs
-#: 290k/132k/141k tokens per rank, needle MATCH). `split` restores the
-#: replicated per-rank draft (A/B only).
-ENV_DFLASH_PLACEMENT = "FLLIPER_PDFLIP_DFLASH_PLACEMENT"
 
 
-def dflash_placement() -> str:
-    # 19.09. (user order): D shards the draft across the TP ranks ("split",
-    # the server default); "solo" (draft whole on one rank, xsn393) is the A/B
-    # opt-in, never the standard -- a replicated or solo draft is refused on D.
-    v = (os.environ.get(ENV_DFLASH_PLACEMENT, "split") or "split").strip().lower()
-    return "solo" if v == "solo" else "split"
 
 
-def dflash_produce_on_p() -> bool:
-    """--dflash-produce-on-p as installed by :func:`apply_spec_form`."""
-    return bool(_SPEC_FORM.get("produce_on_p", DFLASH_PRODUCE_ON_P_DEFAULT == "on"))
 
 
 def p_group_has_draft_producer() -> bool:
@@ -2900,29 +2189,6 @@ def spec_form_env(group: str) -> Dict[str, str]:
     return {}
 
 
-def dflash_produce_line() -> str:
-    """The one launcher line naming group P's DFlash producer form (the
-    draft_kv_off_line pattern: an A/B arm that reads like the default is how a
-    measurement gets attributed to the wrong tree)."""
-    if dflash_produce_on_p():
-        return (
-            "PDFLIP DFLASH-PRODUCE-ON-P: on (p_draft=compute) -- group P's DFlash draft-KV producer "
-            "COMPUTES (aux capture on every PP stage, produce() per prefill chunk, "
-            "hash-keyed publish into the draft arena); the old producer form, A/B only "
-            f"({DFLASH_PRODUCE_ENV}=1 in P's environment)"
-        )
-    return (
-        "PDFLIP DFLASH-PRODUCE-ON-P: off (p_draft=cold) -- STANDARD FORM (27B user decision "
-        "2026-09-24): group P loads the DFlash2 draft on its last PP stage (cold-resident bytes, "
-        "same VRAM, same planner cut, same exchange census and flip) and computes "
-        "nothing with it: no aux capture on any PP stage, no produce(), no "
-        "publish_draft_rows_direct. Group D is unchanged (DFLASH sharded, window "
-        f"{int(_SPEC_FORM['window'])}) and builds its draft context cold "
-        "(#993 zeros + 1 bootstrap round); under the default HICACHE-DRAFT-TIER auto "
-        "the draft gets no HiCache space at all, so expect no DRAFT-PRESENCE line and "
-        f"draft_pages=0 on the front's served lines ({DFLASH_PRODUCE_ENV}=0 in P's "
-        "environment; argv_p and the P FORM key are identical under on/off)"
-    )
 
 
 def p_produces_draft_pages() -> bool:
@@ -2932,14 +2198,8 @@ def p_produces_draft_pages() -> bool:
     return not (spec_form_is_dflash() and not dflash_produce_on_p())
 
 
-W10_SKIPPED_NO_DRAFT_PAGES = (
-    "W10 SKIPPED: P produces no draft pages (--dflash-produce-on-p off)"
-)
 
 
-def d_replayssm_spec() -> bool:
-    """--d-replayssm-spec as installed by :func:`apply_spec_form`."""
-    return bool(_SPEC_FORM.get("d_replayssm_spec", D_REPLAYSSM_SPEC_DEFAULT == "on"))
 
 
 def d_verify_window() -> int:
@@ -3017,318 +2277,39 @@ def d_replayssm_spec_line() -> str:
     )
 
 
-def d_effective_seats(ns) -> int:
-    """H91b: the seats group D actually runs -- ``--max-running-requests`` as
-    --extra-d ships it (the LAST value wins, as in argparse), else D's own
-    ``--d-bs``. ONE reader for every D post that scales with the seats (the
-    H64 verify form, the H91b seat rebook), so the price and the argv cannot
-    describe two different seat counts."""
-    extra = str(getattr(ns, "extra_d", "") or "")
-    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
-    raw_mrr = _argv_scalar(extra, "--max-running-requests")
-    try:
-        mrr = int(str(raw_mrr)) if raw_mrr is not None else d_bs
-    except ValueError:
-        mrr = d_bs
-    return max(1, mrr)
 
 
-def d_stated_seats(ns) -> Optional[int]:
-    """H91b: D's seats when this namespace STATES them (the launcher's own
-    parse always does: --d-bs has a default; --extra-d may carry
-    --max-running-requests), else None -- a hand-built namespace that says
-    nothing about seats is priced as its reference was, byte-identical."""
-    extra = str(getattr(ns, "extra_d", "") or "")
-    if not hasattr(ns, "d_bs") and _argv_scalar(extra, "--max-running-requests") is None:
-        return None
-    return d_effective_seats(ns)
 
 
-def _argv_int_list(extra: str, flag: str) -> Optional[List[int]]:
-    """The integers after the LAST ``flag`` of an --extra-* string (argparse
-    ``nargs='+'``: up to the next ``--``), or None when the flag is absent."""
-    if not extra or not flag:
-        return None
-    try:
-        parts = shlex.split(str(extra))
-    except ValueError:
-        return None
-    found: Optional[List[int]] = None
-    for i, tok in enumerate(parts):
-        vals: List[str] = []
-        if tok == flag:
-            j = i + 1
-            while j < len(parts) and not parts[j].startswith("--"):
-                vals.append(parts[j])
-                j += 1
-        elif tok.startswith(flag + "="):
-            vals = [v for v in tok[len(flag) + 1:].replace(",", " ").split() if v]
-        else:
-            continue
-        try:
-            found = [int(v) for v in vals]
-        except ValueError:
-            found = None
-    return found
 
 
-def d_seat_lines(ns) -> List[str]:
-    """H91b: what the seat count of this boot implies for D's argv, named.
-
-    * --d-bs (the front's D seats) against D's effective
-      --max-running-requests -- unequal means the front hands D requests it
-      queues, or leaves a seat idle;
-    * --cuda-graph-bs-decode must capture every batch 1..seats, else the
-      uncovered batch runs EAGER (correct, slow: the pool step's host
-      rendezvous per layer).
-    Findings, not refusals: the boot still starts."""
-    from flliper.srt.pdflip.d_seats import graph_bs_covers
-
-    extra = str(getattr(ns, "extra_d", "") or "")
-    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
-    seats = d_effective_seats(ns)
-    graph = _argv_int_list(extra, "--cuda-graph-bs-decode")
-    out = [
-        "D-SITZE (H91b): --d-bs %d (Front-Sitze), D --max-running-requests %d (wirksam), "
-        "--cuda-graph-bs-decode %s%s"
-        % (d_bs, seats, "Runtime-Default" if graph is None else " ".join(str(b) for b in graph),
-           # H95: the seat count is the phase's handoff_n, this is its bound
-           (" -- H95: %d ist die OBERGRENZE, D faehrt je Phase n = 1..%d Sitze "
-            "(handoff_n beim Flip P->D, PDFLIP D-PHASE-SEATS), die Sitz-Posten sind "
-            "fuer %d gebucht" % (seats, seats, seats)) if seats > 1 else "")
-    ]
-    if seats != d_bs:
-        out.append(
-            "D-SITZE (H91b) BEFUND: --d-bs %d != D --max-running-requests %d (--extra-d "
-            "gewinnt) -- die Front und D zaehlen verschiedene Sitze" % (d_bs, seats)
-        )
-    if not graph_bs_covers(graph, seats):
-        out.append(
-            "D-SITZE (H91b) BEFUND: --cuda-graph-bs-decode %s faengt nicht jede Batch "
-            "1..%d ein -- die fehlende laeuft EAGER; fuer %d Sitze '--cuda-graph-bs-decode %s'"
-            % (
-                " ".join(str(b) for b in graph),
-                seats,
-                seats,
-                " ".join(str(b) for b in range(1, seats + 1)),
-            )
-        )
-    return out
 
 
-def d_seat_vram_armed(env_d) -> bool:
-    """H95c: FLLIPER_OPT_PDFLIP_D_SEAT_VRAM truthy in the D group's env."""
-    return str((env_d or {}).get("FLLIPER_OPT_PDFLIP_D_SEAT_VRAM", "")).strip().lower() in (
-        "1", "true", "yes", "on")
 
 
-def d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form):
-    """H95c: the seat-post geometry for the seat table's runtime columns
-    (``expert_residency.seat_vram_form``), or None when the switch is off in
-    --env-d or the checkpoint has no GDN geometry."""
-    env_d = plan_kwargs.get("env_d") or {}
-    if not d_seat_vram_armed(env_d):
-        return None
-    from flliper.srt.planner import pp_cut as _pp
-
-    terms = _pp.checkpoint_weight_terms(ns.model)
-    text_cfg = cfg.get("text_config") or cfg
-    ratios = str(plan_kwargs.get("rank_tp_ratio") or "")
-    return er.seat_vram_form(
-        text_cfg, ssm_dtype=getattr(form, "ssm_dtype", None), rank_tp_ratio=ratios,
-        n_ranks=len(plan_kwargs.get("budgets_mib") or ()) or 1,
-        expert_row_bytes=float(terms.expert_layer_weight_bytes) / int(terms.num_experts),
-        moe_layers=int(terms.n_layers))
 
 
-def apply_d_seat_expert_rows(ns, er, rows, seat_vram, label) -> List[str]:
-    """H95c: write FLLIPER_PDFLIP_D_SEAT_EXPERT_ROWS (the seat rows' virtual
-    reservation per rank, from the table) into --env-d -- before build_env
-    reads it -- unless the operator stated it. Returns the lines to log."""
-    env_d_raw = str(getattr(ns, "env_d", "") or "")
-    stated = parse_group_env(env_d_raw).get("FLLIPER_PDFLIP_D_SEAT_EXPERT_ROWS")
-    value = er.seat_expert_rows_value(rows)
-    fixed = er.seat_fixed_mib(rows, seat_vram, value)
-    head = "%s FRACTION-SOLVE %s D-SITZ-VRAM (H95c)" % (D_RANK_SOLVE_MARKER, label)
-    fixed_txt = (
-        "; fest an JEDER Sitzzahl (auch der Kappe): die Seat-Zeilen der Skalen-Tensoren, "
-        "zu klein zum Entmappen, je Rang %s MiB GESCHAETZT -- NICHT im Kappen-Riegel "
-        "gebucht" % ["%.1f" % f for f in fixed] if fixed else "")
-    if stated is not None:
-        return ["%s: --env-d nennt FLLIPER_PDFLIP_D_SEAT_EXPERT_ROWS=%s selbst (Tabelle: %s)%s"
-                % (head, stated, value, fixed_txt)]
-    if not value or all(v == "0" for v in value.split(",")):
-        return ["%s: keine Seat-Zeilen (die Tabelle finanziert bei n=1 keine Zeile)" % head]
-    item = "FLLIPER_PDFLIP_D_SEAT_EXPERT_ROWS=%s" % value
-    ns.env_d = (env_d_raw.rstrip(";") + ";" + item) if env_d_raw.strip() else item
-    return ["%s: --env-d %s (virtuelle Reserve je Rang = k(n=1) + 1; gemappt wird je "
-            "Phase nur, was die Laufzeit exakt aus den ungemappten GDN-Slots finanziert)%s"
-            % (head, item, fixed_txt)]
 
 
-#: #251c: the --env-d keys of D's KV stage form (the launcher's form values)
-D_KV_STAGE_KEYS = ("FLLIPER_PDFLIP_D_KV_STAGE_TOKENS", "FLLIPER_PDFLIP_D_KV_STAGE_ROWS",
-                   "FLLIPER_PDFLIP_D_KV_STAGE_MAX_BY_SEATS")
-#: #251d: the operator's switch -- the stage follows the wake's demand alone
-D_KV_STAGE_BY_DEMAND_KEY = "FLLIPER_PDFLIP_D_KV_STAGE_BY_DEMAND"
 #: #239 S3g: the stage rows per D rank under the token cut (every KV rank)
 D_KV_STAGE_ROWS_BY_RANK_KEY = "FLLIPER_PDFLIP_D_KV_STAGE_ROWS_BY_RANK"
 
 
-def d_kv_stage_tokens_named(ns) -> Optional[Tuple[int, ...]]:
-    """#239 S3h: the KV stage tokens the operator names in --env-d
-    (``FLLIPER_PDFLIP_D_KV_STAGE_TOKENS``), or None when the D group's env does
-    not name them (the launcher would then write its own stage form)."""
-    raw = parse_group_env(str(getattr(ns, "env_d", "") or "")).get(D_KV_STAGE_KEYS[0])
-    if raw is None:
-        return None
-    try:
-        return tuple(int(float(x)) for x in str(raw).split(",") if x.strip())
-    except ValueError:
-        return ()
 
 
-#: 29.09.: the lowest KV stage and the step of the stages below the booked S0
-D_KV_STAGE_FLOOR_KEY = "FLLIPER_PDFLIP_D_KV_STAGE_FLOOR_TOKENS"
 
 
-def d_kv_stage_floor_tokens(env: Mapping[str, str]) -> int:
-    """29.09. (Nutzer 12:35Z, Grundgesetz): the floor stage below S0 in tokens --
-    stages floor, 2 x floor, ... below the booked S0 (0 = none, byte-identical).
-    The D group's env wins over the environ default."""
-    raw = (env or {}).get(D_KV_STAGE_FLOOR_KEY)
-    if raw is None:
-        from flliper.srt.environ import envs
-
-        return max(0, int(envs.FLLIPER_PDFLIP_D_KV_STAGE_FLOOR_TOKENS.get() or 0))
-    try:
-        return max(0, int(float(str(raw).strip() or 0)))
-    except ValueError:
-        return 0
 
 
-def d_kv_stage_by_demand(env: Mapping[str, str]) -> bool:
-    """#251d: FLLIPER_PDFLIP_D_KV_STAGE_BY_DEMAND in the D group's env; a D env that
-    does not name it gets the rank's own default (environ.py, ON since 29.09.),
-    so the launcher prices the form the rank will run."""
-    raw = (env or {}).get(D_KV_STAGE_BY_DEMAND_KEY)
-    if raw is None:
-        from flliper.srt.environ import envs
-
-        return bool(envs.FLLIPER_PDFLIP_D_KV_STAGE_BY_DEMAND.get())
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
-def kv_stage_wave_cap(ns, er, tab, max_by: Sequence[int], env: Mapping[str, str],
-                      head: str) -> Tuple[Optional[int], List[str]]:
-    """#251d: the overflow-wave cap the captured decode steps need under the
-    highest stage per seat count ``max_by``. A form that lowers a batch's
-    capture floor adds waves (``tab.extra_waves``); the step needs
-    max(``tab.capture_waves``) of them, and below that its own bound refuses
-    the capture on TP0 ('Step ids exceed the LRU rows plus the staging rows')
-    -- rc12z22's FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=2 against 3 for S1 at
-    n=5/6. The launcher's own cap (derived, or not written at all) is raised;
-    a cap told in --env-d is refused by name (W169). (None, []) = nothing to
-    change: no extra wave, or the cap already carries it (the default table
-    adds none)."""
-    if not any(int(e) > 0 for e in tab.extra_waves(max_by)):
-        return None, []
-    need = max(tab.capture_waves(max_by))
-    have = er.pool_overflow_waves(env)
-    if need <= have:
-        return None, []
-    if er.POOL_OVERFLOW_WAVES_ENV in env and not getattr(ns, "d_pool_waves_derived", False):
-        raise PdFlipDKvStageWavesRefused(
-            "W169 PdFlipDKvStageWavesRefused: the stage form (highest stage per seat count %s) "
-            "requires %d Ueberlaufwellen je bs %s, --env-d nennt %s=%s -- der Capture "
-            "verweigerte auf TP0 ('Step ids exceed ...'); keine Stufenform geschrieben"
-            % (list(max_by), need, list(tab.capture_waves(max_by)),
-               er.POOL_OVERFLOW_WAVES_ENV, env.get(er.POOL_OVERFLOW_WAVES_ENV)))
-    return need, ["%s: WELLEN (#251d) %s %d -> %d (Launcher-Ableitung): die Stufenform senkt "
-                  "den Capture-Floor, Wellen je bs %s statt %s -- ohne die Anhebung verweigert "
-                  "der Capture auf TP0" % (head, er.POOL_OVERFLOW_WAVES_ENV, have, need,
-                                          list(tab.capture_waves(max_by)), list(tab.waves))]
 
 
-def rank_wave_floor(demand: Sequence[int], scratch_after: Sequence[int],
-                    capture_on: Sequence[int], waves: int) -> Tuple[List[str], List[int]]:
-    """#239 S3g floor, ONE formula for the planner and the rank: the captured
-    step of the cap's seats routes D_r = min(ids, E - R) ids over
-    C_r = LRU + staging (the scratch AFTER the stage rows moved into the seat
-    rows) + capture_on[r] (the seat/stage rows the capture counts ON: the
-    rank's capture floor where it has KV cells, #251c; 0 where it has none --
-    'seat rows ... OFF until a D phase funds them'), in at most ``waves``
-    waves: D_r <= waves x C_r on EVERY rank. Returns (one line per rank with
-    its air ``waves x C - D``, the ranks that break it)."""
-    lines, bad = [], []
-    for r, (d, c0, on) in enumerate(zip(demand, scratch_after, capture_on)):
-        c = int(c0) + int(on)
-        air = int(waves) * c - int(d)
-        lines.append("rang%d D %d <= %d x (%d + %d) = %d, Luft %d%s"
-                     % (r, int(d), int(waves), int(c0), int(on), int(waves) * c, air,
-                        "" if air >= 0 else " -- BRICHT"))
-        if air < 0:
-            bad.append(r)
-    return lines, bad
 
 
-def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int,
-                        head: str) -> List[str]:
-    """#239 S3g floor (rc12z30b 28.09. 20:09:07): ``rank_wave_floor`` over the
-    form the launcher writes. D_r from the seat table at the cap (ids of the
-    cap's seats, E - R of the rank); the scratch after the move (a KV rank
-    gives its stage rows to its seat rows); capture_on[r] = a KV rank's
-    capture floor at the cap's batch (rows + seat extra - the stage rows of
-    the highest stage the cap may take, as ``d_seat_vram.capture_floors``),
-    0 on every rank without a stage table (no KV, no cells, no floor). A
-    rank given stage rows the plan stages no KV for is refused as well: its
-    runtime would build no cells and count them OFF. Refuses by name (W171)
-    before any rank is launched; the lines name each rank's air."""
-    last = rows[-1]
-    n = len(last.scratch_given)
-    staged = {int(t.host_rank): t for t in group.tables}
-    fit_by = {int(f.rank): f for f in fits}
-    cap = len(rows)
-    demand, after, on = [], [], []
-    for r in range(n):
-        c = int(last.scratch_given[r])
-        f = fit_by.get(r)
-        E = int(f.local_experts) if f is not None else 0
-        demand.append(min(int(last.ids_per_step), max(E - (int(last.max_rows[r]) - c), 0)))
-        t = staged.get(r)
-        if t is None:
-            after.append(c)
-            on.append(0)
-            continue
-        # the scratch the rank RUNS (FLLIPER_MOE_SCRATCH_SLOTS as written:
-        # the low rows a floor ladder funds are NEW bank rows, only the rest
-        # leaves the scratch) = its 'C=LRU+staging'; on = its capture floor,
-        # the rows of the cap's top stage -- the two numbers the rank's H95
-        # line prints (y6n TP2: 46 + 0, where the old split read 38 + 9)
-        a = c - (int(t.rows) - int(getattr(t, "low_rows", 0) or 0))
-        after.append(a)
-        j = min(int(max_by[cap - 1]), len(t.tokens) - 1)
-        on.append(int(t.capacity[cap - 1][j]) - a)
-    lines, bad = rank_wave_floor(demand, after, on, int(waves_cap))
-    # the smaller batches of a KV rank: its floor can sit lower (a stage the
-    # cap never takes) -- the table's per-batch waves, the same floor rule
-    bad += [r for r, t in sorted(staged.items())
-            if r not in bad and max(t.capture_waves(max_by)) > int(waves_cap)]
-    host = int(group.host.host_rank)
-    orphan = [r for r in staged if r != host and er_trim_cell(fit_by.get(r), host) <= 0]
-    if bad or orphan:
-        raise PdFlipDKvStageWavesRefused(
-            "W171 PdFlipDKvStageWavesRefused: Wellenboden je D-Rang gebrochen %s%s -- %s; "
-            "keine Stufenform geschrieben"
-            % (["rang%d" % r for r in bad],
-               " / Stufenzeilen ohne KV auf %s" % (["rang%d" % r for r in orphan],)
-               if orphan else "", "; ".join(lines)))
-    return ["%s: WELLENBODEN JE RANG (#239 S3g-Boden, D <= W x (LRU+Staging+Capture-Boden)) %s"
-            % (head, "; ".join(lines))]
 
 
 D_KV_STAGE_LRU_FLOOR_ENV = "FLLIPER_PDFLIP_D_KV_STAGE_LRU_FLOOR"
-D_KV_STAGE_LRU_FLOOR_MARKER = "LRU-UNTERGRENZE (#251c, gemessener Spitzenbedarf)"
 #: re-solves the floor may ask for in one pass (the second one checks the first)
 D_KV_STAGE_LRU_FLOOR_ROUNDS = 2
 
@@ -3349,111 +2330,16 @@ def d_pool_peak_record(profile: Optional[str] = None
     return peak, span, _pconst_boots("D_POOL_PEAK_NONRES_ROWS", profile)
 
 
-def kv_stage_lru_floor(group, rows, fits, max_by: Sequence[int], peak: Sequence[int],
-                       span: Sequence[int], source: str, head: str
-                       ) -> Tuple[Dict[int, int], List[str]]:
-    """(3) 29.09.: the measured peak pool demand as the LRU floor of the stage
-    solve. A KV rank's stage rows are LRU rows in S0; a wake to S_j unmaps
-    ``stage_rows[j]`` of them. The wave rule prices the step at
-    min(b x verify x top_k, E - R) with waves -- the MEASURED peak of
-    non-resident ids per step (MOE-POOL-DEMAND, rc12z30r3: TP2 43 of C 48)
-    is the demand the extra wave hits. Floor per KV rank: the fewest rows any
-    allowed (n, stage) of the written form leaves (``capacity[n][max_by[n]]``)
-    >= the peak, scaled from the measured span E - R to this form's
-    (first order: the non-resident ids of a step grow with the non-resident
-    span). Short by d rows -> the scratch grows by ceil(d / (1 - p)) with
-    p = peak / span: a row moved from resident to scratch widens the span by
-    one row, so the need grows by p per row. Returns ({rank: rows to add},
-    lines); an empty dict when every KV rank holds its peak."""
-    last = rows[-1]
-    fit_by = {int(f.rank): f for f in fits}
-    cap = len(rows)
-    add: Dict[int, int] = {}
-    parts: List[str] = []
-    for t in group.tables:
-        r = int(t.host_rank)
-        if r >= len(peak) or r >= len(last.scratch_given):
-            continue
-        f = fit_by.get(r)
-        E = int(f.local_experts) if f is not None else 0
-        C = int(last.scratch_given[r])
-        span_now = max(E - (int(last.max_rows[r]) - C), 0)
-        p = min(float(peak[r]) / int(span[r]), 1.0) if int(span[r]) > 0 else 1.0
-        need = min(int(math.ceil(p * span_now - 1e-9)), span_now, int(last.ids_per_step))
-        j_by = [min(int(max_by[i]), len(t.tokens) - 1) for i in range(cap)]
-        lru = min(int(t.capacity[i][j_by[i]]) for i in range(cap))
-        text = ("rang%d Peak %d bei Spanne %d -> Bedarf %d bei Spanne %d (E %d - R %d), "
-                "LRU bis S%d min %d" % (r, int(peak[r]), int(span[r]), need, span_now, E,
-                                        E - span_now, max(j_by), lru))
-        if need > lru:
-            k = int(math.ceil((need - lru) / max(1.0 - p, 0.05) - 1e-9))
-            add[r] = k
-            text += " < %d -> Scratch +%d (Bedarf +%.3f je Zeile)" % (need, k, p)
-        else:
-            text += " >= %d, haelt" % need
-        parts.append(text)
-    return add, ["%s: %s (%s aus %s): %s" % (
-        head, D_KV_STAGE_LRU_FLOOR_MARKER, "D_POOL_PEAK_NONRES_ROWS", source or "Record",
-        "; ".join(parts) or "kein KV-Rang")]
 
 
-def er_trim_cell(fit, host_rank: int) -> int:
-    """The planner's trim cell of a fit (0 without one)."""
-    if fit is None:
-        return 0
-    from flliper.srt.planner import expert_residency as er
-
-    return int(er.kv_stage_trim_cell(fit, host_rank))
 
 
-def operator_kv_stage_max(raw: Optional[str], cap: int, stages: int) -> Optional[Tuple[int, ...]]:
-    """The operator's highest stage per seat count, or None when --env-d does
-    not name it. Refuses by name what the table cannot take."""
-    if raw is None or not str(raw).strip():
-        return None
-    try:
-        vals = tuple(int(x) for x in str(raw).split(",") if x.strip())
-    except ValueError:
-        vals = ()
-    if len(vals) != int(cap) or any(v < 0 or v >= int(stages) for v in vals):
-        raise PdFlipDKvStageMaxRefused(
-            "W168 PdFlipDKvStageMaxRefused: --env-d %s=%s passt nicht zur Stufentabelle "
-            "(%d Sitzzahlen, Stufen 0..%d) -- keine Stufenform geschrieben"
-            % (D_KV_STAGE_KEYS[2], raw, int(cap), int(stages) - 1))
-    return vals
 
 
-def _drop_group_env(spec: str, key: str) -> str:
-    return ";".join(x for x in str(spec or "").split(";")
-                    if x.strip() and x.split("=", 1)[0].strip() != key)
 
 
-def _rank_vec(raw: Optional[str], n: int) -> List[int]:
-    vals = [int(float(x)) for x in str(raw or "").split(",") if x.strip()]
-    if len(vals) == 1:
-        vals = vals * n
-    return (vals + [0] * n)[:n] if vals else [0] * n
 
 
-def kv_stage_cut_workers(kv_token_shares, host_rank: int = 0) -> List[int]:
-    """#239 S3g (28.09.): the D ranks other than the attention host that hold
-    full-attention KV under the token cut -- every worker with a share > 0,
-    and (a cut the planner still solves: 'owned', 'maxmin', 'joint') every
-    worker, since any of them may get one. [] without a cut."""
-    if kv_token_shares is None:
-        return []
-    if isinstance(kv_token_shares, str):
-        vec = None
-        if kv_token_shares.startswith("owned:"):
-            try:
-                vec = [float(x) for x in kv_token_shares[len("owned:"):].split(",") if x.strip()]
-            except ValueError:
-                vec = None
-        if vec is None:
-            return [-1]  # unsolved: some worker, not yet known which
-    else:
-        vec = [float(x) for x in kv_token_shares]
-    return [r for r, s in enumerate(vec) if r != int(host_rank) and float(s) > 0.0]
 
 
 def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens: int,
@@ -3706,13 +2592,6 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
                 % (D_RANK_SOLVE_MARKER, label, type(exc).__name__, exc)]
 
 
-def d_seat_graph_mib(ns) -> Optional[List[float]]:
-    """--d-seat-graph-mib: the measured decode-graph cost per extra seat, one
-    value for every rank or one per rank; None = not given."""
-    raw = str(getattr(ns, "d_seat_graph_mib", "") or "").strip()
-    if not raw:
-        return None
-    return [float(x) for x in raw.split(",") if x.strip()]
 
 
 def d_replayssm_spec_plan_form(ns):
@@ -3773,183 +2652,22 @@ def spec_plan_fields() -> Dict[str, object]:
     }
 
 
-#: H25 (Nutzer-Order 24.09. 08:25Z, "Draft auf P streichen"): the operator's
-#: input for "does group P carry the MTP head". The launcher flag
-#: ``--draft-kv-on-p`` and this variable are TWO SPELLINGS OF ONE FACT (the
-#: draft-KV producer IS the draft on P); :func:`resolve_draft_on_p` reconciles
-#: them once, the launcher writes the resolved value back into
-#: ``ns.draft_kv_on_p`` and into its own environment (front and both groups
-#: inherit it through ``build_env``), and
-#: ``pdflip_memory_saver.draft_tag_in_family`` reads it on every rank.
-DRAFT_ON_P_ENV = "FLLIPER_PDFLIP_DRAFT_ON_P"
-DRAFT_ON_P_CONFLICT = "W127 PdFlipDraftOnPConflict"
 
 
-def resolve_draft_on_p(flag_value: str, flag_explicit: bool,
-                       env_set: bool, env_value: bool,
-                       profile_default_on: bool = False) -> Tuple[bool, str]:
-    """``(draft_on_p, provenance)`` for group P, from flag and env.
-
-    The ENV is the authority since H25 (its default is False, the user
-    order); an explicit flag that contradicts an EXPLICIT env is refused by
-    name (W127) -- an A/B arm whose two inputs say opposite things is the boot
-    that gets attributed to the wrong form.  An explicit ``--draft-kv-on-p
-    on`` against the UNSET env (every arm since #1264 passes the flag) does
-    not refuse: it is overruled by the order and the line says so, because the
-    producer it asks for has had no reader since fnFL2x63 (H1: PUBLISH-SWEEP
-    draft_issued=0, D runs DRAFT-COLD every flip).
-
-    UNIFY S6: THE ONE RULE for "does group P carry a draft producer", called
-    by the ONE writer of the ``p_draft`` axis (pdflip/form.resolve_form, injected
-    like parse_group_env). ``profile_default_on`` is the booted profile's row
-    (``p_draft != none``): False for nextflash (H25 above, unchanged), True for
-    qwen27b (``p_draft=cold``, 27B 2026-09-24: the DFlash producer stays built
-    on P, computes nothing) -- there the env is still the explicit authority,
-    and the flag is honoured instead of overruled.
-    """
-    flag_on = str(flag_value) == "on"
-    if env_set:
-        if flag_explicit and flag_on != bool(env_value):
-            raise PdFlipLaunchRefused(
-                f"{DRAFT_ON_P_CONFLICT}: --draft-kv-on-p {flag_value} contradicts "
-                f"{DRAFT_ON_P_ENV}={'1' if env_value else '0'}. Both name whether "
-                "group P carries the MTP draft head; drop one of them."
-            )
-        return bool(env_value), f"env {DRAFT_ON_P_ENV}={'1' if env_value else '0'}"
-    if profile_default_on:
-        if flag_explicit:
-            return flag_on, f"--draft-kv-on-p {flag_value} (profile default: producer on P)"
-        return True, "profile default: producer on P (p_draft cold|compute)"
-    if flag_explicit and flag_on:
-        return False, (f"default {DRAFT_ON_P_ENV}=0 (Nutzer-Order 24.09.) OVERRULES "
-                       f"--draft-kv-on-p {flag_value}: the producer has no reader "
-                       "since fnFL2x63; set the env to 1 to keep the draft on P")
-    return False, f"default {DRAFT_ON_P_ENV}=0 (Nutzer-Order 24.09.)"
 
 
-def strip_speculative_flags(tokens: Sequence[str]) -> Tuple[List[str], List[str]]:
-    """``(kept, stripped)``: every ``--speculative-*`` token of an extra argv,
-    with its value when it takes one.
-
-    H25: no draft on P means ZERO ``--speculative-*`` tokens on group P
-    (#1264 property 1), and ``ring_table.p_carries_drafter`` reads ANY such
-    token as "P carries a drafter".  The Next-Flash arm passes
-    ``--speculative-draft-model-path`` through ``--extra-p``; without this P
-    would still load the MTP head (and a draft path with no algorithm).  A
-    value is a following token that is not itself a flag; ``--flag=value`` is
-    one token.
-    """
-    kept: List[str] = []
-    stripped: List[str] = []
-    toks = [str(t) for t in tokens]
-    i = 0
-    while i < len(toks):
-        t = toks[i]
-        if t.startswith("--speculative-"):
-            stripped.append(t)
-            if "=" not in t and i + 1 < len(toks) and not toks[i + 1].startswith("--"):
-                stripped.append(toks[i + 1])
-                i += 1
-        else:
-            kept.append(t)
-        i += 1
-    return kept, stripped
 
 
-DRAFT_PARK_UNPRICED = "W128 PdFlipDraftParkUnpriced"
 
 
-def d_draft_park_term(ns, draft_on_p: bool) -> Tuple[float, str]:
-    """``(MiB, provenance)`` of D's parked draft (ledger post ``d_draft_host``).
-
-    Non-zero only in the one form where D parks: the exchange arm (under
-    ``ring`` the draft rides the base tag's ring backup), weights flipping
-    (under ``resident`` nothing sleeps) and group P without a draft.  Priced
-    from the draft checkpoint's own headers (``draft_post.d_draft_host_mib``).
-    D with a draft that cannot be priced is refused by name (W128): an
-    unpriced pinned image is host RAM the ledger promised to somebody else.
-    """
-    if draft_on_p:
-        return 0.0, "none (group P carries the draft; the draft tag flips)"
-    if str(ns.pdflip_weight_source) != WEIGHT_SOURCE_EXCHANGE:
-        return 0.0, f"none (weight source {ns.pdflip_weight_source!r}: the draft rides the base tag)"
-    if str(getattr(ns, "flip_weights", "family")) == "resident":
-        return 0.0, "none (--flip-weights resident: nothing sleeps)"
-    extra_d = str(getattr(ns, "extra_d", "") or "")
-    if _argv_scalar(extra_d, "--speculative-algorithm") is None:
-        return 0.0, "none (group D runs no speculative decoding)"
-    from flliper.srt.pdflip import draft_post as _dp
-
-    placement = _argv_scalar(extra_d, "--speculative-draft-placement")
-    path = _argv_scalar(extra_d, "--speculative-draft-model-path")
-    mib = _dp.d_draft_host_mib(str(path), share_embed=d_draft_share_embed(ns)) if path else None
-    if placement != "solo" or mib is None:
-        raise PdFlipLaunchRefused(
-            f"{DRAFT_PARK_UNPRICED}: group P carries no draft, so D parks its draft "
-            "in pinned host RAM while P runs, and that image must be in the host "
-            f"ledger -- but D's argv names placement={placement!r} draft "
-            f"path={path!r} ({'no *.safetensors there' if path else 'no path'}). "
-            "Only '--speculative-draft-placement solo' with an explicit "
-            "--speculative-draft-model-path is priced (rank 0 holds the draft)."
-        )
-    return float(mib), (f"D rank 0 parks its solo draft: checkpoint {path} minus the "
-                        f"target-shared tables (share_embed={d_draft_share_embed(ns)}) "
-                        f"+ buffers {_dp.DRAFT_RUNNER_BUFFER_MIB} = {mib:.0f} MiB pinned")
 
 
-def draft_on_p_line(draft_on_p: bool, provenance: str, stripped: Sequence[str]) -> str:
-    """The one line naming which H25 form ran and where D's draft lives."""
-    if draft_on_p:
-        return (f"PDFLIP DRAFT-ON-P: on ({provenance}) -- group P carries the MTP head as "
-                "draft-KV producer and as the exchange partner of D's draft")
-    return (
-        f"PDFLIP DRAFT-ON-P: off ({provenance}) -- group P boots with NO draft "
-        f"(stripped from --extra-p: {list(stripped) or 'nothing'}); weights_draft leaves "
-        "the family, D parks its draft in pinned system RAM while P runs "
-        "(PDFLIP-DRAFT-PARK/UNPARK) and starts every flipped request DRAFT-COLD"
-    )
 
 
-def draft_kv_off_line() -> str:
-    """The one line the launcher prints when the producer is switched OFF.
-
-    An A-B arm that reads like the default is how a measurement gets
-    attributed to the wrong tree.  This says, in the boot's own log, exactly
-    which of the two forms ran and what it costs.
-    """
-    return (
-        "PDFLIP DRAFT-KV-ON-P: off -- group P boots without the MTP head; "
-        "D reads KV+Mamba from the store, draft state is cold after every "
-        "flip (user order 2026-09-07 stands; this form is the rg6 baseline)"
-    )
 
 
-def hicache_disabled_line() -> str:
-    """#1386: the one line the launcher prints when --pdflip-disable-hicache is set.
-
-    Same reason as :func:`draft_kv_off_line`: an A-B arm that reads like the
-    default is how a measurement gets attributed to the wrong tree. This says,
-    in the boot's own argv-adjacent log, that BOTH groups' argv omit every
-    HiCache flag and the ledger charged 0.00 for it -- the ledger's own
-    ``PDFLIP-HICACHE-DISABLED`` line (host_ledger.choose) is the other half of
-    this same fact, printed at the other end of the one bool.
-    """
-    return (
-        "PDFLIP HICACHE-DISABLED: on -- both groups boot without "
-        "--enable-hierarchical-cache and every --hicache-* flag (Minimalform "
-        "order #1386: 0 requests served means 0 prefixes to reuse); the host "
-        "ledger prices anchors_gib/rings_gib/overhead_gib at 0.00 for the "
-        "identical reason (see PDFLIP-HICACHE-DISABLED in this boot's ARM lines)"
-    )
 #: FLLIPER_PDFLIP_VENV: see the rig-path block at the top (--venv still wins).
 VENV_DEFAULT = os.environ.get("FLLIPER_PDFLIP_VENV") or "/spinning/htsglang-gpu/.venv"
-#: The model context both groups are launched with.  Named once because K9's
-#: --max-kv-per-request default IS this number (the as-built cap, decoupled
-#: from the model context so it can be lowered without touching the context).
-CONTEXT_LENGTH_TOKENS = 262144
-#: D's prefill chunk width.  Named once because it is X's FLOOR (K5): a bound
-#: below one chunk would refuse work D must be able to do to make progress.
-CHUNKED_PREFILL_TOKENS = 4096
 #: P's prefill chunk width (L2 lever, 24.09.): read ONCE at import from the
 #: registered env so the cut solver, the depth funding and argv_p agree; the
 #: TRAIN FIX 5 re-check below still proves that on every boot.  D keeps
@@ -3971,18 +2689,6 @@ X_RECORDED_R_P_TOKS = _PROFILE_27B.constant("X_RECORDED_R_P_TOKS")
 X_RECORDED_FLIP_S = _PROFILE_27B.constant("X_RECORDED_FLIP_S")
 
 
-#: #1271: the UNIT a rate is expressed in. X* divides one rate by another, so
-#: two rates of different units produce a number with no meaning -- and that is
-#: not hypothetical, it is what shipped.
-#:
-#: ``group_throughput``  -- tokens the GROUP moved / the wall it was busy.
-#: ``request_latency``   -- one request's tokens / that request's own wall,
-#:                          which under concurrency includes the time it spent
-#:                          queued behind its peers and is therefore NOT a rate
-#:                          of the group.
-#: ``compute_honest``    -- tokens / rank gpu-ms (compute+wait), the per-rank
-#:                          instrument both groups carry.
-RATE_UNIT_GROUP_THROUGHPUT = "group_throughput"
 RATE_UNIT_REQUEST_LATENCY = "request_latency"
 RATE_UNIT_COMPUTE_HONEST = "compute_honest"
 
@@ -4022,126 +2728,12 @@ from flliper.srt.pdflip.launcher_types import (  # noqa: F401 -- re-export, beha
 )
 
 
-def derive_x_star(flip_s: float, r_d: float, r_p: float, floor_tokens: int,
-                  *, unit_d: str = RATE_UNIT_GROUP_THROUGHPUT,
-                  unit_p: str = RATE_UNIT_GROUP_THROUGHPUT) -> int:
-    """X* = 2*flip_s / (1/r_D - 1/r_P), floored (spec section 0, K5, A1-4).
-
-    THE BREAK-EVEN of the round trip: below X* it is cheaper for D to
-    prefill the request itself than to pay two flips so P can do it faster.
-    ONE number, TWO consumers -- the per-request bound of law 4 and C7's
-    aggregate departure latch -- so there is no second hand number.
-
-    Refuses (ValueError) rather than guessing when the inputs cannot
-    produce a break-even: a D that is not slower than P has none.
-    """
-    # #1271 (a): REFUSE MIXED UNITS BY NAME, before any arithmetic.
-    #
-    # THE SHIPPED DEFECT, measured. `r_P` was
-    # `(prompt_tokens - cached_tokens) / wall` off the front's own
-    # `PDFLIP-SERVED group=P leg=1` line (launcher.py:445-447, appended at
-    # :485-489) -- a PER-REQUEST wall, taken while the front runs the drain at
-    # `p_concurrency=8`, so it counts the time a leg sat behind its peers.
-    # `r_D` came from `verdict=single_prefill` legs, i.e. concurrency ONE.
-    # The formula therefore divided a concurrent-latency rate by a
-    # single-request rate and called the quotient a break-even.
-    #
-    # What that cost: on sb1's front log the SAME boot yields r_P = 1964 tok/s
-    # under the shipped `unc >= 4096` filter (23 samples), 528 tok/s over all
-    # 79 legs, and ~3.1k tok/s as drain-aggregate. rg6 gave 3096 on 8 samples.
-    # r_P did not halve between boots -- the SAMPLE changed: the filter admits
-    # only large-uncached legs, which are the cold, least-queued ones, and as
-    # more of a drain's later legs qualify the median falls. P's compute-honest
-    # rate was ~6594-8325 tok/s across both boots, i.e. flat.
-    if unit_d != unit_p:
-        raise MixedRateUnits(
-            f"X* would divide r_D measured as {unit_d!r} by r_P measured as "
-            f"{unit_p!r}. These are not the same quantity: a request_latency "
-            f"rate under concurrency counts queueing behind peers, a "
-            f"group_throughput rate does not, and a compute_honest rate counts "
-            f"neither. 1/r_D - 1/r_P is only a time-per-token difference when "
-            f"both sides are the SAME measurement. Refusing rather than "
-            f"returning a number with no unit (#1271)."
-        )
-    if flip_s <= 0 or r_d <= 0 or r_p <= 0:
-        raise ValueError(f"non-positive input: flip_s={flip_s} r_d={r_d} r_p={r_p}")
-    denom = (1.0 / r_d) - (1.0 / r_p)
-    if denom <= 0:
-        raise ValueError(
-            f"r_D {r_d:.0f} >= r_P {r_p:.0f}: no break-even exists, the round trip never pays"
-        )
-    return max(int(floor_tokens), int(2.0 * flip_s / denom))
 
 
-_RE_FLIP = re.compile(r"flip_total=(\d+) ms")
-_RE_LEG1 = tolerant_compile(
-    r"PDFLIP-SERVED group=P leg=1 .*?prompt_tokens=(\d+) cached_tokens=(\d+) wall=([0-9.]+)s"
-)
-#: #1271: the front's own P-drain window -- `prefilled` legs over `drain_s`
-#: seconds. This is the denominator r_P was always meant to have.
-_RE_DRAIN = tolerant_compile(r"PDFLIP P-DRAIN epoch=(\d+) .*?drain_s=([0-9.]+)")
-_RE_LEG2 = tolerant_compile(
-    r"PDFLIP-SERVED group=D leg=2 .*?uncached=(\d+) verdict=(\S+) wall=([0-9.]+)s"
-)
 
 
-def _median(xs: List[float]) -> float:
-    ys = sorted(xs)
-    n = len(ys)
-    return ys[n // 2] if n % 2 else 0.5 * (ys[n // 2 - 1] + ys[n // 2])
 
 
-def measure_x_inputs(log_path: str, floor_tokens: int) -> Optional[Tuple[float, float, float, int, int, int]]:
-    """(flip_s, r_D, r_P, n_flips, n_leg2, n_leg1) from ONE front log, or None.
-
-    Reads the front's OWN instruments -- ``flip_total=`` and the two
-    ``PDFLIP-SERVED`` lines -- so every input to X is a measurement this rig
-    printed, not a table.  Only leg-2 lines that actually prefilled on D
-    (``verdict=single_prefill|short_mispriced``) and only extents of at
-    least one chunk count, because a rate taken over a few hundred tokens
-    prices fixed overhead, not throughput.
-    """
-    flips: List[float] = []
-    r_d: List[float] = []
-    r_p: List[float] = []
-    drain_tokens = 0
-    try:
-        with open(log_path, errors="replace") as f:
-            for line in f:
-                m = _RE_FLIP.search(line)
-                if m:
-                    flips.append(int(m.group(1)) / 1000.0)
-                    continue
-                m = _RE_LEG2.search(line)
-                if m:
-                    unc, verdict, wall = int(m.group(1)), m.group(2), float(m.group(3))
-                    if verdict in ("single_prefill", "short_mispriced") and unc >= floor_tokens and wall > 0:
-                        r_d.append(unc / wall)
-                    continue
-                # #1271 (a): r_P IS A GROUP THROUGHPUT, NOT A REQUEST LATENCY.
-                # The leg-1 wall is per-request and the front drains P at
-                # `p_concurrency=8`, so `unc/wall` charges one leg for the time
-                # it spent queued behind its peers. Accumulate the drain's
-                # uncached tokens instead and divide by the drain's OWN wall,
-                # which the front already prints -- the same shape as r_D
-                # (tokens a group moved / the wall it was busy).
-                m = _RE_LEG1.search(line)
-                if m:
-                    unc = int(m.group(1)) - int(m.group(2))
-                    if unc > 0:
-                        drain_tokens += unc
-                    continue
-                m = _RE_DRAIN.search(line)
-                if m:
-                    drain_s = float(m.group(2))
-                    if drain_tokens > 0 and drain_s > 0:
-                        r_p.append(drain_tokens / drain_s)
-                    drain_tokens = 0
-    except OSError:
-        return None
-    if not (flips and r_d and r_p):
-        return None
-    return (_median(flips), _median(r_d), _median(r_p), len(flips), len(r_d), len(r_p))
 
 
 
@@ -4239,75 +2831,12 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int,
     ), False)
 
 
-#: RC7-X (27B): the name a negative --x-busy-tokens is refused with at launch.
-X_BUSY_NEGATIVE_NAME = "W155 PdFlipXBusyNegative"
 
 
-def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int,
-                      x_busy: Optional[int] = None) -> Tuple[int, int, str]:
-    """H84: ``(D's --tp-prefill-max-tokens, the front's --x-ceiling-tokens or 0, line)``.
-
-    UNIFY S4: ONE form of the NF H84 and the 27B RC7-X ceiling (the same
-    intent, doubly built; the 27B had already taken the H84 names). D refuses
-    by W50 on its OWN ``--tp-prefill-max-tokens``; the front routes on its LIVE
-    X. Without the flag both stay the start X, byte-identical to before. With
-    it, D's riegel is raised to the ceiling and the front is told the same
-    number, so the live X may rise up to exactly what D accepts and never above
-    it -- raising only the front's X sent 5-9k to D, D answered W50 and the
-    request went round through P. A ceiling below the start X is lifted to it:
-    D's riegel may never sit below what the front already routes to D. Group P
-    carries no ``--tp-prefill-max-tokens`` and is not touched.
-
-    ``x_busy`` (27B ``--x-busy-tokens``): the floor of the front's X-SOLO band
-    -- up to it D prefills while it decodes others, above it only as a
-    singleton. None = the front's default (the start X, the H84 band floor);
-    a negative value is refused (W155); 0 = no D prefill while D decodes
-    others.
-    """
-    if x_busy is not None and int(x_busy) < 0:
-        raise SystemExit(
-            f"{X_BUSY_NEGATIVE_NAME}: --x-busy-tokens {x_busy} < 0. It bounds the uncached "
-            f"tokens D prefills while it decodes other requests; 0 = none, unset = the start X.")
-    asked = int(ceiling_flag or 0)
-    x = int(x_tokens)
-    busy = "" if x_busy is None else f"; --x-busy-tokens {int(x_busy)} (X-SOLO band floor)"
-    if asked <= 0:
-        return x, 0, (f"X CEILING: off (--x-ceiling-tokens 0) -- group D --tp-prefill-max-tokens {x} "
-                      f"= the front's start X, which is also the ceiling of the front's live X{busy}")
-    ceiling = max(asked, x)
-    lifted = "" if ceiling == asked else f" (asked {asked} < start X {x}: lifted to the start X)"
-    return ceiling, ceiling, (
-        f"X CEILING: --x-ceiling-tokens {ceiling}{lifted} -- group D --tp-prefill-max-tokens "
-        f"{ceiling} (its W50 riegel; D prefills in --chunked-prefill-size {CHUNKED_PREFILL_TOKENS} "
-        f"chunks); front --tp-prefill-max-tokens {x} (start X, unchanged) --x-ceiling-tokens "
-        f"{ceiling}: the live X re-solves within [{CHUNKED_PREFILL_TOKENS}, {ceiling}] and a request "
-        f"between {x if x_busy is None else min(int(x_busy), x)} and the live X goes to D only as a "
-        f"singleton (PDFLIP X-SOLO); group P unchanged{busy}")
 
 
-def resolve_x_mode_launch(ns, cards, x_tokens: int) -> "pdflip_x_curves.XModeLaunch":
-    """X-CURVES 1006: ``--x-mode`` / ``--x-curves`` / ``--x-curves-beyond``
-    resolved ONCE, before D's riegel: the words checked, the curve file loaded
-    and checked against THIS boot's checkpoint, form and live cards. A
-    refusal is a SystemExit naming its W-code (W190..W197), like W155 beside
-    it -- main() keeps its zero try/except law. No flag = the live mode and
-    every argv / line byte-identical. The dual layout refuses every one of the
-    flags (W197): no X rework for Dual."""
-    boot_form = ns.pdflip_boot_form
-    try:
-        return pdflip_x_curves.resolve_launch(
-            mode=ns.x_mode, curves_path=ns.x_curves, beyond=ns.x_curves_beyond,
-            ceiling_flag=ns.x_ceiling_tokens, x_tokens=int(x_tokens),
-            model=pdflip_form.model_key(ns.model),
-            form=pdflip_x_curves.form_axes_of(boot_form) if boot_form is not None else "",
-            hardware=",".join(card_identity.inventory_signature(cards)),
-            dual=bool(getattr(ns, "dual_layout", False)))
-    except pdflip_x_curves.XCurvesRefused as e:
-        raise SystemExit(str(e)) from e
 
 
-#: RC2 review (L1): the name a --d-short-drain-tokens above X is refused with.
-SHORT_DRAIN_ABOVE_X_NAME = "W153 PdFlipShortDrainAboveX"
 
 
 def dual_x_tokens(ns) -> Optional[int]:
@@ -4328,181 +2857,18 @@ def dual_x_tokens(ns) -> Optional[int]:
     return 1 + allowance
 
 
-def refuse_short_drain_above_x(n_tokens: int, x_tokens: int, x_provenance: str) -> None:
-    """LAW 4 SUMMED OVER A DRAIN, at launch (RC2 review, L1).
-
-    ``--d-short-drain-tokens N`` (27B idle policy b) hands a queued SHORT-only
-    backlog of at most N uncached tokens to group D in ONE drain. Each request
-    is <= X by its own route verdict, but the SUM is what D prefills at once,
-    and law 4 (user veto 2026-09-10: D never prefills above X) holds for that
-    sum too. X here is the value this launch hands the front and group D:
-    :func:`resolve_x` has already applied the front floor to the flag
-    (``max(floor, --tp-prefill-max-tokens)``) or derived it. N > X can never
-    be served as asked, so it is refused by name instead of being quietly cut.
-    The front keeps its own riegel beside this one -- every drain is capped at
-    ``min(N, X in force)`` -- because the live X re-solve moves X during a
-    boot, which no launch-time check can see. 0 = off, never refused.
-    """
-    n, x = int(n_tokens or 0), int(x_tokens)
-    if n > 0 and n > x:
-        raise SystemExit(
-            f"{SHORT_DRAIN_ABOVE_X_NAME}: --d-short-drain-tokens {n} exceeds X={x} "
-            f"({x_provenance}). One drain would hand group D {n} uncached tokens to "
-            f"prefill at once; law 4 caps what D prefills at X, summed over the drain "
-            f"too. Pass --d-short-drain-tokens <= {x}, or 0 for off."
-        )
 
 
-#: 27B RC7-X (e28c450a0d): read by group D's scheduler (``_pdflip_store_short_tail_x``).
-STORE_SHORT_TAIL_X_ENV = "FLLIPER_PDFLIP_STORE_SHORT_TAIL_X"
 
 
-def store_short_tail_env(x_tokens: int, x_d_guard: int, x_split: Optional[bool] = None) -> Dict[str, str]:
-    """27B RC7-X: group D's env addition when its W50 riegel stands above the
-    launch X: the #1324/#1471 store-short tail keeps pricing a stalled read's
-    remainder against the LAUNCH X (a recovery prefill on D halts every running
-    decode, like a SHORT grant, which the front bounds by X_busy). Empty when
-    the ceiling is unset -- D's env byte for byte as before.
-
-    UNIFY S7: part of the profile's busy/idle split (``x_split``,
-    FLLIPER_PDFLIP_X_IDLE_REGRANT; qwen27b on, nextflash off) -- off returns {}.
-    ``x_split`` None = read the switch (the published form's profile)."""
-    if x_split is None:
-        x_split = bool(envs.FLLIPER_PDFLIP_X_IDLE_REGRANT.get())
-    if not x_split or int(x_d_guard) <= int(x_tokens):
-        return {}
-    return {STORE_SHORT_TAIL_X_ENV: str(int(x_tokens))}
 
 
-def d_hold_active(d_hold_s: Optional[float]) -> bool:
-    """RC2 review (L4): is ``--d-hold-s`` ON? Unset OR 0 is OFF, like
-    ``--d-short-drain-tokens 0`` and as the >= 0 refusal already promised
-    ("0 / unset = off"). A 0 s hold is not a hold: it used to release a held
-    backlog the moment D went free -- a different policy under the same flag.
-    ONE definition for the argv and the IDLE POLICY line, so they agree."""
-    return d_hold_s is not None and float(d_hold_s) > 0
 
 
-def resolve_pool_floor(
-    override: Optional[int],
-    n_stages: Optional[int] = None,
-) -> Tuple[Optional[int], Optional[Tuple[int, ...]], str]:
-    """The P-cut POOL FLOOR's SOURCE and its RULE LINE -- before the solve.
-
-    Same shape as :func:`resolve_x` for the same reason: a number that can come
-    from two places must publish WHICH, or the boot log cannot be read back.
-    Three states, and the middle one is the one a reader gets wrong:
-
-    * flag ABSENT -> ``(None, DEFAULT_PP_ORDERED_CUT, rule)``: the floor is NOT
-      a number yet.  It is READ OFF THIS BOOT'S OWN FRONTIER by the solver as
-      the priced pool of the ordered cut (#1305,
-      ``pp_cut_launch.derive_pool_floor_from_cut``), and the solver refuses by
-      name (``W67``) when that cut is not on the frontier.  The numeric line
-      is therefore logged AFTER the solve (:func:`pool_floor_line`); this
-      function only states the rule, so a refusal inside the solve still has
-      the source on the record above it.  The previous form -- a constant
-      448,027 typed here as the midpoint of an interval read off ONE boot's
-      frontier -- shipped 42,11,11 under the order's name on boot weg2sn5pre
-      when the census budgets moved the frontier; the operator ruled the
-      constant out (record SECTION 1bg).
-    * flag <= 0 -> ``(None, None, ...)``, ``source=flag``.  OFF, exactly:
-      ``None`` is what the solver saw before #1286b existed, so
-      ``--pp-solve-pool-floor 0`` restores the unfloored makespan byte for
-      byte rather than approximately.  A floor of literally zero would be
-      indistinguishable in effect but would print ``pool_floor=0``, and an
-      instrument that says a floor is armed when none is, is the class this
-      rig calls instrument-text-lies.
-    * flag > 0 -> ``(that value, None, ...)``, ``source=flag``.  The operator
-      outranks the derivation; nothing warns, because choosing the number is
-      the flag's job.
-
-    The cut itself stays SOLVED either way -- this only bounds the set
-    ``--pp-solve-objective`` ranks over.
-    """
-    cut_s = ",".join(str(n) for n in DEFAULT_PP_ORDERED_CUT)
-    if override is None and n_stages is not None and pdflip_pp_ordered_cut_for(n_stages) is None:
-        # HW-P1c 1003 (PP-CUT-FLOOR): the ordered cut is a user order for THREE
-        # stages; a P group of another size has no order and no floor.
-        return None, None, (
-            f"pool_floor=none source=n-stages ({int(n_stages)} stages) -- the shipped default "
-            f"(the floor of the ordered cut {cut_s}, user order 2026-09-09) is a "
-            f"{len(DEFAULT_PP_ORDERED_CUT)}-stage cut and names no floor for {int(n_stages)}; the "
-            f"cut is SOLVED over the unfloored makespan (planner/pp_cut.py), as with "
-            f"--pp-solve-pool-floor 0. --pp-solve-pool-floor N still overrides"
-        )
-    if override is None:
-        return None, tuple(int(n) for n in DEFAULT_PP_ORDERED_CUT), (
-            f"source=default-from-ordered-cut {cut_s} -- the SHIPPED default, user "
-            f"order 2026-09-09 verbatim: '39,13,12 mit bs2 im pp layout soll standard "
-            f"werden vorerst'. The floor is READ OFF THIS BOOT'S FRONTIER by the solve "
-            f"below as the priced pool of {cut_s} (#1305: no constant, no interval, "
-            f"no midpoint -- a number typed here drifted off a moved frontier on boot "
-            f"weg2sn5pre); the cut stays solver-chosen, the floor only bounds the "
-            f"pool. Not on the frontier = W67 refusal, never a neighbour. "
-            f"--pp-solve-pool-floor N overrides, 0 turns it off"
-        )
-    if int(override) <= 0:
-        return None, None, (
-            f"pool_floor=none source=flag (--pp-solve-pool-floor {int(override)}) -- OFF by "
-            f"operator override; the objective ranks over the unfloored feasible set, "
-            f"which is the pre-#1286b behaviour exactly. The shipped default (the floor "
-            f"of the ordered cut {cut_s}, user order 2026-09-09) is NOT in force"
-        )
-    return int(override), None, (
-        f"pool_floor={int(override)} source=flag (--pp-solve-pool-floor) -- operator "
-        f"override; the shipped default (the floor of the ordered cut {cut_s}, user "
-        f"order 2026-09-09, '39,13,12 ... soll standard werden vorerst') is NOT in force"
-    )
 
 
-def pool_floor_line(decision) -> str:
-    """THE ``PP-CUT POOL FLOOR:`` line, from the decision, AFTER the solve.
-
-    Pure, so a desk test can render it.  Three sources, one format:
-    ``pool_floor=<n|none> source=<flag|default-from-ordered-cut <cut>|none>``.
-    Printed after the solve because under the default the NUMBER exists only
-    once the frontier does (#1305); the rule was printed before the solve by
-    :func:`resolve_pool_floor` so a refusal inside the solve is attributable.
-    """
-    src = str(getattr(decision, "pool_floor_source", "none") or "none")
-    floor = getattr(decision, "pool_floor", None)
-    cut = getattr(decision, "pool_floor_cut", None)
-    if src == "default-from-ordered-cut" and cut is not None:
-        cut_s = ",".join(str(n) for n in cut)
-        return (
-            f"PP-CUT POOL FLOOR: pool_floor={int(floor)} "
-            f"source=default-from-ordered-cut {cut_s} (frontier of this boot) -- "
-            f"user order 2026-09-09: '39,13,12 mit bs2 im pp layout soll standard "
-            f"werden vorerst'; the floor is the priced pool of {cut_s} on the "
-            f"PP-CUT FRONTIER line of THIS boot, so 'fastest cut that clears it' "
-            f"selects {cut_s} exactly (#1305)"
-        )
-    if src == "flag":
-        return (
-            f"PP-CUT POOL FLOOR: pool_floor={int(floor)} source=flag "
-            f"(--pp-solve-pool-floor, operator override; the ordered-cut default "
-            f"is NOT in force)"
-        )
-    return (
-        "PP-CUT POOL FLOOR: pool_floor=none source=none (--pp-solve-pool-floor 0: "
-        "OFF by operator override; the objective ranks over the unfloored feasible "
-        "set, the pre-#1286b behaviour exactly)"
-    )
 
 
-def floor_source_for_shipped_line(decision) -> str:
-    """The ``pool_floor_source=`` value :func:`shipped_line` prints."""
-    src = str(getattr(decision, "pool_floor_source", "none") or "none")
-    cut = getattr(decision, "pool_floor_cut", None)
-    if src == "default-from-ordered-cut" and cut is not None:
-        return (
-            "default-from-ordered-cut %s (user order 2026-09-09: '39,13,12 mit bs2 "
-            "im pp layout soll standard werden vorerst')"
-            % (",".join(str(n) for n in cut),)
-        )
-    if src == "flag":
-        return "flag (--pp-solve-pool-floor, operator override)"
-    return "none (--pp-solve-pool-floor 0, operator override: OFF)"
 
 #: The operating point both groups are launched at (`--context-length`), and
 #: therefore the longest prompt group P can be asked to prefill. It is the
@@ -4619,27 +2985,6 @@ def p_activation_record(profile: Optional[str] = None) -> Tuple[Optional[Tuple[f
     return vals, _pconst_boots(P_ACTIVATION_RECORD, profile)
 
 
-def _live_stage_support(base):
-    """AP2 1006: the builtin transient support (measured per P stage on the
-    3-stage reference rig) for the P stage count of THIS launch. Only while an
-    inventory view is installed (``apply_inventory_derivation``: a subset of the
-    calibrated cards, or a boot forced past HW-UNCALIBRATED) whose card count --
-    P = PP<N> -- differs from the support's: each live stage takes the measured
-    points of the reference stage of the same ROLE (``p_card_chunk.role_stage_map``:
-    first, middle, last). Everywhere else (the reference rig, desk callers
-    without a view) ``base`` comes back unchanged."""
-    from flliper.srt.pdflip import inventory_view as _iv
-
-    act = _iv.active()
-    if act is None or not base.points or len(act[2]) == base.n_stages:
-        return base
-    smap = _p_card.role_stage_map(len(act[2]), base.n_stages)
-    if smap is None:
-        return base
-    tag = " RESTAGE %d->%d Stufen %s" % (base.n_stages, len(act[2]), ",".join(str(m) for m in smap))
-    return _p_card.TransientSupport(model=base.model, points=tuple(
-        _p_card.TransientPoint(chunk=p.chunk, mib=tuple(p.mib[m] for m in smap), source=p.source + tag)
-        for p in base.points))
 
 
 def p_transient_support(profile: Optional[str] = None, *, card: bool = False):
@@ -4691,39 +3036,10 @@ def p_prefill_transient_vector_mib(chunk_tokens: int, profile: Optional[str] = N
         raise PdFlipLaunchRefused(str(exc)) from None
 
 
-#: PDFLIP-FORM (24.09.): the checkpoint(s) the #114 slopes above were MEASURED
-#: on -- fnFL2x113/x116/x118 all ran Qwen3.8-Flash-Next-INT4. A transient is a
-#: property of one model's prefill (hidden size, expert fan-out, attention
-#: form), so the slopes are published only for that checkpoint.
-#: UNIFY S3: read off the registry rows (ModelProfile.prefill_transient_checkpoints).
-P_PREFILL_TRANSIENT_CALIBRATION_MODELS: Tuple[str, ...] = tuple(
-    c for _row in pdflip_form.PROFILES.values() for c in _row.prefill_transient_checkpoints
-)
 
 
-#: H87: ``{model_key of this boot: (calibration model, why)}`` -- set ONCE by
-#: :func:`note_calibration_footprint_alias` in ``main`` when this boot's
-#: checkpoint is not a calibration model by NAME but is one by MEMORY FOOTPRINT
-#: (an abliterated derivative). Keyed by the boot's own model name, so a stale
-#: entry can never answer for another checkpoint. ``build_env`` sees only the
-#: form's model NAME, which is why the verdict is taken where the path is known.
-_CALIBRATION_FOOTPRINT_ALIAS: Dict[str, Tuple[str, str]] = {}
 
 
-def note_calibration_footprint_alias(model_path: str) -> Optional[str]:
-    """H87: record whether ``model_path`` is a footprint-identical derivative
-    of a #114/H41 calibration checkpoint; returns the printed line (or None)."""
-    name = pdflip_form.model_key(model_path)
-    _CALIBRATION_FOOTPRINT_ALIAS.pop(name, None)
-    if not name or name in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
-        return None
-    for ref in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
-        ok, why = pdflip_form.reference_model_verdict(model_path, ref)
-        if ok:
-            _CALIBRATION_FOOTPRINT_ALIAS[name] = (ref, why)
-            return (f"H87 CALIBRATION-IDENTITY {name} -> {ref} by memory footprint "
-                    f"({why}): the #114/H41 prefill transient measured on {ref} applies")
-    return None
 
 
 def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
@@ -4804,35 +3120,8 @@ def p_prefill_activation_reserve_by_stage_mib(
     )
 
 
-#: H92 (NF, user order 25.09. ~21:40Z via 27B): the --p-chunk-policy of the
-#: nextflash profile -- ONE flag, ONE installer (:func:`apply_p_chunk_policy`),
-#: which delegates here for --profile nextflash. The NF side (profile by model
-#: key, hard limits, FR_P coupling, stream budget) lives in pdflip/p_chunk_nf.py.
-#: 'fixed' changes NOTHING. Under 'dynamic' the plan's CEILING is group P's
-#: --chunked-prefill-size (P_CHUNKED_PREFILL_TOKENS): argv_p stays
-#: byte-identical, only the P group's env carries the spec.
-#: The shared flags keep the 27B defaults in argparse; for NF a flag the
-#: operator did NOT write reads NF's own default (model 'auto', max 0 = the P
-#: chunk, dynamic-min -1 = the P chunk) -- decided by the argv, not by value.
-P_CHUNK_NF_MODEL_DEFAULT = "auto"
 
 
-def _p_chunk_nf_args(ns, argv_words: Sequence[str]) -> Dict[str, object]:
-    """The NF reading of the shared --p-chunk-* flags (see above)."""
-    def given(flag: str) -> bool:
-        return pdflip_form.flag_given(list(argv_words or ()), flag)
-
-    return {
-        "model": (str(getattr(ns, "p_chunk_model", "") or P_CHUNK_NF_MODEL_DEFAULT)
-                  if given("--p-chunk-model") else P_CHUNK_NF_MODEL_DEFAULT),
-        "max": int(getattr(ns, "p_chunk_max", 0) or 0) if given("--p-chunk-max") else 0,
-        "min": int(getattr(ns, "p_chunk_min", 0) or 0),
-        "fixed": int(getattr(ns, "p_chunk_fixed", 0) or 0),
-        "raster": int(getattr(ns, "p_chunk_raster", 0) or 0),
-        "min_gain": getattr(ns, "p_chunk_min_gain", None),
-        "dynamic_min": (int(getattr(ns, "p_chunk_dynamic_min_tokens", -1))
-                        if given("--p-chunk-dynamic-min-tokens") else -1),
-    }
 
 
 def _apply_p_chunk_policy_nf(ns, boot_form, argv_words: Sequence[str]) -> None:
@@ -4919,22 +3208,6 @@ def p_chunk_policy_install(env_p: Dict[str, str]) -> Tuple[Dict[str, str], List[
 #: That was the only one of the four errors pointing the SAFE way.
 P_CORRIDOR_HOLDBACK_MIB = 1024.0
 
-#: FOLLOWS THE RESERVE SINCE #1257c. The runtime post this stands for
-#: (``model_runner_kv_cache_mixin._gapped_corridor_holdback``) IS the user
-#: reserve, and the reserve now defaults to 0 -- so on a default boot the
-#: runtime charges ``gapped corridor holdback=0.000`` and a pool model still
-#: carrying 1024.0 over-charges group P by a gibibyte PER RANK. The measured
-#: 1024.0 above is what BOTH reference boots emitted, and it is exactly what
-#: this expression still returns whenever the reserve is 1024. Derived, never
-#: re-typed: ``--pp-cut-corridor-holdback-mib`` takes it as its default and
-#: the operator can still pin it.
-def p_corridor_holdback_default_mib(user_reserve_mib=None) -> float:
-    """The 'gapped corridor holdback' post the boot will actually charge."""
-    from flliper.srt.mem_ledger.terms import DEFAULT_USER_RESERVE_MIB
-
-    if user_reserve_mib is None:
-        user_reserve_mib = DEFAULT_USER_RESERVE_MIB
-    return float(max(0, int(user_reserve_mib)))
 
 
 #: Device GDN state per linear layer per sequence SLOT, MiB. Recovered from
@@ -4944,13 +3217,6 @@ def p_corridor_holdback_default_mib(user_reserve_mib=None) -> float:
 #: against the boot's own `per_req=51.43 MiB` at 33 linear layers.
 P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT = _PROFILE_27B.constant("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT")
 
-#: The runtime's OWN safety margin on the demand-driven mamba pool
-#: (model_runner_kv_cache_mixin.py:177 ``MAMBA_AUTO_SAFETY_MARGIN``). Restated
-#: here rather than imported because importing that module drags torch into a
-#: launcher that has no business loading it; the restatement is not free-hand
-#: -- ``test_pp_cut_boot_sizing_1286`` reads the constant out of the runtime's
-#: source and fails when the two drift.
-P_MAMBA_AUTO_SAFETY_MARGIN = 1.25
 
 #: Mamba state SLOTS one running request can hold at once -- the runtime's
 #: ``mamba_slots_per_running_req`` (mem_cache/mamba_pool_floor.py), which is
@@ -4990,24 +3256,6 @@ P_MAMBA_AUTO_SAFETY_MARGIN = 1.25
 #: charges is ``ceil(--p-bs x this x safety)`` and is printed with its inputs
 #: in the PP-CUT budget posts line, where --p-bs appears as a resolved value.
 P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
-#: #1273: where a waking group's weight bytes come from. ``ring`` is today's
-#: path, byte for byte, and stays the default until S6 has booted the other
-#: one; ``exchange`` moves them card-to-card and is what W71 prices.
-#: ``shadow`` (#1273 S5) is the third value and it is RING-AUTHORITATIVE: the
-#: weights still come from the host ring, byte for byte, and the exchange runs
-#: beside them into buffers nothing reads so its bytes can be compared against
-#: the ring's.  It is the only arm that can prove the exchange on silicon
-#: without the exchange being able to break a flip.
-WEIGHT_SOURCE_CHOICES = ("ring", "exchange", "shadow")
-WEIGHT_SOURCE_DEFAULT = "ring"
-#: The arms that NEED the region armed and published to the ranks -- every
-#: choice except the default.  DERIVED and not a second literal: a future arm
-#: added to `WEIGHT_SOURCE_CHOICES` is armed by construction instead of
-#: silently publishing nothing, which is precisely the defect step 7 closed for
-#: `exchange` (it had been absent from a hand-written comparison since S5).
-WEIGHT_SOURCE_ARMED = tuple(a for a in WEIGHT_SOURCE_CHOICES
-                            if a != WEIGHT_SOURCE_DEFAULT)
-WEIGHT_SOURCE_EXCHANGE = "exchange"
 
 #: #1273 S6: THE ON-CARD LANE'S ARM, spec section 3.7 degrade 3's own flag
 #: (``--pdflip-xchg-oncard {ipc|host}``).  It had no producer at all: the ranks
@@ -5019,7 +3267,6 @@ WEIGHT_SOURCE_EXCHANGE = "exchange"
 #: the SAME value decides the charge and the allocation.
 ONCARD_MODE_CHOICES = (weight_exchange_transport.ONCARD_MODE_IPC,
                        weight_exchange_transport.ONCARD_MODE_HOST)
-ONCARD_MODE_DEFAULT = weight_exchange_transport.ONCARD_MODE_IPC
 
 #: The /dev/shm staging region's layout terms, spec section 6/S3: 2 slots per
 #: DIRECTED cross-card pair (double buffering), 32 MiB per slot (evidence E2
@@ -5034,17 +3281,6 @@ XCHG_REGION_SLOT_MIB = 32
 XCHG_REGION_HEADER_MIB = 1
 
 
-def xchg_region_pairs(n_cards: int) -> int:
-    """DIRECTED cross-card pairs on ``n_cards`` cards: ``n * (n - 1)``.
-
-    Round-2 review F8: this was typed as ``6``, which is that arithmetic
-    evaluated on THIS rig and nowhere stated as arithmetic -- on any other card
-    count the region size would have been silently wrong while every test that
-    grades it still passed, because the tests were handed the same 6.  The
-    count comes from the boot's own card list now.
-    """
-    n = int(n_cards)
-    return n * (n - 1) if n > 1 else 0
 
 
 #: #1273 S7 round-2 review F2: does the ``exchange`` arm change any RANK
@@ -5073,45 +3309,8 @@ XCHG_UNWIRED_REASON = "S7-gate-only-no-rank-behaviour-until-S6"
 #: chosen: it is the arithmetic mean of the census the calibration ran on.
 CALIBRATION_PREFIX_TOKENS = 4096
 
-#: DEEP ANCHOR. The user's physics note of 2026-09-07 (recorded verbatim in
-#: the GAPPED block of WEG2_BUILD_DECISIONS_0906.md section 1r): at deep
-#: prefixes one full-attention layer costs a 3080 about 0.4 s per chunk at a
-#: 262,144-token prefix. That is the second depth the family split needs; it
-#: is what makes the optimum a FUNCTION of the design prefix rather than a
-#: constant, and it is cited to its record rather than written as a literal.
-ATTN_ANCHOR_MS = 400.0
-#: HW-GENERIC 1002: the calibration class ATTN_ANCHOR_MS was measured on.
-ATTN_ANCHOR_CARD_CLASS = "RTX3080"
 
 
-def attn_anchor_stage(cards: Sequence["Card"], log: Optional["Log"] = None) -> int:
-    """The first P stage whose card is of :data:`ATTN_ANCHOR_CARD_CLASS`.
-    No such card: refused BY NAME (HW-UNCALIBRATED) -- the anchor is a
-    measurement of that class, and pricing another card's attention layer
-    with it would be a borrow.
-
-    AP1 1006 (Q-710, flags instead of code): that refusal is the VALUE refusal
-    HW-UNCALIBRATED (``refusals.refuse_value``); without ``--force`` it reads and
-    raises as before. With ``--force`` the anchor is BORROWED onto the stage the
-    reference rig measured it on (the position of the anchor class in
-    ``card_identity.REFERENCE_INVENTORY``, clamped to the stage count): the
-    positional ``MEASURED_MS_PER_LAYER`` entry of that stage is the one the anchor
-    is combined with, so the pair stays the reference's pair. UNMEASURED on the
-    live card; the FORCED-PAST line says so."""
-    for i, c in enumerate(cards):
-        if card_identity.calibration_class(c) == ATTN_ANCHOR_CARD_CLASS:
-            return i
-    ref_stage = min(max(0, len(cards) - 1), card_identity.REFERENCE_INVENTORY.index(ATTN_ANCHOR_CARD_CLASS))
-    _refuse_value_once(
-        card_identity.CODE_UNCALIBRATED,
-        f"{card_identity.CODE_UNCALIBRATED}: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, "
-        f"{ATTN_ANCHOR_MS:g} ms/layer) was measured on class {ATTN_ANCHOR_CARD_CLASS}; no P stage "
-        "carries that class (" + ", ".join(card_identity.class_label(c) for c in cards)
-        + "). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed."
-        f"  --force BORROWS it onto P stage {ref_stage} ({card_identity.class_label(cards[ref_stage])}), "
-        f"the stage the reference rig measured it on: UNMEASURED on this card (HW-UNCALIBRATED).",
-        log=log)
-    return ref_stage
 #: PP-COST (01.10.): the stage model the 27B INT8 P cut is priced on under
 #: --pp-cut-stage-model auto (rank-line fit of 09290020 cut 43,11,10 and four
 #: 44,10,10 boots of 01.10., pdflip/p_stage_model_data/)
@@ -5167,30 +3366,6 @@ def resolve_pp_cut_stage_model(arg: str, profile: Optional[str], model: str,
     return model_obj, "%s (%s)" % (os.path.basename(path), model_obj.source[:160])
 
 
-def pp_cut_chunk_mix(log_path: Optional[str], fallback_width: int, fallback_prefix: int,
-                     graph_bucket: int):
-    """(chunk mix, provenance): the predecessor boot's PP0 chunks as
-    (width, prefix bin, mode, count); without a readable log ONE cell, the
-    configured chunk at the design prefix, named as such."""
-    from flliper.srt.pdflip import p_stage_model as _psm
-
-    if log_path:
-        try:
-            with open(log_path, errors="replace") as fh:
-                mix = _psm.chunk_mix_from_samples(_psm.samples_from_rank_lines(fh))
-        except OSError as exc:
-            mix, why = (), "unreadable (%s)" % exc
-        else:
-            why = "no paired PP0 rank line"
-        if mix:
-            return mix, "MEASURED chunk mix of %s (%d PP0 chunks, %d cells)" % (
-                log_path, int(sum(n for *_x, n in mix)), len(mix))
-    else:
-        why = "no predecessor P log"
-    mode = _psm.MODE_GRAPH if (graph_bucket and int(fallback_width) <= int(graph_bucket)) else _psm.MODE_EAGER
-    return ((int(fallback_width), int(fallback_prefix), mode, 1.0),), (
-        "FALLBACK chunk mix: %s -- one cell, the configured chunk %d at the design prefix %d (%s)"
-        % (why, int(fallback_width), int(fallback_prefix), mode))
 ATTN_ANCHOR_PREFIX_TOKENS = 262144
 
 #: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
@@ -5285,20 +3460,6 @@ D_DECODE_STEPS_PROVENANCE = (
 #: archaeology.
 D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed", "decode-bs1", "decode-bs6")
 
-#: USER ORDER 2026-09-09, verbatim: "der decode bs6 soll mit bs6 (nicht mehr
-#: bs4) der standard werden". Group D's default objective moves from the
-#: capacity-first `maxkv` split to the bs=6 OPERATING POINT.
-#:
-#: WHAT THE ORDER TRADES, from dec2c's own A/B rather than from an argument:
-#: the bs=6 vector [42,11,11] measured **+10.3 % at bs4 for -1.4 % pool**. So
-#: the maxkv law is not repealed -- it is outranked at this one position,
-#: because the ranking a boot should follow is the ranking AT THE OPERATING
-#: POINT IT RUNS, and D runs decode.
-#:
-#: `maxkv` stays fully selectable via --d-tp-objective and its argv is
-#: byte-identical to the pre-#1241 form; only which arm you get by saying
-#: nothing has changed. --d-bs is NOT touched here (separate branch).
-D_TP_OBJECTIVE_DEFAULT = "decode-bs6"
 
 #: The two positions that emit an EXPLICIT weight vector rather than one of
 #: the runtime's two symbolic resolvers.
@@ -5332,52 +3493,10 @@ D705_PROVENANCE = (
 
 
 
-#: THE THREE FACTS, ONCE. See :class:`EarlyReadFact` for why each is stated in
-#: both currencies and why that is not second bookkeeping.
-EARLY_READ_FACTS: Tuple[EarlyReadFact, ...] = (
-    EarlyReadFact(
-        env_key="FLLIPER_UNEVEN_DCP",
-        env_value="1",
-        flag=("--uneven-dcp",),
-        groups="D",
-        reader="server_args.py:9631 _handle_dcp_validation / :12025 "
-               "_handle_uneven_tp, both before :7186 _handle_environment_variables",
-    ),
-    EarlyReadFact(
-        env_key="FLLIPER_UNEVEN_DCP_WEIGHTED",
-        env_value="1",
-        flag=("--uneven-dcp-weighted",),
-        groups="D",
-        reader="server_args.py:9632 _handle_dcp_validation / :10517 "
-               "uneven_weighted_dcp_enabled, both before :7186",
-    ),
-    EarlyReadFact(
-        env_key="FLLIPER_MAMBA_SSM_DTYPE",
-        env_value="bfloat16",
-        flag=("--mamba-ssm-dtype", "bfloat16"),
-        groups="both",
-        reader="uneven_perf.py:4648, reached from _handle_uneven_tp at "
-               "server_args.py:6976 -- before the flag publishes itself at :7186",
-    ),
-)
 
 
-def early_read_flags(group: str) -> List[str]:
-    """The argv half of :data:`EARLY_READ_FACTS` for one group."""
-    out: List[str] = []
-    for fact in EARLY_READ_FACTS:
-        if fact.groups in ("both", group):
-            out.extend(fact.flag)
-    return out
 
 
-def early_read_provenance() -> str:
-    """One line naming every doubly-stated fact and the reader that needs it."""
-    return "PDFLIP EARLY-READ ENV (#1235): " + "; ".join(
-        "%s=%s == %s [groups %s, pre-promotion reader %s]"
-        % (f.env_key, f.env_value, " ".join(f.flag), f.groups, f.reader)
-        for f in EARLY_READ_FACTS
-    )
 
 
 #: #1235 THE UNOWNED ENV LITERALS, PROMOTED TO FLAGS AND TO LAUNCHER OUTPUT.
@@ -5418,524 +3537,66 @@ BARLINK_BAR1_CAP_CYCLES = 300000000000
 #: is quieter, smaller costs log volume, and nothing about the boot depends on
 #: the value except how much of it a reader can see.
 COLLECTIVE_CENSUS_INTERVAL = 50
-#: Group P's BAR1 windows. The provenance is the SAME arithmetic group D's
-#: window carries (#1234 C1) and it lived only in state.deviations: the two
-#: groups' windows are sized to fit TOGETHER -- P 24+96 and D 16+32+40 = 208 of
-#: the 224 MiB usable per 3080, measured Used 224/256 including the RM
-#: carve-out. It is cited here so P's window is not the one number in this file
-#: a reader has to go looking for.
-P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
-#: DUAL-TP3PP3 (27B line): group P's BAR1 windows while BOTH groups are awake
-#: (metal 30.09. boot f9fch3: with P at the flip default 24+96, D's dcp window
-#: was refused on both 3080s). The NF release ships no dual layout, but the
-#: constant keeps :func:`apply_bar1_windows`' default check well-defined when
-#: the dual flags are set explicitly.
-DUAL_P_BARLINK_BAR1_WINDOW_MIB = "16,PP_0=64"
-#: Group D's BAR1 windows (#1234 C1, the derivation lives at argv_d): the
-#: default of --d-barlink-bar1-window-mib (HW-P1c: derived per N by
-#: pdflip/bar1_windows.py; this value is the N = 3 / 256 MiB BAR measurement).
-D_BARLINK_BAR1_WINDOW_MIB = "16,TP_0=32,DCP_0=40"
 #: Group P's device mamba pool (--max-mamba-cache-size); see argv_p.
 P_MAX_MAMBA_CACHE_SIZE = 24
-#: H92c: the runtime's HARD FLOOR per running P request on P's posture
-#: (``mem_cache/mamba_pool_floor.mamba_slots_per_running_req``): 1 active + 1
-#: ping-pong (P runs --disable-overlap-schedule) + 1 donation + 1 pinned
-#: checkpoint (``--hicache-write-policy write_back``: no #755 reorder, so the
-#: two do not share). Measured, fnFL2h91bb2 P log:
-#: ``MAMBA-FLOOR pool=32 floor=32 retention_budget=0 (8 running requests x 4 =
-#: 32)``. Everything above ``seats x this`` is the anchor-retention budget; at 0
-#: every host backup of an anchor is refused. The planner only NAMES it on the
-#: budget-posts line (the launch/runtime riegel is AW's); a test holds this
-#: constant against the runtime function on P's posture.
-P_MAMBA_FLOOR_SLOTS_PER_SEAT = 4
-
-
-
-
-
-
-
-
-
-
-#: #239: the marker of the refusal and of the dry-run line.
-KV_TOKEN_CUT_MARKER = "#239 KV-TOKEN-SCHNITT"
-
-
-def d_kv_token_cut(ns):
-    """#239: what ``--d-kv-token-cut`` hands the D solve: ``None`` (off),
-    ``expert_residency.KV_TOKEN_CUT_MAXMIN`` / ``KV_TOKEN_CUT_JOINT`` (S2b), or
-    the stated ratio vector."""
-    from flliper.srt.planner import expert_residency as _er
-
-    raw = str(getattr(ns, "d_kv_token_cut", pdflip_form.KV_TOKEN_CUT_OFF)
-              or pdflip_form.KV_TOKEN_CUT_OFF).strip()
-    if raw == pdflip_form.KV_TOKEN_CUT_OFF:
-        return None
-    if raw in (_er.KV_TOKEN_CUT_MAXMIN, _er.KV_TOKEN_CUT_JOINT, _er.KV_TOKEN_CUT_OWNED):
-        return raw
-    if raw.startswith(_er.KV_TOKEN_CUT_OWNED_FORCED_PREFIX):
-        # #239 M1b: shares forced, ownership + FR_D solved by the planner
-        try:
-            _er.owned_cut_request(raw)
-        except ValueError as exc:
-            raise PdFlipLaunchRefused(f"{KV_TOKEN_CUT_MARKER}: {exc}") from None
-        return raw
-    try:
-        vec = [float(x) for x in raw.split(",") if x.strip()]
-    except ValueError:
-        vec = []
-    if not vec or any(x < 0 for x in vec) or sum(vec) <= 0:
-        raise PdFlipLaunchRefused(
-            f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {raw!r} is neither "
-            f"{pdflip_form.KV_TOKEN_CUT_OFF!r}, {_er.KV_TOKEN_CUT_MAXMIN!r}, "
-            f"{_er.KV_TOKEN_CUT_JOINT!r}, {_er.KV_TOKEN_CUT_OWNED!r} nor a ratio "
-            f"vector of the D ranks")
-    return tuple(vec)
-
-
-def d_kv_dtype_bytes(ns) -> int:
-    """#239: bytes per KV element on D -- ``--kv-cache-dtype`` of extra_d,
-    else the profile row's ``kv_dtype`` (fp8 = 1, anything else 2)."""
-    dtype = _argv_scalar(getattr(ns, "extra_d", ""), "--kv-cache-dtype") or ""
-    if not dtype:
-        row = pdflip_form.profile_row(getattr(ns, "profile", "") or "")
-        dtype = str(getattr(row, "kv_dtype", "") or "") if row is not None else ""
-    return 1 if dtype.lower().startswith("fp8") else 2
-
-
-def refuse_unwired_token_cut(ns, boot_form) -> None:
-    """#239 S2/S3e: a real boot of ``kv=qsa_forma_dcp`` stops here, by name,
-    while a seam it stands on (``rank_role.TOKEN_CUT_SEAMS``) is unwired. The
-    refusal names the seams from the register, so it lifts when -- and only
-    when -- the last of them is marked built."""
-    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "dry_run", False):
-        return
-    from flliper.srt import rank_role
-
-    missing = rank_role.unwired_token_cut_seams()
-    if missing == ("F14",) and getattr(ns, "pdflip_disable_hicache", False):
-        # #239 S4a: F14 is the worker's bytes in the HOST TIER and the store;
-        # a boot without either (--pdflip-disable-hicache: no L2, no L3, #1386)
-        # has no such bytes, so the runtime half is complete for it.
-        print(f"{KV_TOKEN_CUT_MARKER} F14-FREI (no Host-Tier): --d-kv-token-cut "
-              f"{ns.d_kv_token_cut} bootet mit --pdflip-disable-hicache; F14 (Host-Tier/"
-              "Store des KV-Workers) ist offen und wird hier nicht betreten.", flush=True)
-        return
-    if not missing:
-        return
-    raise PdFlipTokenCutNotWired(
-        f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} (form kv=qsa_forma_dcp) "
-        f"is planned but not wired -- Form A seam(s) {', '.join(missing)} unwired "
-        f"({'; '.join(rank_role.SEAMS[m].what for m in missing)}; #239 S3d/S3e). "
-        "--dry-run prints the planned cut; a real boot needs every seam built.")
-
-
-
-
-#: #239 S3h: the marker of the flip riegel line (refusal and allowance).
-KV_TOKEN_CUT_FLIP_MARKER = "#239 S3h FLIP UNTER KV-TOKEN-SCHNITT"
-
-
-def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
-    """#239 S3h: the flip boot (P and D) of ``kv=qsa_forma_dcp``.
-
-    None for every other form and for ``--d-only``. A flip boot with a host
-    tier is the wired form: the line names what carries the cut and is
-    returned. A flip boot without one is refused by name (a dry run prints
-    the line with 'would refuse' and returns it; a real boot raises
-    :class:`PdFlipTokenCutFlipNotWired`).
-
-    The KV stages (29.09., S3h lifted where S3g holds): ONE operator-named
-    stage passes as before. Stages the operator does not name are the
-    launcher's to write (#251c + S3g: stage rows per KV rank, each from its
-    own trim cell) -- this riegel runs before the plan, so it lets them
-    through provisionally and ``refuse_flip_stage_form_without_trim_cells``
-    decides after the FRACTION-SOLVE. More than one operator-named stage stays
-    refused: the launcher writes no per-rank rows for them, a KV worker would
-    meet the top stage untrimmed."""
-    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
-        return None
-    from flliper.srt import rank_role
-
-    why = []
-    missing = rank_role.unwired_token_cut_seams()
-    if missing:
-        why.append("seam(s) %s unwired (%s)" % (
-            ", ".join(missing), "; ".join(rank_role.SEAMS[m].what for m in missing)))
-    if getattr(ns, "pdflip_disable_hicache", False):
-        why.append(
-            "--pdflip-disable-hicache: the P->D hand-off under the cut rides the "
-            "arena L2 and the canonical store (the D workers read their owner "
-            "rows of P's pages), and this boot has neither")
-    stages = d_kv_stage_tokens_named(ns)
-    if stages is not None and len(stages) != 1:
-        why.append(
-            "the D KV stage form is operator-named with %d stages %s -- the "
-            "launcher writes no stage rows per KV rank for it (S3g: each KV "
-            "worker trims only with its own trim cell in the plan), a KV-holding "
-            "worker would build its pool for the top stage; name ONE stage "
-            "(--env-d %s=<tokens>) or leave it to the launcher"
-            % (len(stages), list(stages), D_KV_STAGE_KEYS[0]))
-    if why:
-        msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
-               "(form kv=qsa_forma_dcp) in a FLIP boot refused -- "
-               + " | ".join(why) + ". The cut boots with --d-only either way.")
-        if getattr(ns, "dry_run", False):
-            print(msg + " (dry run: would refuse)", flush=True)
-            return msg
-        raise PdFlipTokenCutFlipNotWired(msg)
-    stage_text = (
-        f"({D_KV_STAGE_KEYS[0]}={stages[0]}) " if stages is not None else
-        "(KV-Stufen vom Launcher: Stufenzeilen je KV-Rang aus seiner Trim-Zelle, "
-        "S3g -- Entscheid nach dem FRACTION-SOLVE, ohne Trim-Zelle je KV-Worker "
-        "benannte Verweigerung) ")
-    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} ERLAUBT: --d-kv-token-cut {ns.d_kv_token_cut} "
-           + stage_text +
-           "im Flip-Boot -- Traeger: das eine Arena-L2 und der kanonische "
-           "Seitenspeicher (P schreibt ganze Seiten, die KV-Worker lesen ihre "
-           "Owner-Zeilen, Tail-Adopt je Owner), Claim = Gruppen-MIN (Worker nur "
-           "im MIN-Arm), Wake-Kredit je Rang gegen die eigene Karte. Metall-Marker: "
-           "'#239 F14 KV-WORKER-WINDOW' auf TP1/TP2, 'PDFLIP-WAKE-KV-FIRST' je Rang, "
-           "kein 'DRAFT-DISAGREE'.")
-    print(msg, flush=True)
-    return msg
-
-
-def refuse_flip_stage_form_without_trim_cells(ns, boot_form, log) -> Optional[str]:
-    """#239 S3h after the FRACTION-SOLVE (29.09.): the flip boot under the
-    token cut whose KV stages the operator left to the launcher.
-
-    Called right before every flip D start (dry run, real), after the last
-    D solve wrote -- or dropped -- the stage form. None for every other form,
-    for ``--d-only`` and for an operator-named stage (the pre-plan riegel
-    decided those). Otherwise every rank the cut gives FA KV must carry its
-    own stage rows in the written form (``_d_kv_stage_written``: the rows
-    from its trim cell, ``kv_stage_trim_cell``); a dropped form or a KV
-    worker without rows is refused by name -- the flip boot does not fall
-    back to fixed tokens silently. A dry run prints 'would refuse' and returns
-    the line; a real boot raises :class:`PdFlipTokenCutFlipNotWired`."""
-    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
-        return None
-    w = getattr(ns, "_d_kv_stage_written", None)
-    if not w and d_kv_stage_tokens_named(ns) is not None:
-        return None  # operator-named (one stage, the riegel let it through)
-    why = None
-    if not w:
-        why = ("keine Stufenform geschrieben (Zeile 'D-KV-STUFEN (#251c): entfaellt' im "
-               "FRACTION-SOLVE nennt den Grund) -- die KV-Worker haben keine Trim-Zelle im "
-               "Plan; feste Token nur mit genau EINER benannten Stufe (--env-d %s=<tokens>)"
-               % D_KV_STAGE_KEYS[0])
-    else:
-        cut = [int(r) for r in (w.get("cut_workers") or ())]
-        rows = {int(r): int(x) for r, x in (w.get("worker_rows") or {}).items()}
-        if -1 in cut:
-            why = "der Schnitt ist ungeloest -- welche Worker KV halten, ist nicht bekannt"
-        else:
-            lacking = [r for r in cut if rows.get(r, 0) <= 0]
-            if lacking:
-                why = ("KV-Worker Rang %s ohne eigene Stufenzeilen (Trim-Zelle) in der "
-                       "geschriebenen Form %s -- er baute seinen FA-KV-Pool auf der obersten "
-                       "Stufe ungetrimmt" % (",".join(str(r) for r in lacking), rows))
-    if why:
-        msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
-               "(form kv=qsa_forma_dcp) in a FLIP boot refused -- KV-Stufen: " + why
-               + ". The cut boots with --d-only either way.")
-        if getattr(ns, "dry_run", False):
-            log(msg + " (dry run: would refuse)")
-            return msg
-        raise PdFlipTokenCutFlipNotWired(msg)
-    per_rank = " ".join("rang%d: %d" % (r, rows[r]) for r in sorted(rows))
-    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} STUFEN ERLAUBT: jeder KV-Worker %s traegt seine "
-           "Stufenzeilen aus der eigenen Trim-Zelle (%s; TP0 %d) -- S3g greift im Flip-Boot. "
-           "Metall-Marker: '#251c KV-STAGE form=' mit trims_here=True auf TP0 UND den "
-           "KV-Workern, 'D-KV-STUFEN RESIDENZ (#239 S3g) rang1/rang2' im FRACTION-SOLVE, "
-           "kein 'PdFlipDSeatVramRefused ... holds full-attention KV', kein W171."
-           % (",".join(str(r) for r in cut), per_rank, int(w["rows"])))
-    log(msg)
-    return msg
-
-
-#: #239 S3f: the marker of the published ownership.
-D_OWNER_MARKER = "D-EIGENTUM (#239 S3f)"
-
-
-def d_seat_table_form(plan, kv_cut_kw: dict, fractions):
-    """#239 S3f: what the H95 seat table solves at every seat count. Under an
-    owned cut (``owned`` / ``owned:<v>``) the planner has SOLVED ownership,
-    cut and FR_D once; the seat table recomputes exactly that form (the cut
-    as a fixed vector, FR_D as solved) and never re-solves the ownership --
-    a second owned solve starts from the already published vector as its x1
-    base and refuses every row (dry run 28.09. 17:50Z, 'keine tragbare Form
-    ... Eigentum ab 215,113,160'). Any other cut: unchanged."""
-    from flliper.srt.planner import expert_residency as _er
-
-    if (not kv_cut_kw or not _er.owned_cut_request(kv_cut_kw.get("kv_token_shares"))[0]
-            or not getattr(plan, "solved_owner_ratio", None)):
-        return dict(kv_cut_kw), [float(x) for x in fractions]
-    out = dict(kv_cut_kw)
-    out["kv_token_shares"] = tuple(float(x) for x in plan.kv_token_cut)
-    fr = plan.solved_fractions or fractions
-    return out, [float(x) for x in fr]
-
-
-def publish_d_owner_ratio(ns, plan, label: str, log) -> List[float]:
-    """#239 S3f: the ownership vector the planner solved under
-    ``--d-kv-token-cut owned`` goes to ``--extra-d --rank-moe-ratio`` (the one
-    place it lives for group D; argparse keeps the last copy, so every copy is
-    replaced), and the before/after into ``ns._d_owner_solve`` for the
-    record. Returns the new vector as floats for the caller's later readers."""
-    from flliper.srt.pdflip import draft_post as _dp
-
-    before = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
-    if getattr(ns, "_d_owner_stated", None) is None:
-        # the STATED vector, kept once: a second solve pass (dry-run and real
-        # call, the d-only expectation) starts from it again, never from its
-        # own published answer (Form A baseline of the x1 rule stays fixed)
-        ns._d_owner_stated = [str(x) for x in before]
-    before = list(ns._d_owner_stated)
-    new = [int(x) for x in plan.solved_owner_ratio]
-    ns.extra_d = _dp.replace_vector_flag(getattr(ns, "extra_d", "") or "",
-                                         "--rank-moe-ratio", new)
-    rec = dict(plan.owner_record)
-    rec["label"] = label
-    rec["stated_ratios"] = [str(x) for x in before]
-    ns._d_owner_solve = rec
-    log(f"{D_RANK_SOLVE_MARKER} {label} {D_OWNER_MARKER} veroeffentlicht: --extra-d "
-        f"--rank-moe-ratio {','.join(str(x) for x in new)} (vorher "
-        f"{','.join(str(x) for x in before)}; der Planer setzt das Eigentum, kein Handwert)")
-    return [float(x) for x in new]
-
-
-#: VRAM loop P1c (28.09., user: "macht der Planer es besser und die Werte werden
-#: nicht uebernommen?" -- yes: FRACTION-SOLVE D computed DECKE 0.062/0.586/0.491
-#: against the profile's 0.060/0.510/0.480 in every NF boot, ~1.3 GiB idle on
-#: nv0). The planner OWNS FR_D: its edge wins; a profile value binds only as a
-#: named cap (``FLLIPER_PDFLIP_FR_D_CAP`` in --env-d). Default ON.
-FR_D_CEILING_ENV = "FLLIPER_PDFLIP_FR_D_CEILING"
-FR_D_CAP_ENV = "FLLIPER_PDFLIP_FR_D_CAP"
-#: P0 (torch cache cap) must be armed in the SAME D group: the edge leaves ~0 MiB
-#: after KV, and without a bounded cache the allocator swing (0.7-3.5 GiB,
-#: PDFLIP-VRAM-PEAK rc12z26) takes that memory back at the next peak.
-TORCH_CACHE_CAP_ENV = "FLLIPER_PDFLIP_TORCH_CACHE_CAP"
-FR_D_CEILING_MARKER = "FR-D-DECKE (VRAM-Loop P1c)"
-
-
-def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool,
-                       map_built: bool = False
-                       ) -> Tuple[Optional[List[float]], List[str]]:
-    """The fraction group D boots with when the planner's edge is higher than
-    the stated FR_D, or ``(None, lines)`` when the stated one stays.
-
-    Never under an owned cut (#239 S3f publishes FR_D itself) and never over a
-    fraction the planner already solved (S2b). Raises only: a rank whose edge
-    is below its stated FR is the W122/scratch-cap path's business, not this
-    one's. Every rank is named, adopted or not.
-
-    rc12z30b: never after the Platztausch map is built (``map_built``) -- the
-    map read FR_D from --extra-d before P started, and a raised FR_D after it
-    is a D form the map does not describe (the rc12z29b death class)."""
-    given = [float(x) for x in fractions]
-    if str(env_d.get(FR_D_CEILING_ENV, "1")).strip() == "0":
-        return None, [f"{FR_D_CEILING_MARKER}: {FR_D_CEILING_ENV}=0 -- gegeben {given} bleibt"]
-    if owned or getattr(plan, "solved_fractions", ()) or getattr(plan, "solved_owner_ratio", ()):
-        return None, []
-    fits = list(getattr(plan, "fits", ()) or ())
-    if len(fits) != len(given) or any(f.ceiling_fraction is None for f in fits):
-        return None, [f"{FR_D_CEILING_MARKER}: keine Kante auf jedem Rang -- gegeben {given} bleibt"]
-    ceil = [float(f.ceiling_fraction) for f in fits]
-    cap_raw = str(env_d.get(FR_D_CAP_ENV, "")).strip()
-    cap: Optional[List[float]] = None
-    if cap_raw:
-        try:
-            cap = [float(x) for x in cap_raw.split(",")]
-        except ValueError:
-            cap = None
-        if cap is None or len(cap) != len(given):
-            return None, [f"{FR_D_CEILING_MARKER}: {FR_D_CAP_ENV}={cap_raw!r} unlesbar -- "
-                          f"gegeben {given} bleibt"]
-    new = []
-    lines = []
-    for r, (g, c) in enumerate(zip(given, ceil)):
-        target = min(c, cap[r]) if cap is not None else c
-        val = max(g, target)
-        new.append(val)
-        why = ("Decke" if cap is None or c <= cap[r] else f"Decke {c:.3f} gekappt auf "
-               f"{FR_D_CAP_ENV} {cap[r]:.3f}")
-        lines.append(f"{FR_D_CEILING_MARKER} rang{r}: gegeben {g:.3f} -> {val:.3f} ({why}"
-                     + (", Decke unter gegeben: bleibt" if c < g else "") + ")")
-    if all(abs(a - b) < 5e-4 for a, b in zip(new, given)):
-        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke = gegeben, nichts zu uebernehmen"]
-    if str(env_d.get(TORCH_CACHE_CAP_ENV, "0")).strip() != "1":
-        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: P0 aus "
-                              f"({TORCH_CACHE_CAP_ENV}!=1 in --env-d) -- ohne gedeckelten "
-                              f"Allokator-Cache nimmt der Cache-Swing den Platz an der naechsten "
-                              f"Peak zurueck; gegeben {given} bleibt"]
-    if map_built:
-        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: die "
-                              f"Platztausch-Karte ist schon aus FR_D {given} gebaut -- "
-                              f"eine hoehere FR_D danach waere eine Form, die die Karte "
-                              f"nicht beschreibt"]
-    return new, lines
-
-
-def d_form_solved_by_planner(ns) -> bool:
-    """#239 rc12z29c: the D solve sets D's ownership and/or FR_D itself (an
-    owned cut, S2b joint, S2 maxmin: ``--d-kv-token-cut`` names a mode, not a
-    vector). Then that form must be solved BEFORE the Platztausch map is
-    built, because the map's D phase (window per rank, resident ids) and its P
-    phase (the common prefix, the store slots) are both functions of it."""
-    return isinstance(d_kv_token_cut(ns), str)
-
-
-def d_fr_ceiling_before_map(ns) -> bool:
-    """R2 (28.09.): the P1c FR-D ceiling moves FR_D, and FR_D is a function
-    the Platztausch map is built from -- so where P1c is ARMED (default on,
-    P0 ``FLLIPER_PDFLIP_TORCH_CACHE_CAP=1`` in --env-d, a MoE D form with an
-    ownership and an FR vector in --extra-d) the D form is solved and pinned
-    BEFORE the map, from the expectation budgets, exactly like an owned /
-    joint / maxmin form (#239 rc12z29c). After the map it would be refused
-    (a514587c52, W170) and NF stayed on the profile's FR_D with ~1.3 GiB idle
-    on nv0. A form the planner solves itself is already pinned there."""
-    if d_form_solved_by_planner(ns):
-        return False
-    env_d = parse_group_env(getattr(ns, "env_d", "") or "")
-    if str(env_d.get(FR_D_CEILING_ENV, "1")).strip() == "0":
-        return False
-    if str(env_d.get(TORCH_CACHE_CAP_ENV, "0")).strip() != "1":
-        return False
-    extra_d = getattr(ns, "extra_d", "") or ""
-    return bool(_argv_vector(extra_d, "--rank-moe-ratio")
-                and _argv_vector(extra_d, "--rank-moe-resident-fraction"))
-
-
-def pin_d_form_for_map(ns, log) -> Optional[dict]:
-    """#239 rc12z29c: freeze the D form the Platztausch map is built from.
-
-    rc12z29b (f833fcbb2d, -st-cut) died at D's load, TP1: 'Platztausch-Karte:
-    Layer 0 Phase D nennt Ids ausserhalb dieses Rangs (lokal [-33, ...],
-    lo=226)' -- the map was built (publish_expert_map, before P starts) from
-    the STATED --rank-moe-ratio 183,137,168, the owned solve (after P's sleep)
-    published 215,113,160 into --extra-d, and D's expert window followed the
-    published one. The map cannot follow afterwards: P loaded its common
-    prefix and store slots from it. So the form is solved once before the map
-    (``d_form_solved_by_planner``), the map reads the published vectors, and
-    every later D solve checks exactly that form (fixed cut, fixed ownership,
-    fixed FR_D) against the measured budgets -- a form that no longer fits is
-    refused by name (W122/W130), never re-solved under a map that describes
-    another one. Returns the pinned form (also on ``ns._d_map_form``)."""
-    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
-    fr = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
-    cut = getattr(ns, "_d_solved_cut", None)
-    # R2: a form without a token cut (the P1c pin) pins cut None -- only a
-    # cut that was ASKED for and not published leaves the form unpinned
-    if not ratios or not fr or (not cut and d_kv_token_cut(ns) is not None):
-        log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: the Solve "
-            f"vor der Karte hat keinen Schnitt/Vektor veroeffentlicht (ratio {ratios}, "
-            f"FR_D {fr}, Schnitt {cut}) -- die Karte liest die Vektoren, die jetzt in "
-            f"--extra-d stehen")
-        return None
-    form = {"ratios": [str(x) for x in ratios], "fractions": [str(x) for x in fr],
-            "cut": tuple(float(x) for x in cut) if cut else None}
-    ns._d_map_form = form
-    log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) GEPINNT: die Platztausch-Karte "
-        f"baut Phase D aus --rank-moe-ratio {','.join(form['ratios'])}, FR_D "
-        f"{','.join(form['fractions'])}, Token-Schnitt "
-        f"{list(form['cut']) if form['cut'] else 'keiner'} -- dieselben "
-        f"Vektoren, die D's Expertenfenster liest; jeder spaetere D-Solve prueft genau "
-        f"diese Form gegen sein Budget und loest sie nicht neu")
-    return form
-
-
-#: #239 S3a: the D argv that carries the planner's token cut to the runtime
-#: (server_args._resolve_form_a_dcp -> rank_role.resolve_dcp_under_host_kv).
-D_TOKEN_CUT_FLAGS = (
-    "--uneven-token-vector",
-    "--uneven-token-vector-role",
-    "--uneven-token-vector-provenance",
-)
-#: The provenance the runtime's #797 register sees: the planner, this boot.
-D_TOKEN_CUT_PROVENANCE = "planner-239-token-cut"
-
-
-def d_token_cut_vector(plan_cut, stated) -> Optional[Tuple[int, ...]]:
-    """#239 S3a: the integer token vector D runs, or None (no cut).
-
-    ``plan_cut`` is the planner's solved cut (``maxmin``/``joint``, already in
-    /``KV_TOKEN_SHARE_GRID``); a stated ratio vector (``stated``) goes onto the
-    same grid by largest remainder, zeros kept -- a 0 is a layout here.
-    """
-    from flliper.srt.distributed.utils import partition_units
-    from flliper.srt.planner import expert_residency as _er
-
-    if plan_cut:
-        return tuple(int(x) for x in plan_cut)
-    if not isinstance(stated, tuple) or not stated:
-        return None
-    return tuple(
-        partition_units(
-            _er.KV_TOKEN_SHARE_GRID,
-            [int(round(float(x) * 10**6)) for x in stated],
-            allow_zero=True,
-        )
-    )
-
-
-def publish_d_token_cut(ns, vector, label: str) -> Optional[str]:
-    """#239 S3a: ship the token cut to group D (``ns.extra_d``), or refuse.
-
-    An operator ``--d-uneven-token-vector`` next to a planned cut is a second
-    statement of the same fact; which one the runtime would read is argparse
-    order, so it is refused by name. Returns the log line, None when there is
-    no cut to ship.
-    """
-    if vector is None:
-        return None
-    if getattr(ns, "d_uneven_token_vector", None):
-        raise PdFlipLaunchRefused(
-            f"{KV_TOKEN_CUT_MARKER}: --d-uneven-token-vector "
-            f"{ns.d_uneven_token_vector} and the planned token cut "
-            f"{list(vector)} (--d-kv-token-cut {ns.d_kv_token_cut}) both state "
-            "D's token ownership. Drop one: a stated vector goes through "
-            "--d-kv-token-cut, which prices it.")
-    toks = shlex.split(str(getattr(ns, "extra_d", "") or ""))
-    out: List[str] = []
-    i = 0
-    while i < len(toks):
-        t = toks[i]
-        if t in D_TOKEN_CUT_FLAGS:
-            i += 2
-            continue
-        if any(t.startswith(f + "=") for f in D_TOKEN_CUT_FLAGS):
-            i += 1
-            continue
-        out.append(t)
-        i += 1
-    out += [
-        D_TOKEN_CUT_FLAGS[0], ",".join(str(int(v)) for v in vector),
-        D_TOKEN_CUT_FLAGS[1], "pin",
-        D_TOKEN_CUT_FLAGS[2], D_TOKEN_CUT_PROVENANCE,
-    ]
-    ns.extra_d = shlex.join(out)
-    return (
-        f"{KV_TOKEN_CUT_MARKER} {label} (#239 S3a) an D: --uneven-token-vector "
-        f"{','.join(str(int(v)) for v in vector)} role=pin provenance="
-        f"{D_TOKEN_CUT_PROVENANCE} -- der Planer-Schnitt ist die Laufzeit-Form "
-        "(dcp = Raenge, jeder Rang haelt die kv-Koepfe seiner Token)")
-
-
-
-
-
-
-
-
-
-
-
-
-def _now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class Log:
@@ -5962,26 +3623,8 @@ class Log:
 #: that re-read the card list: p_stage_live_classes, p_stage_power_current,
 #: _live_inventory_or_none). None = every NVML device (today's behaviour).
 _CARD_SELECTION: Optional[Tuple[int, ...]] = None
-#: refusal code of a --cards value that names no card / a card twice
-CODE_CARDS = "HW-CARDS"
 
 
-def parse_card_selection(text: Optional[str]) -> Optional[Tuple[int, ...]]:
-    """``"1,0"`` -> ``(1, 0)``; empty/None -> None (every card). Refuses BY
-    NAME (HW-CARDS) a malformed entry or a duplicate index."""
-    t = str(text or "").strip()
-    if not t:
-        return None
-    out: List[int] = []
-    for part in t.split(","):
-        p = part.strip()
-        if not p.isdigit():
-            raise PdFlipLaunchRefused(
-                f"{CODE_CARDS}: --cards {t!r}: {p!r} is not an NVML index (expected e.g. '1,0')")
-        if int(p) in out:
-            raise PdFlipLaunchRefused(f"{CODE_CARDS}: --cards {t!r} names NVML index {p} twice")
-        out.append(int(p))
-    return tuple(out)
 
 
 def set_card_selection(text: Optional[str]) -> Optional[Tuple[int, ...]]:
@@ -5991,21 +3634,6 @@ def set_card_selection(text: Optional[str]) -> Optional[Tuple[int, ...]]:
     return _CARD_SELECTION
 
 
-def select_cards(cards: Sequence["Card"], selection: Optional[Sequence[int]]) -> List["Card"]:
-    """The cards whose NVML index is in ``selection`` (all when None), in
-    NVML order; an index NVML did not report is refused BY NAME."""
-    cards = list(cards)
-    if selection is None:
-        return cards
-    have = {int(c.nvml_index) for c in cards}
-    missing = [i for i in selection if int(i) not in have]
-    if missing:
-        raise PdFlipLaunchRefused(
-            f"{CODE_CARDS}: --cards {','.join(str(i) for i in selection)}: NVML index "
-            f"{','.join(str(i) for i in missing)} not reported (NVML sees "
-            f"{','.join(str(i) for i in sorted(have)) or 'no card'})")
-    want = {int(i) for i in selection}
-    return [c for c in cards if int(c.nvml_index) in want]
 
 
 def selected_nvml_cards() -> List[Card]:
@@ -6052,27 +3680,6 @@ def resolve_cards() -> List[Card]:
     return cards
 
 
-def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
-    """Release table row 27: the power limit and SM clock ceiling of every
-    card go into the boot record (``state.cards[i]``: power_limit_w,
-    power_limit_default_w, power_limit_max_w, sm_clock_max_mhz; None = NVML
-    did not answer) and one ``POWER-LIMIT rank`` line per card into the
-    launcher log. Never raises: a missing answer is recorded as such."""
-    from flliper.srt.registry import nvml as _nvml
-    from flliper.srt.pdflip import power_limit as _pl
-
-    try:
-        by_uuid = {p.uuid: p for p in _nvml.power_snapshot()}
-        why = ""
-    except Exception as exc:  # noqa: BLE001
-        by_uuid, why = {}, f"{type(exc).__name__}: {exc}"
-    for i, c in enumerate(cards[:len(records)]):
-        p = by_uuid.get(c.uuid)
-        # a COPY of the record: the Card object itself is not grown
-        records[i] = dict(records[i], **{
-            k: (getattr(p, k) if p is not None else None)
-            for k in ("power_limit_w", "power_limit_default_w", "power_limit_max_w", "sm_clock_max_mhz")})
-        log(_pl.boot_line({"launcher_card": i}, p, why or "card not in the NVML power snapshot"))
 
 
 #: HW-GENERIC 1002: the launcher flags (dest names) and the --extra-p/-d,
@@ -6112,26 +3719,8 @@ def positional_inputs_present(ns) -> List[str]:
     return out
 
 
-def records_inventory(profile: str) -> Tuple[Tuple[str, ...], str]:
-    """(the inventory the profile's MEASURED records were taken on, its source)."""
-    from flliper.srt.pdflip import profile_records as _pr
-
-    inv = _pr.inventory_of(str(profile))
-    if inv is not None:
-        return inv, f"profile_records_data/{profile}.json inventory"
-    return card_identity.REFERENCE_INVENTORY, (
-        f"profile {profile!r} records declare no inventory: every record of this tree "
-        "was measured on the reference rig")
 
 
-def calibrated_inventory(ns) -> Tuple[Tuple[str, ...], str]:
-    """(the inventory the profile's positional VECTORS (argv/env) were
-    measured on, its source): ``--profile-inventory``, else the records'."""
-    explicit = card_identity.parse_inventory(getattr(ns, "profile_inventory", ""))
-    if explicit is not None:
-        return explicit, "--profile-inventory"
-    prof = getattr(ns, "profile", None) or pdflip_form.DEFAULT_PROFILE
-    return records_inventory(str(prof))
 
 
 def derivation_assessment(ns, cards: Sequence["Card"],
@@ -6231,97 +3820,15 @@ def inventory_check_line(ns, cards: Sequence["Card"],
             + (") MISMATCH (--force)" if msgs else ") MATCH"))
 
 
-def apply_bar1_windows(ns, cards: Sequence["Card"], log=None) -> Optional[str]:
-    """HW-P1c 1003 (BAR1-WINDOW): the group windows for THIS card count and the
-    MEASURED BAR1 of the cards (pdflip/bar1_windows.py). Only the untouched
-    defaults (and the dual default) are replaced; an operator's explicit
-    window is kept. N = 3 on 256 MiB BARs: the shipped windows, no line."""
-    n = len(cards)
-    if n in _topo.PROVEN_CARD_COUNTS:
-        return None   # the proven layout is not re-judged: the shipped windows stand byte for byte
-    dual = bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False))
-    p_cur = str(getattr(ns, "p_barlink_bar1_window_mib", P_BARLINK_BAR1_WINDOW_MIB))
-    d_cur = str(getattr(ns, "d_barlink_bar1_window_mib", D_BARLINK_BAR1_WINDOW_MIB))
-    p_default = p_cur in (P_BARLINK_BAR1_WINDOW_MIB, DUAL_P_BARLINK_BAR1_WINDOW_MIB)
-    d_default = d_cur == D_BARLINK_BAR1_WINDOW_MIB
-    pl = bar1_windows_mod.plan(
-        n, [getattr(c, "bar1_total_mib", None) for c in cards], dual=dual,
-        p_base=p_cur if not p_default else (DUAL_P_BARLINK_BAR1_WINDOW_MIB if dual else None),
-        d_base=d_cur if not d_default else None)
-    if not pl.ok:
-        raise PdFlipLaunchRefused(f"BAR1-WINDOW: {pl.why}")
-    changed = (pl.p != p_cur and p_default) or (pl.d != d_cur and d_default)
-    if p_default:
-        ns.p_barlink_bar1_window_mib = pl.p
-    if d_default:
-        ns.d_barlink_bar1_window_mib = pl.d
-    if changed or pl.usable_mib is None and n != _topo.PROVEN_CARD_COUNTS[0]:
-        line = pl.line()
-        if log is not None:
-            log(line)
-        return line
-    return None
 
 
-def configure_xchg_region(n_cards: int, log=None) -> None:
-    """HW-P1c 1003 (XCHG-REGION): lay the host exchange region out for ``n_cards``
-    in THIS process (the ranks learn N from the env var ``prepare_region``
-    publishes). N = 3: no-op."""
-    if int(n_cards) == weight_exchange_region.DEFAULT_N_CARDS:
-        weight_exchange_region.configure(weight_exchange_region.DEFAULT_N_CARDS)
-        return
-    prev = weight_exchange_region.configure(int(n_cards))
-    if log is not None:
-        log(f"PDFLIP-XCHG-REGION geometry for {int(n_cards)} cards (was {prev}): "
-            f"{weight_exchange_region.N_PAIRS} directed cross pairs, "
-            f"{weight_exchange_region.REGION_BYTES / (1 << 20):.0f} MiB, data offset "
-            f"{weight_exchange_region.DATA_OFF // (1 << 20)} MiB; ranks read "
-            f"{weight_exchange_region.ENV_N_CARDS}")
 
 
-def _derive_csv(policy: str, text: str, calibrated: Sequence[str], live: Sequence[str]) -> Optional[str]:
-    """A 'a,b,c' vector under a derivation policy, as 'a,b' text; None when not derivable."""
-    from flliper.srt.pdflip import inventory_view as _iv
-
-    got = _iv.derive_vector(policy, str(text), tuple(calibrated), tuple(live))
-    return None if got is None else (got if isinstance(got, str) else ",".join(str(x) for x in got))
 
 
 _derive_csv_strict = _derive_csv
 
 
-def _forced_record_borrow(prof: str, cal: Sequence[str], live: Sequence[str],
-                          cards: Sequence["Card"]) -> Tuple[Dict[str, Tuple[str, str]], Dict[str, str]]:
-    """AP2 1006: the positional records of ``prof`` that :func:`inventory_view.borrow_vector`
-    can place on the live cards (name -> (old text, borrowed text)) and the arch twins it
-    used (live class label -> calibrated class, AP1 ``card_identity.arch_twin_class``).
-    Only for a boot forced past HW-UNCALIBRATED; a record with no borrow is not listed."""
-    from flliper.srt.pdflip import inventory_view as _iv
-    from flliper.srt.pdflip import profile_records as _pr
-
-    twins: Dict[str, str] = {}
-    for c in cards:
-        label = card_identity.class_label(c)
-        if label not in cal:
-            twin = card_identity.calibration_class(c) or card_identity.arch_twin_class(c)
-            if twin:
-                twins[label] = twin
-    out: Dict[str, Tuple[str, str]] = {}
-    for r in _pr.records(prof):
-        if not _pr.is_positional(r.value, len(cal)):
-            continue
-        pol = _iv.RECORD_POLICY.get(r.name)
-        if pol in (_iv.CONSUMER, _iv.CUT_GATED, _iv.ADVISORY, _iv.CUT_PIN):
-            continue
-        got = _iv.borrow_vector(pol, r.value, tuple(cal), tuple(live), twins)
-        if got is None:
-            continue
-
-        def _t(v):
-            return v if isinstance(v, str) else ",".join(str(x) for x in v)
-
-        out[r.name] = (_t(r.value), _t(got))
-    return out, twins
 
 
 def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
@@ -6487,23 +3994,6 @@ def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
 PDFLIP_CARD_COUNT = _topo.PROVEN_CARD_COUNTS[0]
 
 
-def order_cards(cards: List[Card], expect_count: Optional[int] = None) -> List[Card]:
-    """CUDA ordinal order (rank 0 / PP0 / TP0 first), from NVML PROPERTIES
-    (pdflip/card_identity.py): biggest NVML total first, then nameplate DRAM
-    bandwidth, then NVML index. On the reference rig that is the 5090 first,
-    then the 3080s by NVML index -- the order the name-based predecessor
-    produced, byte for byte. Never a fixed index, never a name substring.
-
-    HW-P1a 1003: no count gate by default -- the count is the inventory's and
-    :func:`topology_check_line` refuses an unrunnable one BY NAME with its
-    blockers. ``expect_count`` (a caller that needs exactly N) still refuses
-    HW-COUNT. The arch gate (HW-ARCH) runs once in :func:`resolve_cards`."""
-    try:
-        return card_identity.order_cards(cards, expect_count, gate=False)
-    except card_identity.CardInventoryRefused as exc:
-        # PROFIL-EDITOR S1: --force lifts the COUNT refusal (a value refusal); the arch gate does not run here
-        refusals.refuse_value("HW-COUNT", str(exc), PdFlipLaunchRefused, cause=exc)
-        return card_identity.order_cards(cards, None, gate=False)
 
 
 #: HW-P1a: launcher flag dests whose value is a per-card vector the topology
@@ -6517,14 +4007,6 @@ _TOPOLOGY_VECTOR_FLAGS = tuple(f for f in POSITIONAL_VECTOR_FLAGS
 _TOPOLOGY_VECTOR_TOKENS = tuple(t for t in POSITIONAL_VECTOR_TOKENS if t != "FLLIPER_PDFLIP_L15_MIB=")
 
 
-def _vector_len(value: str) -> Optional[int]:
-    """Entry count of a per-card vector value; None for a scalar (no comma:
-    one value for every card, e.g. ``FLLIPER_MOE_SCRATCH_SLOTS=32``) or an
-    unexpanded shell variable."""
-    v = str(value or "").strip().strip("'\"")
-    if not v or v.startswith("$") or "," not in v:
-        return None
-    return len(v.split(","))
 
 
 def positional_vector_lengths(ns) -> Dict[str, int]:
@@ -6613,75 +4095,12 @@ def topology_check_line(ns, cards: Sequence["Card"],
     return _topo.topology_line(t)
 
 
-def log_power_limits(state: BootState, cards: List[Card], log, *,
-                     reading: Optional["_power.PowerReading"] = None) -> "_power.PowerReading":
-    """fnFL2 H57 (Nutzer 24.09. 18:53Z: "... im powerlimit bei 400 und 230 ...
-    da ich spaeter das powerlimit ggf. erhoehen werde").
-
-    Druckt ``POWER-LIMIT nvml0=230/320W nvml1=400/600W nvml2=230/320W
-    sm_clock_max=...`` (NVML, nur lesend), legt dasselbe in ``state.power_limits``
-    (-> ``boot_<TAG>.json``) und datiert jede Zeit-/Raten-Referenz des Planers
-    dagegen: weicht ihr Limit ab, ``REFERENZ VERALTET (Power-Limit ...)`` mit
-    Namen. VERWEIGERT NIE -- die VRAM-Riegel (W122/W130/W132/W126) lesen die
-    Lesung nicht, und ein unlesbares NVML macht die Referenzen ``undatiert``,
-    nicht den Boot unmoeglich. ``cards`` in CUDA-Ordinal-Reihenfolge (die
-    Kartenraten-Bibliothek wird je Stufe gestempelt, wie der Solver sie liest).
-    """
-    reading = _power.read_card_power() if reading is None else reading
-    state.power_limits = _power.state_dict(reading)
-    log(_power.launch_line(reading))
-    library_ref = _power.card_library_reference(reading, cards)
-    for line in _power.reference_lines(
-            reading, _power.TIMED_REFERENCES + ((library_ref,) if library_ref else ())):
-        log(line)
-    return reading
 
 
-def nvml_memory(cards: List[Card]) -> Dict[str, "nvml_registry.MemoryInfo"]:
-    """Live memory per card UUID, from the registry's ONE NVML reader.
-
-    Replaces a local ``nvidia-smi --query-gpu=uuid,memory.used,memory.total``
-    reader.  Two figures the callers below need are not derivable from that
-    pair: ALLOCATABLE FREE (the driver's own ``free``, carve-out already
-    excluded -- ``total - used`` returns free PLUS the carve-out, the form the
-    corridor rule forbids and boot weg2rg6 measured at +424/+518/+424 MiB), and
-    the carve-out itself.  ``MemoryInfo.tenant_used_mib`` is the "is another
-    tenant on this card" figure and is 0-1 MiB on an idle card; the v1
-    ``used_bytes`` is not, and reading it as tenancy is how #539 refused an
-    empty machine.
-    """
-    res = {dev.uuid: mem for dev, mem in nvml_registry.memory_snapshot()}
-    missing = [c.uuid for c in cards if c.uuid not in res]
-    if missing:
-        raise PdFlipLaunchRefused(
-            f"NVML has no memory row for {missing} -- the card set changed under the "
-            f"launcher (present: {sorted(res)})"
-        )
-    return res
 
 
-def nvml_process_mib(pids: set) -> Dict[str, int]:
-    """Sum of NVML per-process usage per card UUID over ``pids``."""
-    out = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_uuid", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    # NS 26.09.: the same row parser as the front's flip reading -- a row that is
-    # not 'pid, used, uuid' (e.g. "No running processes found", "[N/A]") is
-    # skipped and counted, never an unpack error (boot dkr27bbar1i8h109261950).
-    from flliper.srt.pdflip.front import parse_compute_apps
-
-    return parse_compute_apps(out, pids)
 
 
-def session_pids(sid: int) -> set:
-    out = subprocess.run(["ps", "-eo", "pid,sid"], capture_output=True, text=True).stdout
-    pids = set()
-    for line in out.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) == sid:
-            pids.add(int(parts[0]))
-    return pids
 
 
 # --------------------------------------------------------------------------
@@ -6820,12 +4239,6 @@ def wait_ready(port: int, pid: int, deadline_s: float, log: Log, name: str, proc
     raise PdFlipLaunchRefused(f"group {name} not READY on :{port} after {deadline_s:.0f} s (last {last})")
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 # --------------------------------------------------------------------------
@@ -6833,274 +4246,24 @@ def _alive(pid: int) -> bool:
 # --------------------------------------------------------------------------
 
 
-def shm_holder_pids(path: str, proc_root: str = "/proc") -> List[int]:
-    """Every LIVE pid that maps or holds open a file at or under ``path``.
-
-    Read out of ``/proc/<pid>/maps`` and ``/proc/<pid>/fd`` rather than from
-    ``fuser``: ``fuser`` is one exit code for a whole argv (the #1217 check
-    could not say WHICH file was held, or by whom), it is not always installed,
-    and it cannot be handed a fake tree by a test.  The pid list this returns is
-    printed in the refusal, so a live holder is actionable instead of a boolean.
-
-    A path that appears with the kernel's ``(deleted)`` suffix still counts: an
-    unlinked-but-mapped region still occupies the memory this sweep exists to
-    free.  Matching is on the full path with a boundary, never a substring, so
-    ``hicache-weg2-fix973`` never matches ``hicache-weg2-fix9730``.
-    """
-    prefix = os.path.realpath(path)
-    holders: List[int] = []
-
-    def _hit(candidate: str) -> bool:
-        p = candidate.strip()
-        if p.endswith(" (deleted)"):
-            p = p[: -len(" (deleted)")]
-        return p == prefix or p.startswith(prefix + "/")
-
-    try:
-        entries = os.listdir(proc_root)
-    except OSError:
-        return holders
-    for entry in sorted(entries, key=lambda e: int(e) if e.isdigit() else 0):
-        if not entry.isdigit():
-            continue
-        found = False
-        try:
-            with open(f"{proc_root}/{entry}/maps") as f:
-                for line in f:
-                    parts = line.split(maxsplit=5)
-                    if len(parts) == 6 and _hit(parts[5]):
-                        found = True
-                        break
-        except OSError:
-            pass
-        if not found:
-            fd_dir = f"{proc_root}/{entry}/fd"
-            try:
-                for fd in os.listdir(fd_dir):
-                    try:
-                        if _hit(os.readlink(f"{fd_dir}/{fd}")):
-                            found = True
-                            break
-                    except OSError:
-                        continue
-            except OSError:
-                pass
-        if found:
-            holders.append(int(entry))
-    return holders
 
 
-def _tree_bytes(path: str) -> Tuple[int, int, int]:
-    """(allocated bytes, apparent bytes, entry count) of a file or tree.
-
-    WHICH BYTE COUNT, stated because the two differ here by 0.53 GiB and only
-    one of them is host RAM: ``st_blocks * 512`` is what the tmpfs actually
-    OCCUPIES (and what ``df`` and the cgroup's ``shmem`` count), ``st_size`` is
-    the apparent size ``ls`` shows.  Measured on the real orphan
-    ``/dev/shm/hicache-weg2-fix973`` (2026-09-08): apparent 4,042,810,432 B =
-    3.77 GiB, allocated 3,471,384,576 B = 3.23 GiB -- and 3.23 GiB is the figure
-    boot weg2dk7 attributed and the figure a sweep frees.  Reporting the
-    apparent size as "freed" would over-claim by half a GiB.
-    """
-    def _pair(p: str) -> Tuple[int, int]:
-        st = os.lstat(p)
-        return st.st_blocks * 512, st.st_size
-
-    try:
-        alloc, apparent = _pair(path)
-    except OSError:
-        return 0, 0, 0
-    if not os.path.isdir(path) or os.path.islink(path):
-        return alloc, apparent, 1
-    alloc, apparent, n = 0, 0, 0
-    for root, _dirs, files in os.walk(path):
-        for name in files:
-            try:
-                a, b = _pair(os.path.join(root, name))
-            except OSError:
-                continue
-            alloc += a
-            apparent += b
-            n += 1
-    return alloc, apparent, n
 
 
-#: The module the stock server is started as.  A process is a server only when
-#: its argv carries ``-m`` followed by EXACTLY this token -- see
-#: :func:`live_launch_servers` for why a substring of the command line is not.
-LAUNCH_SERVER_MODULE = "flliper.launch_server"
-#: Rename transition (compat_shims): this tree's module FIRST, then the other package
-#: generation's.  A server started by a launcher of the other generation holds cards and
-#: /dev/shm exactly like one of ours; without its spelling here the #1217 census would not
-#: even look at it (FL5, RENAME_PLAN 8.14 item 1).
-LAUNCH_SERVER_MODULES: Tuple[str, ...] = _name_variants(LAUNCH_SERVER_MODULE)
-#: The boot token's env key as ``KEY=`` bytes, this tree's spelling first, then the other
-#: generation's.  A rank's own environment is folded onto one spelling by the package hook, so a
-#: server of the other generation carries ONLY the other one (see :func:`_proc_boot_tag`).
-BOOT_TOKEN_ENV_KEYS: Tuple[bytes, ...] = tuple(
-    k.encode() + b"=" for k in _env_name_variants("FLLIPER_PDFLIP_BOOT_TOKEN")
-)
 
 
-def _proc_argv(pid: str, proc_root: str) -> List[str]:
-    try:
-        with open(f"{proc_root}/{pid}/cmdline", "rb") as f:
-            raw = f.read()
-    except OSError:
-        return []
-    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
 
 
-def _proc_ppid(pid: int, proc_root: str) -> int:
-    try:
-        with open(f"{proc_root}/{pid}/stat") as f:
-            # comm may hold spaces and ')': the fields after the LAST ')' are
-            # "state ppid ...".
-            return int(f.read().rsplit(")", 1)[1].split()[1])
-    except (OSError, IndexError, ValueError):
-        return 0
 
 
-def _proc_ancestors(pid: int, proc_root: str) -> List[int]:
-    chain: List[int] = []
-    seen = {pid}
-    p = _proc_ppid(pid, proc_root)
-    while p > 1 and p not in seen:
-        chain.append(p)
-        seen.add(p)
-        p = _proc_ppid(p, proc_root)
-    return chain
 
 
-def is_launch_server_argv(argv: Sequence[str]) -> bool:
-    """True only for ``<python...> [opts] -m flliper.launch_server ...``.
-
-    argv[0]'s basename must start with ``python`` and the module must be a
-    WHOLE argument after ``-m`` -- never a piece of a longer string.  A shell
-    whose ``-c`` script merely MENTIONS the module (``bash -c 'pgrep -fc
-    "flliper.launch_server"; bash start_when_free.sh ...'``) is not a server,
-    and neither is ``python -m flliper.srt.pdflip.launcher``.
-    """
-    if not argv or not os.path.basename(argv[0]).startswith("python"):
-        return False
-    # rename transition: either generation's module (LAUNCH_SERVER_MODULES)
-    for i, a in enumerate(argv[1:], start=1):
-        if a == "-m" and i + 1 < len(argv) and argv[i + 1] in LAUNCH_SERVER_MODULES:
-            return True
-        if a.startswith("-m") and a[2:] in LAUNCH_SERVER_MODULES:
-            return True
-    return False
 
 
-def _proc_has_cuda_context(pid: str, proc_root: str) -> bool:
-    """A CUDA context holds ``/dev/nvidia*`` open (fd) and mapped (maps)."""
-    fd_dir = f"{proc_root}/{pid}/fd"
-    try:
-        for fd in os.listdir(fd_dir):
-            try:
-                if os.readlink(f"{fd_dir}/{fd}").startswith("/dev/nvidia"):
-                    return True
-            except OSError:
-                continue
-    except OSError:
-        pass
-    try:
-        with open(f"{proc_root}/{pid}/maps") as f:
-            for line in f:
-                if "/dev/nvidia" in line:
-                    return True
-    except OSError:
-        pass
-    return False
 
 
-def _proc_boot_tag(pid: str, proc_root: str) -> Optional[str]:
-    """The Weg-2 boot tag a server was started under, from its own
-    ``FLLIPER_PDFLIP_BOOT_TOKEN`` (``<tag>:<epoch>:<launcher pid>``, published by
-    :func:`build_env` for both groups).  ``None`` = no token (a stock server of
-    another operator) or unreadable -- both count as a FOREIGN tag.
-
-    Rename transition: either spelling of the key (:data:`BOOT_TOKEN_ENV_KEYS`),
-    this tree's first when a process somehow carries both.  A server of the
-    other generation with a token is judged by its TAG like one of ours, not
-    as "no token"."""
-    try:
-        with open(f"{proc_root}/{pid}/environ", "rb") as f:
-            raw = f.read()
-    except OSError:
-        return None
-    found: Dict[bytes, bytes] = {}
-    for kv in raw.split(b"\0"):
-        for key in BOOT_TOKEN_ENV_KEYS:
-            if kv.startswith(key) and key not in found:
-                found[key] = kv[len(key):]
-    for key in BOOT_TOKEN_ENV_KEYS:
-        if key in found:
-            return found[key].decode("utf-8", "replace").split(":", 1)[0]
-    return None
 
 
-def live_launch_servers(
-    tag: str, proc_root: str = "/proc", self_pid: Optional[int] = None
-) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    """#1217, fnFL2 H26: the LIVE ``flliper.launch_server`` processes that must
-    refuse a residue sweep -- and, separately, the ones that only look like one.
-
-    WHY NOT ``pgrep -f "flliper[.]launch_server"`` (what this replaces): it
-    matches a SUBSTRING of every command line on the box.  Metal 24.09.
-    08:56-08:57Z, boot fnFL2x140: three starts, three refusals naming pids
-    3122930 / 3157795 / 3189930, each gone seconds later.  Each was the
-    operator's own Bash-tool shell, ``bash -c '... pgrep -fc
-    "flliper.launch_server"; ... bash start_when_free.sh fnFL2x139
-    boot_nf_x140.sh fnFL2x140 ...'`` -- the ANCESTOR of this very launcher
-    (tool shell -> start_when_free.sh -> boot_nf_x140.sh -> boot_nf_cd_long.sh
-    -> arm_fnFL2_long.sh -> timeout -> ``python -m flliper.srt.pdflip.launcher
-    ... --dry-run``), alive exactly as long as the start it was waiting on.
-    The trap only armed because two dead 16 KB ``flliper_loads_*`` flags of
-    another boot sat in /dev/shm; without own entries pgrep never ran.
-
-    The rules:
-
-    * this process and its whole parent chain are never counted;
-    * only a real server argv counts (:func:`is_launch_server_argv`); any
-      other process whose command line merely contains the module name goes
-      to the second list, which the caller logs;
-    * a real server counts when it holds a CUDA context, or when its boot tag
-      (``FLLIPER_PDFLIP_BOOT_TOKEN``) is not ``tag`` -- a stock server without a
-      token is foreign and counts even before its CUDA init.  Only a server of
-      THIS tag with no CUDA context (nothing it could be holding) is skipped.
-    """
-    me = os.getpid() if self_pid is None else self_pid
-    mine = {me, *_proc_ancestors(me, proc_root)}
-    live: List[Dict[str, object]] = []
-    ignored: List[Dict[str, object]] = []
-    try:
-        entries = os.listdir(proc_root)
-    except OSError:
-        return live, ignored
-    for entry in sorted((e for e in entries if e.isdigit()), key=int):
-        argv = _proc_argv(entry, proc_root)
-        if not argv:
-            continue
-        server = is_launch_server_argv(argv)
-        if not server and not any(m in a for a in argv for m in LAUNCH_SERVER_MODULES):
-            continue
-        pid = int(entry)
-        head = " ".join(argv)[:160]
-        if pid in mine:
-            ignored.append({"pid": pid, "why": "self/ancestor", "argv": head})
-            continue
-        if not server:
-            ignored.append({"pid": pid, "why": "not a server argv", "argv": head})
-            continue
-        cuda = _proc_has_cuda_context(entry, proc_root)
-        boot_tag = _proc_boot_tag(entry, proc_root)
-        rec: Dict[str, object] = {"pid": pid, "cuda": cuda, "tag": boot_tag, "argv": head}
-        if cuda or boot_tag != tag:
-            live.append(rec)
-        else:
-            ignored.append({**rec, "why": "own tag, no CUDA context"})
-    return live, ignored
 
 
 def shm_residue_sweep(
@@ -7236,16 +4399,6 @@ def shm_residue_sweep(
             "refused": {}, "archive": archive, "sems_unlinked": sem_gone}
 
 
-def d_only_bind_argv(front_host: str) -> List[str]:
-    """#239 M1s (rc12z30g D-only, 28.09.): with --d-only there is NO front, so
-    group D on :30032 IS the client surface. common_flags binds every group to
-    127.0.0.1 (the groups sit behind the front), and inside the container the
-    Docker port forward cannot reach a loopback-only socket -- host_acceptance
-    serve_d waited forever and the probes had to go in by nsenter. D-only binds
-    where the front would have: --front-host (default 0.0.0.0, user order
-    2026-09-10). Appended after common_flags, so it is the last --host argparse
-    reads; a flip boot never calls this."""
-    return ["--host", str(front_host)]
 
 
 def refuse_if_front_unbindable(log: Log, host: str, port: int, dry: bool) -> None:
@@ -7291,24 +4444,6 @@ def stale_deadman_sweep(log: Log, ports: Sequence[int], dry: bool) -> None:
                     pass
 
 
-def split_preflight_refusals(text: str) -> Tuple[List[str], List[str]]:
-    """``(ram_lines, other_lines)``: the ``REFUSED:`` lines of ``host_ledger_preflight.sh``
-    split by cause (HOSTWARN2, 13.10.2026).
-
-    The script (outside the tree, ``devtools/host_ledger_preflight.sh``) has two verdicts
-    and ONE exit code: ``REFUSED: MemAvailable ...`` (host RAM under its floor) and
-    ``REFUSED: only N GiB free on /`` (DISK under 100 GiB). The user rule 06.10. covers host
-    RAM only, so the launcher reads the script's own log and lets only the RAM lines through
-    as warnings; a disk line stays a refusal. The split is by the script's own wording
-    (``MemAvailable``), not by guess: a ``REFUSED:`` line that does not name it is ``other``.
-    """
-    ram: List[str] = []
-    other: List[str] = []
-    for ln in text.splitlines():
-        if not ln.startswith("REFUSED:"):
-            continue
-        (ram if "MemAvailable" in ln else other).append(ln.strip())
-    return ram, other
 
 
 def host_preflight(log: Log, tag: str, dry: bool) -> None:
@@ -7361,18 +4496,6 @@ def host_preflight(log: Log, tag: str, dry: bool) -> None:
     log(swap_line)
 
 
-def _free_instrument(mem: Dict[str, "nvml_registry.MemoryInfo"], cards: List[Card]) -> str:
-    """The ``free`` instrument covering EVERY card in one printed line.
-
-    FIX 2, finding 3: the label used to be the literal ``nvml_v2_free`` typed
-    into the f-string, while the figure came from whichever struct the registry
-    could read.  The weakest card sets the token, because one token stands for
-    the whole line.
-    """
-    rows = [mem[c.uuid] for c in cards if c.uuid in mem]
-    if rows and not all(r.carve_out_known for r in rows):
-        return nvml_registry.FREE_INSTRUMENT_V1
-    return nvml_registry.FREE_INSTRUMENT_V2
 
 
 def cards_free_check(cards: List[Card], log: Log) -> None:
@@ -7526,34 +4649,6 @@ class StoreDiskPlan:
         return store_extra_config(self.max_size_bytes, self.min_free_bytes)
 
 
-def fs_of(path: str, mounts_text: Optional[str] = None) -> Tuple[str, str, str]:
-    """W57: (mount point, fs type, source) of the filesystem holding ``path``
-    -- the longest /proc/mounts mount point above its nearest existing
-    ancestor. ("", "", "") when /proc/mounts is unreadable."""
-    p = os.path.abspath(str(path or "/"))
-    while p != "/" and not os.path.exists(p):
-        p = os.path.dirname(p)
-    real = os.path.realpath(p)
-    if mounts_text is None:
-        try:
-            with open("/proc/mounts") as fh:
-                mounts_text = fh.read()
-        except OSError:
-            return "", "", ""
-
-    def _unesc(v: str) -> str:
-        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), v)
-
-    best = ("", "", "")
-    for ln in mounts_text.splitlines():
-        parts = ln.split()
-        if len(parts) < 3:
-            continue
-        src, mnt, typ = _unesc(parts[0]), _unesc(parts[1]), parts[2]
-        inside = real == mnt or real.startswith(mnt.rstrip("/") + "/") or mnt == "/"
-        if inside and len(mnt) >= len(best[0]):
-            best = (mnt, typ, src)
-    return best
 
 
 def plan_store(
@@ -7729,239 +4824,27 @@ def prepare_store(log: Log, plan: StoreDiskPlan, dry: bool) -> str:
     return plan.directory
 
 
-#: L3P (user 2026-09-27: "der l3 hicache wird jedesmal verworfen, oder? der soll
-#: natürlich persistent sein"): the disk store is the RETENTION tier, so it is
-#: one directory per model that every boot reattaches to, not one per boot tag.
-#: Named ``l3-<model>-<hash of the model path>``; the prefix is what the sweep
-#: spares. What keeps a reused page honest is the KEY, not the directory: every
-#: page key carries compute_model_identity_hash (model path, revision, dtype,
-#: quantization, kv_cache_dtype, uneven-TP vectors), so a page written in
-#: another byte format is a clean miss, never a wrong hit.
-L3_PERSIST_PREFIX = "l3-"
 
 
-def l3_persist_enabled(env=None) -> bool:
-    """L3P: ``FLLIPER_PDFLIP_L3_PERSIST`` (default on; 0 = the per-boot store,
-    swept at the next boot, exactly as before)."""
-    e = os.environ if env is None else env
-    raw = (e.get("FLLIPER_PDFLIP_L3_PERSIST", "") or "").strip().lower()
-    return raw not in ("0", "false", "no", "off")
 
 
-#: L3P: bump when the ON-DISK page format changes incompatibly (the #706
-#: geometry-neutral canonical page is generation 706); a new generation gets
-#: a new directory instead of a MixedGenerationError on a reused one.
-L3_PERSIST_GENERATION = "706"
-L3_IDENTITY_FILE = "L3_IDENTITY.json"
-#: HANDBACK N-1 (01.10.): profiles whose anchor keying switched to the exact
-#: bigram form. Their L3 identity names it, so a store written under the
-#: upstream keying -- whose persisted Mamba anchors at k units carry the state
-#: after k+1 tokens -- becomes a new directory instead of a silently wrong
-#: anchor (the page KV keys themselves are unchanged). NF ran the exact form
-#: already; its identity and directory stay byte for byte.
-L3_ANCHOR_KEYING_PROFILES = {"qwen27b": "exact-n1"}
-#: YaRN x2: how the runtime applies a rope override (hf_transformers.config.
-#: apply_model_override_args, nested sub-config merge). Bump when that changes.
-L3_ROPE_APPLY = "merge-v1"
 
 
-def _l3_extra_flag(extra: str, flag: str) -> str:
-    """The value argparse will keep for ``flag`` in a shell-split EXTRA string
-    (the LAST occurrence), or ""."""
-    try:
-        toks = shlex.split(extra or "")
-    except ValueError:
-        return str(extra or "")
-    val = ""
-    for i, t in enumerate(toks):
-        if t == flag and i + 1 < len(toks):
-            val = toks[i + 1]
-        elif t.startswith(flag + "="):
-            val = t[len(flag) + 1:]
-    return val
 
 
-def l3_weights_fingerprint(model: str) -> str:
-    """L3P N4: sha1 over (name, size, mtime_ns) of the checkpoint's weight
-    files -- a checkpoint swapped IN PLACE at the same path is a new identity.
-    Top level of the model directory (or the file itself for a GGUF path);
-    stat only, nothing is read."""
-    real = os.path.realpath(str(model or ""))
-    rows = []
-    try:
-        if os.path.isfile(real):
-            st = os.stat(real)
-            rows.append((os.path.basename(real), st.st_size, st.st_mtime_ns))
-        else:
-            with os.scandir(real) as it:
-                for e in it:
-                    if e.name.endswith((".safetensors", ".gguf", ".bin", ".pt", ".pth")) and e.is_file():
-                        st = e.stat()
-                        rows.append((e.name, st.st_size, st.st_mtime_ns))
-    except OSError:
-        return ""
-    rows.sort()
-    return hashlib.sha1(repr(rows).encode()).hexdigest()
 
 
-def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
-                        kv_cache_dtype: str = KV_CACHE_DTYPE, extra_p: str = "",
-                        extra_d: str = "", vision: str = "") -> dict:
-    """L3P: what a persistent store is FOR. User 2026-09-27: "aber natürlich
-    zwischen 27b und nf verschiedene L3 caches. sonst knallts" -- one model,
-    one directory. Beside the checkpoint (path, config sha, weight-file stat
-    fingerprint) it carries every launcher-side input that changes the BYTES
-    of a page without changing its key: the KV dtype (the line's constant and
-    an EXTRA override of either group), the effective
-    ``--json-model-override-args`` of both groups (rope_scaling / YaRN: the
-    key hashes token ids only), and the vision mode. The rank adds what only
-    it knows (dtype, quantization, revision) in ``L3_RANK_IDENTITY.<group>``
-    and refuses a mismatch there."""
-    real = os.path.realpath(str(model or ""))
-    cfg_sha = ""
-    try:
-        with open(model_config_path(model), "rb") as f:
-            cfg_sha = hashlib.sha1(f.read()).hexdigest()
-    except Exception:  # noqa: BLE001 -- a GGUF or unreadable config: the path still separates
-        pass
-    kv = str(kv_cache_dtype or "")
-    kv_p = _l3_extra_flag(extra_p, "--kv-cache-dtype") or kv
-    kv_d = _l3_extra_flag(extra_d, "--kv-cache-dtype") or kv
-
-    def _sha(v: str) -> str:
-        return hashlib.sha1(v.encode()).hexdigest()[:16] if v else ""
-
-    ident = {
-        "model_path": real,
-        "model_config_sha1": cfg_sha,
-        "weights_fp": l3_weights_fingerprint(model),
-        "profile": str(profile or ""),
-        "form_kv": str(form_kv or ""),
-        "kv_cache_dtype": kv if kv_p == kv_d == kv else f"P={kv_p},D={kv_d}",
-        "override_p": _sha(_l3_extra_flag(extra_p, "--json-model-override-args")),
-        "override_d": _sha(_l3_extra_flag(extra_d, "--json-model-override-args")),
-        "vision": str(vision or ""),
-        "generation": L3_PERSIST_GENERATION,
-    }
-    _keying = L3_ANCHOR_KEYING_PROFILES.get(str(profile or ""))
-    if _keying:
-        ident["anchor_keying"] = _keying
-    # YaRN x2 (28.09.): the rope the pages were rotated with, by name -- the
-    # override's rope/position part (rope_scaling, rope_parameters,
-    # max_position_embeddings; top level and text_config), canonical, and the
-    # way the runtime applies it (L3_ROPE_APPLY: f37d83617d merges a nested
-    # text_config override key by key; before it, the same string replaced the
-    # sub-config). Only when an override names a rope -- a store without one
-    # keeps its identity (and its directory) byte for byte.
-    rope_p = _l3_rope_view(_l3_extra_flag(extra_p, "--json-model-override-args"))
-    rope_d = _l3_rope_view(_l3_extra_flag(extra_d, "--json-model-override-args"))
-    if rope_p or rope_d:
-        ident["rope"] = rope_p if rope_p == rope_d else f"P={rope_p},D={rope_d}"
-        ident["rope_apply"] = L3_ROPE_APPLY
-    return ident
 
 
-def l3_persistent_store(directory: str) -> bool:
-    """L3P: ``directory`` is a persistent L3 store (its ``l3-`` name or its
-    identity file) -- no teardown and no sweep may remove it."""
-    d = str(directory or "").rstrip("/")
-    return bool(d) and (
-        os.path.basename(d).startswith(L3_PERSIST_PREFIX)
-        or os.path.isfile(os.path.join(d, L3_IDENTITY_FILE))
-    )
 
 
-def l3_persist_dir_name(identity: dict) -> str:
-    """L3P: ``l3-<profile>-<model>-<identity10>``; the readable part names the
-    model, the digest separates everything else the identity carries."""
-    base = os.path.basename(str(identity.get("model_path", "")).rstrip("/")) or "model"
-    label = "-".join(x for x in (identity.get("profile") or "", base) if x)
-    label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:80]
-    digest = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
-    return f"{L3_PERSIST_PREFIX}{label}-{digest}"
 
 
-def l3_persist_check_identity(directory: str, identity: dict, dry: bool) -> str:
-    """L3P: the directory's own identity file must match; returns "new" /
-    "match". A mismatch is REFUSED BY NAME -- a store is never shared by two
-    identities, whatever its name says."""
-    path = os.path.join(directory, L3_IDENTITY_FILE)
-    try:
-        with open(path) as f:
-            have = json.load(f)
-    except FileNotFoundError:
-        have = None
-    except (OSError, ValueError) as exc:
-        raise PdFlipStoreDiskRefused(
-            f"W57 PdFlipStoreDiskRefused: L3-PERSIST identity file {path} unreadable "
-            f"({type(exc).__name__}: {exc}); refusing to reuse a store whose owner "
-            f"cannot be proven. Move the directory aside or set FLLIPER_PDFLIP_L3_PERSIST=0.")
-    if have is None:
-        if not dry:
-            os.makedirs(directory, exist_ok=True)
-            tmp = path + ".w"
-            with open(tmp, "w") as f:
-                json.dump(identity, f, sort_keys=True, indent=1)
-            os.replace(tmp, path)
-        return "new"
-    if have != identity:
-        diff = sorted(k for k in set(have) | set(identity) if have.get(k) != identity.get(k))
-        raise PdFlipStoreDiskRefused(
-            f"W57 PdFlipStoreDiskRefused: L3-PERSIST store {directory} belongs to another "
-            f"identity (differs in {diff}: store {[have.get(k) for k in diff]} vs this boot "
-            f"{[identity.get(k) for k in diff]}). Two models never share an L3 store "
-            f"(user 2026-09-27). Move the directory aside or set FLLIPER_PDFLIP_L3_PERSIST=0.")
-    return "match"
-
-#: L3-REVOKE (28.09., rc12z17): a persistent store cannot tell a page computed
-#: with broken weights from a good one -- the identity separates what was
-#: CONFIGURED, not what a running boot COMPUTED. rc12z17 (103bfdf29a) wiped
-#: D-TP0's live expert bank at its first S1 wake (10:51:24Z, n=4, rows +33 ->
-#: +23: tms_set_spans(now=True) released the one extent that held every row)
-#: and served garbage until the stop; every page it wrote in that window had
-#: the store's own identity and would have been reused as a hit. The operator
-#: names such a window in ``L3_REVOKED.json`` (``l3_revoke_window``); the next
-#: attach, before any rank starts, MOVES every ``.bin`` written inside it (by
-#: mtime -- a page is written once, whole, via tmp+rename) into the sibling
-#: ``<store>.revoked``. Moved, never deleted (deleting is the user's).
-L3_REVOKED_FILE = "L3_REVOKED.json"
-L3_REVOKED_SUFFIX = ".revoked"
 
 
-def _l3_revoked_path(directory: str) -> str:
-    return os.path.join(directory, L3_REVOKED_FILE)
 
 
-def l3_revoked_windows(directory: str) -> List[Tuple[float, float, str]]:
-    """L3-REVOKE: the store's revoked write windows ``(from, to, reason)`` in
-    unix seconds, [] without a record. An unreadable or malformed record is
-    REFUSED BY NAME (W57): a revocation that cannot be read must not turn
-    into silent reuse of the pages it names."""
-    path = _l3_revoked_path(directory)
-    try:
-        with open(path) as f:
-            raw = json.load(f)
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as exc:
-        raise PdFlipStoreDiskRefused(
-            f"W57 PdFlipStoreDiskRefused: L3-REVOKE record {path} unreadable "
-            f"({type(exc).__name__}: {exc}); the pages it names cannot be told apart. "
-            f"Fix the record (python -m flliper.srt.pdflip.l3_store_audit revoke) or move "
-            f"the directory aside.")
-    out: List[Tuple[float, float, str]] = []
-    try:
-        for w in raw["windows"]:
-            t0, t1 = float(w["from_unix"]), float(w["to_unix"])
-            if not t0 <= t1:
-                raise ValueError(f"from {t0} after to {t1}")
-            out.append((t0, t1, str(w.get("reason", ""))))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise PdFlipStoreDiskRefused(
-            f"W57 PdFlipStoreDiskRefused: L3-REVOKE record {path} malformed "
-            f"({type(exc).__name__}: {exc}); expected "
-            f'{{"windows": [{{"from_unix": s, "to_unix": s, "reason": "..."}}]}}.')
-    return out
+
 
 
 def l3_revoke_window(directory: str, from_unix: float, to_unix: float, reason: str) -> dict:
@@ -7988,84 +4871,14 @@ def l3_revoke_window(directory: str, from_unix: float, to_unix: float, reason: s
     return rec
 
 
-def _l3_rope_view(override: str) -> str:
-    """The rope/position part of a ``--json-model-override-args`` value
-    (``rope_scaling``/``rope_parameters``/``max_position_embeddings``, top
-    level and ``text_config``), canonical JSON; "" without one."""
-    if not override:
-        return ""
-    try:
-        args = json.loads(override)
-    except (TypeError, ValueError):
-        return override  # unparseable: compared verbatim
-    if not isinstance(args, dict):
-        return ""
-    keys = ("rope_scaling", "rope_parameters", "max_position_embeddings")
-    view = {k: args[k] for k in keys if k in args}
-    txt = args.get("text_config")
-    if isinstance(txt, dict):
-        sub = {k: txt[k] for k in keys if k in txt}
-        if sub:
-            view["text_config"] = sub
-    return json.dumps(view, sort_keys=True) if view else ""
 
 
-def l3_persist_check_rope(extra_p: str, extra_d: str) -> None:
-    """L3-REVOKE companion (#259): P and D write and read the SAME pages (one
-    L2, one L3; the key hashes token ids only). A rope override on one group
-    and not the other (YaRN x2 on D alone) gives both groups the same keys for
-    KV rotated at different positions -- refused by name before the store is
-    touched, instead of a directory identity that records both and shares
-    them."""
-    p = _l3_rope_view(_l3_extra_flag(extra_p, "--json-model-override-args"))
-    d = _l3_rope_view(_l3_extra_flag(extra_d, "--json-model-override-args"))
-    if p != d:
-        raise PdFlipStoreDiskRefused(
-            f"W57 PdFlipStoreDiskRefused: L3-PERSIST P and D rotate differently "
-            f"(P rope {p or 'config'} vs D rope {d or 'config'}); they share every "
-            f"L2/L3 page by token-id key, so one group would read the other's KV at "
-            f"the wrong positions. Give both --extra-p and --extra-d the same rope "
-            f"override, or set FLLIPER_PDFLIP_L3_PERSIST=0.")
 
 
-def _l3_move_revoked(directory: str, root: str, name: str, dry: bool) -> bool:
-    """Move one revoked page into ``<directory>.revoked`` (same relative path)."""
-    if dry:
-        return True
-    src = os.path.join(root, name)
-    rel = os.path.relpath(src, directory)
-    dst = os.path.join(directory.rstrip("/") + L3_REVOKED_SUFFIX, rel)
-    try:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        os.replace(src, dst)
-        return True
-    except OSError:
-        return False
 
 
-L3_SUFFIX_REGISTRY = "L3_SUFFIXES"
 
 
-def l3_registered_suffixes(directory: str) -> Optional[Tuple[str, ...]]:
-    """L3P N1: the union of every group's scan suffixes the ranks recorded in
-    ``<dir>/L3_SUFFIXES.<group>.json`` (written by HiCacheFile at attach), or
-    None when no group has recorded yet (first boot of this store)."""
-    out: List[str] = []
-    found = False
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return None
-    for n in names:
-        if not (n.startswith(L3_SUFFIX_REGISTRY + ".") and n.endswith(".json")):
-            continue
-        try:
-            with open(os.path.join(directory, n)) as f:
-                out.extend(str(x) for x in json.load(f).get("suffixes", []))
-            found = True
-        except (OSError, ValueError, AttributeError):
-            continue
-    return tuple(dict.fromkeys(x for x in out if x)) if found else None
 
 
 def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, int]:
@@ -8469,48 +5282,8 @@ def sweep_store_residue(log: Log, keep: str, dry: bool, root: str = STORE_ROOT) 
     return freed
 
 
-def store_extra_config(max_size_bytes: int, min_free_bytes: int) -> str:
-    """The backend's own knobs, in BYTES, with no unit rounding in between.
-
-    ``max_size_scope: shared`` is kept from the tmpfs form and is what makes
-    this a DIRECTORY cap: every writer rank builds its own evictor over the
-    same directory, and ``LRUFileEvictor._load_config`` divides a shared cap by
-    the writer count so the sum of the ranks' caps is the number passed here.
-    """
-    return json.dumps(
-        {
-            "max_size": str(int(max_size_bytes)),
-            "min_free_space": str(int(min_free_bytes)),
-            "max_size_scope": "shared",
-        },
-        separators=(",", ":"),
-    )
 
 
-def read_arc_state(
-    param_path: str = "/sys/module/zfs/parameters/zfs_arc_max",
-    kstat_path: str = "/proc/spl/kstat/zfs/arcstats",
-) -> Dict[str, Optional[int]]:
-    """ZFS ARC facts in BYTES: ``arc_max`` (the module parameter), ``c_max``
-    and ``size`` (live, from arcstats).  ``None`` -- never 0 -- for anything
-    unreadable, because 0 is a MEANINGFUL value of ``zfs_arc_max`` (it means
-    "unset, use the built-in default") and must not be forged by an absence.
-    """
-    out: Dict[str, Optional[int]] = {"arc_max": None, "c_max": None, "size": None}
-    try:
-        with open(param_path) as f:
-            out["arc_max"] = int(f.read().strip())
-    except (OSError, ValueError):
-        pass
-    try:
-        with open(kstat_path) as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) == 3 and parts[0] in ("c_max", "size"):
-                    out[parts[0]] = int(parts[2])
-    except (OSError, ValueError):
-        pass
-    return out
 
 
 def arc_preflight_line(
@@ -8628,54 +5401,9 @@ def store_read_cost_line(plan: StoreDiskPlan, cap_tokens: int) -> str:
 # --------------------------------------------------------------------------
 
 
-#: #1356 THE VISION KNOB. `off` (default) boots P and D TEXT-ONLY; `resident`
-#: keeps the tower loaded on both groups, which is what every boot up to and
-#: including weg2xsn27 did. `resident` is kept for the day the tower becomes a
-#: 7th rank transient between the flips -- that is #1356 proper and it is NOT
-#: this slice.
-#:
-#: WHY IT IS A DEFAULT AND NOT AN OPT-IN: weg2xsn27 loaded the tower on all six
-#: ranks and replicated it threefold on P -- 879 MiB per P card in the manifest
-#: and 2.63 GiB across the host ring, measured. No Weg-2 form serves images,
-#: and the front refuses them by name, so the bytes bought nothing.
-VISION_OFF = "off"
-VISION_RESIDENT = "resident"
-#: Task #58 (user order 2026-09-20): the tower is in NO layout resident. An
-#: image request loads it onto one card before the P prefill really starts,
-#: runs it, and takes it down again.
-#:
-#: THE ARGV IS NOT `--no-enable-multimodal` FOR THIS ONE, and that is the
-#: whole difference. `off` passes that flag, which also switches off the
-#: TOKENIZER's image path (`model_config.py:573 is_multimodal`), so no
-#: `mm_items` are ever built and there is nothing for a stage to encode.
-#: `transient` instead sets the hf-config override `language_model_only`,
-#: which `vision_tower_forced_off` (`models/qwen3_vl.py:1230`) also honours:
-#: the tokenizer keeps processing images, `self.visual` stays None
-#: (`:1286`), `skip_vision_weight` (`:1243`) drops the checkpoint's tower
-#: tensors, and `weight_name_needed` now stops them being READ at all.
-#: Measured in fn8ag2 (docstring `qwen3_vl.py:1216-1220`).
-VISION_TRANSIENT = "transient"
-VISION_CHOICES = (VISION_OFF, VISION_RESIDENT, VISION_TRANSIENT)
 
-#: `--json-model-override-args` payload for the transient form. One constant
-#: so the launcher and the tests cannot drift.
-VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
 
-#: H125 (NF, user order 2026-09-24 10:15Z): where the transient tower's bytes
-#: come from (`disk` = the checkpoint shard, O_DIRECT, the 27B stage; `ram` =
-#: a tmpfs image of the tower extent, staged once by P's PP0) and where it
-#: sits on the card (`auto` = the KV tail, else free VRAM; `kvtail`; `free`).
-#: The defaults publish NOTHING: the P env of a transient boot is the 27B one,
-#: and a text-only boot is byte-identical to every boot before H125. The
-#: variable names are the rank's (`pdflip.vision_rank_stage`), one spelling.
-VISION_SOURCE_DISK = "disk"
-VISION_SOURCE_RAM = "ram"
-#: user order 27.10.: ONE standing pinned host copy of the tower, an H2D per image;
-#: the RANK's default under `--pdflip-vision-place weights` (FLLIPER_PDFLIP_VISION_PINNED=0
-#: = off), so the launcher default stays `disk` and publishes nothing
-VISION_SOURCE_PINNED = "pinned"
 VISION_SOURCES = (VISION_SOURCE_DISK, VISION_SOURCE_RAM, VISION_SOURCE_PINNED)
-VISION_PLACE_AUTO = "auto"
 #: VISION-WEIGHTS (09.10.): `weights` = the tower borrows victim weight memory
 #: of P's PP0 (pdflip.vision_victim); off until the metal proof
 VISION_PLACES = (VISION_PLACE_AUTO, "kvtail", "free", "weights")
@@ -8687,93 +5415,17 @@ VISION_D_ENV = "FLLIPER_PDFLIP_VISION_D"
 VISION_PLACE_ENV = "FLLIPER_PDFLIP_VISION_PLACE"
 
 
-def vision_on_d_of(ns) -> bool:
-    """The launcher's ONE decision whether group D encodes images (user order 27.10.: flip layouts yes, dual layout no,
-    ``FLLIPER_PDFLIP_VISION_D=0`` off). The front reads the same function (``front.vision_on_d``) with the same inputs."""
-    from flliper.srt.pdflip.front import vision_on_d
-
-    dual = bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False))
-    return vision_on_d(str(getattr(ns, "pdflip_vision", VISION_OFF)), dual)
 
 
-def vision_stage_knobs_refusal(vision: str, source: str, place: str) -> str:
-    """A source/place that is not the default only means something under
-    `--pdflip-vision transient`; anywhere else it is refused by name (a knob
-    that silently does nothing is a boot nobody can read)."""
-    if vision == VISION_TRANSIENT:
-        return ""
-    if source != VISION_SOURCE_DISK or place != VISION_PLACE_AUTO:
-        return (
-            f"W111 PdFlipVisionArmRefused: --pdflip-vision-source {source} / "
-            f"--pdflip-vision-place {place} were given, but --pdflip-vision is "
-            f"{vision!r} -- they act only on the transient stage"
-        )
-    return ""
 
 
-def vision_source_host_line(model: str, source: str) -> str:
-    """The host-RAM price of `--pdflip-vision-source ram`, named at the launch:
-    the tower extent (header read only) lives in a tmpfs image for the life
-    of P's PP0 (shmem, charged to memory.current). Empty for `disk`."""
-    if source not in (VISION_SOURCE_RAM, VISION_SOURCE_PINNED):
-        return ""
-    try:
-        from flliper.srt.planner.vision_stage_load import find_tower_shard, tower_extent
 
-        ext = tower_extent(find_tower_shard(model))
-        mib = f"{(ext.file_last_end - ext.file_first_offset) / (1 << 20):.1f} MiB"
-    except Exception as exc:  # noqa: BLE001 -- unmeasured is said, never guessed
-        mib = f"size unread ({type(exc).__name__}: {exc})"
-    if source == VISION_SOURCE_PINNED:
-        return (
-            f"W102 PdFlipVisionStage SOURCE=pinned: P's PP0 stages the tower extent into ONE pinned host "
-            f"copy once ({mib}), kept for the life of the boot (pinned, counted in memory.current); "
-            "every image then loads from it by H2D instead of the disk"
-        )
-    return (
-        f"W102 PdFlipVisionStage SOURCE=ram: P's PP0 stages the tower extent into a tmpfs "
-        f"image once ({mib}), held in host RAM for the life of the boot (shmem, counted in "
-        "memory.current, NOT in the host ledger's terms); every image then loads from RAM "
-        "instead of the disk"
-    )
-
-#: Task #47 Scheibe 6a (20.09.): the checkpoint PROFILE the two groups are built
-#: for. ``qwen27b`` is every boot before this flag existed (byte-identical argv
-#: and env). ``nextflash`` = Qwen3.8 Next Flash: P = PP3 (tp 1 per stage), D =
-#: Form A (host,worker,worker), whose rank_role collapses DCP to 1 and REFUSES an
-#: inherited FLLIPER_UNEVEN_DCP=1 -- so the uneven-DCP facts (EARLY_READ_FACTS,
-#: env AND flag half) are owned per group here (flip_nextflash_groups
-#: GROUP_ENV_VALUES: P 1/1, D 0/0) and the flag half is dropped on both.
-#: UNIFY S3: the names and their rows live in the registry (pdflip/form.py
-#: PROFILES); what differs per profile is a table row there, never an ``if``
-#: on the name here.
-PROFILE_QWEN27B = pdflip_form.PROFILE_QWEN27B
 PROFILE_NEXTFLASH = pdflip_form.PROFILE_NEXTFLASH
 PROFILES = tuple(pdflip_form.PROFILES)
 
 
-def _profile_early_read(profile: Optional[str]) -> bool:
-    """Does ``profile`` put the #1235 early-read facts' FLAG half in the argv
-    (ModelProfile.early_read_flags; 27B yes, NF no)? Unknown profile: no."""
-    row = pdflip_form.profile_row(profile)
-    return bool(row is not None and row.early_read_flags)
 
 
-def vision_model_flags(vision: str):
-    """The model-side argv this vision form needs. PURE -- enumerable at a
-    desk, which is where the three forms are pinned against each other."""
-    if vision == VISION_OFF:
-        return ["--no-enable-multimodal"]
-    if vision == VISION_TRANSIENT:
-        return ["--json-model-override-args", VISION_TRANSIENT_OVERRIDE]
-    if vision == VISION_RESIDENT:
-        return []
-    raise ValueError(
-        f"unknown --pdflip-vision {vision!r}; expected one of "
-        f"{list(VISION_CHOICES)}. Refusing rather than defaulting: a boot "
-        "whose tower state nobody stated is a boot that can return plausible "
-        "wrong text for an image request."
-    )
 
 
 def common_flags(
@@ -8926,28 +5578,6 @@ def common_flags(
     ] + (["--enable-weights-cpu-backup"] if weights_cpu_backup else [])
 
 
-def admin_key_flag(admin_api_key: Optional[str]) -> List[str]:
-    """#1275: BOTH groups get the key, or the capability is half-present.
-
-    The front talks to P and D with the same header, and the resize lever is
-    wanted on whichever group holds the store -- so a key on one group only
-    would make the front's flip RPCs succeed against one peer and 401 against
-    the other, which is a worse state than having no key at all. One helper,
-    two call sites, so the two argv builders cannot drift apart.
-
-    Empty list when unkeyed, which keeps every pre-#1275 argv byte-identical.
-    """
-    # #1361 [22-fix4] ONE TOKEN, `--flag=value`. The two-token form hands the
-    # value to argparse as a separate word, and a value that starts with '-'
-    # is then read as an option: boot weg2xsn25's first launch (065608) died
-    # on `argument --admin-api-key: expected one argument` because that mint
-    # began with a hyphen (1 in 64). `mint()` no longer produces such a key,
-    # and this form makes the argv safe for ANY key, including one an operator
-    # supplies by hand, which never passes through `mint()` at all.
-    # The P form key does not move: `ring_table._flag_pairs` normalises
-    # `--flag value` to `--flag=value` before hashing, and the flag is in
-    # FORM_KEY_EXCLUDED_FLAGS either way (verified, both spellings).
-    return [f"--admin-api-key={admin_api_key}"] if admin_api_key else []
 
 
 def argv_p(
@@ -9147,308 +5777,25 @@ def argv_p(
         list(extra) if draft_kv_on_p else strip_speculative_flags(extra)[0])
 
 
-#: fnFL2 H37 (Task #118): the scheduler flag that bounds how many requests ONE
-#: prefill forward of group P may carry.
-P_MICRO_BATCH_FLAG = "--pp-max-micro-batch-size"
 
 
-def _last_flag_value(argv: Sequence[str], flag: str) -> Optional[str]:
-    """The value argparse KEEPS for ``flag`` in a token list: the LAST one,
-    in either spelling (``--flag v`` / ``--flag=v``). ``None`` when absent.
-
-    The list twin of :func:`_argv_scalar` (which takes the --extra-* STRING):
-    ``argv_p`` holds ``extra`` already split, and the finished argv is a list.
-    """
-    found = None
-    toks = list(argv or ())
-    for i, tok in enumerate(toks):
-        tok = str(tok)
-        if tok == flag and i + 1 < len(toks):
-            found = str(toks[i + 1])
-        elif tok.startswith(flag + "="):
-            found = tok[len(flag) + 1:]
-    return found
 
 
-def p_micro_batch_flags(p_bs: int, extra: Sequence[str]) -> List[str]:
-    """fnFL2 H37: group P's ``--pp-max-micro-batch-size``, or nothing.
-
-    WHAT IT LIFTS. Unset, the scheduler derives the width as
-    ``max_running_requests // pp_size`` (scheduler.default_pp_micro_batch_size)
-    and ``get_num_allocatable_reqs`` caps every forward at it -- on PP3 that is
-    ONE request per forward for ``--p-bs`` 1..5, so ``--p-bs 3`` buys three
-    requests in flight on three stages but never two in one forward (and every
-    END-ANCHOR tail of 1-4 tokens runs as a forward of its own). For a
-    prefill-only group whose requests finish at the end of their prefill, the
-    forward is bounded by the chunk TOKEN budget (``rem_chunk_tokens`` is a
-    per-batch budget in ``PrefillAdder``), not by a request count; the total
-    stays bounded by ``req_to_token_pool`` (= ``--max-running-requests``).
-
-    The width is P's EFFECTIVE ``--max-running-requests`` -- the one argparse
-    keeps, i.e. an ``--extra-p`` value if the arm doubled the flag -- so the two
-    never disagree. An ``--extra-p`` ``--pp-max-micro-batch-size`` wins and
-    nothing is emitted (same rule as ``--max-mamba-cache-size``).
-
-    Off (the default): ``[]``, the argv is byte-identical to before H37.
-    """
-    if not envs.FLLIPER_PDFLIP_ENABLE_P_UNDIVIDED_MICRO_BATCH.get():
-        return []
-    if _last_flag_value(extra, P_MICRO_BATCH_FLAG) is not None:
-        return []
-    mrr = _last_flag_value(extra, "--max-running-requests")
-    width = int(mrr) if mrr is not None else int(p_bs)
-    return [P_MICRO_BATCH_FLAG, str(max(1, width))]
 
 
-def p_micro_batch_line(argv_of_p: Sequence[str]) -> str:
-    """fnFL2 H37: ONE line at launch that says how many requests one P
-    forward may carry, and why -- the reading the burst probe is checked
-    against (``Prefill batch, #new-seq: k`` on PP0 cannot exceed it).
-
-    Also names a DOUBLED ``--max-running-requests`` (launcher value and an
-    ``--extra-p`` value that differ): argparse keeps the last, so ``--p-bs``
-    then no longer states P's concurrency -- the front still dispatches
-    ``--p-bs`` + P_QUEUE_AHEAD.
-    """
-    toks = [str(t) for t in argv_of_p]
-    mrr_all = [toks[i + 1] for i, t in enumerate(toks)
-               if t == "--max-running-requests" and i + 1 < len(toks)]
-    mrr_all += [t.split("=", 1)[1] for t in toks if t.startswith("--max-running-requests=")]
-    try:
-        mrr = int(_last_flag_value(toks, "--max-running-requests") or 0)
-        pp = int(_last_flag_value(toks, "--pp-size") or 1)
-    except ValueError:
-        return ("P-MICRO-BATCH unreadable argv "
-                "(--max-running-requests/--pp-size not integers)")
-    stock = max(mrr // max(pp, 1), 1) if mrr > 0 else 1
-    doubled = (f" DOUBLED --max-running-requests {'/'.join(mrr_all)}: argparse keeps {mrr}"
-               if len(set(mrr_all)) > 1 else "")
-    mb = _last_flag_value(toks, P_MICRO_BATCH_FLAG)
-    if mb is None:
-        return (f"P-MICRO-BATCH mode=stock width={stock} (= --max-running-requests "
-                f"{mrr} // pp {pp}): one P forward admits at most {stock} request(s); "
-                f"FLLIPER_PDFLIP_ENABLE_P_UNDIVIDED_MICRO_BATCH=1 lifts it to {max(mrr, 1)}{doubled}")
-    if envs.FLLIPER_PDFLIP_ENABLE_P_MULTI_ANCHOR_TAILS.get():
-        # fnFL2 H42: every whole-fit prompt's END-ANCHOR body becomes a tail
-        # of its own (managers/anchor_tails.py); the tails end together.
-        tails = ("FLLIPER_PDFLIP_ENABLE_P_MULTI_ANCHOR_TAILS=1: every END-ANCHOR body is an "
-                 "anchor tail of its own request, so up to that many requests REACH THEIR END "
-                 "per forward (their tails [N-1', N) ride together in the next pass)")
-    else:
-        tails = ("END-ANCHOR still mints ONE continuation per pass (#959/#996), so at "
-                 "most one request REACHES ITS END per forward "
-                 "(FLLIPER_PDFLIP_ENABLE_P_MULTI_ANCHOR_TAILS=1 lifts it)")
-    return (f"P-MICRO-BATCH mode=undivided width={mb} (--max-running-requests {mrr}, "
-            f"stock would be {stock}): one P forward admits up to {mb} request(s) within the "
-            f"chunk budget; {tails}{doubled}")
 
 
-def w38_armed_line(argv_of_p: Sequence[str]) -> str:
-    """State group P's carrierless-PP arm AT LAUNCH, once.
-
-    RECONCILED 2026-09-08 (pdflip train, W38 vs #1245): there is ONE arm for the
-    carrierless PP fact now, and it is #1245's ``undistributable`` drop --
-    ``clear_state_aligned_extent_undistributable`` at scheduler.py:12157, gated
-    on ``pp_row_carrier_present(self)`` exactly as W38 was.  W38's own gate at
-    ``Scheduler._prefetch_kvcache`` is DELETED: it refused the store READ
-    outright and was desk-only, while #1245 is BOOT-PROVEN (weg2rg6, 141 group-P
-    prefill passes, 20 leg-1 legs, three real drops, W27 genuine 0 over that
-    population).  So group P DOES read the store again; what it may not do is
-    ADOPT a host hit that landed on this rank alone.
-
-    Read off the argv this launcher is about to run rather than asserted from
-    memory: ``--pp-size N`` with N > 1 is the predicate's own precondition, so
-    if that flag ever changes the line changes with it instead of lying.
-    """
-    pp = 1
-    for i, a in enumerate(argv_of_p):
-        if a == "--pp-size" and i + 1 < len(argv_of_p):
-            try:
-                pp = int(argv_of_p[i + 1])
-            except ValueError:
-                pp = 1
-    if pp <= 1:
-        return ("PDFLIP #1245 NOT ARMED: group P is launched with --pp-size %d, so no rank can hold a "
-                "fact it cannot tell its peers and nothing is dropped" % pp)
-    return ("PDFLIP #1245 ARMED (W38 RETIRED INTO IT): group P is launched --pp-size %d and the no-flip "
-            "PP form carries no #631 row carrier, so an asynchronously-completed host hit that landed "
-            "on ONE rank is DROPPED at admission (#1245 UNDISTRIBUTABLE LOAD-BACK DROPPED) instead of "
-            "moving that rank's prefix_indices alone -- the W27 width divergence that killed boots "
-            "weg2sc1 and weg2rg3. THE STORE READ ITSELF IS NOT REFUSED any more: W38 "
-            "PdFlipCarrierlessPpStoreRead disarmed it entirely and was the desk-only half of the same "
-            "fact; the two arms were reconciled to the boot-proven one. WHAT IT COSTS: only the "
-            "extents actually dropped, counted by that log line, not P's whole L3 prefix reuse. "
-            "Measured per drain epoch by the front's 'PDFLIP P-PREFIX-REUSE' line; the write-through "
-            "and D's own store read are untouched, and the drop lifts itself the moment a carrier "
-            "exists (#968 PP0-authoritative materialisation is the named remedy)." % pp)
-
-def _refuse_if_extra_raises_budget(
-    budgets: List[int], extra: List[str], group: str
-) -> None:
-    """W100: ``--extra-*`` darf ein Kartenbudget SENKEN, nie HEBEN.
-
-    WARUM DAS EIN EIGENER RIEGEL IST (fnFL2w51, 22.09.). Der Launcher
-    rechnet je Karte ``total - corridor - dormant_residue`` und schreibt das
-    Ergebnis als ``--rank-gpu-memory-mib`` in die argv. Danach haengt er
-    ``extra`` an -- und wenn der Arm dort dieselbe Flag noch einmal setzt,
-    gewinnt sie, weil argparse den LETZTEN Wert nimmt. Still, ohne eine
-    Zeile.
-
-    In w51 stand im argv von D zweimal ``--rank-gpu-memory-mib``:
-
-        28240,16672,16672   der Launcher (Korridor, predicted_free -230)
-        29900,18500,18500   der Arm (Handzahl aus v70-v75)
-
-    Der Arm gewann, D-TP0 lud das Zielmodell bis auf 1,30 GB avail, und der
-    SOLO-Draft danach fand keinen Platz mehr:
-
-        PDFLIP-TAG-POOL tag=weights_draft pool=new
-        [torch_memory_saver.cpp] CUresult error: 2 (out of memory)
-                                 func=cu_mem_create line=194
-
-    Die Richtung ist das Entscheidende, nicht die Doppelung: ein Arm, der
-    ein Budget SENKT, nimmt sich Luft und das ist immer sicher. Ein Arm, der
-    es HEBT, ueberzieht eine Karte, die der Launcher bereits bis an ihre
-    Grenze gerechnet hat -- und der Posten, der dann faellt, ist der
-    letztgeladene (hier der Draft), nicht der, den jemand gewaehlt haette.
-
-    Kein Opt-out: ist der Launcher-Wert zu niedrig, gehoert SEINE Rechnung
-    korrigiert ([[planner-alleinzustaendigkeit-vram]]), nicht ueberstimmt.
-    """
-    if not extra:
-        return
-    _values: Optional[List[int]] = None
-    for _i, _tok in enumerate(extra):
-        if _tok == "--rank-gpu-memory-mib" and _i + 1 < len(extra):
-            _roh = extra[_i + 1]
-        elif _tok.startswith("--rank-gpu-memory-mib="):
-            _roh = _tok.split("=", 1)[1]
-        else:
-            continue
-        try:
-            _values = [int(x) for x in str(_roh).strip().strip('"\'').split(",") if x != ""]
-        except ValueError:
-            # Unlesbar ist NICHT harmlos: dieselbe Flag steht dann trotzdem
-            # hinter der des Launchers und gewinnt. Benennen statt schweigen.
-            raise RuntimeError(
-                f"W100 PdFlipExtraBudgetRaise: --extra-{group.lower()} setzt "
-                f"--rank-gpu-memory-mib auf {_roh!r}, das nicht als "
-                f"MiB-Liste lesbar ist -- es ueberschreibt trotzdem die "
-                f"Launcher-Budgets {budgets}."
-            )
-    if _values is None:
-        return
-    if len(_values) != len(budgets):
-        raise RuntimeError(
-            f"W100 PdFlipExtraBudgetRaise: --extra-{group.lower()} setzt "
-            f"--rank-gpu-memory-mib mit {len(_values)} Eintraegen "
-            f"({_values}), der Launcher rechnet mit {len(budgets)} "
-            f"({budgets}). Die Listen muessen dieselbe Flotte meinen."
-        )
-    _hoch = [
-        (i, int(b), int(e)) for i, (b, e) in enumerate(zip(budgets, _values)) if e > b
-    ]
-    if _hoch:
-        _text = "; ".join(
-            f"Rang {i}: Launcher {b} MiB -> extra {e} MiB (+{e - b})"
-            for i, b, e in _hoch
-        )
-        raise RuntimeError(
-            f"W100 PdFlipExtraBudgetRaise: --extra-{group.lower()} HEBT "
-            f"Kartenbudgets ueber die Launcher-Rechnung -- {_text}. Der "
-            f"Launcher-Wert ist total minus Korridor minus dormantes "
-            f"Residuum; darueber ueberzieht die Karte und der zuletzt "
-            f"geladene Posten faellt (fnFL2w51: der Solo-Draft, "
-            f"cu_mem_create CUresult 2). Senken ist erlaubt, heben nicht: "
-            f"ist die Launcher-Rechnung zu tight, gehoert SIE korrigiert."
-        )
 
 
-def _d_adopt_armed(ns) -> bool:
-    """#108: EINE Aufloesung des ``--pdflip-d-adopt``-Flags im Launcher.
-
-    Beide ``argv_d``-Bauer und der Env-Schreiber lesen DIESE Funktion. Zwei
-    Ableitungen derselben Entscheidung sind der Weg, auf dem zwei Antworten
-    entstehen (#91/#106/#107 -- dreimal dieselbe Klasse an einem Tag).
-    """
-    return str(getattr(ns, "pdflip_d_adopt", "off")).strip().lower() == "on"
 
 
-def _adopt_load_format_flag(armed: bool) -> List[str]:
-    """#108: unter Adoption laedt D mit ``dummy``, nicht von Platte.
-
-    ``armed`` KOMMT VOM AUFRUFER, ES WIRD KEINE ENV GELESEN -- und das ist
-    der ganze Fix aus fnFL2w52. Die erste Fassung rief
-    ``adopt.adopt_armed()`` ohne ``explicit``; im LAUNCHER-Prozess ist
-    ``FLLIPER_PDFLIP_D_ADOPT`` aber nicht gesetzt (sie geht nur an die
-    Kinder), also gab die Funktion IMMER ``[]`` zurueck -- waehrend der
-    Launcher danebenschrieb "D startet mit --load-format dummy". Im argv
-    des Boots stand der Flag null mal, D las 288 Presplit-Layer von
-    Platte, und die Zeile war eine BEHAUPTUNG. Der Docstring von
-    ``adopt_armed`` benennt genau diese Falle ("ein Launcher-Aufrufer ohne
-    explicit liest still seine eigene ungesetzte Umgebung"); ein
-    Parameter kann man nicht vergessen zu setzen, eine Env schon.
-
-    ``DummyModelLoader`` ruft ``initialize_dummy_weights`` UND danach
-    ``process_weights_after_loading`` je Modul -- Repack, Presplit und
-    Pool-Geometrie entstehen also identisch zum Plattenweg. Nur die Zahlen
-    sind Zufall, und genau die bringt der Erstflip.
-
-    Der Flag geht ans ENDE der Launcher-Liste, VOR ``extra``: so kann ein
-    Arm ihn mit seinem eigenen ``--load-format`` ueberstimmen.
-    """
-    if not armed:
-        return []
-    return ["--load-format", "dummy"]
 
 
-def _refuse_if_extra_drops_transient_lmo(vision: str, extra, group: str) -> None:
-    """EXTRA is appended LAST and argparse keeps the last occurrence of
-    ``--json-model-override-args``, so an EXTRA override is the one the group
-    gets. Under ``--pdflip-vision transient`` it must carry
-    ``language_model_only`` itself, or the group would build the tower it must
-    not have -- refused by name instead of lost silently (27B f09dc0d6e4,
-    extended to P on NF by H125: the NF arm's EXTRA_P and EXTRA_D both carry
-    ``{"language_model_only":true}``, which passes)."""
-    _extra = list(extra or ())
-    if vision != VISION_TRANSIENT or "--json-model-override-args" not in _extra:
-        return
-    _i = len(_extra) - 1 - _extra[::-1].index("--json-model-override-args")
-    try:
-        _lmo = bool(json.loads(_extra[_i + 1]).get("language_model_only"))
-    except (IndexError, ValueError, AttributeError):
-        _lmo = False
-    if not _lmo:
-        raise PdFlipLaunchRefused(
-            f"W111 PdFlipVisionArmRefused: --extra-{group.lower()} carries its own "
-            "--json-model-override-args without language_model_only, and "
-            "argparse keeps only the last one -- --pdflip-vision transient's "
-            f"{VISION_TRANSIENT_OVERRIDE} would be lost and {group} would build a "
-            'tower. Add "language_model_only": true to the EXTRA override.'
-        )
 
 
-MM_SKIP_HASH_ENV = "FLLIPER_MM_SKIP_COMPUTE_HASH"
 
 
-def _refuse_if_transient_mm_hash_unstable(vision: str, env, group: str) -> None:
-    """H125d: under ``--pdflip-vision transient`` an image's radix/L3 key is its
-    ``pad_value`` = ``MM_PAD_SHIFT_VALUE + hash``, computed from the pixel
-    values in P's AND in D's tokenizer (``MultimodalDataItem.set_pad_value``).
-    D reads P's pages only if both hashes agree. ``FLLIPER_MM_SKIP_COMPUTE_HASH``
-    replaces the content hash with ``uuid4()`` -- a different key per process,
-    so D never matches the image and refuses it (W123) on every request.
-    Refused by name at the launch instead."""
-    if vision != VISION_TRANSIENT:
-        return
-    raw = str((env or {}).get(MM_SKIP_HASH_ENV, "") or "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        raise PdFlipLaunchRefused(
-            f"W111 PdFlipVisionArmRefused: {MM_SKIP_HASH_ENV}={raw} in group {group}'s "
-            "environment -- --pdflip-vision transient keys an image by its content "
-            "hash on P and D; a random per-process hash makes D's image prefix "
-            "unmatchable (W123 on every image). Unset it for this boot."
-        )
+
 
 
 def argv_d(
@@ -9633,323 +5980,24 @@ def argv_d(
     ] + admin_key_flag(admin_api_key) + _adopt_load_format_flag(d_adopt) + extra
 
 
-def _import_duplex_gate() -> float:
-    from flliper.srt.managers import pdflip_memory_saver
-
-    return float(pdflip_memory_saver.DUPLEX_SPLIT_MIN_RATIO)
 
 
 
 
-#: R17's gate, read from the module that owns the key so the launcher's printed
-#: verdict and the rank's actual key can never be computed from two numbers.
-DUPLEX_GATE = _import_duplex_gate()
 
 
-def _front_leg_form() -> str:
-    """``front.FLIP_LEG_FORM`` -- read, never restated.
-
-    The launch check has to know how the flip orders its legs, and the only
-    honest source is the module that does the ordering.  A copy here would be a
-    second bookkeeping of the same fact and would go stale the moment C9 lands.
-    """
-    from flliper.srt.pdflip import front
-
-    return front.FLIP_LEG_FORM
 
 
-def _split_decisions(
-    card_uuids: Sequence[str],
-    ratios: Optional[Dict[str, float]] = None,
-    leg_form: str = "interleave",
-    override: Optional[bool] = None,
-) -> Dict[str, bool]:
-    """Per card: does its PCIe key SPLIT the two directions?  Decided ONCE, here.
-
-    FIX 1 round 1, and boot weg2rg2 is the reason it is a decision at all rather
-    than a reading of R17's ratio.  R17 asks whether the split BUYS enough
-    (concurrent aggregate >= 1.5x serial); weg2rg2 asked whether the single key
-    is SAFE under C9's gathered legs, and the answer is no.  Each leg holds the
-    per-card key across its whole tag loop, so on a one-key card the pair is
-    serialised again and R5's premise -- W's per-tag releases fund S's acquires
-    -- is false there: the sleep leg blocks in ``acquire`` at free = 0 holding
-    the key the wake leg needs.  Measured cost of that on nvml0: 120.189 s, W31,
-    W29 on three ranks, group-fatal W4.
-
-    So: under GATHERED legs every card splits, whatever its ratio.  That is not
-    free-lunch reasoning -- the x4 card's 1.316 is concurrent OVER serial, so
-    concurrency is 32 % faster there too; R17's gate only ever said the split is
-    not worth a mechanism of its own, and A1-4 says that card gets no BENEFIT
-    from the split, not that it must not have one.  Under a front that does NOT
-    gather (no state of this tree), the ratio gate stands and a card below it
-    keeps one key -- which is correct there, because a serial front never has
-    two legs in flight to deadlock.
-
-    ``override`` is the test injection point: ``True`` = force every key to
-    split, ``False`` = force every key single (the weg2rg2 state).
-    """
-    if override is not None:
-        return {uuid: bool(override) for uuid in card_uuids}
-    if leg_form == "interleave":
-        return {uuid: True for uuid in card_uuids}
-    table = ratios or {}
-    return {
-        uuid: table.get(uuid) is not None and table[uuid] >= DUPLEX_GATE
-        for uuid in card_uuids
-    }
 
 
-#: The launch check's body, run BY THE TREE THE RANKS IMPORT (FIX 3 round 3,
-#: finding 2).  It sets the duplex variable under the NAME THAT TREE USES -- not
-#: the launcher's -- so a tree that renamed it is a failed probe rather than a
-#: silently unconfigured one, and it asks for the KEY, which is the only artefact
-#: the launcher and the rank must agree on.  ``CUDA_VISIBLE_DEVICES=''`` in the
-#: caller's env means no context is bought to answer.
-_KEY_PROBE = (
-    "import json, os, sys\n"
-    "from flliper.srt.managers import pdflip_memory_saver as s\n"
-    "os.environ[s.PCIE_DUPLEX_ENV] = sys.argv[1]\n"
-    "out = {}\n"
-    "for u in json.loads(sys.argv[2]):\n"
-    "    try:\n"
-    "        keys = {s.pcie_lock_path(u, direction=d) for d in s.PCIE_DIRECTIONS}\n"
-    "    except TypeError:\n"
-    "        keys = {s.pcie_lock_path(u)}\n"
-    "    out[u] = [len(keys), len(s.PCIE_DIRECTIONS)]\n"
-    "sys.stdout.write('PDFLIP-KEYS ' + json.dumps(out))\n"
-)
 
 
-def _resolve_keys_in_rank_tree(
-    card_uuids: Sequence[str], published: str, py: str, tree: str
-) -> Tuple[Dict[str, Tuple[int, int]], str]:
-    """``{uuid: (keys THAT tree builds, directions THAT tree has)}``, or ``({}, why)``.
-
-    BOTH halves come from the rank tree, never one from here: a tree with a
-    different :data:`PCIE_DIRECTIONS` would otherwise be compared against this
-    launcher's count and read as split when it is not.
-
-    One interpreter start per boot, in the environment ``build_env`` gives the
-    ranks (``PYTHONPATH=<tree>/python``), because a stale tree on that path is
-    precisely the divergence this check exists to see and precisely the one an
-    in-process import cannot show.
-    """
-    # Rename 1b: one spelling per variable before the pop below (name_compat).
-    env = canonical_env(dict(os.environ))
-    env["PYTHONPATH"] = f"{tree}/python"
-    env["CUDA_VISIBLE_DEVICES"] = ""
-    from flliper.srt.managers import pdflip_memory_saver as _s
-
-    env.pop(_s.PCIE_DUPLEX_ENV, None)  # the probe sets the TREE's own name
-    try:
-        proc = subprocess.run(
-            [py, "-c", _KEY_PROBE, published, json.dumps(list(card_uuids))],
-            capture_output=True, text=True, env=env, cwd=tree, timeout=300,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {}, f"{type(exc).__name__}: {exc}"
-    out = proc.stdout or ""
-    marker = "PDFLIP-KEYS "
-    if proc.returncode != 0 or marker not in out:
-        tail = " | ".join((proc.stderr or "").strip().splitlines()[-3:])
-        return {}, f"rc={proc.returncode} stderr={tail[:400]!r}"
-    try:
-        raw = json.loads(out[out.index(marker) + len(marker):].strip())
-        return {str(k): (int(v[0]), int(v[1])) for k, v in raw.items()}, ""
-    except (ValueError, TypeError, KeyError, IndexError) as exc:
-        return {}, f"unparsable probe answer ({type(exc).__name__}: {exc})"
 
 
-def _serialised_cards(
-    card_uuids: Sequence[str],
-    published: str = "",
-    leg_form: str = "interleave",
-    *,
-    py: str = "",
-    tree: str = "",
-    notes: Optional[List[str]] = None,
-) -> List[str]:
-    """The cards on which the two flip legs are SERIALISED, by UUID.
-
-    FIX 1 (round 1), and boot weg2rg2 is why.  Serialisation is a property of a
-    CARD, not of the flip: C9 puts both legs in flight, but each leg takes the
-    per-card PCIe key for its WHOLE tag loop (weight_updater sleep-D2H at the
-    ``with self._pdflip_pcie_lock(...)`` around the pause loop, wake-H2D around
-    the resume loop), and on a card whose measured duplex ratio does not reach
-    R17's gate both directions resolve to the SAME key.  There the gathered pair
-    is serialised again -- W's per-tag releases cannot fund S's acquires,
-    because W is queued behind S on the key, or S behind W.
-
-    The predecessor computed the AND over cards, printed it, and gated nothing;
-    its justification was that "a card that keeps one key costs time on that
-    card, and nothing else".  The metal refuted that 20 minutes later: nvml0
-    (1.316, DUPLEX-NULL) passed R5 on both directions, armed, and wedged
-    120.189 s into the FIRST flip -- W31 PdFlipHostRingExhausted need=24 free=12
-    MiB, its peer holding the granules and itself queued on that same single
-    key, ending in W29 on all three P ranks and a group-fatal W4.
-
-    IT ASKS THE KEY, NOT ITS OWN DICT (FIX 2 round 2, finding 2).  The
-    grandparent passed :func:`_split_decisions`' answer straight back in as
-    ``splits=``, so the saver returned it verbatim and the check was
-    tautological -- it could not see a rank that would resolve the published
-    string differently, which is the ONE thing it exists to see.  Here the
-    argument is the PUBLISHED STRING and the answer is read off the KEY ITSELF:
-    the two directions' lock paths, compared.
-
-    IT ASKS THE TREE THE RANKS IMPORT (FIX 3 round 3, finding 2), and that is
-    the half FIX 2 still owed.  Resolving through the LAUNCHER's own
-    ``pdflip_memory_saver`` cannot see a stale worktree on ``PYTHONPATH`` or a
-    partial rebase -- the exact deployment shape the W34 comment names as the
-    reason this arm exists -- because the launcher's import is not the ranks'
-    import.  With ``py`` and ``tree`` given, the key is resolved by one
-    subprocess per boot under ``PYTHONPATH=<tree>/python`` and
-    ``CUDA_VISIBLE_DEVICES=''``; a tree that single-keys a card sends that card
-    to W34, and a probe that DIES (no module, unknown wire format, W36) makes
-    every card serialised, which is the same refusal one step earlier.
-
-    Without them the resolution is IN-PROCESS and says so in ``notes``: that is
-    the desk path, for tests that own both sides of the import themselves.  It is
-    never the boot path -- :func:`prepare_host_ring` always passes both.
-    """
-    if leg_form != "interleave":
-        # The front itself does not gather: every card is serialised, whatever
-        # its key does.
-        if notes is not None:
-            notes.append(
-                f"PDFLIP-HOST-RING KEY-PROBE skipped: leg_form={leg_form!r} is not "
-                "'interleave', so every card is serialised whatever its key does")
-        return list(card_uuids)
-    if py and tree:
-        counts, why = _resolve_keys_in_rank_tree(card_uuids, published, py, tree)
-        if not counts:
-            if notes is not None:
-                notes.append(
-                    f"PDFLIP-HOST-RING KEY-PROBE FAILED in the RANK TREE {tree} "
-                    f"({py}): {why} -- the tree the ranks import cannot resolve "
-                    "the key this launcher published, so EVERY card is reported "
-                    "SERIALISED and this boot refuses (W34) before either group "
-                    "starts, rather than taking one key at the first flip")
-            return list(card_uuids)
-        # A card the probe did not answer for is SERIALISED, never assumed split.
-        serialised = [u for u in card_uuids
-                      if counts.get(u, (0, 1))[0] < counts.get(u, (0, 1))[1]]
-        if notes is not None:
-            notes.append(
-                f"PDFLIP-HOST-RING KEY-PROBE resolver=RANK TREE {tree} ({py}) "
-                + ", ".join(
-                    f"{u}={counts.get(u, (0, 0))[0]}/{counts.get(u, (0, 0))[1]} "
-                    "key(s) per direction" for u in card_uuids)
-                + f" -- serialised={serialised or 'none'}")
-        return serialised
-    from flliper.srt.managers import pdflip_memory_saver
-
-    if notes is not None:
-        notes.append(
-            "PDFLIP-HOST-RING KEY-PROBE resolver=IN-PROCESS (desk path: no --tree "
-            "given) -- this cannot see a stale tree on the ranks' PYTHONPATH")
-    serialised: List[str] = []
-    saved = os.environ.get(pdflip_memory_saver.PCIE_DUPLEX_ENV)
-    os.environ[pdflip_memory_saver.PCIE_DUPLEX_ENV] = published
-    try:
-        for uuid in card_uuids:
-            try:
-                keys = {
-                    pdflip_memory_saver.pcie_lock_path(uuid, direction=d)
-                    for d in pdflip_memory_saver.PCIE_DIRECTIONS
-                }
-            except TypeError:
-                # A saver whose pcie_lock_path has no direction parameter at
-                # all: one key, both legs, by construction.
-                keys = {pdflip_memory_saver.pcie_lock_path(uuid)}
-            except getattr(pdflip_memory_saver, "PdFlipDuplexDecisionRefused", ()):
-                # W36 raised while resolving.  It is already a named refusal;
-                # here it means SERIALISED, so the launcher's own W34 arm gives
-                # the operator the whole picture in one refusal instead of a
-                # traceback out of a helper.
-                keys = {uuid}
-            if len(keys) < len(pdflip_memory_saver.PCIE_DIRECTIONS):
-                serialised.append(uuid)
-    finally:
-        if saved is None:
-            os.environ.pop(pdflip_memory_saver.PCIE_DUPLEX_ENV, None)
-        else:
-            os.environ[pdflip_memory_saver.PCIE_DUPLEX_ENV] = saved
-    return serialised
 
 
-def _credit_counter_rows(credit_dir: str = "") -> List[Tuple[str, str, str, int]]:
-    """``(path, name, boot half of the epoch, publisher pid)`` per counter file.
-
-    The boot half is everything before the first ``.`` of the stored epoch token
-    (:func:`pdflip_memory_saver.credit_epoch` composes ``<boot>.<flip>``).  A
-    LEGACY file whose stamp is a bare integer has no boot half and gets ``""``,
-    which matches no boot -- the conservative direction, since it belongs to a
-    boot that predates the token.
-    """
-    from flliper.srt.managers import pdflip_memory_saver
-
-    directory = credit_dir or os.environ.get(
-        pdflip_memory_saver.VRAM_CREDIT_DIR_ENV,
-        os.environ.get(pdflip_memory_saver.PCIE_LOCK_DIR_ENV,
-                       pdflip_memory_saver.DEFAULT_PCIE_LOCK_DIR),
-    )
-    prefix = "." + pdflip_memory_saver.VRAM_CREDIT_PREFIX
-    # rename transition (compat_shims): counters of boots under the other name are this line's too
-    prefixes = (prefix,) + _name_counterparts((prefix,))
-    rows: List[Tuple[str, str, str, int]] = []
-    if not os.path.isdir(directory):
-        return rows
-    for name in sorted(os.listdir(directory)):
-        if not name.startswith(prefixes):
-            continue
-        path = os.path.join(directory, name)
-        epoch, pid = "", 0
-        try:
-            with open(path, errors="replace") as fh:
-                state = json.loads(fh.read() or "{}")
-            if isinstance(state, dict):
-                epoch = str(state.get("epoch", ""))
-                pid = int(state.get("publisher_pid", 0) or 0)
-        except (OSError, ValueError, TypeError):
-            # A torn or foreign file names no boot and no holder.  It is swept
-            # as dead residue at launch, never removed as "this boot's".
-            epoch, pid = "", 0
-        rows.append((path, name, epoch.split(".")[0] if "." in epoch else "", pid))
-    return rows
 
 
-def remove_vram_credit_counters(credit_dir: str = "", *,
-                                boot_nonce: str = "") -> List[str]:
-    """Unlink THIS boot's per-card VRAM credit counters.  Returns what went.
-
-    FIX 2 round 2, finding 1.  ``vram_credit_path`` is keyed by card UUID and
-    nothing else, so the file outlives the boot that wrote it -- and a TERMINAL
-    one (``leg_complete`` plus a whole image of credit) is exactly what a later
-    boot's flip of the same index read as its own funding while the epoch was
-    only the front's flip counter.  Measured on this rig 2026-09-08: three such
-    files from boot weg2rg2, one carrying 13912 MiB of credit.
-
-    SCOPED BY THE BOOT NONCE (FIX 3 round 3).  The predecessor unlinked EVERY
-    ``.pdflip-vram-credit-*`` in the directory, so a teardown of boot A would
-    delete a live boot B's counters mid-flip -- and B then waits on a counter
-    whose file has gone.  The same commit that introduced the nonce is the one
-    that made a counter identifiable; here it is used.  An EMPTY nonce removes
-    nothing: "this boot" is then unknown, and the unscoped sweep is precisely
-    the defect.  Crash residue is the LAUNCH sweep's job
-    (:func:`sweep_dead_credit_counters`), which can check that no holder lives.
-    """
-    removed: List[str] = []
-    if not boot_nonce:
-        return removed
-    for path, name, boot, _pid in _credit_counter_rows(credit_dir):
-        if boot != str(boot_nonce):
-            continue
-        try:
-            os.unlink(path)
-        except OSError:
-            continue
-        removed.append(name)
-    return removed
 
 
 def sweep_dead_credit_counters(log: Log, credit_dir: str = "",
@@ -10079,207 +6127,28 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
     return weight_exchange_region.prepare_region(boot_nonce, hook_mode=hook_mode, log=log)
 
 
-def _split_fraction_text(text) -> list:
-    """Ein Fraction-Flag des LAUNCHERS als Liste (#130).
-
-    `--pp-cut-expert-device-fraction 0.367,0.75,0.95` kommt als String am
-    Namespace an, nicht als argv-Fragment -- `_argv_vector` findet es
-    dort nie. Leerer/unlesbarer Wert -> leere Liste, der Aufrufer faellt
-    dann auf seine zweite Quelle zurueck.
-    """
-    t = str(text or "").strip()
-    if not t:
-        return []
-    out = []
-    for piece in t.replace(";", ",").split(","):
-        piece = piece.strip()
-        if not piece:
-            continue
-        try:
-            out.append(float(piece))
-        except ValueError:
-            return []
-    return out
 
 
-def _argv_scalar(extra: str, flag: str):
-    """Der LETZTE Wert hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
-
-    Der letzte, nicht der erste: argparse nimmt bei doppelter Flagge den
-    letzten, und genau diese Doppelung hat am 22.09. zehn Flags still
-    umgedreht (Memory ``argv-doppelung-arm-schlaegt-planer``). Wer hier den
-    ersten naehme, laese einen Wert, mit dem der Boot nicht startet.
-
-    ``None`` wenn die Flagge fehlt oder ohne Wert dasteht.
-    """
-    if not extra or not flag:
-        return None
-    try:
-        parts = shlex.split(str(extra))
-    except ValueError:
-        return None
-    hit = None
-    for i, tok in enumerate(parts):
-        if tok == flag and i + 1 < len(parts):
-            hit = parts[i + 1]
-        elif tok.startswith(flag + "="):
-            hit = tok[len(flag) + 1:]
-    return hit
 
 
-#: P-COVERS-D-SESSION (user law 02.10. ~07:55Z): the boot-refusal marker.
-P_COVERS_D_SESSION_MARK = "P-COVERS-D-SESSION"
 
 
-def d_session_tokens(extra_d: str, max_kv_per_request: int) -> int:
-    """D's maximum decode session: the ``--max-kv-per-request`` group D runs
-    with (its ``--extra-d`` value wins, argparse keeps the last)."""
-    raw = _argv_scalar(extra_d, "--max-kv-per-request")
-    try:
-        return int(raw) if raw is not None else int(max_kv_per_request)
-    except (TypeError, ValueError):
-        return int(max_kv_per_request)
 
 
-def p_covers_d_session(argv_p_shipped: Sequence[str], d_session: int) -> Tuple[bool, str]:
-    """LAW (user 02.10. ~07:55Z): "kann nie passieren, weil P ja bis 262k
-    prefillen kann und eine einzelne D session nur maximal 262k haben kann.
-    das selbe gilt fuer yarn ... deswegen ja die stufen in P". P's KV stage
-    (its ``--max-total-tokens`` pool) and its per-request cap
-    (``--max-kv-per-request``) must each hold D's maximum session, so no
-    request is ever D's to prefill for a capacity reason (the CARRIER-EXCEEDS
-    route is deleted). Returns ``(ok, line)``; a term the shipped P argv does
-    not name is printed as unnamed, never assumed."""
-    d = int(d_session)
-    cap = _last_flag_value(argv_p_shipped, "--max-kv-per-request")
-    pool = _last_flag_value(argv_p_shipped, "--max-total-tokens")
-    short = []
-    for name, raw in (("P --max-kv-per-request", cap), ("P --max-total-tokens (KV stage)", pool)):
-        if raw is None:
-            continue
-        try:
-            if int(raw) < d:
-                short.append(f"{name}={int(raw)} < D session {d}")
-        except ValueError:
-            continue
-    line = (f"{P_COVERS_D_SESSION_MARK} D session (--max-kv-per-request)={d} "
-            f"P cap={cap if cap is not None else 'unnamed'} "
-            f"P stage pool={pool if pool is not None else 'unnamed'}")
-    if short:
-        return False, (line + " REFUSED: " + "; ".join(short) + " -- P must prefill every "
-                       "request D can hold (no D prefill for capacity, law 02.10.); raise P's "
-                       "stage (YaRN 524k / 786k) or lower D's --max-kv-per-request")
-    return True, line + " ok"
 
 
-def carrier_covers_d_session(carrier_max: int, d_session: int) -> Tuple[bool, str]:
-    """LAW 02.10. (second half): the carrier (D's host staging read, the
-    window loop's transit) must hold D's maximum session too -- below it the
-    front's W52 would refuse a prompt D can hold. Returns ``(ok, line)``."""
-    c, d = int(carrier_max), int(d_session)
-    line = f"{P_COVERS_D_SESSION_MARK} carrier_max={c} D session={d}"
-    if c > 0 and c < d:
-        return False, (line + " REFUSED: the carrier is below D's session -- raise D's L2 "
-                       "(it is derived from --max-kv-per-request) or lower --max-kv-per-request")
-    return True, line + " ok"
 
 
-def yarn_context_tokens(override_json) -> Optional[int]:
-    """YaRN x2 (27.09.): the context a YaRN rope override stretches the model
-    to -- ``original_max_position_embeddings x factor`` of a ``rope_type``
-    ``yarn`` block in ``--json-model-override-args`` (in ``text_config`` or at
-    the top level, ``rope_parameters`` or ``rope_scaling``); None without one.
-    The runtime derives the same number (``get_context_length``)."""
-    if not override_json:
-        return None
-    try:
-        args = json.loads(override_json) if isinstance(override_json, str) else dict(override_json)
-    except (TypeError, ValueError):
-        return None
-    for scope in (args.get("text_config"), args):
-        if not isinstance(scope, dict):
-            continue
-        for key in ("rope_parameters", "rope_scaling"):
-            rope = scope.get(key)
-            if (isinstance(rope, dict) and rope.get("rope_type", rope.get("type")) == "yarn"
-                    and rope.get("original_max_position_embeddings") and rope.get("factor")):
-                return int(int(rope["original_max_position_embeddings"]) * float(rope["factor"]))
-    return None
 
 
-def group_context_tokens(ns, group: str) -> Tuple[int, str]:
-    """YaRN x2 (27.09.): the context group ``group`` ('p'/'d') is launched
-    with, and where it comes from. argparse keeps the LAST ``--context-length``
-    and the group's ``--extra-*`` follows the common flags
-    (``CONTEXT_LENGTH_TOKENS``), so an extra value is the group's; without one
-    a YaRN override in the extra stretches it; else the rig's common value."""
-    extra = getattr(ns, f"extra_{group}", "") or ""
-    raw = _argv_scalar(extra, "--context-length")
-    if raw is not None:
-        try:
-            return int(raw), f"--extra-{group} --context-length"
-        except ValueError:
-            pass
-    yarn = yarn_context_tokens(_argv_scalar(extra, "--json-model-override-args"))
-    if yarn:
-        return yarn, f"--extra-{group} YaRN override (original x factor)"
-    return CONTEXT_LENGTH_TOKENS, "CONTEXT_LENGTH_TOKENS"
 
 
-def group_kv_tokens(ns, group: str) -> Tuple[int, str]:
-    """YaRN x2 (27.09.): the KV tokens the form of group ``group`` must hold
-    -- its context (#77: the whole context is the duty), or its
-    ``--max-total-tokens`` pool where that is larger. Replaces the fixed
-    CONTEXT_LENGTH_TOKENS of the D solve: a 524288 form priced at 262144
-    'fitted' by 3.5 GiB on TP0 it does not have."""
-    ctx, src = group_context_tokens(ns, group)
-    raw = _argv_scalar(getattr(ns, f"extra_{group}", "") or "", "--max-total-tokens")
-    try:
-        pool = int(raw) if raw is not None else 0
-    except ValueError:
-        pool = 0
-    if pool > ctx:
-        return pool, f"--extra-{group} --max-total-tokens (> context {ctx} from {src})"
-    return ctx, src
 
 
-def _rope_cache_cols(cfg: dict) -> int:
-    """Columns of the cos/sin cache ``get_rope`` builds for this config: the
-    rotary dim = head_dim x partial_rotary_factor (text sub-config first, the
-    v5 ``rope_parameters`` or the top level for the factor). 0 = unreadable."""
-    text = cfg.get("text_config") or cfg
-    head_dim = text.get("head_dim") or (
-        int(text["hidden_size"]) // int(text["num_attention_heads"])
-        if text.get("hidden_size") and text.get("num_attention_heads") else 0)
-    rope = text.get("rope_parameters") or text.get("rope_scaling") or {}
-    factor = rope.get("partial_rotary_factor", text.get("partial_rotary_factor", 1.0))
-    try:
-        return int(int(head_dim) * float(factor if factor is not None else 1.0))
-    except (TypeError, ValueError):
-        return 0
 
 
-GGUF_DENSE_VOCAB_ENV = "FLLIPER_GGUF_DENSE_VOCAB"
 
 
-def _p_gguf_dense_vocab(ns, model: Optional[str]) -> bool:
-    """True when group P loads a GGUF checkpoint with the legacy dense vocab
-    (``model_loader.gguf_qwen35.gguf_dense_vocab``: token_embd/output are
-    dequantized to BF16 at load) -- read where P reads it: the exported env,
-    overridden by an ``--env-p`` entry.  The name is restated here only so this
-    module does not import torch; the reader's spelling is pinned by a test."""
-    if not model or not os.path.isfile(str(model)):
-        return False
-    from flliper.srt.pdflip import gguf_census as _gguf_census
-
-    if not _gguf_census.is_gguf_checkpoint(str(model)):
-        return False
-    val = os.environ.get(GGUF_DENSE_VOCAB_ENV, "0")
-    try:
-        val = parse_group_env(str(getattr(ns, "env_p", "") or "")).get(GGUF_DENSE_VOCAB_ENV, val)
-    except ValueError:
-        pass
-    return str(val).strip() == "1"
 
 
 def p_stage_fixed_for_checkpoint(
@@ -10344,132 +6213,22 @@ def p_stage_fixed_for_checkpoint(
     return out, line + note
 
 
-def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Optional[str]]:
-    """YaRN x2 27B (29.09.): the per-stage VRAM the EAGER RoPE cos/sin cache
-    grows by when group P boots a longer context than the one its per-stage
-    posts (``--pp-cut-stage-fixed-mib``, P_PP_STAGE_FIXED_MIB) were read at.
-
-    ``reserve_rope_cache_for_long_sequences`` sizes every cache to the context
-    (fp32, ``rows x rotary_dim``) in ``load_model``, i.e. BEFORE the KV pool is
-    sized, so the growth comes straight out of the pool. MEASURED at 262144
-    (dkr27browauthoritybar1fs09290956, P): 'MRotaryEmbedding 262528x64 float32
-    64.1 MiB' on PP0/PP1/PP2 and the DFlash2 draft's 'RotaryEmbedding
-    262528x128 float32 128.2 MiB' on PP2 (the draft sits cold on the last
-    stage). At 524288 the pool model would otherwise price PP0 +64 MiB and PP2
-    +192 MiB too optimistic -- 4.1k / 24.6k tokens under the cap+chunk floor
-    it promised (per_request_max > realised pool). Delta = (ctx - 262144) x
-    cols x 4 B; target on every stage, the DFLASH draft on the last one.
-    ``((0,)*n, None)`` at or below 262144 -- every x1 form is byte-identical."""
-    zero = tuple(0.0 for _ in range(int(n_stages)))
-    if n_stages <= 0:
-        return zero, None
-    ctx, src, extra_rows, tcols, dcols, dname = _rope_context_terms(ns, "p")
-    if extra_rows <= 0:
-        return zero, None
-    per_col = extra_rows * 4 / (1024.0 * 1024.0)
-    delta = [tcols * per_col for _ in range(int(n_stages))]
-    delta[-1] += dcols * per_col
-    line = (f"PP-CUT ROPE-KONTEXT (YaRN x2 27B): P context {ctx} (from {src}) > {CONTEXT_LENGTH_TOKENS} "
-            f"(the posts' context) -> eager cos/sin cache +{extra_rows} rows x 4 B: target {tcols} cols "
-            f"= +{tcols * per_col:.1f} MiB on every stage"
-            + (f", draft {dname} {dcols} cols = +{dcols * per_col:.1f} MiB on the last stage" if dcols else "")
-            + f"; stage_fixed += {[round(x, 1) for x in delta]} MiB")
-    return tuple(delta), line
+from flliper.srt.pdflip.launcher_p_choose import (  # noqa: F401 -- re-export, behaviour-neutral move
+    p_rope_context_delta_mib,
+)
 
 
-def _rope_context_terms(ns, group: str):
-    """The ONE reading behind every RoPE-context delta (P pool floor, W11/W11b, D's dormant reserve):
-    ``(ctx, src, extra_rows, target_cols, draft_cols, draft_name)`` for group ``group``; extra_rows <= 0 at or
-    below 262144 (the rig's posts and records were measured there), and then no config is read."""
-    ctx, src = group_context_tokens(ns, group)
-    extra_rows = int(ctx) - CONTEXT_LENGTH_TOKENS
-    if extra_rows <= 0:
-        return ctx, src, extra_rows, 0, 0, None
-    tcols, dcols, dname = _rope_cols(ns)
-    return ctx, src, extra_rows, tcols, dcols, dname
 
 
-def _rope_cols(ns) -> Tuple[int, int, Optional[str]]:
-    """Cos/sin cache columns of the target and (DFLASH) the draft -- context-free; read from the configs."""
-    try:
-        tcols = _rope_cache_cols(_model_config(str(ns.model)))
-    except (OSError, ValueError, KeyError):
-        tcols = 0
-    dcols, dname = 0, None
-    if str(getattr(ns, "spec_form", "") or "").upper() == "DFLASH":
-        dpath = str(getattr(ns, "dflash_draft_path", "") or DFLASH_DRAFT_PATH_DEFAULT)
-        try:
-            dcols = _rope_cache_cols(_model_config(dpath))
-            dname = os.path.basename(dpath.rstrip("/"))
-        except (OSError, ValueError, KeyError):
-            dcols = 0
-    return tcols, dcols, dname
 
 
-def d_rope_context_delta_mib(ns, from_ctx: int = CONTEXT_LENGTH_TOKENS) -> Tuple[float, Optional[str]]:
-    """YaRN x2 27B (29.09., zw4skn W19 at the first P wake): group D's per-rank share of the RoPE context
-    growth, from the SAME reading as :func:`p_rope_context_delta_mib`. D is TP -- every rank builds the whole
-    target's cos/sin cache AND the DFlash draft's -- and both stay resident while D sleeps, so D's dormant
-    residue (the x1 record behind ``dc_expect_d``) grows by (target + draft cols) x extra rows x 4 B on every
-    card. MEASURED dkr27browauthorityyarn2bar1fs09291825 (z30y3g, 524288): D_c(D) 2146 / 1718 / 1718 against the
-    reserve 2106 / 1678 / 1678 built from the x1 record 1786 / 1358 / 1358 + 256 + 64 -> W19. ``(0.0, None)`` at
-    or below 262144: every x1 reserve is byte-identical.
-
-    ``from_ctx`` = the context the residue it is added to was MEASURED at (a record stamps
-    ``vram_residue_context_tokens`` when it is not 262144; the constants are 262144): the delta is the
-    difference, so a record measured at 524288 prices 0 for a 524288 boot and a NEGATIVE delta for an x1 boot
-    (its own residue already carries the larger caches)."""
-    ctx, src = group_context_tokens(ns, "d")
-    if int(ctx) == int(from_ctx) or (int(ctx) <= CONTEXT_LENGTH_TOKENS and int(from_ctx) <= CONTEXT_LENGTH_TOKENS):
-        return 0.0, None
-    tcols, dcols, dname = _rope_cols(ns)
-    rows = int(ctx) - int(from_ctx)
-    per_col = rows * 4 / (1024.0 * 1024.0)
-    delta = (tcols + dcols) * per_col
-    return delta, (f"D ROPE-KONTEXT (YaRN x2 27B): D context {ctx} (from {src}) vs {int(from_ctx)} (the dormant "
-                   f"residue's measured context) -> {rows:+d} rows x 4 B x (target {tcols} + draft "
-                   f"{dname or '-'} {dcols}) cols = {delta:+.1f} MiB per D rank, resident in the dormant image")
 
 
-def p_rope_draft_delta_mib(ns) -> float:
-    """YaRN x2 27B (29.09., heu5g3 W11b death): the DFlash draft's share of :func:`p_rope_context_delta_mib`
-    -- the SAME function, read at two stages (target on both, the draft only on the last), so the W11 draft
-    budget and the W11b build accounting price exactly the MiB the P pool floor already priced. 0.0 at or
-    below 262144 (every x1 form byte-identical) and without a DFLASH draft."""
-    delta, _line = p_rope_context_delta_mib(ns, 2)
-    return max(0.0, float(delta[-1]) - float(delta[0]))
+from flliper.srt.pdflip.launcher_d_p_build import (  # noqa: F401 -- re-export, behaviour-neutral move
+    p_rope_draft_delta_mib,
+)
 
 
-def _argv_vector(extra: str, flag: str):
-    """Der Komma-Vektor hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
-
-    #106. Gibt eine Liste von STRINGS zurueck, nicht von Zahlen: sie wird
-    woertlich in `FLLIPER_MOE_EXPERT_STORE_GEOMETRY` weitergereicht, und der
-    Leser (`expert_store.shared_geometry`) parst selbst und verwirft
-    Unlesbares. Hier zu casten hiesse, denselben Zweifel zweimal zu
-    beantworten -- und die zweite Antwort koennte von der ersten abweichen.
-
-    ``None`` wenn die Flagge fehlt oder ohne Wert dasteht; eine leere Liste
-    kann nie entstehen, weil sie vom Aufrufer nicht von "fehlt" zu
-    unterscheiden waere.
-    """
-    if not extra or not flag:
-        return None
-    try:
-        parts = shlex.split(str(extra))
-    except ValueError:
-        return None
-    for i, tok in enumerate(parts):
-        raw = None
-        if tok == flag and i + 1 < len(parts):
-            raw = parts[i + 1]
-        elif tok.startswith(flag + "="):
-            raw = tok[len(flag) + 1:]
-        if raw is None:
-            continue
-        vec = [x.strip() for x in raw.split(",") if x.strip()]
-        return vec or None
-    return None
 
 
 def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
@@ -10643,160 +6402,14 @@ def teardown_xchg_region(log: Log, boot_nonce: str) -> Dict[str, int]:
 
 
 
-def xchg_form_argv(argv: Sequence[str], weight_source: str) -> List[str]:
-    """Group P's form argv, PLUS the xchg token when this boot arms the exchange.
-
-    B4e, and ``ring_table`` wrote the requirement at the name it defined for
-    it: *"when the xchg slice lands on the line its launcher must add the same
-    token to the argv it hands ``solve`` (one line, ``p_argv +
-    [XCHG_FORM_TOKEN]``), or its own boots will rank a serving source as their
-    form's twin -- the mirror of this defect."*  The slice has landed and the
-    token was missing, so #1305 item 4 -- written to keep an xchg source away
-    from a boot that does NOT arm the exchange -- was excluding every boot of
-    this form from the selection of a boot that DOES.
-
-    MEASURED cost of the omission, 2026-09-11: B4c's census took group P's
-    per-card rows from a boot that ran the PP layer split ``[42, 11, 11]``
-    while the armed form runs ``[39, 13, 12]``, because every boot that ran the
-    armed split carries ``PDFLIP-XCHG-REGION`` and was excluded.  P's rows are a
-    LAYER PLACEMENT, so that is not a rounding difference.
-
-    THE PREDICATE IS ``WEIGHT_SOURCE_ARMED``, not a hand-written comparison,
-    and that is the whole design of it: the same derived tuple decides whether
-    ``prepare_xchg_env`` publishes the region at all, so the MARKER this boot
-    emits and the TOKEN it claims cannot disagree, and a future arm carries
-    both by construction.  A hand comparison here is exactly how ``exchange``
-    was missed at step 7.
-    """
-    out = list(argv)
-    if str(weight_source) in WEIGHT_SOURCE_ARMED:
-        out.append(ring_table.XCHG_FORM_TOKEN)
-    return out
 
 
-#: B4e (ii): the refusal is W48's, and NO new code is minted for it.  W48
-#: ``PdFlipRingFormMismatch`` IS "form key X != source Y" -- the launcher already
-#: raises that class for its own un-priceable argv -- and the W-code census
-#: keys on (code, NAME) pairs, so a second name under W48 would be a new
-#: collision while a new number would be a second spelling of one event.
-PdFlipXchgFormSourceMissing = ring_table.PdFlipRingFormMismatch
 
 
-def refuse_unless_same_form_source(
-    table: Optional[ring_table.RingTable], weight_source: str
-) -> Optional[str]:
-    """Under an armed arm, a table solved from ANOTHER form is a refusal.
-
-    The token above stops #1305 item 4 from excluding this form's own boots --
-    and by doing so it also removes the thing that used to make the absence
-    LOUD.  With the token on, ``solve`` simply falls through to the form-DISTANCE
-    ranking and returns the closest twin, silently, which is the foreign-split
-    defect one layer down: the ring's residual, the ledger's charge and (via
-    ``pdflip/xchg_census.py``) group P's per-card placement would all be a
-    measurement of a form this boot does not run.
-
-    So the launcher refuses, and PRINTS THE CLOSEST TWIN IT REJECTED -- the
-    selected boot IS the closest twin, because the distance ranking put it
-    first -- together with both form keys and the term-level difference, so the
-    next reader knows which boot to produce rather than which number to lower.
-
-    THREE NON-CASES, each deliberate:
-      * ``table is None``: ``prepare_host_ring`` has already refused (R22/W20)
-        for a reason of its own; a second refusal here would bury it.
-      * the DEFAULT arm: a serving boot has no same-form requirement -- that is
-        #1305 item 4's whole subject, and acceptance (iii) is that its
-        selection does not move.
-      * ``form_same is None``: the form gate never ran, and an unarmed gate is
-        never read as a passed one (``solve``'s own words).  It refuses.
-    """
-    if table is None or str(weight_source) not in WEIGHT_SOURCE_ARMED:
-        return None
-    if getattr(table, "form_same", None) is True:
-        return None
-    unarmed = getattr(table, "form_same", None) is None
-    # #1367 THE FOURTH NON-CASE: THE FIRST ARMED BOOT OF A FORM.
-    # The armed arm puts XCHG_FORM_TOKEN into group P's argv and the token is
-    # IN the form key, so an armed boot's key can never equal an unarmed
-    # boot's. With no same-form candidate in existence, the sentence this
-    # refusal ended with -- "Boot the arm once to produce the first same-form
-    # source" -- names the boot it is refusing: a remedy that cannot be
-    # carried out. Measured: xsn30 dry run rc=2 on all three groups, armed key
-    # 0a15b55459fb against the unarmed 2b66740bedf9 of xsn29.
-    #
-    # The operator's ruling (2026-09-13) is narrow and is NOT a rebuild of the
-    # key: the exchange arm is a different weight statement and keeps its own
-    # key. Absence of a same-form source is the BOOTSTRAP STATE -- the same
-    # reading #1362 gave the model digest and the lane cut -- and it takes the
-    # THIRD W48 shape that already exists for the default arm: the source's
-    # weight statement is discarded and re-derived from THIS boot's argv
-    # (ring_table.py:2737), so only the non-weight residual is carried.
-    #
-    # WHAT IS NOT RELAXED: a same-form source that EXISTS and did not win is a
-    # real mismatch and still stops the boot below -- which is why this reads
-    # the inventory `solve` ranked, and not merely `form_same`.
-    same_form_sources = tuple(getattr(table, "same_form_candidates", ()) or ())
-    # #1374 W9: PRESENT-BUT-UNUSABLE IS NOT A WITNESS. `same_form_candidates`
-    # now carries only the stems that survived `solve`'s own checks; the ones it
-    # ranked and then eliminated come with their reason, and they are NAMED in
-    # the bootstrap line so the zero above is explained rather than merely
-    # asserted. Boot weg2xsn31 is what this costs otherwise: weg2xsn30 died at
-    # wall 8 before D ever slept, so it is same-form (0a15b55459fb) and carries
-    # `no sleep-pass lines for D` -- counted as a witness, it refused its own
-    # successor, and `--ring-table-boot` could not help because the form gate
-    # runs after the stem choice and meets the same missing D lines. Every boot
-    # that dies at a wall would lock the next one out.
-    unusable = tuple(getattr(table, "same_form_unusable", ()) or ())
-    if not unarmed and not same_form_sources:
-        _excluded = ("; same-form stems present but unusable: "
-                     + ", ".join(f"{st} reason={why}" for st, why in unusable)
-                     if unusable else "")
-        return (
-            f"PDFLIP-RING W48 BOOTSTRAP armed first boot -- form key "
-            f"{table.form_key} has NO boot yet, so there is no same-form source "
-            f"to be missing. The closest twin {table.boot} (form key "
-            f"{table.source_form_key}) is carried for its NON-WEIGHT residual "
-            f"only; this boot's weight statement is source=derived, re-derived "
-            f"from its own argv, and the exchange region's residual comes from "
-            f"the published terms rather than from a foreign form. The next "
-            f"armed boot of this form finds this one and is no longer a "
-            f"bootstrap. A USABLE same-form source that disagrees still "
-            f"refuses: {table.form_diff}{_excluded}"
-        )
-    raise PdFlipXchgFormSourceMissing(
-        f"W48 PdFlipRingFormMismatch: --pdflip-weight-source {weight_source} arms the "
-        f"exchange, so this boot's group-P form carries {ring_table.XCHG_FORM_TOKEN} "
-        f"and its ring table must be solved from a boot of the SAME form.  "
-        + ("The form gate did not run at all, so no source can be called same-form. "
-           if unarmed else
-           f"The closest twin the ranking could offer is boot {table.boot}, whose "
-           f"form key is {table.source_form_key} against this boot's "
-           f"{table.form_key}: {table.form_diff}.  ")
-        + (f"A USABLE same-form source EXISTS and did not win, so this is a "
-           f"real mismatch and not a first boot: "
-           f"{', '.join(same_form_sources)}.  "
-           if same_form_sources else "")
-        + (f"(Same-form stems that were ranked and then ELIMINATED do not "
-           f"count as witnesses and are not the reason for this refusal: "
-           f"{', '.join(f'{st} reason={why}' for st, why in unusable)}.)  "
-           if unusable else "")
-        + "There is NO fallback: a chunk tag is a LAYER BAND, so a source of "
-        "another PP form states group P's bytes on the wrong cards, and the "
-        "ring's residual, the ledger's charge and the exchange census would "
-        "each be a measurement of a form this boot does not run (MEASURED "
-        "2026-09-11: source split [42, 11, 11] against this form's "
-        "[39, 13, 12]).  Boot the arm once to produce the first same-form "
-        "source, or pin one with --ring-table-boot."
-    )
 
 
-#: AP4 1526: ``--pdflip-xchg-census-map`` of THIS launch, set once by ``main`` (the
-#: three census readers below take no ``ns``; their call texts are pinned by
-#: desk tests).  "" = no operator mapping.
-_XCHG_CENSUS_MAP: List[str] = [""]
 
 
-def set_xchg_census_map(text: str) -> None:
-    _XCHG_CENSUS_MAP[0] = str(text or "")
 
 
 def load_xchg_census_for_cards(
@@ -11343,96 +6956,12 @@ def _env_knobs(ns) -> Dict[str, object]:
     }
 
 
-def _vision_knob(ns, attr: str, default: str) -> str:
-    """H125: one knob, refused by name when it cannot act (see
-    vision_stage_knobs_refusal)."""
-    val = str(getattr(ns, attr, default) or default)
-    why = vision_stage_knobs_refusal(
-        str(getattr(ns, "pdflip_vision", VISION_OFF)),
-        str(getattr(ns, "pdflip_vision_source", VISION_SOURCE_DISK) or VISION_SOURCE_DISK),
-        str(getattr(ns, "pdflip_vision_place", VISION_PLACE_AUTO) or VISION_PLACE_AUTO),
-    )
-    if why:
-        raise PdFlipLaunchRefused(why)
-    return val
 
 
-def pdflip_boot_token(ns) -> str:
-    """#1348/#1395: ONE boot identity, shared by BOTH groups -- the single
-    producer :func:`lane_coverage_boot_token` reuses rather than a second
-    ``time.time()`` computation.
-
-    Memoised on the namespace because `_env_knobs` is called once per group
-    and the two groups must carry the SAME token -- a per-call `time.time()`
-    would give P and D different identities and any reader keying on it
-    would see two boots instead of one.
-
-    UNCONDITIONAL AND SAFE TO ALWAYS PUBLISH -- unlike
-    `FLLIPER_PDFLIP_LANE_COVERAGE_TOKEN` (see `lane_coverage_boot_token`'s own
-    docstring: that variable's mere PRESENCE arms `coverage.py` line tracing
-    elsewhere, 2x-10x on the traced modules, so it stays a gated FLAG output
-    on purpose), this token decides nothing and arms nothing by existing --
-    it is read-only identity, the same shape #1292's own dump directory
-    reuse problem needs regardless of which instrument is armed. #1395
-    reads it in `mem_ledger.activation_probe.boot_token()` via
-    `FLLIPER_PDFLIP_BOOT_TOKEN` (below) for exactly the sibling defect
-    `lane_coverage_boot_token`'s own docstring already names: "the dump
-    directory is #1292's and #1292's is reused across boots".
-    """
-    tok = getattr(ns, "_pdflip_boot_token", "")
-    if not tok:
-        tok = f"{getattr(ns, 'tag', 'notag')}:{int(time.time())}:{os.getpid()}"
-        setattr(ns, "_pdflip_boot_token", tok)
-    return tok
 
 
-def lane_coverage_boot_token(ns) -> str:
-    """#1348: WHICH BOOT this run's coverage dumps belong to, or ``""`` when
-    the coverage instrument itself is not armed.
-
-    The GATE stays exactly as it was -- `FLLIPER_PDFLIP_LANE_COVERAGE_TOKEN`'s
-    presence in a rank's environment is what tells `lane_coverage.py`
-    whether to trace lines at all, so an ambient value in the operator's own
-    shell must never arm it by accident (that popping discipline is why the
-    switch is a flag and not an ambient variable in the first place). The
-    VALUE, once armed, is :func:`pdflip_boot_token`'s -- one producer, so a
-    boot's coverage dumps and its phase-footprint dumps (#1395) agree on
-    which boot they belong to when both instruments are armed together.
-    """
-    if not getattr(ns, "xchg_coverage_diff", False):
-        return ""
-    return pdflip_boot_token(ns)
 
 
-def refuse_double_coverage_arm(env, *, xchg_coverage_diff: bool) -> None:
-    """PRE-SPAWN refusal when both coverage instruments would be armed.
-
-    `lane_coverage.arm` refuses by name when `FLLIPER_SEAM_COVERAGE_DIR` is
-    set -- but it does so INSIDE each rank, after the spawn. A leftover value
-    in the operator's shell therefore burned the whole window: six ranks
-    refused, the boot ran with no instrument, and the refusal sat in the rank
-    logs where the ingest report never looks (review S-3). The launcher pops
-    its OWN variable and never that one, so nothing upstream catches it
-    either.
-
-    Measured reason this matters at all: a second `Coverage.start()` raises
-    nothing and blinds the first collector for its duration, so "both armed"
-    does not fail loudly on its own -- it produces two dumps that quietly
-    describe something neither instrument claims.
-    """
-    if not xchg_coverage_diff:
-        return
-    other = env.get("FLLIPER_SEAM_COVERAGE_DIR")
-    if other:
-        raise SystemExit(
-            "REFUSING TO BOOT: --xchg-coverage-diff was passed while "
-            f"FLLIPER_SEAM_COVERAGE_DIR={other!r} is set in the environment. "
-            "Two coverage tracers in one process measure neither -- the "
-            "second start() silently blinds the first, and a blind window "
-            "reads as a never-executed seam. Unset FLLIPER_SEAM_COVERAGE_DIR "
-            "or drop --xchg-coverage-diff. Refused here, before the spawn, "
-            "because the per-rank refusal costs the whole window."
-        )
 
 
 def lane_coverage_dump_dir(ns) -> str:
@@ -11457,97 +6986,12 @@ def lane_coverage_dump_dir(ns) -> str:
     )
 
 
-def parse_group_env(spec: str) -> Dict[str, str]:
-    """'KEY=VAL;KEY=VAL' -> dict; empty -> {}. Entries are ';'-separated because
-    the values themselves are comma vectors (FLLIPER_MOE_SCRATCH_SLOTS=74,48,48).
-    A malformed entry is refused by name rather than dropped (#781 class)."""
-    out: Dict[str, str] = {}
-    for item in [x for x in str(spec or "").split(";") if x.strip()]:
-        if "=" not in item:
-            raise ValueError(f"--env-p/--env-d entry {item!r} is not KEY=VAL")
-        k, v = item.split("=", 1)
-        out[k.strip()] = v.strip()
-    # Rename 1b: an arm may still spell a name the old (or already the new)
-    # way; callers read the dict by the tree's own name.
-    return canonical_env(out)
 
 
-def user_reserve_env_value(user_reserve_by_card: Dict[str, int]) -> str:
-    """``{card_uuid: MiB}`` -> the value of ``corridor_guard.USER_RESERVE_ENV``.
-
-    #236: ONE serialiser for the front's ``fenv`` and every group's env, so the
-    three consumers (front, P ranks, D ranks) cannot be handed different text
-    for the same mapping.
-    """
-    return json.dumps({u: int(v) for u, v in user_reserve_by_card.items()})
 
 
-def effective_reserve_by_card(
-    cards: Sequence["Card"],
-    user_reserve_by_card: Optional[Dict[str, int]],
-    booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
-) -> Tuple[Dict[str, int], Dict[str, int]]:
-    """The reserve the launcher ACTUALLY BOOKS per card for ONE group, and what it masked.
-
-    ``(effective, masked)``, both ``{card_uuid: MiB}``. On a card whose awake rest is a
-    BOOKED record (``booked_rest_mib[i] is not None``) the launcher charges no user
-    reserve: the measured rest is what consumed it ("reserve 0 BY DESIGN ... would book a
-    forbidden corridor reserve", ``booked_rest_kwargs``; keine-korridor-reserve-nie), so the
-    effective value is 0 and the stated value goes to ``masked``. On every other card the
-    effective value is the operator's. ONE function for ``budgets_from_dc`` (its
-    ``_reserve_eff``) and for the rank env (#236 review MUSS-1), so the launcher's budget
-    and a rank's floor cannot price different reserves for the same card and group.
-    """
-    booked = [None] * len(cards) if booked_rest_mib is None else list(booked_rest_mib)
-    if len(booked) != len(cards):
-        raise PdFlipLaunchRefused(
-            f"#236: {len(booked)} booked rests for {len(cards)} cards -- a partial "
-            "vector never prices a card it never saw")
-    effective: Dict[str, int] = {}
-    masked: Dict[str, int] = {}
-    for i, c in enumerate(cards):
-        stated = int((user_reserve_by_card or {}).get(c.uuid, 0))
-        if booked[i] is not None:
-            effective[c.uuid] = 0
-            if stated > 0:
-                masked[c.uuid] = stated
-        else:
-            effective[c.uuid] = stated
-    return effective, masked
 
 
-def user_reserve_rank_env(
-    user_reserve_by_card: Optional[Dict[str, int]],
-    cards: Optional[Sequence["Card"]] = None,
-    booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
-) -> Dict[str, str]:
-    """The env entries that carry the operator's reserve to the ranks of ONE group.
-
-    Empty unless the operator stated a reserve on at least one card:
-    ``parse_user_reserve`` returns ``{uuid: 0}`` for every card when the flag is
-    absent, and publishing that would turn "no reserve stated" into "reserve 0
-    stated" on a rank, which silently beats the rank's own
-    ``--rank-user-reserve-mib`` scalar fallback (``reserve_for_card``).
-
-    With ``cards`` the value is the group's EFFECTIVE reserve
-    (:func:`effective_reserve_by_card`, the same function ``budgets_from_dc`` prices
-    with): a booked-rest card gets 0 and is named in
-    ``corridor_guard.USER_RESERVE_MASKED_ENV`` (log only). Without ``cards`` (a group
-    with no booked rest, e.g. P, and desk callers) the operator's value is published as
-    stated.
-    """
-    if not user_reserve_by_card or not any(int(v) > 0 for v in user_reserve_by_card.values()):
-        return {}
-    if cards is None:
-        if booked_rest_mib is not None:
-            raise ValueError("a booked-rest vector needs the cards it belongs to")
-        effective, masked = {u: int(v) for u, v in user_reserve_by_card.items()}, {}
-    else:
-        effective, masked = effective_reserve_by_card(cards, user_reserve_by_card, booked_rest_mib)
-    out = {corridor_guard.USER_RESERVE_ENV: user_reserve_env_value(effective)}
-    if masked:
-        out[corridor_guard.USER_RESERVE_MASKED_ENV] = user_reserve_env_value(masked)
-    return out
 
 
 def user_reserve_env_entries(env: Dict[str, str], operator_extra: Optional[Dict[str, str]],
@@ -12117,38 +7561,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     return env
 
 
-_DRAFTER_RE = re.compile(r"HiCache draft KV registered: .*drafter=([0-9a-f]{16}|None)")
-_LAYOUT_RE = re.compile(r"#706 canonical DRAFT page active: .*layout=v(\d+) drafter=([0-9a-f]{16}|None)")
 
 
-def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
-    """W10 (#1233): the drafter identity and canonical draft layout of both
-    groups, read from their logs. ``match`` is False on ANY disagreement or
-    absence -- a group that registered no drafter at all is the pre-fix
-    shape, not a pass."""
-    out: Dict[str, object] = {}
-    for name, path in (("P", log_p), ("D", log_d)):
-        ids, layouts, n = set(), set(), 0
-        try:
-            with open(path, errors="replace") as f:
-                for line in f:
-                    m = _DRAFTER_RE.search(line)
-                    if m:
-                        ids.add(m.group(1))
-                        n += 1
-                    m = _LAYOUT_RE.search(line)
-                    if m:
-                        layouts.add(f"v{m.group(1)}")
-        except OSError:
-            pass
-        out[name] = ",".join(sorted(ids)) if ids else None
-        out[f"layout_{name}"] = ",".join(sorted(layouts)) if layouts else None
-        out[f"n_{name}"] = n
-    out["match"] = bool(
-        out["P"] and out["D"] and out["P"] == out["D"] and "," not in str(out["P"])
-        and out["layout_P"] and out["layout_P"] == out["layout_D"]
-    )
-    return out
 
 
 _RESIDENT_RE = tolerant_compile(r"PDFLIP DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
@@ -12335,27 +7749,6 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
 W11B_FREE_OVER_UNACCOUNTED = 4.0
 
 
-def gate_w10(log_p: str, log_d: str, log, *, p_produces_draft_pages: bool) -> Dict[str, object]:
-    """W10 (#1233) as a function so its skip is pinnable (27B c60a5d387f).
-
-    Under --dflash-produce-on-p off (p_draft=cold) group P registers its
-    drafter (the producer is built) but writes no page under it, so D's draft
-    reads miss whatever the identities say -- a mismatch there refuses a boot
-    for a route that does not exist (metal: weg2xsn414). The identities are
-    still read and logged, never graded. Otherwise the W10 gate as before."""
-    w10 = check_drafter_identity(log_p, log_d)
-    ids = (f"P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
-           f"match={w10['match']} (P lines {w10['n_P']}, D lines {w10['n_D']})")
-    if not p_produces_draft_pages:
-        log(f"{W10_SKIPPED_NO_DRAFT_PAGES} -- D's draft reads miss by construction and take the cold path "
-            f"(#993 zeros + 1 bootstrap round); identities read, NOT graded: {ids}")
-        return w10
-    log(f"W10 DRAFTER-IDENTITY {ids}")
-    if not w10["match"]:
-        raise PdFlipLaunchRefused(f"W10 PdFlipDrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
-                                f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
-                                f"an identity the prefill group never writes")
-    return w10
 
 
 def gate_w11(log_p: str, log: Log, rope_ctx_mib: float = 0.0) -> Dict[str, object]:
@@ -12599,39 +7992,10 @@ def _installed_max_share_from_record() -> Optional[float]:
     return max(v) / float(sum(v))
 
 
-def _gib(v) -> str:
-    """#1361: bytes as GiB, or ``unreadable`` -- never 0.00 for an absence."""
-    return "unreadable" if v is None else f"{int(v) / host_ledger.GIB:.2f} GiB"
 
 
 
 
-def served_model_name(model_path: str, override: str = "") -> str:
-    """#1362: the name a boot serves under, DERIVED from the model it loads.
-
-    ``--served-model-name`` was the literal ``Qwen3.8-27B`` for every boot this
-    launcher ever made.  It is the name the front routes on, the load drivers
-    address and every probe asserts against, so on the 4B-FP8 transition
-    vehicle the boot would have answered under the 27B's name -- a silent
-    identity swap in the one field whose whole job is identity.
-
-    The basename of the checkpoint directory is the default; an explicit
-    override wins and is the reason the flag exists (a HuggingFace snapshot
-    path ends in a commit hash, which is a correct identity and a terrible
-    name).
-    """
-    if override:
-        return str(override)
-    p = str(model_path or "").rstrip("/")
-    base = os.path.basename(p)
-    # A snapshot directory is named by its commit; walk up to the repo name,
-    # which is what a human and a load driver both mean by "the model".
-    if base and len(base) >= 32 and all(c in "0123456789abcdef" for c in base):
-        parts = [x for x in p.split("/") if x]
-        for cand in reversed(parts[:-1]):
-            if cand not in ("snapshots", "blobs", "refs"):
-                return cand.replace("models--", "").replace("--", "/")
-    return base or "unknown-model"
 
 
 def measured_record_path() -> str:
@@ -12655,55 +8019,10 @@ def hostsample_csv_path(tag: str) -> str:
             f"hostsample_{tag}.csv")
 
 
-def xchg_bounce_arm_pins_host(weight_source: str, oncard_mode: str) -> bool:
-    """Does THIS ARM pin host bytes for the exchange's carrier?  A BOOLEAN.
-
-    ONE PRODUCER OF THE PREDICATE, and after AMENDMENT 5 it produces ONLY the
-    predicate.  It used to answer "how many bytes" as well
-    (`xchg_bounce_charge_bytes`, returning the retired
-    `host_ledger.xchg_bounce_bytes` ceiling), which made it a second producer
-    of a SIZE that `xchg_bounce.bounce_terms` already owns -- and the two
-    disagreed by 4x on one payload, because the ceiling counted
-    `ONCARD_SLOTS_MAX 8` slots where the term prices `SLOTS_PER_PAIR 2`.  The
-    size now has exactly one owner and this call answers only the arm question.
-
-    BOTH ARMS DECIDE IT.  `--pdflip-weight-source ring` creates no region at all;
-    `--pdflip-xchg-oncard ipc` creates one but exports a VRAM bounce that is
-    freed with its own leg, so no bounce FILE exists and no host byte is
-    pinned.  Host bytes exist on `shadow`/`exchange` + `host` and nowhere else,
-    and this is the same arm string `prepare_xchg_env` publishes to the
-    ranks -- so the arm a rank enforces and the arm that was paid for cannot be
-    two readings.
-
-    It is a function rather than an expression inside `choose_host_ledger`
-    because the property under test -- "the charge fires on exactly the arm
-    that can allocate" -- must be provable without a host to read.
-    """
-    if str(weight_source) == WEIGHT_SOURCE_DEFAULT:
-        return False
-    return str(oncard_mode) == weight_exchange_transport.ONCARD_MODE_HOST
 
 
-#: The D-side vector every production boot runs, and the DEFAULT of
-#: ``choose_host_ledger``'s ``d_vector`` parameter. Named once because the
-#: lane record is keyed on it: two spellings of this string are two cut keys,
-#: and a boot that prices under one key and publishes under the other charges
-#: for lanes it does not create (or creates lanes it did not charge).
-XCHG_D_VECTOR_DEFAULT = "tp3"
 
 
-def xchg_lane_count(stage_ratio, legs, d_vector: str = XCHG_D_VECTOR_DEFAULT):
-    """``(n_lanes, provenance)`` for THIS boot's cut -- the one producer.
-
-    #1368: the ledger charges the bounce and the launcher publishes its INPUTS
-    to the ranks, and until now each built the cut key at its own call site.
-    The rank-side guard compares the published ``n_lanes`` against the lanes it
-    really enumerates and refuses when the price is below them, so the two
-    sites disagreeing is not a cosmetic drift -- it is a refused boot, and the
-    refusal would name the ledger rather than the publication that diverged.
-    """
-    return host_ledger.resolve_xchg_lanes(
-        host_ledger.xchg_cut_key(str(stage_ratio or ""), str(d_vector), str(legs)))
 
 
 #: #1374 OPTION 1: the weight-chunk length this boot ships, published by `main`
@@ -12886,91 +8205,10 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
 
 
 
-def ring_absent_by_design(weight_source: str, inject_mode: str) -> bool:
-    """Is there NO host weights ring in this boot -- by design, not by accident?
-
-    B4f, and boot weg2xsn13's S6I shadow dry-run is why it is a function.  The
-    predecessor read ring absence off the WEIGHT SOURCE alone
-    (``weight_source == "exchange"``) and the dry-run stopped at rc=1 before a
-    card was touched, inside the ledger::
-
-        ValueError: ring_absent_by_design with a non-zero ring
-        (ring_bytes=46133149696, ring_span1_bytes=44559237120)
-
-    THE LEDGER WAS RIGHT.  Its guard exists for exactly that -- *"a
-    contradiction resolved silently is how a charged term becomes invisible"* --
-    and the same run had armed 21715+9758+12529 MiB = 42.97 GiB of ring and
-    handed it those very bytes.
-
-    RING ABSENCE IS A PROPERTY OF THE INJECT ARM, NOT OF THE WEIGHT SOURCE.
-    #1327's comment ("under ``exchange`` the launcher publishes no
-    ``TMS_HOST_RING_*``") is true only where the exchange is the AUTHORITY.
-    Under ``--pdflip-xchg-inject shadow`` -- the DEFAULT, and the form the S6I
-    order grades -- the refill is still the authority and the ring is still
-    armed: that order's item (b) requires ``host_weights=`` UNCHANGED and calls
-    a ``host_weights=0.00`` there a FAIL.  So ``exchange`` + ``shadow`` is an
-    ordered, real form in which the ring is PRESENT, and it is precisely the
-    combination the old predicate could not express.
-
-    Hence the conjunction, in ONE named place so the declaration and the arm
-    strings cannot be spelled differently at two call sites, and written as an
-    equality against the recognised constants rather than a negation -- an
-    unrecognised inject mode must not zero a charged ring, and
-    ``weight_exchange.inject_mode`` already answers ``shadow`` for anything it
-    does not recognise.
-    """
-    return (
-        str(weight_source) == WEIGHT_SOURCE_EXCHANGE
-        and str(inject_mode) == weight_exchange.INJECT_AUTHORITATIVE
-    )
 
 
-def pdflip_weights_cpu_backup_ring_kw(
-    ring_bytes: int, ring_span1_bytes: int,
-    ring_absent_by_design_base: bool,
-    weights_cpu_backup_armed: bool,
-) -> Tuple[int, int, bool]:
-    """``(ring_bytes, ring_span1_bytes, ring_absent_by_design)`` for the ledger.
-
-    #1369: ONE function for BOTH halves of the same fact, because
-    ``host_ledger.price``'s own contradiction guard REFUSES
-    ``ring_absent_by_design=True`` beside a non-zero ring (boot weg2xsn13's
-    own lesson, see :func:`ring_absent_by_design`'s docstring) -- a caller
-    that ORs the DECLARATION into ``True`` without also zeroing the BYTES
-    would turn "the ring is gone" into a boot-time crash instead of a price.
-    Kept here, one call, rather than at each of the two former call sites,
-    so the two halves cannot drift apart the way #1358's slot size/count
-    once did.
-
-    ``weights_cpu_backup_armed`` False -- the operator's explicit
-    ``--pdflip-weights-cpu-backup off``, OR ``auto`` under an armed,
-    authoritative exchange -- zeroes both byte counts and forces the
-    declaration True, REGARDLESS of ``ring_absent_by_design_base`` (the
-    pre-#1369 predicate: today only true under exchange+authoritative).
-    True passes every input through unchanged -- byte-identical to every
-    boot before this flag existed.
-    """
-    if weights_cpu_backup_armed:
-        return (
-            int(ring_bytes), int(ring_span1_bytes),
-            bool(ring_absent_by_design_base),
-        )
-    return 0, 0, True
 
 
-def pinned_reserve_line(ledger_gib, ledger_src: str = "") -> str:
-    """29.09.: the PDFLIP-HOST PINNED-RESERVE line -- the reserve the ranks'
-    pinned-host checks will ACTUALLY use (read back through
-    pinned_host_reserve(), after the export) with its source: env (explicit
-    FLLIPER_PINNED_HOST_RESERVE_GIB), ledger (the host ledger's measured
-    margin) or native (10 GiB, no finite cgroup); plus the number the
-    ledger's PINNED WALL was priced with, so a mismatch is visible."""
-    from flliper.srt.mem_cache import pinned_host_budget as _phb
-
-    gib, kind, detail = _phb.pinned_host_reserve_effective()
-    wall = "none (no finite memory.max)" if ledger_gib is None else f"{float(ledger_gib):.2f} GiB ({ledger_src})"
-    return (f"PDFLIP-HOST PINNED-RESERVE effective={gib:.2f} GiB source={kind} ({detail}) "
-            f"ledger_wall_reserve={wall}")
 
 
 def choose_host_ledger(
@@ -13500,58 +8738,15 @@ def choose_host_ledger(
     return arm, reap_headroom_gib, _baseline_lines + _bounce_lines + lines, cg
 
 
-#: The worker's own #706 line (cache_controller._generate_storage_config):
-#: a Form A expert worker holds no attention layer, builds no page window
-#: and rides the null storage tier -- for W7/W10 it stands in for BOTH the
-#: KV-page and the GDN-blob marker of that rank (fnFL2 v18, 21.09.: D READY
-#: with 1 host + 2 workers was refused "kv x1 blob x1, need 3 each").
-FORM_A_WORKER_CANONICAL_MARKER = "this rank is a Form A expert worker (no attention layer) -- no page window"
-#: #239 S3h/F14 (rc12z29d, 28.09. 20:34:28Z): under the KV token cut a Form A
-#: worker that owns token rows builds a whole-page KV window
-#: (cache_controller, F14 branch) and says so with THIS line instead of the
-#: no-window one. It is that rank's canonical KV page; it holds no GDN blob
-#: (the recurrent state stays the attention host's), so like the no-window
-#: line it stands in for the blob marker of that rank. W7/W10 counted only the
-#: old line and refused the first cut boot that reached READY:
-#: "D logged kv x1 blob x1, need 3 each" (TP0 #706 lines + 2 F14 workers).
-FORM_A_KV_WORKER_CANONICAL_MARKER = "#239 F14 KV-WORKER-WINDOW: Form A worker owns token rows"
 
 
-def canonical_marker_counts(path: str) -> tuple:
-    """(kv, blob, workers): the #706 KV-page and GDN-blob markers of a group
-    log, each worker line (no-window or F14 KV window) counted once into both."""
-    # IPC-LOG-EXCEPTION: comparison number only -- canonical_state_gate decides on the
-    # RankState records and merely REPORTS a disagreement ('IPC MISMATCH').
-    n_kv = count_marker(path, "#706 canonical KV page active")
-    n_blob = count_marker(path, "canonical GDN blob active")
-    n_worker = (count_marker(path, FORM_A_WORKER_CANONICAL_MARKER)
-                + count_marker(path, FORM_A_KV_WORKER_CANONICAL_MARKER))
-    return n_kv + n_worker, n_blob + n_worker, n_worker
 
 
-def d_kv_worker_ranks(extra_d: str) -> List[int]:
-    """#239 F14: the Form A workers (``--rank-tp-ratio`` 0) that own token rows
-    under the cut D runs (``--uneven-token-vector``) -- exactly the ranks that
-    must build a canonical KV window. Empty without a cut or outside Form A."""
-    toks = _argv_vector(extra_d or "", "--uneven-token-vector")
-    tp = _argv_vector(extra_d or "", "--rank-tp-ratio")
-    if not toks or not tp or len(toks) != len(tp):
-        return []
-    try:
-        return [r for r, (t, w) in enumerate(zip(toks, tp))
-                if float(w) == 0.0 and float(t) > 0.0]
-    except ValueError:
-        return []
 
 
 _STATE_MISSING_LOGGED: set = set()
 
 
-def boot_state_dir() -> Optional[str]:
-    """IPC §2.2: the boot's state/<boot_id>/ directory (PDFLIP_STATE_DIR, mounted by
-    the arm), or None -- then the launcher writes no state and the rank records
-    stay next to the group logs."""
-    return envs.PDFLIP_STATE_DIR.get() or None
 
 
 def boot_state_write(log: Log, state: Optional[str] = None, *, cause: Optional[dict] = None,
@@ -13579,20 +8774,8 @@ def boot_state_write(log: Log, state: Optional[str] = None, *, cause: Optional[d
         log(f"IPC STATE WRITE FAILED ({type(e).__name__}): {e}")
 
 
-_CAUSE_RE = re.compile(r"\b(W\d+[a-z]?)\s+(PdFlip[A-Za-z0-9]+)")
 
 
-def refusal_cause(e: BaseException) -> dict:
-    """A launcher refusal as §2.2 cause: code = W-number + name (never the bare
-    W-number, 27B requirement 6), origin launcher, the full text."""
-    msg = str(e)
-    m = _CAUSE_RE.search(msg)
-    if m:
-        code, name = f"{m.group(1)}_{m.group(2)}", m.group(2)
-    else:
-        name = type(e).__name__
-        code = f"{_w_code_of(e)}_{name}"
-    return state_file_mod.make_cause(code, "launcher", msg, name=name, exception_type=type(e).__name__)
 
 
 def rank_state_dir_for(spec: GroupSpec) -> str:
@@ -13642,30 +8825,6 @@ def core_cwd_for(group_log: str, tree: str, log: Log) -> str:
     return d
 
 
-def group_rank_count(argv: Sequence[str]) -> int:
-    """The rank count of a group, from the argv the launcher built for it:
-    ``--tp-size`` x ``--pp-size`` (last occurrence wins, as in the server).
-
-    27B NVFP4 duo 23.10.: the W7/W10 canonical gate was called with a literal
-    3 (the reference rig's card count); on a 2-card launch P is TP1 x PP2 and
-    D is TP2, so a clean group was refused as "group reports 1x2 ranks,
-    launcher expects 3" (boot dkr27bnvfp4duobar1duo10230518)."""
-    from flliper.srt.pdflip import carrier_census as _cc
-    tp = _cc.tp_size_of(argv, default=1) or 1
-    pp = 1
-    items = list(argv)
-    for i, a in enumerate(items):
-        v = None
-        if a == "--pp-size" and i + 1 < len(items):
-            v = items[i + 1]
-        elif a.startswith("--pp-size="):
-            v = a.split("=", 1)[1]
-        if v is not None:
-            try:
-                pp = int(v)
-            except ValueError:
-                pass
-    return tp * pp
 
 
 def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
@@ -13747,16 +8906,6 @@ def rank_vram_display(spec: GroupSpec, log: Log, states: Optional[list] = None) 
     return n
 
 
-def count_marker(path: str, marker: str) -> int:
-    n = 0
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                if marker in line:
-                    n += 1
-    except FileNotFoundError:
-        pass
-    return n
 
 
 # --------------------------------------------------------------------------
@@ -13852,21 +9001,8 @@ def write_p_respawn_spec(spec: GroupSpec, ns, log: Log, dry: bool,
     return path
 
 
-def group_form_block(env) -> Optional[dict]:
-    """DASHBOARD-AUS-IPC (e): the boot form this group was handed (the one
-    :data:`pdflip_form.FORM_ENV` every rank reads), as ``groups.<G>.form`` -- the
-    rigdash's start form then comes from state.json, not from the log's
-    PDFLIP-FORM line. ``None`` = no pdflip form published (teardown, desk test)."""
-    f = pdflip_form.current_form(env)
-    if f is None:
-        return None
-    return {**f.axes(), "profile": f.profile, "model": f.model, "describe": f.describe()}
 
 
-def front_launch_fields(argv: Sequence[str], env: Dict[str, str]) -> dict:
-    """Nutzer 29.09. (rigdash „komplette Startflags inkl. ENV“): state.json
-    launch.front = das exec'te argv der Front (redigiert wie im Log) + ihre Umgebung."""
-    return {"launch.front": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(argv), env)}
 
 
 def release_shared_cache(spec_d: GroupSpec, log: Log) -> Optional[dict]:
@@ -13981,15 +9117,6 @@ def helper_registry_dir(tag: str) -> str:
     return f"{EVIDENCE_DIR}/helpers_{tag}"
 
 
-def _proc_start_ticks(pid: int) -> int:
-    """/proc/<pid>/stat field 22 (starttime), 0 when unreadable. Split after the
-    LAST ')' -- comm may carry spaces and parentheses."""
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            rest = f.read().rsplit(b")", 1)[1].split()
-        return int(rest[19])
-    except (OSError, IndexError, ValueError):
-        return 0
 
 
 def register_helper(tag: str, name: str, pid: int, log: Optional[Log] = None, suffix: str = "pid") -> str:
@@ -14067,21 +9194,6 @@ def _stop_helper_pid(pid: int, expect: str = "boot_deadman") -> str:
         return "gone"
 
 
-def census_entry_for_pricing(record_path: str, key: str, *, model: str,
-                             evidence_dir: str) -> Tuple[Optional[Dict[str, object]], str]:
-    """29.09. NF1d: the host census entry the ledger prices from, ``(entry, line)``.
-
-    A record that predates ``shm_total_max_gib`` (the peak of the SUM at one
-    instant) gets it rebuilt from this key's own memts
-    (host_census.backfill_shm_total) -- only for a checkpoint that is NOT the
-    reference: the 27B record stays byte for byte, and no model named (a desk
-    caller) touches nothing."""
-    from flliper.srt.pdflip import host_census as _hc
-
-    if model and pdflip_form.reference_model_verdict(model, host_ledger.REFERENCE_MODEL)[0] is False:
-        entry, line = _hc.backfill_shm_total(record_path, key, evidence_dir)
-        return (dict(entry) if entry is not None else None), line
-    return _hc.load_record(record_path).get(key), ""
 
 
 def memts_csv_path(tag: str) -> str:
@@ -14096,20 +9208,8 @@ def memts_pgrep_pattern(tag: str) -> str:
     return rf"^bash .*{re.escape(MEMTS)} {re.escape(memts_csv_path(tag))}( |$)"
 
 
-def memts_owner_pattern(tag: str) -> str:
-    """argv pattern of the processes whose life the logger is bound to: the
-    launcher (until it returns after LAUNCHED) and the front (from before the
-    launcher returns until the arm's teardown). Escaped, so the supervisor's
-    own argv -- which carries this string -- never matches it."""
-    return rf"flliper\.srt\.pdflip\.(launcher|front) .*--tag {re.escape(tag)}( |$)"
 
 
-def _proc_cmdline(pid: int) -> str:
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return f.read().replace(b"\0", b" ").decode(errors="replace").strip()
-    except OSError:
-        return ""
 
 
 def start_memts(state: "BootState", log: Log) -> int:
@@ -14167,16 +9267,6 @@ def stop_memts(tag: str, pid: int) -> str:
     return f"PDFLIP-TEARDOWN memts pid={pid} {verdict} (killpg={killed} pgrep-net={net} csv={csv})"
 
 
-def flip_weights_tags(ns, family: List[str]) -> List[str]:
-    """The weights tags the launcher sleeps/resumes: the family, or NOTHING
-    under ``--flip-weights resident`` (fnFL2 v7, 20.09.: the post-READY
-    sleep(P) named weights_0..7 + weights, the server's W4 guard refused a
-    weights tag on a resident boot, three ranks disagreed -> W29 crash).
-    The front derives its own empty list from ``--weights-resident``; this
-    is the launcher half of the same rule."""
-    if getattr(ns, "flip_weights", "family") == "resident":
-        return []
-    return list(family)
 
 
 def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> float:
@@ -14190,33 +9280,8 @@ def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> floa
     return dt
 
 
-def _group_env_value(name: str, group_envs, default: str) -> str:
-    """29.09.: ``name`` as the RANKS see it -- the group env (--env-p/--env-d,
-    applied over the launcher env by build_env) wins; when both groups set it
-    differently the larger one prices (the ONE arena is shared). The launcher
-    env only when no group sets it (ENV-LAUNCHER != RANG)."""
-    vals = [str(e[name]) for e in (group_envs or ()) if e and str(e.get(name, "") or "")]
-    if vals:
-        return max(vals, key=float)
-    return str(os.environ.get(name, default) or default)
 
 
-def arena_gib_into_groups(ns, group_envs, gib: float) -> List[str]:
-    """29.09.: write a ledger-derived arena size into every group env that
-    names FLLIPER_HICACHE_ARENA_GIB (``ns.env_p``/``ns.env_d`` and the parsed
-    dicts the ledger prices from), so ranks and ledger read the same number.
-    Groups that do not name it inherit the launcher env. Returns the groups
-    rewritten."""
-    key, val, done = "FLLIPER_HICACHE_ARENA_GIB", f"{float(gib):g}", []
-    for attr in ("env_d", "env_p"):
-        spec = str(getattr(ns, attr, "") or "")
-        if key in parse_group_env(spec):
-            setattr(ns, attr, set_group_env(spec, key, val))
-            done.append(attr)
-    for e in group_envs or ():
-        if e is not None and key in e:
-            e[key] = val
-    return done
 
 
 #: model -> the arena page widths `_pdflip_arena_ledger_terms` last priced
@@ -14310,195 +9375,24 @@ def _pdflip_arena_ledger_terms(model: str, group_envs=None) -> dict:
         raise PdFlipLaunchRefused(f"W108 PdFlipArenaLedgerRefused: the arena term could not be derived: {exc!r}")
 
 
-def model_config_path(model: str) -> str:
-    """The ``config.json`` that describes ``model``, by the SERVER's own rule
-    (``server_args.declared_config_path_for``, the body of
-    ``ServerArgs.declared_config_path``) -- never a second copy of it.
-
-    27B line G2 (2026-09-25): a GGUF launch names the ``.gguf`` FILE, whose
-    config is the SIBLING ``config.json``; ``os.path.join(model, "config.json")``
-    found ``<...>.gguf/config.json`` and every launcher reader died on it. A
-    directory resolves exactly as before. None found: ``FileNotFoundError`` (the
-    type a missing config always raised here, so callers that catch ``OSError``
-    keep their behaviour), naming every place that was looked at."""
-    from flliper.srt.server_args import (
-        declared_config_path_candidates,
-        declared_config_path_for,
-    )
-
-    path = declared_config_path_for(model)
-    if path is None:
-        looked = declared_config_path_candidates(model) or [
-            os.path.join(str(model), "config.json")
-        ]
-        raise FileNotFoundError(
-            2, "no config.json describes %s (looked at %s)" % (model, ", ".join(looked)),
-            looked[-1],
-        )
-    return path
 
 
-def model_is_gguf_file(model: str) -> bool:
-    """Whether ``model`` names a GGUF checkpoint FILE -- the server's own
-    predicate (``check_gguf_file``: a file with the ``.gguf`` suffix or the GGUF
-    magic), the one that turns ``--load-format auto`` into ``gguf`` and the
-    quantization into ``gguf`` (arg_groups/overrides._gguf_quantization)."""
-    from flliper.srt.utils.hf_transformers_utils import check_gguf_file
-
-    return bool(model) and check_gguf_file(model)
 
 
-def _model_config(model: str) -> dict:
-    with open(model_config_path(model)) as f:
-        return json.load(f)
 
 
-def gguf_backbone_depth(model: str) -> Optional[int]:
-    """A GGUF file's backbone depth as the SERVER reconciles it
-    (``gguf_registry.reconcile_sibling_config``): ``block_count`` minus the
-    NEXTN/MTP draft blocks it counts (``nextn_predict_layers``). None where the
-    metadata does not say. Read once per file (host_ledger.gguf_header_facts)."""
-    return host_ledger.gguf_header_facts(model).backbone_depth
 
 
-def model_num_layers(model: str) -> int:
-    """The backbone depth, through the SERVER's own probe order (fix 6).
-
-    For a GGUF file the loader's authority is the FILE: a depth that differs
-    from the sibling config is reconciled there (the file wins, layer_types
-    rebuilt), and every layer map this launcher derives from the config would
-    then describe another model -- W162, before any card is touched."""
-    from flliper.srt.server_args import declared_num_hidden_layers_from_config
-
-    n = declared_num_hidden_layers_from_config(_model_config(model))
-    if not n or n <= 0:
-        raise PdFlipLaunchRefused(f"num_hidden_layers not found in {model_config_path(model)}")
-    if model_is_gguf_file(model):
-        depth = gguf_backbone_depth(model)
-        if depth is not None and depth != int(n):
-            raise PdFlipLaunchRefused(
-                f"W162 PdFlipGgufDepthRefused: {model} carries {depth} backbone "
-                f"blocks, its sibling {model_config_path(model)} declares "
-                f"num_hidden_layers={n}. The loader runs the FILE's depth "
-                "(gguf_registry.reconcile_sibling_config) while the chunk map, "
-                "the P cut and the layer kinds of this launcher come from the "
-                "config -- two sides of one seam on different models. Supply "
-                "the config.json of exactly this GGUF next to it."
-            )
-    return int(n)
 
 
-#: --tokenizer-path (27B line G2, 2026-09-25): the tokenizer BOTH groups load.
-#: None, the default, adds nothing to either argv (the server reads the
-#: tokenizer from --model-path, byte-identical to every argv before the flag).
-#: Installed once by :func:`apply_tokenizer_path`, read by every
-#: :func:`common_flags` call, so P and D can never tokenize differently.
-_TOKENIZER_PATH: Dict[str, Optional[str]] = {"path": None}
 
 
-def tokenizer_path_decision(
-    model: str, explicit: str = ""
-) -> Tuple[Optional[str], Optional[str]]:
-    """``(the --tokenizer-path both groups get, or None; a log line or None)``.
-
-    * given: used on BOTH groups, refused (W163) unless it is a directory with
-      one of the server's own sibling tokenizer files -- a typo dies here, not
-      in two groups' tokenizer managers;
-    * not given, not a GGUF file: ``(None, None)`` -- the argv is unchanged;
-    * not given, a GGUF file whose tokenizer the server can find itself
-      (transformers' GGUF route for a non-bespoke arch, or sibling files next
-      to the .gguf): ``(None, line)``;
-    * not given, a bespoke-arch GGUF (qwen35, qwen35moe, gemma4, ...) with no
-      tokenizer next to it: W163 now, instead of the same ValueError in both
-      groups' tokenizer managers after the cards are taken. Nothing is guessed:
-      the fix is named, not applied (the unsloth Qwen3.8-27B GGUF directory
-      ships no tokenizer; the FP8/INT8 checkpoints of the same model carry the
-      same tokenizer.json).
-    """
-    from pathlib import Path
-
-    from flliper.srt.utils.hf_transformers.tokenizer import (
-        _SIBLING_TOKENIZER_FILES,
-        _has_sibling_tokenizer,
-    )
-
-    wanted = ", ".join(_SIBLING_TOKENIZER_FILES)
-    explicit = str(explicit or "").strip()
-    if explicit:
-        if not (os.path.isdir(explicit) and _has_sibling_tokenizer(Path(explicit))):
-            raise PdFlipLaunchRefused(
-                f"W163 PdFlipTokenizerRefused: --tokenizer-path {explicit!r} is not "
-                f"a directory holding any of {wanted}."
-            )
-        return explicit, f"PDFLIP TOKENIZER --tokenizer-path {explicit} (both groups)"
-    if not model_is_gguf_file(model):
-        return None, None
-    from flliper.srt.model_loader.gguf_registry import sibling_config_gguf_archs
-
-    parent = os.path.dirname(os.path.abspath(model))
-    # _peek_bespoke_gguf_arch's derivation (general.architecture of the metadata
-    # part, in the registry's sibling-config set) over the header this launch
-    # reads once anyway -- its own call would parse the GGUF again (8.5 s).
-    header_arch = host_ledger.gguf_header_facts(model).arch
-    arch = header_arch if header_arch in sibling_config_gguf_archs() else None
-    if arch is None:
-        return None, (
-            f"PDFLIP TOKENIZER {model}: read by transformers from the GGUF itself "
-            "(not a sibling-config arch)"
-        )
-    if _has_sibling_tokenizer(Path(parent)):
-        return None, f"PDFLIP TOKENIZER {model}: the sibling files in {parent} (arch {arch})"
-    raise PdFlipLaunchRefused(
-        f"W163 PdFlipTokenizerRefused: {model} is a {arch} GGUF, whose tokenizer "
-        f"the server reads ONLY from sibling files, and {parent} holds none of "
-        f"{wanted}. Pass --tokenizer-path <dir> with this model's tokenizer "
-        "(the safetensors checkpoint of the same model), or place the files "
-        "next to the .gguf."
-    )
 
 
-def apply_tokenizer_path(ns) -> Optional[str]:
-    """Install --tokenizer-path once, before any argv is built (the install-once
-    shape of apply_p_prefill_graph); returns the log line, if any."""
-    path, line = tokenizer_path_decision(
-        str(getattr(ns, "model", "") or ""),
-        str(getattr(ns, "tokenizer_path", "") or ""),
-    )
-    _TOKENIZER_PATH["path"] = path
-    return line
 
 
-def tokenizer_path_flags() -> List[str]:
-    """The installed tokenizer as argv words: ``[]`` when none was installed."""
-    path = _TOKENIZER_PATH.get("path")
-    return ["--tokenizer-path", str(path)] if path else []
 
 
-def model_layer_kinds(model: str) -> List[bool]:
-    """One flag per layer: True = full attention, False = linear/GDN.
-
-    THE SERVER'S OWN DERIVATION, called rather than re-implemented
-    (``server_args.declared_layer_kinds_from_config``, which
-    ``ServerArgs.declared_layer_kinds`` also calls), so the launcher's
-    chunk->card map and the server's PP split cannot disagree about the
-    checkpoint.
-
-    #1233 fix 6: this used to read ``layer_types`` ONLY and refuse otherwise,
-    which is STRICTER than the authority it claimed to mirror -- that one also
-    accepts ``layers_block_type`` and ``full_attention_interval`` (its own
-    docstring names the latter as the Qwen3.5/3.6 GDN hybrid source).  On such
-    a checkpoint the server derived a real hybrid split while this refused and
-    published NO map, and no map means ``front.interleave_pause_order`` returns
-    the IDENTITY order -- the order that killed boot weg2dk4 with a device OOM
-    in ``cu_mem_create``.  A degradation that is honest about its reason is
-    still a degradation into a known boot killer.
-
-    The one refusal left is the one that has no authority to defer to: a
-    config whose depth cannot be read at all.
-    """
-    from flliper.srt.server_args import declared_layer_kinds_from_config
-
-    return declared_layer_kinds_from_config(_model_config(model), model_num_layers(model))
 
 
 def p_stage_layers(
@@ -14548,49 +9442,6 @@ def p_stage_layers(
     )
 
 
-def shipped_layer_split(
-    stage_ratio: str,
-    attn_stage_ratio: str,
-    layer_set: str,
-    is_full_attention: Sequence[bool],
-    n_stages: int,
-) -> List[int]:
-    """The per-stage LAYER COUNTS group P's ARGV will actually run.
-
-    The counterpart of :func:`p_stage_layers`, and the reason it exists: that
-    function's own docstring says it reads "the SAME two score vectors
-    ``argv_p`` passes", and since the merge train brought :func:`solve_p_cut`
-    that premise is no longer true by construction -- argv_p passes whatever
-    the solver returned.  A premise that used to hold and now has to be CHECKED
-    is a guard, not a comment, so the split is derived from the argv strings
-    themselves and compared (``main``, W46).
-
-    Both argv forms are resolved through the runtime's OWN parser for that
-    form -- ``parse_pp_layer_sets`` for a layer SET, ``derive_pp_layer_split``
-    for the score pair -- never by counting the score vector, which is the
-    conflation :func:`p_stage_layers` exists to undo.  ``[]`` when the argv
-    states no cut at all; an empty answer is never compared as agreement.
-    """
-    if layer_set:
-        from flliper.srt.distributed.utils import parse_pp_layer_sets
-
-        return [
-            len(x)
-            for x in parse_pp_layer_sets(
-                layer_set, len(list(is_full_attention)), int(n_stages), allow_gapped=True
-            )
-        ]
-    if not stage_ratio:
-        return []
-    from flliper.srt.distributed.utils import derive_pp_layer_split
-
-    return list(
-        derive_pp_layer_split(
-            _csv_ints(stage_ratio),
-            is_full_attention=list(is_full_attention),
-            attn_scores=_csv_ints(attn_stage_ratio) if attn_stage_ratio else None,
-        )
-    )
 
 
 def build_tms_preload(tree: str, venv: str, log: Log) -> str:
@@ -14610,53 +9461,6 @@ def build_tms_preload(tree: str, venv: str, log: Log) -> str:
 #: refused the 84k prompt on boot weg2ls4b2 at limit=27466 of pool 30518).
 CARRIER_PREFETCH_FRACTION = 0.9
 
-def parse_user_reserve(raw, cards) -> Dict[str, int]:
-    """``--user-reserve-mib`` -> ``{card_uuid: MiB}``. Refuses, never guesses.
-
-    #1257c. A scalar applies to every card; a list is in **RANK / CUDA-ORDINAL
-    ORDER** -- the order :func:`order_cards` returns, i.e. the 5090 FIRST and
-    then the 3080s by NVML index -- and must have exactly one entry per card.
-    KEYED BY UUID on the way out for the reason every other per-card table in
-    this file is: NVML enumeration is not stable across boots, and an
-    index-keyed reserve would silently move to a different card the day the
-    order shifts.
-
-    CORRECTED #1342: this docstring, and the flag's help text, both used to say
-    "NVML-ordinal order". THE CODE WAS ALWAYS RIGHT AND THE PROSE WAS WRONG --
-    the values are zipped against ``cards``, which is
-    ``order_cards(resolve_cards())`` (built at ``launcher.py:9082``, consumed
-    at ``:9237``), so position 0 is the 5090 on this rig while NVML index 0 is
-    a 3080. Boot weg2xsn17 proved it by controlled A/B: passing the DOCUMENTED
-    ``1400,1800,1400`` put 1400 MiB on the 5090 and 1800 on a 3080, while
-    ``1800,1400,1400`` -- the standing form in every order -- reproduced the
-    reference boot byte-identically.
-
-    SO THE DANGEROUS REPAIR IS THE OTHER ONE: "fixing" the code to NVML order
-    would silently hand the 5090 the 1400 meant for a 3080, and the 5090 is the
-    card that OOMed in #1312. The standing form ``1800,1400,1400`` is correct
-    and matches the user setting (5090 1800 / 3080s 1400); it is pinned by
-    ``test_the_standing_reserve_form_puts_1800_on_the_5090``.
-    """
-    text = str(raw if raw is not None else 0).strip()
-    if not text:
-        return {c.uuid: 0 for c in cards}
-    try:
-        values = [int(part) for part in text.split(",")]
-    except ValueError:
-        raise SystemExit(
-            f"--user-reserve-mib must be an integer or a comma-separated list "
-            f"of integers, got {text!r}."
-        ) from None
-    if any(v < 0 for v in values):
-        raise SystemExit(f"--user-reserve-mib values must be >= 0, got {values}.")
-    if len(values) == 1:
-        values = values * len(cards)
-    if len(values) != len(cards):
-        raise SystemExit(
-            f"--user-reserve-mib has {len(values)} entries but this boot has "
-            f"{len(cards)} card(s); pass one value or exactly one per card."
-        )
-    return {c.uuid: v for c, v in zip(cards, values)}
 
 
 def served_dormant_growth(cards: List[Card], profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
@@ -14690,11 +9494,6 @@ def d_awake_rest(cards: List[Card], profile: Optional[str] = None) -> Tuple[Opti
     return [None if v is None else int(v) for v in vals], _pconst_boots("D_AWAKE_REST_MIB", profile)
 
 
-def budget_rest_from_records(profile: Optional[str] = None) -> bool:
-    """VRAM-GRUNDGESETZ 29.09.: the profile row's ``budget_rest_from_records``
-    (qwen27b on, nextflash off) unless ``FLLIPER_PDFLIP_BUDGET_REST_RECORD`` is set."""
-    row = pdflip_form.profile_row(profile if profile is not None else pdflip_form.DEFAULT_PROFILE)
-    return _budget_rest.switch_on(bool(getattr(row, "budget_rest_from_records", False)))
 
 
 def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
@@ -14757,44 +9556,6 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
     return {"booked_rest_mib": rests, "booked_rest_provenance": prov}
 
 
-def d_card_vote_lines(cards: Sequence[Card], group: str = "D", fixed: Optional[Sequence[float]] = None):
-    """THE LINE OF THE CARD, ONE READER for the launcher (PDFLIP-VOTE-LINE-BOOK and, #201 TRIM-LAW, the flip arm's
-    trim threshold): per D ordinal ``i`` (``cards[i]`` = the NVML-identified card of D rank ``i``, its ``uuid`` from
-    ``card_identity``, never torch order) the corridor floor (``corridor_budget.floors_for_cards``, reserve 0 -- the
-    rank's own read ``corridor_floor_for_current_device`` gets no user reserve either, and a reserve in a line is
-    forbidden: keine-korridor-reserve-nie), the vote line ``extend_trim.line_for_floor_mib(floor, fixed[i] if
-    measured)`` -- the formula :func:`extend_trim.corridor_line_mib` evaluates on the rank -- and whether that line is
-    USABLE: the floor is MEASURED and its footprint store is of THIS form (review S3,
-    ``budget_rest.footprint_form_mismatch``: the launcher reads the LAST published D digest). Returns
-    ``(floors by uuid, lines, usable, why-not-of-this-form)``."""
-    from flliper.srt.pdflip.extend_trim import line_for_floor_mib
-
-    n = len(cards)
-    # reserve 0 BY DESIGN: the booked path charges no user reserve, and a reserve here
-    # would book a forbidden corridor reserve as "line" (keine-korridor-reserve-nie)
-    floors = corridor_budget.floors_for_cards(cards, group, 0)
-    act = [bool(floors[c.uuid].measured) for c in cards]
-    lines = [line_for_floor_mib(floors[c.uuid].mib, fixed[i] if (fixed is not None and act[i]) else None)
-             for i, c in enumerate(cards)]
-    form_why: List[Optional[str]] = [None] * n
-    uuids = [c.uuid for c in cards]
-    _stores: Dict[str, object] = {}
-    for i, c in enumerate(cards):
-        if not act[i]:
-            continue
-        path = str(floors[c.uuid].provenance or "").split("#", 1)[0].strip()
-        if path not in _stores:
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    _stores[path] = json.load(fh) or {}
-            except Exception as exc:  # noqa: BLE001 -- an unreadable store books nothing
-                _stores[path] = f"footprint store {path or '-'} unreadable ({type(exc).__name__})"
-        st = _stores[path]
-        why = st if isinstance(st, str) else _budget_rest.footprint_form_mismatch(st, uuids)
-        if why is not None:
-            act[i] = False
-            form_why[i] = why
-    return floors, lines, act, form_why
 
 
 def d_admit_need_record(profile: Optional[str] = None, n: Optional[int] = None,
@@ -14993,17 +9754,6 @@ def d_extend_vote_fixed_record(profile: Optional[str] = None, n: Optional[int] =
     return out, src
 
 
-def vote_fixed_live_root() -> str:
-    """VOTE-FIXED-LIVE: the store root (``FLLIPER_PDFLIP_VOTE_FIXED_DIR``, else the rig cache dir of the footprint
-    and card-probe files); the launcher hands the resolved path to the ranks, so both read one directory."""
-    got = str(os.environ.get(_vfl.ENV_DIR, "") or "").strip()
-    if got:
-        return got
-    try:
-        from flliper.srt.rigmon.card_probe import CACHE_DIR
-    except Exception:  # noqa: BLE001 -- rigmon import shape
-        CACHE_DIR = os.path.expanduser("~/.cache/flliper")
-    return CACHE_DIR
 
 
 #: VOTE-FIXED-LIVE (review S3): group D's effective --kv-cache-dtype as main resolved it from --extra-d ("" = the
@@ -15155,130 +9905,18 @@ def _d_extend_vote_fixed_live_env(ns, log, label: str, cards: Optional[Sequence[
         f"({why}); record: {record_src}")
 
 
-def torch_cache_cap_armed(ns) -> bool:
-    """P0 (pdflip/torch_cache_cap.py) armed for group D: ``FLLIPER_PDFLIP_TORCH_CACHE_CAP=1``
-    in --env-d -- after :func:`apply_profile_torch_cache_cap_default` that is
-    the registry row's default unless --env-d named the switch itself."""
-    return str(parse_group_env(getattr(ns, "env_d", "") or "").get(TORCH_CACHE_CAP_ENV, "0")
-               ).strip() == "1"
 
 
-def apply_profile_torch_cache_cap_default(ns) -> Optional[str]:
-    """PDFLIP-ALLOC-OVERHANG: the registry row's ``torch_cache_cap`` into
-    ``ns.env_d`` (FLLIPER_PDFLIP_TORCH_CACHE_CAP=1) unless --env-d states the
-    switch itself (=0 turns it off). Written INTO ``ns.env_d`` so every
-    reader (the D solve's cap vector, the budget's capped rest, P1c, the
-    rank) sees ONE value. Returns the line naming it, or None."""
-    row = pdflip_form.profile_row(getattr(ns, "profile", None))
-    if row is None or not bool(getattr(row, "torch_cache_cap", False)):
-        return None
-    env_d = str(getattr(ns, "env_d", "") or "")
-    if TORCH_CACHE_CAP_ENV in parse_group_env(env_d):
-        return None
-    ns.env_d = set_group_env(env_d, TORCH_CACHE_CAP_ENV, "1")
-    return (f"{_budget_rest.OVERHANG_MARKER} registry {row.id}: --env-d {TORCH_CACHE_CAP_ENV}=1 "
-            f"(P0 torch cache cap on the physical line, D books the capped rest; --env-d "
-            f"{TORCH_CACHE_CAP_ENV}=0 = the uncapped form)")
 
 
-#: LEISTUNGSSCHALTER (user rule 29.09.): the marker of the line naming the
-#: registry row's per-group switch defaults written into --env-p/--env-d.
-GROUP_SWITCH_DEFAULTS_MARKER = "PDFLIP-LEISTUNGSSCHALTER"
 
 
-def apply_profile_group_switch_defaults(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
-    """LEISTUNGSSCHALTER (user rule 29.09. ~10:15Z: proven on metal -> default
-    on in the code): the registry row's ``group_switch_defaults`` (pdflip/form.py)
-    into ``ns.env_p`` / ``ns.env_d``. A key that group's env already states,
-    or that the launcher's own environment carries (an operator export, which
-    build_env hands every group), is left alone -- an explicit value always
-    wins, =0 turns the switch off. Written INTO the group env so every reader
-    (the D solve, the ranks; build_env applies --env-* last) sees ONE value.
-    Returns the line naming what was written, or None (qwen27b: GC_FREEZE only)."""
-    row = pdflip_form.profile_row(getattr(ns, "profile", None))
-    rows = dict(getattr(row, "group_switch_defaults", None) or {}) if row is not None else {}
-    if not rows:
-        return None
-    env_os = canonical_env(dict(os.environ if environ is None else environ))
-    wrote: List[str] = []
-    for group, attr in (("P", "env_p"), ("D", "env_d")):
-        spec = str(getattr(ns, attr, "") or "")
-        stated = parse_group_env(spec)
-        for key, val in rows.get(group, {}).items():
-            if key in stated or key in env_os:
-                continue
-            spec = set_group_env(spec, key, str(val))
-            wrote.append(f"{group}:{key}={val}")
-        setattr(ns, attr, spec)
-    if not wrote:
-        return None
-    return (f"{GROUP_SWITCH_DEFAULTS_MARKER} registry {row.id} (default on after the metal proof; "
-            f"a stated --env-p/--env-d or exported value wins): " + " ".join(wrote))
 
 
-def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optional[str]:
-    """#239 LEISTUNGSSCHALTER: an UNSET ``--d-kv-token-cut`` takes the registry
-    row's ``d_kv_token_cut`` (nextflash ``owned``; qwen27b ``off``). Applied
-    BEFORE the form is resolved (the kv axis derives from the flag), and only
-    where the boot can run the cut -- else the code default ``off`` stays:
-    D states Form A worker roles (``derive_kv`` refuses the cut without them),
-    no other ``--form-kv`` is stated, and a flip boot has its host tier and at
-    most one operator-named KV stage (``refuse_flip_under_token_cut``). Returns
-    the line naming the default, or None."""
-    if getattr(ns, "teardown", False):
-        return None
-    if pdflip_form.flag_given(argv_words, "--d-kv-token-cut"):
-        return None
-    if str(getattr(ns, "d_kv_token_cut", pdflip_form.KV_TOKEN_CUT_OFF)
-           or pdflip_form.KV_TOKEN_CUT_OFF) != pdflip_form.KV_TOKEN_CUT_OFF:
-        return None
-    row = pdflip_form.profile_row(getattr(ns, "profile", None))
-    want = str(getattr(row, "d_kv_token_cut", pdflip_form.KV_TOKEN_CUT_OFF)
-               or pdflip_form.KV_TOKEN_CUT_OFF) if row is not None else pdflip_form.KV_TOKEN_CUT_OFF
-    if want == pdflip_form.KV_TOKEN_CUT_OFF:
-        return None
-    stated_kv = getattr(ns, "form_kv", None)
-    if stated_kv and stated_kv != "qsa_forma_dcp":
-        return None
-    roles = pdflip_form.flag_values(shlex.split(str(getattr(ns, "extra_d", "") or "")), "--rank-role")
-    if not roles or "worker" not in [r.strip() for r in roles[-1].split(",")]:
-        return None
-    if not getattr(ns, "d_only", False):
-        if getattr(ns, "pdflip_disable_hicache", False):
-            return None
-        stages = d_kv_stage_tokens_named(ns)
-        if stages is not None and len(stages) != 1:
-            return None
-    ns.d_kv_token_cut = want
-    return (f"{KV_TOKEN_CUT_MARKER} registry {row.id}: --d-kv-token-cut {want} "
-            "(default on after the metal proof; --d-kv-token-cut off = the uncut Form A)")
 
 
-#: SCHALTER-HALBPORT 1002: the line naming a --pdflip-vision the registry row set
-VISION_DEFAULT_MARKER = "PDFLIP-VISION-DEFAULT"
 
 
-def apply_profile_vision_default(ns, argv_words: Sequence[str]) -> Optional[str]:
-    """SCHALTER-HALBPORT 1002: an UNSET ``--pdflip-vision`` takes the registry
-    row's ``vision`` where the row says so (``vision_arg_default``: nextflash
-    ``transient``, as every NF boot ran it, nf-int4.env:229). qwen27b states
-    nothing here (its profiles give the flag), so its parser default ``off``
-    stands. Applied BEFORE the form is resolved (the vision axis reads the
-    flag). A given flag always wins. Returns the line naming the default, or
-    None."""
-    if getattr(ns, "teardown", False) or pdflip_form.flag_given(argv_words, "--pdflip-vision"):
-        return None
-    if str(getattr(ns, "pdflip_vision", VISION_OFF) or VISION_OFF) != VISION_OFF:
-        return None
-    row = pdflip_form.profile_row(getattr(ns, "profile", None))
-    if row is None or not getattr(row, "vision_arg_default", False):
-        return None
-    want = str(row.vision or VISION_OFF)
-    if want == VISION_OFF or want not in VISION_CHOICES:
-        return None
-    ns.pdflip_vision = want
-    return (f"{VISION_DEFAULT_MARKER} registry {row.id}: --pdflip-vision {want} "
-            "(the row's vision; a given --pdflip-vision wins)")
 
 
 #: PR (30.09.): group D's paired miss record is ON by default -- the records
@@ -15309,10 +9947,6 @@ def apply_owned_miss_record_default(ns) -> Optional[str]:
             f"them as RECORD from K={_owned_miss_min_paired()} paired forwards per rank)")
 
 
-def _owned_miss_min_paired() -> int:
-    from flliper.srt.planner import expert_residency as _er
-
-    return int(_er.OWNED_MISS_MIN_PAIRED_FORWARDS)
 
 
 def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
@@ -15372,70 +10006,10 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
     return ms, src
 
 
-def d_owned_miss_ms_rank(ns, *, env_d: Mapping[str, str], n: int
-                         ) -> Tuple[Optional[Tuple[float, ...]], str]:
-    """01.10. (owned cut from the profiles): the cost per missed expert row
-    of EVERY D rank from its own paired records (each card at its own link:
-    NF D TP1 = NVML0 3080 x4, TP2 = NVML2 3080 x8 -- the (host, worker) pair
-    of :func:`d_owned_miss_ms` pools both 3080s into one worker cost).
-    ``(None, "")`` without a full window on every rank."""
-    from flliper.srt.layers.moe import pool_miss_cost as _miss_cost
-    from flliper.srt.planner import expert_residency as _er
-
-    model = str(getattr(ns, "model", "") or "")
-    root = str(env_d.get("FLLIPER_PDFLIP_OWNED_MISS_RECORD", "") or "").strip()
-    if not root:
-        return None, ""
-    got = _er.owned_miss_per_rank_from_records(
-        _er.read_owned_miss_rank_records(_miss_cost.record_dirs_for(root, model)),
-        n=int(n), model=model)
-    if got is None:
-        return None, ""
-    return got
 
 
-def d_owned_extend_h2d(cards: Sequence["Card"]) -> Tuple[Optional[List[float]], str]:
-    """S54 (19.10.): the measured pinned H2D GB/s of every D rank's card, in
-    rank order, from the card probe (``rigmon.card_probe``, the artifact the
-    cold tier and the planner's cost model already price links from -- read
-    by UUID, never by enumeration order). ``(None, why)`` when a card has no
-    measured rate: the owned solve's extend term then stays off, named."""
-    try:
-        from flliper.srt.layers.moe.expert_offload import _card_probe_h2d_table
-
-        table = _card_probe_h2d_table()
-    except Exception as exc:  # noqa: BLE001 - an unreadable probe is an absence
-        return None, f"Kartenprobe nicht lesbar ({type(exc).__name__})"
-    out, parts = [], []
-    for c in cards:
-        g = table.get(str(getattr(c, "uuid", "")))
-        if g is None:
-            return None, f"nvml{getattr(c, 'nvml_index', '?')} ohne gemessenen H2D in der Kartenprobe"
-        out.append(float(g))
-        parts.append(f"nvml{getattr(c, 'nvml_index', '?')} {g:.2f}")
-    return out, "Kartenprobe H2D GB/s " + " / ".join(parts)
 
 
-def d_owned_heat_records(ns, *, env_d: Mapping[str, str]) -> Tuple[List[dict], str]:
-    """01.10. (owned cut from the profiles): the #276 heat records of group
-    D's ``FLLIPER_DEBUG_MOE_HEAT`` directory -- the owned solve's non-resident
-    demand (``plan_d_residency`` maps them to a routed-lane share per global
-    expert). The directory is the line's per-checkpoint heat directory (the
-    profile names it); ``([], "")`` when it is unset."""
-    import glob
-    import json as _json
-
-    root = str(env_d.get("FLLIPER_DEBUG_MOE_HEAT", "") or "").strip()
-    if not root or not os.path.isdir(root):
-        return [], ""
-    recs = []
-    for path in sorted(glob.glob(os.path.join(root, "moe_heat_*.json"))):
-        try:
-            with open(path) as fh:
-                recs.append(_json.load(fh))
-        except (OSError, ValueError):
-            continue
-    return recs, root
 
 
 def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
@@ -15448,50 +10022,8 @@ def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int
         return None, ""
 
 
-def d_card_ledger(terms: Sequence[Dict[str, object]], budgets_d: Sequence[int], label: str):
-    """rc12c: the #145 card ledger from the SAME terms ``budgets_from_dc``
-    charged, plus what its measured corridor pass took off on top."""
-    import msgspec
-
-    from flliper.srt.planner import expert_residency as _er
-
-    led = _er.DCardLedger(
-        source=f"budgets_from_dc pass {label}",
-        total_mib=tuple(float(t["total"]) for t in terms),
-        carve_mib=tuple(float(t["carve"]) for t in terms),
-        dormant_mib=tuple(float(t["dormant"]) for t in terms),
-        floor_mib=tuple(float(t["floor"]) for t in terms),
-        awake_mib=tuple(float(t["awake"]) for t in terms),
-        awake_source=tuple(str(t["awake_source"]) for t in terms),
-    )
-    extra = tuple(max(0.0, led.card_budget_mib(i) - float(b)) for i, b in enumerate(budgets_d))
-    return msgspec.structs.replace(led, corridor_pass_mib=extra)
 
 
-def d_scratch_cap(fits, scratch: Sequence[int]) -> Tuple[List[int], List[str]]:
-    """rc12c: THE CONSUMER FOLLOWS THE BOOKED BUDGET. Where the #145 balance of
-    a rank misses (262k KV no longer fits beside its expert buffer), its
-    FLLIPER_MOE_SCRATCH_SLOTS is lowered to the planner's edge at the given
-    fraction -- never raised, never below the two rows the runtime needs (a
-    rank without an edge keeps its value and the refusal names it)."""
-    from flliper.srt.planner import expert_residency as _er
-
-    out = [int(s) for s in scratch]
-    lines: List[str] = []
-    for f in fits:
-        if f.verdict == "PASST":
-            continue
-        rows, s_edge = _er.scratch_edge(
-            local_experts=f.local_experts, fraction=f.fraction, max_rows=f.ceiling_max_rows)
-        if s_edge is None or s_edge >= out[f.rank]:
-            continue
-        lines.append(
-            f"SCRATCH-DECKEL rang{f.rank}: FLLIPER_MOE_SCRATCH_SLOTS {out[f.rank]} -> {s_edge} "
-            f"(Planer-Kante bei f {f.fraction:.3f}: <= {rows} Zeilen x {f.n_layers * f.slot_mib:.1f} "
-            f"MiB; Budget {f.budget_mib:.0f} MiB gebucht, Verdikt vorher {f.verdict}) -- der "
-            f"Experten-Puffer folgt dem gebuchten Budget, nicht dem freien Speicher")
-        out[f.rank] = int(s_edge)
-    return out, lines
 
 
 def d_extend_growth_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
@@ -15514,10 +10046,6 @@ def d_extend_growth_per_row_record(profile: Optional[str] = None) -> Tuple[Optio
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_EXTEND_GROWTH_PER_ROW_MIB", profile)
 
 
-#: NF port 1003: the arming variables of the per-rank run-time measurement of the extend rate
-EXTEND_RATE_MEASURE_ENV = "FLLIPER_PDFLIP_EXTEND_RATE_MEASURE"
-EXTEND_RATE_MEASURE_RANKS_ENV = "FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS"
-EXTEND_RATE_MARKER = "EXTEND-RATE"
 
 
 def d_extend_rate_fill_null(ns, rate: Sequence[Optional[float]]):
@@ -15547,57 +10075,10 @@ def d_extend_rate_fill_null(ns, rate: Sequence[Optional[float]]):
                     "record": rate}
 
 
-def d_extend_rate_measure_ranks_env(ns, log, label: str, fill: dict, rtext: str) -> None:
-    """NF port 1003: arm the run-time measurement on the filled ranks ONLY (a recorded rank keeps
-    its recorded rate) and name every rank's start source: ``EXTEND-RATE source=record+derived``.
-    A value named in --env-d wins; a rank that stays without any rate is named as NOT armed."""
-    from flliper.srt.pdflip import extend_trim as _et
-
-    _env_d = getattr(ns, "env_d", "") or ""
-    _have = parse_group_env(_env_d)
-    _ranks = ",".join(str(r) for r in fill["ranks"])
-    _given = (str(_have.get(EXTEND_RATE_MEASURE_ENV, "1")).strip() != "1"
-              or str(_have.get(EXTEND_RATE_MEASURE_RANKS_ENV, _ranks)).strip() != _ranks)
-    if _ranks and not _given:
-        _env_d = set_group_env(_env_d, EXTEND_RATE_MEASURE_ENV, "1")
-        ns.env_d = set_group_env(_env_d, EXTEND_RATE_MEASURE_RANKS_ENV, _ranks)
-    _vals = [x.strip() for x in str(rtext).split(",")]
-    _per_rank = "; ".join(f"rank{i}={src} {_vals[i] if i < len(_vals) else '-'}"
-                          for i, src in enumerate(fill["sources"]))
-    _unarmed = [i for i, src in enumerate(fill["sources"]) if src == "none"]
-    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source=record+derived start={rtext} "
-        f"measure={'on' if _ranks and not _given else 'off'} ranks={_ranks or '-'}"
-        f"{' (aus --env-d, Vorrang)' if _given else ''} safety={_et.RATE_SAFETY} ({_per_rank}; "
-        f"Start = max(record-floor, ratio, geometry): record-floor = hoechste erfasste Rate des Profils "
-        f"(kein Rang startet unter dem gemessenen Wert), ratio = Rate des erfassten Rangs x "
-        f"D_EXTEND_GROWTH_MIB[Rang] / D_EXTEND_GROWTH_MIB[erfasster Rang], "
-        f"geometry = {fill['geometry']} aus config.json (Q-694b-Formel, auf NF unter dem gemessenen Wert)"
-        f"{'' if not fill['geo_err'] else ' (' + fill['geo_err'] + ')'}; je Startrang gilt "
-        f"max(Start, gemessen x {_et.RATE_SAFETY}), Ratsche nur nach oben)"
-        + (f" -- Rang {','.join(str(i) for i in _unarmed)}: weder Wachstums-Record noch Geometrie, "
-           f"der Extend-Chunk-Deckel ist dort NICHT scharf" if _unarmed else ""))
 
 
-def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float]]] = None) -> str:
-    """rc12e: ``FLLIPER_PDFLIP_EXTEND_TRIM_MIB`` from the card ledger's floor and
-    the solved form's booked activation, per rank; '' when a rank is missing.
-    rc12f: with ``growth_mib`` (``D_EXTEND_GROWTH_MIB``) the extend's measured
-    reserved growth replaces the activation where it is larger."""
-    from flliper.srt.pdflip import extend_trim as _et
-
-    act = {int(f.rank): float(f.activation_mib) for f in fits}
-    n = len(ledger.floor_mib)
-    if any(r not in act for r in range(n)):
-        return ""
-    if growth_mib is not None and len(growth_mib) != n:
-        growth_mib = None
-    return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)], growth_mib)
 
 
-def d_lend_floor_env(ledger) -> str:
-    """D-TRANSIENT-LEND: ``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB`` = the card ledger's
-    near-OOM floor per rank (MiB, rounded up)."""
-    return ",".join(str(int(math.ceil(float(f)))) for f in ledger.floor_mib)
 
 
 def log_boot_state(log, msg: str) -> None:
@@ -15692,64 +10173,14 @@ def d_only_solve(ns, cards, dc_mib, log, *, user_reserve_by_card, p_split, chunk
     return budgets
 
 
-def set_group_env(spec: str, key: str, value: str) -> str:
-    """``spec`` ('KEY=VAL;...') with ``key`` set to ``value`` (appended when
-    absent); every other entry keeps its text and its place."""
-    items = [x for x in str(spec or "").split(";") if x.strip()]
-    done = False
-    for i, item in enumerate(items):
-        if "=" in item and item.split("=", 1)[0].strip() == key:
-            items[i] = f"{key}={value}"
-            done = True
-    if not done:
-        items.append(f"{key}={value}")
-    return ";".join(items)
 
 
-def _pconst_boots(name: str, profile: Optional[str] = None) -> str:
-    """``boot <tag>[,<tag>...]`` of the record behind ``name`` for ``profile``
-    (H94: a record names the boots it was measured on, so the budget line says
-    whose measurement it charges); the provenance text where no boot is named."""
-    prof = profile if profile is not None else pdflip_form.DEFAULT_PROFILE
-    row = pdflip_form.profile_row(prof)
-    rec = row.constants.get(name) if row is not None else None
-    if rec is None:
-        return ""
-    boots = tuple(getattr(rec, "boots", ()) or ())
-    if boots:
-        own = "" if getattr(rec, "measured_on", prof) == prof else f" measured_on={rec.measured_on}"
-        return "boot " + ",".join(boots) + own
-    return str(getattr(rec, "provenance", ""))
 
 
-def budget_charges_driver_carve(profile: Optional[str] = None) -> bool:
-    """The profile row's ``budget_charges_driver_carve`` (rc12b OOM); False
-    for an unknown profile, so nothing changes where no row says so."""
-    row = pdflip_form.profile_row(profile if profile is not None else pdflip_form.DEFAULT_PROFILE)
-    return bool(getattr(row, "budget_charges_driver_carve", False))
 
 
-def driver_carve_charged(card, min_total_mib: int) -> bool:
-    """Is the driver carve booked on ``card`` (with the profile's carve switch on)?
-
-    The ``min_total_mib`` scope (27B b1 death) is a MEASURED decision about
-    the reference rig's classes: the 27B corridor pass was SATISFIED on the
-    20 GB RTX 3080s with their carve already in predicted_free, and bound on
-    the 5090. HW-GENERIC 1002: it therefore holds for those calibration
-    classes only; a card of any other class books its NVML-reported carve
-    (a measured, unallocatable term -- not a margin), because no measurement
-    says its corridor already absorbs it."""
-    if card_identity.calibration_class(card) is None:
-        return True
-    return int(card.total_mib) >= int(min_total_mib or 0)
 
 
-def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
-    """The profile row's ``driver_carve_min_total_mib`` (27B b1 death): the
-    carve is charged only on cards with at least this NVML total; 0 (and an
-    unknown profile) = every card."""
-    row = pdflip_form.profile_row(profile if profile is not None else pdflip_form.DEFAULT_PROFILE)
-    return int(getattr(row, "driver_carve_min_total_mib", 0) or 0)
 
 
 
@@ -16161,12 +10592,6 @@ def dual_priority_armed(ns) -> bool:
             or str(getattr(ns, "dual_green_ladder", "off")) != "off")
 
 
-def _read_driver_text() -> Optional[str]:
-    try:
-        with open("/proc/driver/nvidia/version") as f:
-            return f.read(4096)
-    except OSError:
-        return None
 
 
 def dual_priority_env(ns, group: str, log=None) -> Dict[str, str]:
@@ -16319,30 +10744,6 @@ def _alive_not_zombie(pid: int, proc_root: str = "/proc") -> bool:
         return True
 
 
-def _mps_pids_on_pipe(pipe_dir: str, proc_root: str = "/proc") -> Dict[str, List[int]]:
-    """The MPS control daemon and server processes of THIS boot: argv0 basename names the program, the
-    environment must carry this boot's ``CUDA_MPS_PIPE_DIRECTORY`` (another boot's daemon is never touched)."""
-    want = f"CUDA_MPS_PIPE_DIRECTORY={pipe_dir}".encode()
-    out: Dict[str, List[int]] = {"daemon": [], "server": []}
-    try:
-        names = os.listdir(proc_root)
-    except OSError:
-        return out
-    for n in names:
-        if not n.isdigit():
-            continue
-        try:
-            with open(f"{proc_root}/{n}/cmdline", "rb") as f:
-                argv0 = os.path.basename(f.read().split(b"\0", 1)[0].decode(errors="replace"))
-            kind = {"nvidia-cuda-mps-control": "daemon", "nvidia-cuda-mps-server": "server"}.get(argv0)
-            if kind is None:
-                continue
-            with open(f"{proc_root}/{n}/environ", "rb") as f:
-                if want in f.read().split(b"\0"):
-                    out[kind].append(int(n))
-        except OSError:
-            continue
-    return out
 
 
 def stop_dual_mps(tag: str, root: str = "", *, armed: bool = False, run=subprocess.run, scan=_mps_pids_on_pipe,
@@ -16427,47 +10828,12 @@ def stop_dual_mps_of_state(st, log=print) -> str:
     return line
 
 
-def _d_early_start_armed(ns) -> bool:
-    """BOOTZEIT 3: the one resolution of ``--pdflip-d-early-start``.
-
-    'auto' (the default since the series 29.09., dearly z30x2) is on for the
-    profiles whose row carries a metal proof (``d_early_start_proven``: Next
-    Flash) and off for every other one, so the 27B line boots serial exactly
-    as before until its own proof boot ran with an explicit 'on'."""
-    mode = str(getattr(ns, "pdflip_d_early_start", "off") or "off")
-    if getattr(ns, "dual_layout", False):
-        # DUAL-TP3PP3: D is sized from P's AWAKE footprint, measured after P's
-        # READY -- an early D would be planned before that number exists.
-        return False
-    if mode == "auto":
-        return d_early_start_proven(getattr(ns, "profile", None))
-    return mode == "on"
 
 
 
 
-def refuse_d_early_start_unreviewed(ns) -> None:
-    """W185, called before group P starts: a named refusal, never a silent off.
-
-    27B (29.09.): with ``d_expect_from_p_records`` the 27B plans the early D
-    from P's records, so an explicit 'on' boots (the proof boot); 'auto'
-    stays off there until ``d_early_start_proven``. The 27B review's reader
-    concern (ns.env_d/_d_owner_solve between launch_group(P) and #5) holds on
-    this tree without a reader: only the early branch itself and the
-    refusal's restore touch them in that window."""
-    if (str(getattr(ns, "pdflip_d_early_start", "off")) == "on"
-            and not d_expect_from_p_records(ns.profile)):
-        raise PdFlipDEarlyStartUnreviewed(
-            f"W185 PdFlipDEarlyStartUnreviewed: --pdflip-d-early-start on with profile "
-            f"{ns.profile or pdflip_form.DEFAULT_PROFILE!r}, whose D expectation is the legacy "
-            f"term (registry d_expect_from_p_records=False): the early D would be planned "
-            f"from D's own reserve, not P's measured residue. Boot with 'off' (byte-identical).")
 
 
-def _group_rank_count(argv: Sequence[str]) -> int:
-    """Scheduler ranks one group spawns: --tp-size x --pp-size of its argv."""
-    toks = list(argv)
-    return int(_last_flag_value(toks, "--tp-size") or 1) * int(_last_flag_value(toks, "--pp-size") or 1)
 
 
 def d_early_stage0_watch(gate: str, sized_dir: str, expected_p_ranks: int, d_pid_fn,
@@ -16855,65 +11221,12 @@ def _p_page_size(model: str, p_bs: int = DEFAULT_P_BS) -> int:
         return 1
 
 
-def p_seats(ns) -> int:
-    """Group P's SEATS = its effective ``--max-running-requests``: a value in
-    ``--extra-p`` beats ``--p-bs`` (argparse keeps the last; the same rule as
-    ``p_micro_batch_flags``). One reader for the P card and the mamba floor."""
-    _mrr = _argv_scalar(getattr(ns, "extra_p", ""), "--max-running-requests")
-    try:
-        return int(_mrr) if _mrr is not None else int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
-    except (TypeError, ValueError):
-        return int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
 
 
-def p_mamba_mib_per_slot_by_stage(kinds: Sequence[str], stage_layers: Sequence[int],
-                                  mib_per_linear_layer_per_slot: float) -> Tuple[float, ...]:
-    """H92c: MiB one mamba slot costs on each P stage = price x the stage's
-    LINEAR layers, counted off the checkpoint's own ``layer_types`` over the
-    contiguous cut (Next Flash 29,11,8 -> 22/8/6 linear -> 34.29/12.47/9.35)."""
-    out: List[float] = []
-    start = 0
-    for n in stage_layers:
-        seg = list(kinds[start:start + int(n)])
-        out.append(float(mib_per_linear_layer_per_slot)
-                   * sum(1 for k in seg if str(k) != "full_attention"))
-        start += int(n)
-    return tuple(out)
 
 
-def p_mamba_floor_text(slots: int, seats: int) -> str:
-    """H92c: the runtime's hard floor against P's slots, as a named clause of
-    the budget-posts line. A WARNING, never a refusal (the riegel is AW's):
-    at retention 0 every anchor host backup is refused (fnFL2h91bb2)."""
-    floor = int(seats) * int(P_MAMBA_FLOOR_SLOTS_PER_SEAT)
-    retention = int(slots) - floor
-    text = ("mamba floor %d seats x %d = %d, retention budget %d"
-            % (int(seats), int(P_MAMBA_FLOOR_SLOTS_PER_SEAT), floor, retention))
-    if retention <= 0:
-        text += (" -- WARNUNG MAMBA-RETENTION: --max-mamba-cache-size %d <= Sitze x %d; "
-                 "jeder Host-Backup eines Ankers wird verweigert (fnFL2h91bb2 "
-                 "'MAMBA-FLOOR pool=32 floor=32 retention_budget=0'); mindestens "
-                 "Sitze x %d + Retention-Budget geben" % (
-                     int(slots), int(P_MAMBA_FLOOR_SLOTS_PER_SEAT),
-                     int(P_MAMBA_FLOOR_SLOTS_PER_SEAT)))
-    return text
 
 
-def _without_budget_flag(extra: List[str]) -> List[str]:
-    """``extra`` without ``--rank-gpu-memory-mib`` (both spellings)."""
-    out: List[str] = []
-    skip = False
-    for tok in extra:
-        if skip:
-            skip = False
-            continue
-        if tok == "--rank-gpu-memory-mib":
-            skip = True
-            continue
-        if tok.startswith("--rank-gpu-memory-mib="):
-            continue
-        out.append(tok)
-    return out
 
 
 def p_mamba_slots(ns, model: str, p_bs: int) -> Tuple[int, str]:
@@ -17137,45 +11450,14 @@ def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = DEFAULT_D
 
 
 
-def _gcd_reduce(values: Sequence[int]) -> Tuple[int, ...]:
-    vals = [max(1, int(v)) for v in values]
-    g = math.gcd(*vals) if len(vals) > 1 else vals[0]
-    return tuple(v // max(1, g) for v in vals)
 
 
-def _weights_from_scores(scores: Sequence[float]) -> Tuple[int, ...]:
-    """A ratio vector proportional to a measured per-rank rate.
-
-    ``--rank-tp-ratio`` takes a comma-separated integer ratio
-    (server_args.py:467 ``_parse_rank_tp_ratio``), so the rates are scaled to
-    integers and gcd-reduced. x1000 because this rig's slowest and fastest
-    measured rates differ by ~4x and rounding at x1 would quantise a 3.99x
-    ratio to 4:1 -- the vector must carry the measurement, not a rounding of it.
-    """
-    lo = min(float(s) for s in scores)
-    return _gcd_reduce([int(round(float(s) / max(lo, 1e-9) * 1000.0)) for s in scores])
 
 
-def _published_profile() -> Optional[str]:
-    """The profile id of the pdflip form this launcher published (None = none)."""
-    f = pdflip_form.current_form()
-    return f.profile if f is not None else None
 
 
-def _d_layout_is_tp_symmetric() -> bool:
-    """UNIFY S7: is the published profile's D TP-symmetric (d_layout
-    paged_dcp, the 27B)? No form / unknown profile: False (the NF rule)."""
-    row = pdflip_form.profile_row(_published_profile())
-    return bool(row is not None and row.d_layout == "paged_dcp")
 
 
-def _group_fact_value(group: str, flag: str) -> Optional[str]:
-    """The value EARLY_READ_FACTS states for ``flag`` on ``group`` -- the same
-    row build_env exports and the argv builders emit."""
-    for fact in EARLY_READ_FACTS:
-        if fact.groups in ("both", group) and len(fact.flag) >= 2 and fact.flag[0] == flag:
-            return str(fact.flag[1])
-    return None
 
 
 def d_window_pool_fields() -> Dict[str, object]:
@@ -17221,32 +11503,12 @@ def d_plan_inputs(model: str, tp_size: int, d_bs: int,
     )
 
 
-def d_row_attn_units(pcm, weights: Sequence[int]) -> List[int]:
-    """The attention UNIT vector a D operating-point row prices ``weights``
-    with -- the runtime widens the grid to the q-heads when the o-group count
-    is below the world size (uneven_perf.py:4520-4528). ONE implementation for
-    the row and for the calibration that must reproduce the row exactly."""
-    from flliper.srt.distributed.utils import partition_units
-
-    n_ranks = len(weights)
-    a_units = int(pcm.attn_units)
-    grid = a_units if a_units >= n_ranks else max(int(pcm.q_heads), n_ranks)
-    return list(partition_units(grid, list(weights)))
 
 
 _KV_POOL_SIZING_RE = re.compile(
     r"TP(\d+)\] KV pool sizing: available_bytes=(\d+) .*?cell_size=(\d+)")
 
 
-def _d_argv_of_front_log(front_log: str) -> List[str]:
-    try:
-        with open(front_log, errors="replace") as f:
-            for line in f:
-                if "group D argv:" in line:
-                    return shlex.split(line.split("group D argv:", 1)[1])
-    except OSError:
-        pass
-    return []
 
 
 def d_overhead_calibration(
@@ -17367,198 +11629,14 @@ def d_overhead_calibration(
     return None, f"no D log of this line carries 'KV pool sizing' and a group D argv (skipped {skipped})"
 
 
-def _attn_axis_for(weights: Sequence[int], plan_flags) -> str:
-    """Which axis the attention family's COMPUTE rides for one D vector (#1293).
-
-    ``"token"`` exactly when the boot form is replicated-KV uneven DCP -- the
-    serving form: every rank keeps the FULL replicated kv-head set and runs the
-    attention core over its own TOKEN shard, so the compute follows the token
-    vector, which is continuous (#492: "attention grid-PINNED was FALSE").
-    ``"head"`` otherwise (even DCP, no DCP, or a uniform plan), where the
-    kv-head unit grid genuinely carries the family.
-
-    THE PREDICATE IS #503's SHARED ONE, NOT A THIRD SPELLING.
-    ``plan_uneven_dcp_kv_replicated`` (distributed/utils.py, placed next to the
-    runtime's ``uneven_dcp_kv_replicated`` by #503 so the two cannot drift)
-    answers this exact question at plan time from the flags about to be
-    emitted. A ``plan_flags`` with no DCP evidence (``dcp_size`` unset and no
-    KV token vector) answers "head" for ANY weights -- a non-DCP form must
-    never silently take the token axis, because there the token vector does
-    not exist and the head grid is the real carrier.
-    """
-    from flliper.srt.distributed.utils import plan_uneven_dcp_kv_replicated
-
-    return (
-        "token"
-        if plan_uneven_dcp_kv_replicated(plan_flags, list(weights))
-        else "head"
-    )
 
 
-def _axis_floor_ranks(units: int, weights: Sequence[int]) -> Tuple[int, ...]:
-    """Ranks whose proportional share of ``units`` is BELOW one whole unit.
-
-    ``partition_units`` guarantees every rank >= 1 unit, so each of these is
-    pinned at the partitioner's floor and the realised split stops carrying the
-    weight ratio on that axis. This is the one REACHABLE failure of a unit grid
-    -- a rank owning ZERO units cannot happen -- and naming the ranks rather
-    than answering yes/no is what lets the caller re-normalise against the grid
-    that binds and say WHICH rank moved.
-    """
-    total = sum(int(w) for w in weights)
-    if total <= 0 or int(units) <= 0:
-        return tuple()
-    return tuple(
-        r
-        for r, w in enumerate(weights)
-        if float(int(w)) / float(total) * float(int(units)) < 1.0
-    )
 
 
-def _axis_renormalisation(
-    family: str,
-    axis: str,
-    units: int,
-    weights: Sequence[int],
-    realised: Sequence[int],
-) -> str:
-    """Floor-aware re-normalisation, as a printable statement (#1293).
-
-    When a grid binds, ``partition_units`` floors the starved ranks to one unit
-    and takes the shortfall back off the largest shares, so the realised
-    fractions are NOT the requested ratio. Printing the requested ratio there
-    would be the instrument-text-lies shape -- the number reported would not be
-    the number shipped. This prints BOTH plus the drift between them, with the
-    family and the axis named, so a floored grid is READABLE instead of either
-    silently wrong or automatically fatal.
-    """
-    floored = _axis_floor_ranks(units, weights)
-    if not floored or not realised:
-        return ""
-    w_total = float(sum(int(w) for w in weights)) or 1.0
-    r_total = float(sum(int(u) for u in realised)) or 1.0
-    want = [float(int(w)) / w_total for w in weights]
-    got = [float(int(u)) / r_total for u in realised]
-    return (
-        "%s/%s grid BINDS: rank(s) %s below one of %d units, pinned at the "
-        "floor; realised shares %s vs requested %s (max drift %.3f)"
-        % (
-            family,
-            axis,
-            list(floored),
-            int(units),
-            [round(g, 3) for g in got],
-            [round(w, 3) for w in want],
-            max(abs(g - w) for g, w in zip(got, want)),
-        )
-    )
 
 
-def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap, cards=()) -> str:
-    """The per-rank arithmetic behind a W64 feasible=False, as one clause.
-
-    A refusal that names only its verdict makes the reader re-derive the
-    reason by hand -- three boots of this flip paid that price, because
-    "does not leave a positive KV pool on at least one rank" does not say
-    WHICH rank, nor by how much, nor which term ate the budget.  Every number
-    here comes from the same model that produced the verdict (no second
-    accounting): the weight shards and the mamba pool from ``pcm``, the
-    predicted per-rank tokens straight off ``cap["p"]``, and the two flat
-    reserves from ``uneven_perf``'s own constants -- so the four terms add up
-    to the budget the gate used and the shortfall is readable without a
-    second run.
-    """
-    THIS_GROUP = "D"   # this breakdown only ever prices group D's vectors
-    try:
-        from flliper.srt.uneven_perf import (
-            _PREDICT_MAMBA_ACT_RESERVE_MIB,
-            _PREDICT_MIN_RANK_TOKENS,
-            _PREDICT_OVERHEAD_MIB,
-        )
-
-        MI = float(2 ** 20)
-        attn = list(attn_units) if attn_units else None
-        wb = pcm.per_rank_weight_bytes(list(mlp), attn)
-        # #62: the same subtraction predict_capacity makes -- what the host
-        # expert store holds is not on the card. Printed as its own term so
-        # the line cannot read as "the card carries all of it" again.
-        off = pcm.per_rank_offloaded_weight_bytes(list(mlp))
-        mb = pcm.mamba_pool_bytes_for(attn)
-        cell = float(pcm.kv_cell_bytes)
-        overhead = float(_PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB)
-        ptok = list(cap.get("p") or [])
-        rows = []
-        for r in range(len(budgets)):
-            free = (
-                float(budgets[r]) - (wb[r] - off[r]) / MI - mb[r] / MI - overhead
-            )
-            # THE KEYS, so a reader can JOIN this line to the measurement.
-            # Without them the number is unattachable: the census speaks
-            # `pp<PP>tp<TP>`, the budget lines speak `card=`/`nvml_idx=`, and
-            # this line spoke neither -- a peer tool built on it could not
-            # tell which rank, which card, or even which group it was reading
-            # (reported 2026-09-21). The group is constant here and said out
-            # loud rather than left to be inferred.
-            _card = cards[r] if r < len(cards) else None
-            _key = "group=%s r%d" % (THIS_GROUP, r)
-            if _card is not None:
-                _key += " nvml%s %s" % (
-                    getattr(_card, "nvml_index", "?"),
-                    getattr(_card, "name", "?"),
-                )
-            rows.append(
-                "%s budget=%d - weights=%.0f (of which %.0f in the host "
-                "expert store) - mamba=%.0f - reserves=%.0f "
-                "=> free=%.0f MiB / kv_cell=%.0f B = %d tokens%s"
-                % (
-                    _key, int(budgets[r]), (wb[r] - off[r]) / MI, off[r] / MI,
-                    mb[r] / MI, overhead, free,
-                    cell, int(ptok[r]) if r < len(ptok) else -1,
-                    "  <-- BELOW the minimum" if (
-                        r < len(ptok) and ptok[r] < _PREDICT_MIN_RANK_TOKENS
-                    ) else "",
-                )
-            )
-        return (
-            "  THE ARITHMETIC (same model, no second accounting; a rank needs "
-            ">= %d tokens): %s"
-            % (_PREDICT_MIN_RANK_TOKENS, "; ".join(rows))
-        )
-    except Exception as exc:  # pragma: no cover - diagnostic only
-        return "  (per-rank breakdown unavailable: %s)" % exc
 
 
-def d_moe_residency(env_d: str, tp_size: int):
-    """Group D's expert residency, as the capacity model needs it (#62).
-
-    ``(resident_fraction, scratch_slots)`` per rank, or ``(None, None)`` when
-    the arm pins neither -- then the model keeps pricing every expert as
-    card-resident, which is what a non-offloading boot really does.
-
-    READ FROM THE ARM'S OWN ``--env-d`` STRING, not from this process's
-    environment: the launcher never has D's env set (the keys are handed to
-    the group at spawn), and three fnFL2 boots were spent on exactly that
-    confusion -- a term "read from the env" that no env in the reading process
-    ever carried.  One entry is broadcast to every rank, ``tp_size`` entries
-    are taken per rank, and any other count is IGNORED rather than guessed at:
-    a mis-sized vector must not silently become a capacity claim.
-    """
-    def _vec(raw, cast):
-        if not raw:
-            return None
-        try:
-            parsed = [cast(x) for x in str(raw).split(",") if x.strip()]
-        except ValueError:
-            return None
-        if len(parsed) == 1:
-            return parsed * tp_size
-        return parsed if len(parsed) == tp_size else None
-
-    env = parse_group_env(env_d or "")
-    return (
-        _vec(env.get("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"), float),
-        _vec(env.get("FLLIPER_MOE_SCRATCH_SLOTS"), int),
-    )
 
 
 #: Prefix of the one line that says where group D's capacity model got its
@@ -18297,73 +12375,6 @@ def d_operating_point_rows(
     return (rows, refusals)
 
 
-def d_operating_point_line(
-    rows: Sequence[DOperatingPointRow], refusals: Sequence[str], shipped: str
-) -> str:
-    """All three vectors, their price and their pool, on ONE line.
-
-    The trade is only readable if the alternatives are printed next to what
-    shipped, in the same units, from the same model, on the same boot.
-    """
-    if not rows:
-        return (
-            "PDFLIP D-OPERATING-POINTS UNPRICED (shipped=%s): %s"
-            % (shipped, " | ".join(refusals) or "no reason given")
-        )
-    parts = []
-    for row in rows:
-        priced = (
-            "%.4f %s" % (row.round_ms, row.round_unit)
-            if row.round_ms is not None
-            else row.round_unit
-        )
-        # #1293: which axis the attention compute rides, named per row, plus
-        # the token partition when that axis carries it and the floor-binding
-        # statement when any grid binds. `attn_axis=head` is the pre-DCP
-        # reading of the attn heads printed before it; `attn_axis=token`
-        # says the heads are the PROJECTION split and the compute follows
-        # `token_units`.
-        axis_bit = " attn_axis=%s" % row.attn_axis
-        if row.attn_token_units:
-            axis_bit += " token_units %s" % (list(row.attn_token_units),)
-        if row.axis_note:
-            axis_bit += " [%s]" % row.axis_note
-        parts.append(
-            "%s%s: weights %s from %s %s -> attn %s%s GDN %s, round %s, world pool "
-            "%s, funded ctx %s, feasible %s"
-            % (
-                row.position,
-                " [SHIPPED]" if row.position == shipped else "",
-                list(row.weights),
-                row.score_name,
-                [round(x, 1) for x in row.scores],
-                list(row.attn_heads),
-                axis_bit,
-                list(row.gdn_heads),
-                priced,
-                row.world_pool_tokens
-                if row.world_pool_tokens is not None
-                else "UNPRICED",
-                # BOTH, because they answer different questions: the world
-                # pool is the sum over ranks, the funded context is bounded by
-                # the SMALLEST rank (min(sum P, 64 min P)) and is the quantity
-                # a carrier bound is about. A vector that collapses one rank
-                # moves the second far more than the first.
-                row.funded_ctx_tokens
-                if row.funded_ctx_tokens is not None
-                else "UNPRICED",
-                "UNPRICED" if row.feasible is None else row.feasible,
-            )
-        )
-    tail = (" REFUSED: " + " | ".join(refusals)) if refusals else ""
-    note = next((r.note for r in rows if r.note), "")
-    return (
-        "PDFLIP D-OPERATING-POINTS (#1241 slice 2, the operating-point axis of "
-        "the #1017 solve; shipped=%s, default %s since the user order of "
-        "2026-09-09 -- 'maxkv' is still selectable and its argv is still "
-        "byte-identical to the pre-#1241 form). %s. %s%s"
-        % (shipped, D_TP_OBJECTIVE_DEFAULT, " || ".join(parts), note, tail)
-    )
 
 
 
@@ -18655,46 +12666,6 @@ def d_tp_ratio_decision(
 
 
 
-#: #1032 THE VECTOR THIS LAUNCHER MUST NEVER SHIP AGAIN, and the boot that
-#: showed what the runtime does with it.
-#:
-#: ``--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`` sat on
-#: group D's argv. 29,19,16 is the emitted value of RETRACTED investigation
-#: #602 (planner/retracted.py REGISTER), so every Weg-2 boot printed the #797
-#: PROVENANCE warning and then spent a supersession undoing it.
-#:
-#: WHAT THE LOG ACTUALLY SHOWS, because the fix must not be justified against
-#: a claim the evidence refutes (boot weg2rg6, D log
-#: /spinning/evidence-665-f1/boot_weg2_weg2rg6_7f88b1c75d_0908_070324.D.log):
-#: the seed did NOT reach the pools. All three "Uneven-DCP token sizing" lines
-#: read ratios 17 / 7 / 8, i.e. partition_units(64, measured P_r) gcd-reduced
-#: from the measured per-rank capacities 364718 / 154980 / 170464; `vector [29`
-#: does not appear on a single sizing line. The install LANDED and superseded
-#: the seed, exactly as role='seed' promises.
-#:
-#: SO THE DEFECT IS NOT "D SERVED ON THE RETRACTED SPLIT" -- it is that a
-#: retracted lineage was shipped at all, and that the runtime spends a
-#: supersession every boot undoing a number the launcher had no business
-#: stating. Normalised to one sum, the seed 29,19,16 against the measured
-#: 34,14,16 is +17 % on rank 0 and -26 % on rank 1: had the install NOT landed,
-#: that is the split D would have served.
-#:
-#: The fix is therefore to state nothing. With no vector on the argv the
-#: runtime derives its own starting point from THIS boot's budgets
-#: (distributed/utils.py:1135, partition_units(64, budget-minus-checkpoint))
-#: and the measured install replaces it after profiling -- the same install
-#: that already ran, now without withdrawn evidence upstream of it.
-#:
-#: WHAT IS GIVEN UP, named rather than left to be discovered: no seed means
-#: nothing arms ``note_seed_awaiting_supersession``, so the
-#: assert_seed_superseded gate does not hold this boot to an install. That
-#: gate exists because a SEED carries foreign lineage; the budget-derived
-#: fallback carries this boot's own numbers, so an install that does not
-#: happen leaves D on its own honest estimate rather than on a withdrawn one.
-#: (And the gate's disarm keys on the VERDICT boolean, not on a changed vector
-#: -- distributed/utils.py:306 says so in its own docstring -- so "the gate did
-#: not fire" was never proof of an install either. The sizing lines are.)
-RETRACTED_SEED_VECTOR_1032 = (29, 19, 16)
 
 #: #1317n the controller's own load-pool fraction, mirrored here because the
 #: launcher must size the pool the controller will only lend 90 % of.
@@ -18707,369 +12678,30 @@ except Exception:  # noqa: BLE001
     HICACHE_LOAD_POOL_USAGE_FRACTION_1317N = 0.9
 
 
-def d_token_vector_decision(
-    vector: Optional[str],
-    role: str,
-    provenance: Optional[str],
-) -> DTokenVectorDecision:
-    """Group D's token-vector argv, and the refusal that keeps #602 out.
-
-    Default (``vector`` unset): NOTHING is shipped. The line says which branch
-    the boot is on and where the vector will come from instead.
-
-    Operator-supplied: the value is checked against the runtime's OWN
-    retraction register (``planner.retracted.find_retracted_token_vector``, the
-    same authority ``_refuse_retracted_token_vector`` uses) BEFORE the window
-    is spent. The runtime refuses a retracted PIN and only warns about a
-    retracted SEED, because at that point a seed is still going to be
-    superseded; here neither is accepted, because a launcher that types a
-    retracted number has already made the mistake the register exists to
-    catch, and the desk is the cheap place to say so.
-    """
-    role = str(role or "pin")
-    if not vector:
-        return DTokenVectorDecision(
-            flags=(),
-            line=(
-                "PDFLIP D-TOKEN-VECTOR: none shipped (default). SOURCE = "
-                "estimate(budget): group D derives its own starting vector "
-                "from THIS boot's --rank-gpu-memory-mib "
-                "(distributed/utils.py resolve_cp_token_ratios, the "
-                "partition_units(64, budget - weights - 1536 MiB) rung). "
-                "OBJECTIVE = the profiled per-rank capacity optimum: the "
-                "runtime supersedes that estimate IN-PROCESS after profiling "
-                "and prints the pool it moved -- 'installed measured KV-token "
-                "ownership vector [..] (pre-boot estimate was [..]), "
-                "max_total_num_tokens X -> ~Y'. That install is armed by the "
-                "ROLE, and #1270 is why this sentence can be believed again: "
-                "an undeclared vector now reads role='estimate', not 'pin'. "
-                "Boot weg2sb1 is the counter-example -- with the #1032 seed "
-                "gone nothing declared a vector, the estimate [30,17,17] "
-                "inherited 'pin', the install was suppressed and D served "
-                "574,336 tokens against rg6's 681,856 (-15.8 %%) while the "
-                "measured [17,7,8] was printed as an unusable restart hint. "
-                "The retracted #602 seed %s this launcher used to ship stays "
-                "GONE (#1032): the seed was never the right way to arm the "
-                "install, it was only the way that happened to work, and it "
-                "carried a foreign lineage to hold a boot to."
-                % (",".join(str(v) for v in RETRACTED_SEED_VECTOR_1032),)
-            ),
-        )
-
-    try:
-        parsed = [int(x) for x in str(vector).split(",") if x.strip() != ""]
-    except ValueError:
-        raise PdFlipLaunchRefused(
-            "W46 PdFlipTokenVectorRefused: --d-uneven-token-vector %r is not a "
-            "comma-separated integer vector." % (vector,)
-        )
-    if not parsed or any(v <= 0 for v in parsed):
-        raise PdFlipLaunchRefused(
-            "W46 PdFlipTokenVectorRefused: --d-uneven-token-vector %r must be "
-            "positive integers, one per DCP rank." % (vector,)
-        )
-
-    from flliper.srt.planner.retracted import (
-        find_retracted_token_vector,
-        token_vector_refusal_text,
-    )
-
-    entry = find_retracted_token_vector(parsed, provenance)
-    if entry is not None:
-        raise PdFlipLaunchRefused(
-            "W46 PdFlipTokenVectorRefused: "
-            + token_vector_refusal_text(
-                entry,
-                parsed,
-                "the Weg-2 launcher refuses to ship it in EITHER role. The "
-                "runtime warns about a retracted role='seed' and refuses only "
-                "a 'pin' (distributed/utils.py:704); this launcher refuses "
-                "both, because a boot window is the expensive place to learn "
-                "that a number was withdrawn",
-            )
-        )
-
-    flags = (
-        "--uneven-token-vector",
-        ",".join(str(v) for v in parsed),
-        "--uneven-token-vector-role",
-        role,
-    )
-    if provenance:
-        flags = flags + ("--uneven-token-vector-provenance", str(provenance))
-    return DTokenVectorDecision(
-        flags=flags,
-        line=(
-            "PDFLIP D-TOKEN-VECTOR: %s role=%s provenance=%s -- OPERATOR "
-            "ADVISORY, checked against planner.retracted's register at the "
-            "desk and not found withdrawn. role='seed' still promises "
-            "supersession by this boot's measured per-rank capacity; 'pin' "
-            "asserts the value against that measurement. Default is to ship "
-            "nothing at all."
-            % (
-                ",".join(str(v) for v in parsed),
-                role,
-                provenance or "(undeclared -- the value match is what caught "
-                "#602, so state it if you know it)",
-            )
-        ),
-    )
-
-
-#: The one line ``read_pp_bubble`` understands, emitted per window per rank by
-#: ``scheduler_components/pp_bubble.py:summary_line``. Anchored on the whole
-#: field name including its ``=``: a bare number would match milliseconds
-#: elsewhere in the line, which is the bare-ticket-number trap in miniature.
-_BUBBLE_RE = re.compile(
-    r"PP-BUBBLE rank=(?P<rank>\d+) .*?"
-    r" n=(?P<n>\d+) \(n_gaps=(?P<n_gaps>\d+),"
-    r" forward_ms=(?P<forward>[0-9.]+),"
-    r" bubble_ms=(?P<bubble>[0-9.]+),"
-    r" starved_ms=(?P<starved>[0-9.]+);"
-)
 
 
 
 
-def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
-    """The BINDING stage's bubble totals from one group-P log, or None.
-
-    The binding stage is the one with the largest forward total: under a
-    pipelined prefill the makespan is that stage's time, so its idle is the
-    idle that costs throughput. Returns None when the file does not exist or
-    carries no PP-BUBBLE line -- absence of the instrument, never a measured
-    zero (#892 / the indicator law: a tool says "I found nothing", never
-    "there is nothing").
-    """
-    per_rank: Dict[int, List[float]] = {}
-    try:
-        with open(path, "r", errors="replace") as fh:
-            for line in fh:
-                m = _BUBBLE_RE.search(line)
-                if m is None:
-                    continue
-                acc = per_rank.setdefault(int(m.group("rank")), [0.0] * 4 + [0.0])
-                acc[0] += float(m.group("forward"))
-                acc[1] += float(m.group("bubble"))
-                acc[2] += float(m.group("starved"))
-                acc[3] += float(m.group("n"))
-                acc[4] += 1.0
-    except OSError:
-        return None
-    if not per_rank:
-        return None
-    rank = max(per_rank, key=lambda r: per_rank[r][0])
-    fwd, bub, starved, n_fwd, windows = per_rank[rank]
-    return BubbleMeasurement(
-        source=path,
-        rank=rank,
-        windows=int(windows),
-        forward_ms=fwd,
-        bubble_ms=bub,
-        starved_ms=starved,
-        n_forwards=int(n_fwd),
-    )
 
 
-#: 27B FP8 (Qwen/Qwen3.8-27B-FP8, block 128x128) on the pdflip flip, the simple
-#: variant: ONE byte layout on every card. The kernel choice is RANK-LOCAL
-#: (fp8.py: ``use_marlin = force_marlin or can_auto_enable_marlin_fp8()``,
-#: sm80..88): a 3080 repacks to Marlin ``int32 [K/16, 4N]`` + group scales
-#: ``[K/128, N]``, a 5090 keeps native ``fp8 [N, K]`` + ``weight_scale_inv
-#: [N/128, K/128]`` -- and the exchange copies bytes between the cards, so the
-#: layouts must agree. Forcing Marlin everywhere makes them agree (the geometry
-#: is the one compressed-tensors pack-quantized already moves: MIXED_FUSED_COLS,
-#: weg2xsn258) and costs the 5090 its native FP8 GEMM. Marlin's per-card lock
-#: workspace stays on the module: the exchange coverage books it as
-#: local_scratch and every weights resume re-zeroes it
-#: (weight_exchange.zero_local_scratch, adopted from the NF line).
-FP8_UNIFORM_MARLIN_ENV = {
-    "FLLIPER_FORCE_FP8_MARLIN": "1",
-}
-
-#: The checkpoint families --fp8-uniform-marlin makes one byte layout for:
-#: ``fp8`` (Qwen/Qwen3.8-27B-FP8) and ``modelopt`` -- NVIDIA ModelOpt exports,
-#: e.g. RadixArk Qwen3.8-27B-NVFP4 (MIXED_PRECISION: FP8 per-tensor attention
-#: and GDN projections, NVFP4 g16 MLP and lm_head). Under ``modelopt`` the FP8
-#: linears take Marlin through FLLIPER_FORCE_FP8_MARLIN (ModelOptFp8LinearMethod,
-#: upstream #31340) and the NVFP4 linears through the server argument below; on
-#: the 5090 both would otherwise run native kernels with other byte layouts
-#: (fp8 [N,K] + scalar scale; NVFP4 CUTLASS with 128x4-swizzled block scales).
-UNIFORM_MARLIN_QUANT_METHODS = ("fp8", "modelopt")
-
-#: The server argument that puts every NVFP4 linear of a ModelOpt checkpoint on
-#: Marlin (fp4_utils.initialize_fp4_gemm_config: ``auto`` resolves per rank --
-#: cutlass on sm_120, marlin on sm_80..89).
-FP4_UNIFORM_MARLIN_ARGV = ("--fp4-gemm-backend", "marlin")
 
 
-def checkpoint_quant_method(model_path: str) -> str:
-    """``quantization_config.quant_method`` of the checkpoint's config.json (top
-    level or ``text_config``), lower case; for an export that states its
-    quantization only in ``hf_quant_config.json`` (older ModelOpt exports)
-    ``"modelopt"``; ``""`` for none or unreadable.
-
-    A GGUF file is ``"gguf"``: the server's own override for it
-    (arg_groups/overrides._gguf_quantization), and its sibling config.json is an
-    upstream config that says nothing about the file's quantization (27B line
-    G2)."""
-    if model_is_gguf_file(str(model_path)):
-        return "gguf"
-    try:
-        with open(model_config_path(str(model_path))) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return ""
-    for holder in (cfg, cfg.get("text_config") or {}):
-        qc = holder.get("quantization_config") if isinstance(holder, dict) else None
-        if isinstance(qc, dict) and qc.get("quant_method"):
-            return str(qc["quant_method"]).strip().lower()
-    try:
-        with open(os.path.join(str(model_path), "hf_quant_config.json")) as f:
-            hf = json.load(f)
-    except (OSError, ValueError):
-        return ""
-    section = hf.get("quantization") if isinstance(hf, dict) else None
-    if isinstance(section, dict) and section.get("quant_algo"):
-        return "modelopt"
-    return ""
 
 
-#: Backlog #38 (--fp4-native-mixed): the NVFP4 linears keep the NATIVE byte
-#: layout on every rank and pick their kernel per rank (sm_120 W4A4 CUTLASS,
-#: sm_86 Marlin W4A16 in place) -- docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md.
-FP4_NATIVE_MIXED_ARGV = ("--fp4-gemm-backend", "native-mixed")
 
 
-def uniform_marlin_argv(
-    quant_method: str, uniform_marlin: bool, fp4_native_mixed: bool = False
-) -> List[str]:
-    """The server argv BOTH groups get for --fp8-uniform-marlin: the NVFP4
-    Marlin backend for a ModelOpt checkpoint, nothing otherwise (FP8 is forced
-    through the environment). With --fp4-native-mixed the NVFP4 linears get
-    the native-mixed backend instead (one native layout, kernel per rank); the
-    FP8 linears stay on Marlin."""
-    if uniform_marlin and str(quant_method or "").lower() == "modelopt":
-        return list(FP4_NATIVE_MIXED_ARGV if fp4_native_mixed else FP4_UNIFORM_MARLIN_ARGV)
-    return []
 
 
-def fp4_native_mixed_env(um_argv: Sequence[str]) -> Dict[str, str]:
-    """The environment --fp4-native-mixed adds (launcher + both groups), ONE
-    boot-uniform switch read by (a) the exchange class names -- the NVFP4 native
-    parameters become leaves of their linear's class (contract L4) -- and (b)
-    the planner's NVFP4 lanes (uneven_perf.NVFP4_LANE_RECORD, L7). Empty for
-    every other argv, so no other boot changes."""
-    if tuple(um_argv or ()) == FP4_NATIVE_MIXED_ARGV:
-        return {"FLLIPER_FP4_NATIVE_MIXED_BOOT": "1"}
-    return {}
 
 
-def fp4_native_mixed_refusal(
-    quant_method: str, uniform_marlin: bool, fp4_native_mixed: bool
-) -> Optional[str]:
-    """W160 text when --fp4-native-mixed cannot hold: it only re-routes the
-    NVFP4 linears of a ModelOpt checkpoint, and the FP8 linears of that same
-    checkpoint still need --fp8-uniform-marlin for one layout. None = fine."""
-    if not fp4_native_mixed:
-        return None
-    if str(quant_method or "").lower() != "modelopt":
-        return ("W160 PdFlipFp8LayoutRefused: --fp4-native-mixed applies to a ModelOpt "
-                "NVFP4 checkpoint only; this checkpoint's quant_method is %r"
-                % (quant_method or "none"))
-    if not uniform_marlin:
-        return ("W160 PdFlipFp8LayoutRefused: --fp4-native-mixed moves only the NVFP4 "
-                "linears to the native layout; the FP8 linears of the same ModelOpt "
-                "checkpoint still need --fp8-uniform-marlin (one layout on every rank)")
-    return None
 
 
-def with_uniform_marlin_argv(extra: str, argv: Sequence[str]) -> str:
-    """``--extra-p`` / ``--extra-d`` with :func:`uniform_marlin_argv` appended;
-    unchanged when it is empty or already carries the same backend. A different
-    --fp4-gemm-backend in the extras is REFUSED (W160): the flag promises one
-    layout on every rank and an operator-pinned backend would break it."""
-    if not argv:
-        return extra
-    toks = shlex.split(extra or "")
-    flag, value = argv[0], argv[1]
-    for i, tok in enumerate(toks):
-        got = None
-        if tok == flag and i + 1 < len(toks):
-            got = toks[i + 1]
-        elif tok.startswith(flag + "="):
-            got = tok.split("=", 1)[1]
-        if got is None:
-            continue
-        if got == value:
-            return extra
-        raise PdFlipLaunchRefused(
-            "W160 PdFlipFp8LayoutRefused: --fp8-uniform-marlin puts every NVFP4 linear "
-            "on Marlin (%s %s) on BOTH groups, but the group extras pin %s %s -- one "
-            "tensor would have two byte layouts across the flip" % (flag, value, flag, got))
-    return " ".join(shlex.quote(t) for t in toks + list(argv))
 
 
-def fp8_layout_decision(
-    quant_method: str, weight_source: str, uniform_marlin: bool
-) -> Tuple[Dict[str, str], Optional[str]]:
-    """``(env for BOTH groups, log line or None)`` for --fp8-uniform-marlin;
-    raises W160 for the one combination that cannot flip correctly.
 
-    * not an FP8 checkpoint: ``{}``; the flag is inert (named once if given);
-    * FP8 + the flag: :data:`FP8_UNIFORM_MARLIN_ENV` on every rank;
-    * FP8 under ``--pdflip-weight-source exchange`` WITHOUT the flag: REFUSED --
-      the 5090 and the 3080s would hold different bytes for one tensor and
-      the exchange would move one card's layout onto the other's;
-    * FP8 under the ring (each group refills ITS OWN bytes on the same card):
-      native per-card layouts never meet, nothing to force; named, not forced.
-    """
-    qm = str(quant_method or "").lower()
-    if qm not in UNIFORM_MARLIN_QUANT_METHODS:
-        if uniform_marlin:
-            return {}, ("PDFLIP FP8-UNIFORM-MARLIN inert: the checkpoint's quant_method is %r, "
-                        "not one of %s -- no environment added"
-                        % (qm or "none", "/".join(UNIFORM_MARLIN_QUANT_METHODS)))
-        return {}, None
-    if uniform_marlin:
-        if qm == "modelopt":
-            layout = ("FP8 linears Marlin int32 [K/16,4N] + per-channel scales [1,N], "
-                      "NVFP4 linears Marlin int32 [K/16,2N] + fp8 scales [K/16,N] via "
-                      "server argv %s on both groups; the 5090 gives up its native "
-                      "FP8 and NVFP4 CUTLASS GEMMs for it" % " ".join(FP4_UNIFORM_MARLIN_ARGV))
-        else:
-            layout = ("Marlin int32 [K/16,4N] + group scales [K/128,N] on the 5090 as on "
-                      "the 3080s; the 5090 gives up its native block-FP8 GEMM for it")
-        return dict(FP8_UNIFORM_MARLIN_ENV), (
-            "PDFLIP FP8-UNIFORM-MARLIN on (--fp8-uniform-marlin, %s checkpoint): %s on "
-            "every rank of BOTH groups -- one byte layout for the flip exchange (%s); "
-            "the Marlin lock workspace is booked local_scratch and re-zeroed after "
-            "every weights resume (rank line 'PDFLIP-RESUME local-scratch zeroed=')"
-            % (qm, " ".join("%s=%s" % kv for kv in sorted(FP8_UNIFORM_MARLIN_ENV.items())),
-               layout))
-    if str(weight_source) == WEIGHT_SOURCE_EXCHANGE:
-        if qm == "modelopt":
-            raise PdFlipLaunchRefused(
-                "W160 PdFlipFp8LayoutRefused: the checkpoint is a ModelOpt export "
-                "(quant_method modelopt: FP8 and/or NVFP4 linears) and --pdflip-weight-source "
-                "exchange moves weight BYTES card to card, but both kernel choices are "
-                "rank-local: a 3080 repacks to Marlin (FP8 int32 [K/16,4N], NVFP4 int32 "
-                "[K/16,2N] + fp8 scales [K/16,N]), the 5090 keeps native layouts (fp8 "
-                "[N,K] + scalar scale; NVFP4 CUTLASS with swizzled block scales). One "
-                "tensor would have two layouts and the flip would copy one onto the "
-                "other. Pass --fp8-uniform-marlin (Marlin on every rank, one layout), or "
-                "run --pdflip-weight-source ring.")
-        raise PdFlipLaunchRefused(
-            "W160 PdFlipFp8LayoutRefused: the checkpoint is FP8 (quant_method fp8) and "
-            "--pdflip-weight-source exchange moves weight BYTES card to card, but the "
-            "FP8 kernel choice is rank-local: a 3080 repacks to Marlin int32 "
-            "[K/16,4N] + group scales, the 5090 keeps native fp8 [N,K] + "
-            "weight_scale_inv. One tensor would have two layouts and the flip would "
-            "copy one onto the other. Pass --fp8-uniform-marlin (Marlin on every "
-            "rank, one layout), or run --pdflip-weight-source ring.")
-    return {}, ("PDFLIP %s native per-card layouts under --pdflip-weight-source %s: each "
-                "group refills its own bytes on its own card, no byte crosses a card "
-                "boundary, nothing forced" % (qm.upper(), weight_source))
+
+
+
 
 
 def p_cut_calibration_line(model_path: str, quant_method: str) -> Optional[str]:
@@ -19097,352 +12729,44 @@ def p_cut_calibration_line(model_path: str, quant_method: str) -> Optional[str]:
             "checkpoint's P log" % (qm, dg[:12], rec_why, _csv(P_PP_STAGE_RATIO_SCORES), qm))
 
 
-#: --p-attn-head-split (27B, release table row 22, ATTN_HEAD_SPLIT.md phase 2):
-#: 'off' (default) = no env, the pool model and argv byte-identical.
-P_ATTN_HEAD_SPLIT_DEFAULT = "off"
-#: A split chunk must be EAGER: min_w above every captured prefill bucket.
-P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT = 1024
 
 
-def p_attn_head_split_cfg(ns, pp_size: int, chunk_tokens: int, model: str):
-    """The ONE AHConfig for group P, or None when off. Called by solve_p_cut
-    (pool model post) and by main (group P's env) with the same inputs, so
-    the planner and the ranks price and book one number."""
-    from flliper.srt.pdflip import attn_head_split as _ah
-
-    text = str(getattr(ns, "p_attn_head_split", P_ATTN_HEAD_SPLIT_DEFAULT) or "off")
-    try:
-        dels = _ah.parse_spec(text)
-    except _ah.AHSpecError as exc:
-        raise SystemExit(str(exc))
-    if not dels:
-        return None
-    with open(model_config_path(model)) as fh:
-        cfg = json.load(fh)
-    tc = cfg.get("text_config") or cfg
-    num_q, num_kv = int(tc["num_attention_heads"]), int(tc["num_key_value_heads"])
-    head_dim = int(tc.get("head_dim") or int(tc["hidden_size"]) // num_q)
-    min_w = int(getattr(ns, "p_attn_head_split_min_w", P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT)
-                or P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT)
-    buckets = list(p_prefill_graph_buckets())
-    if buckets and min_w <= max(buckets):
-        raise SystemExit(f"--p-attn-head-split-min-w {min_w}: a split chunk must run eager, "
-                         f"above the captured prefill bucket(s) {buckets}")
-    spec = p_chunk_policy_spec()
-    max_w = max(int(chunk_tokens), int(spec.limits.max_tokens) if spec is not None else 0)
-    if min_w > max_w:
-        raise SystemExit(f"--p-attn-head-split: min_w {min_w} > the widest P chunk {max_w} -- "
-                         "the split would never fire")
-    try:
-        _ah.validate(dels, pp_size=int(pp_size), num_kv_heads=num_kv, gqa=max(1, num_q // num_kv))
-    except _ah.AHSpecError as exc:
-        raise SystemExit(str(exc))
-    if num_q % num_kv:
-        raise SystemExit(f"--p-attn-head-split: {num_q} q heads over {num_kv} kv heads")
-    ab = str(getattr(ns, "p_attn_head_split_ab", "off") or "off")
-    ab = "" if ab == "off" else ab
-    deadline = float(getattr(ns, "p_attn_head_split_deadline_ms", _ah.DEADLINE_MS_DEFAULT))
-    if not any(d.downstream for d in dels) and deadline != _ah.DEADLINE_MS_DEFAULT:
-        raise SystemExit("--p-attn-head-split-deadline-ms: only a downstream (V2) owner has a deadline; "
-                         "the spec has upstream helpers only")
-    return _ah.AHConfig(dels, min_w, int(getattr(ns, "max_kv_per_request", 0) or CONTEXT_LENGTH_TOKENS),
-                        max_w, head_dim, num_q // num_kv, num_kv, deadline_ms=deadline, ab=ab)
 
 
-def _p_ah_post_vector(ns, pp_size: int, chunk_tokens: int, model: str) -> Tuple[float, ...]:
-    from flliper.srt.pdflip import attn_head_split as _ah
-
-    return _ah.stage_post_vector(p_attn_head_split_cfg(ns, pp_size, chunk_tokens, model), pp_size)
 
 
-def p_attn_head_split_env(cfg) -> Dict[str, str]:
-    """Group P's env for the split; {} when off (byte-identical)."""
-    from flliper.srt.pdflip import attn_head_split as _ah
-
-    return {} if cfg is None else {_ah.ENV: cfg.to_env()}
 
 
-def p_attn_head_split_line(cfg, pp_size: int) -> str:
-    from flliper.srt.pdflip import attn_head_split as _ah
-
-    return (
-        "PDFLIP P-ATTN-HEAD-SPLIT: on %s (owner:helper:layers:G|hA-B), min_w %d, mirror cap %d "
-        "tokens, max_w %d, deadline %.1f ms, ab %s; post '%s' MiB per stage = %s (booked by the "
-        "ranks and by the cut's pool model), barlink p2p %.2f MiB/pair, pinned host %.1f MiB "
-        "(ATTN_HEAD_SPLIT.md, P_MICROBATCH_AH2.md)"
-        % (",".join(d.text() for d in cfg.delegations), cfg.min_w, cfg.cap_tokens, cfg.max_w,
-           cfg.deadline_ms if any(d.downstream for d in cfg.delegations) else 0.0, cfg.ab or "off",
-           _ah.POST_NAME, ",".join("%.1f" % v for v in _ah.stage_post_vector(cfg, pp_size)),
-           cfg.p2p_bytes() / 2**20, _ah.host_pinned_mib(cfg, pp_size))
-    )
 
 
-def p_trim_end_anchor_env(on: bool) -> Dict[str, str]:
-    """Group P's environment for ``--p-trim-end-anchor``: {} when off (the
-    byte-identity guarantee). The variable NAME lives in
-    pdflip/p_trim_end_anchor.py, the one module the ranks read it from."""
-    from flliper.srt.pdflip import p_trim_end_anchor as _pt
-
-    return {_pt.TRIM_ENV: "1"} if on else {}
 
 
-def fork_anchor_env(token: Optional[int], p_trim: bool) -> Dict[str, str]:
-    """``--fork-anchor-token``: the SAME environment for group P and group D
-    ({} when off -- the byte-identity guarantee). The variable NAME lives in
-    pdflip/fork_anchor.py, the one module the ranks read it from.
-
-    Refused without ``--p-trim-end-anchor``: D's store read stops at the fork
-    and must meet a P leg whose END anchor sits there; P's split path anchors
-    at N-1 and would leave D's capped read without an anchor in range."""
-    from flliper.srt.pdflip import fork_anchor as _fa
-
-    if token is None:
-        return {}
-    if int(token) <= 0:
-        raise SystemExit(f"--fork-anchor-token must be a positive token id, got {token}")
-    if not p_trim:
-        raise SystemExit(
-            "--fork-anchor-token needs --p-trim-end-anchor: group D stops its store "
-            "read at the prompt's fork, which only a fork-cut P leg anchors")
-    return {_fa.TOKEN_ENV: str(int(token))}
 
 
-def turn_anchor_env(token: Optional[int]) -> Dict[str, str]:
-    """``--turn-anchor-token``: group P's environment for the TURN ANCHOR
-    (pdflip/turn_anchor.py; {} when off -- the byte-identity guarantee). Group
-    D reads nothing new: the anchor is a regular store node at a page."""
-    if token is None:
-        return {}
-    if int(token) <= 0:
-        raise SystemExit(f"--turn-anchor-token must be a positive token id, got {token}")
-    return {"FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN": str(int(token))}
 
 
-def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
-    """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
-
-    Empty when both are off -- that is the byte-identity guarantee, pinned by
-    test_pdflip_p_host_overlap.py. The variable NAMES live in
-    managers/pdflip_p_overlap.py, the one module the runtime reads them from."""
-    from flliper.srt.managers import pdflip_p_overlap as _pov
-
-    env: Dict[str, str] = {}
-    if overlap:
-        env.update(_pov.launcher_env_p_host_overlap())
-    if hostgap:
-        env.update(_pov.launcher_env_p_hostgap())
-    return env
 
 
-def p_host_overlap_lines(overlap: bool, hostgap: bool) -> List[str]:
-    """The provenance lines for the two switches -- none when both are off."""
-    lines: List[str] = []
-    if overlap:
-        lines.append(
-            "PDFLIP P-HOST-OVERLAP: on (--p-host-overlap) -- group P gets %s: a "
-            "middle prefill chunk exchanges no output (upstream's pure-chunk "
-            "skip), the last rank fences its schedule stream on each forward "
-            "device-side, and the chunked-prefill HiCache publish runs after "
-            "the next launch instead of inside the plan. Reason: weg2xsn420 "
-            "4x98k PP2 pass 873 ms against 733 gpu-ms, ~95-140 ms card idle "
-            "per 4096 chunk from host work serialised behind the stage's own "
-            "forward (managers/pdflip_p_overlap.py)."
-            % " ".join("%s=%s" % kv for kv in sorted(p_host_overlap_env(True, False).items()))
-        )
-    if hostgap:
-        lines.append(
-            "PDFLIP P-HOSTGAP: on (--p-hostgap) -- group P prints one #PGAP line "
-            "per forward: gpu_gap_ms = card idle before it (timing events, no "
-            "sync), host phases since the previous launch."
-        )
-    return lines
 
 
-def p_recv_stream_env(on: bool) -> Dict[str, str]:
-    """Group P's extra environment for ``--p-recv-stream``; empty when off
-    (byte-identity, pinned by test_pdflip_p_recv_stream.py). The NAME lives in
-    managers/pdflip_p_overlap.py, the one module the runtime reads it from."""
-    from flliper.srt.managers import pdflip_p_overlap as _pov
-
-    return _pov.launcher_env_p_recv_stream() if on else {}
 
 
-def p_recv_stream_lines(on: bool) -> List[str]:
-    """The provenance line for ``--p-recv-stream`` -- none when off."""
-    if not on:
-        return []
-    return [
-        "PDFLIP P-RECV-STREAM: on (--p-recv-stream) -- group P gets %s: the proxy "
-        "frame's NCCL receive runs on a side stream without the fence on the "
-        "running forward, the schedule stream waits for it device-side. Reason: "
-        "#PGAP 26.09. (i8B/i8drt) PP1/PP2 card idle per chunk = frame transfer "
-        "serialised behind the previous forward (PP2 2048: ~11 ms of ~462 ms, "
-        "0.1 ms on PP0 which receives no frame) (managers/pdflip_p_overlap.py)."
-        % " ".join("%s=%s" % kv for kv in sorted(p_recv_stream_env(True).items()))
-    ]
 
 
-#: --p-prefill-graph-split (27B line, 2026-09-24): 0 = off, the default.
-P_PREFILL_GRAPH_SPLIT_DEFAULT = 0
 
 
-def p_graph_split_env(ns) -> Dict[str, str]:
-    """Group P's environment for --p-prefill-graph-split; {} when off or when
-    the prefill graph itself is off (nothing to split inside)."""
-    from flliper.srt.layers.attention import fi_graph_split as _fgs
-
-    n = int(getattr(ns, "p_prefill_graph_split", P_PREFILL_GRAPH_SPLIT_DEFAULT) or 0)
-    if n < 0 or n == 1:
-        raise SystemExit(f"--p-prefill-graph-split must be 0 (off) or >= 2, got {n}")
-    if not p_prefill_graph_buckets():
-        return {}
-    return _fgs.launcher_env_p_graph_split(n)
 
 
-def newest_bubble_log(
-    evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
-) -> Optional[str]:
-    """Newest ``*.P.log`` in ``evidence_dir`` that actually CARRIES the line.
-
-    ``accept`` (PDFLIP-FORM, 24.09.): only logs of this boot's checkpoint
-    (``pdflip_form.same_model_log``); None = every log, as before.
-
-    Not simply the newest P log: a boot that died before its first bubble
-    window, or one built before the instrument existed, has no measurement,
-    and taking its silence as ``share=0`` would derive ``depth=0`` from a file
-    rather than from a measurement. Such a log is skipped and an older one
-    that carries the line is preferred; the chosen path is printed, so a
-    reader can see how old the number is.
-    """
-    try:
-        names = [n for n in os.listdir(evidence_dir) if n.endswith(".P.log")]
-    except OSError:
-        return None
-    paths = [os.path.join(evidence_dir, n) for n in names]
-    for path in sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True):
-        if accept is not None and not accept(path):
-            continue
-        if read_pp_bubble(path) is not None:
-            return path
-    return None
 
 
-#: The runtime's transport for an explicit per-stage layer SET. It is READ by
-#: the ranks and WRITTEN by exactly one thing: this launcher, from
-#: ``--pp-layer-set`` or from the solver's own chosen map. An INHERITED value
-#: is refused (W44), never honoured -- see :func:`refuse_inherited_layer_set`.
-PP_LAYER_SET_ENV = "FLLIPER_PP_LAYER_SET"
 PP_CROSSING_WIRE_ENV = "FLLIPER_PP_CROSSING_WIRE"
 
-_PREFILL_RE = re.compile(
-    r"\b(?P<rank>PP\d+)\] Prefill batch,.*?#new-token: (?P<new>\d+), "
-    r"#cached-token: (?P<cached>\d+)"
-)
 
 
-def refuse_inherited_layer_set(env: Mapping[str, str]) -> None:
-    """W44: a layer set inherited from the environment is REFUSED, never used.
-
-    ``build_env`` starts from ``os.environ``, so before this refusal an
-    exported ``FLLIPER_PP_LAYER_SET`` reached group P's ranks without passing
-    through the launcher at all: the solver would rank and print one layout
-    while the boot ran another, and the PP-CUT provenance line would describe
-    a layout that never existed. That is the #505(a) silent-substitution class
-    with a whole stage map as the substituted object.
-
-    ONE KNOB, ONE READER (upstream-minimal). The flag ``--pp-layer-set`` is the
-    only way to configure the map, and the launcher is the only writer of the
-    variable. Not a twin of the env: its REPLACEMENT as the interface, with the
-    variable demoted to the wire that carries the decision to the ranks.
-    """
-    raw = str(env.get(PP_LAYER_SET_ENV, "") or "").strip()
-    if not raw:
-        return
-    raise PdFlipLaunchRefused(
-        "W44 PdFlipLayerSetEnvRefused: %s=%r is set in this launcher's own "
-        "environment. It is no longer an input: --pp-layer-set is, and the "
-        "launcher is the only writer of the variable (it carries the solved "
-        "or pinned map to group P's ranks). Honouring an inherited value "
-        "would let the boot run a stage map the PP-CUT provenance line does "
-        "not describe. Unset it and pass --pp-layer-set %s instead."
-        % (PP_LAYER_SET_ENV, raw, raw)
-    )
 
 
-def read_mean_prefill_prefix(path: str) -> Optional[Tuple[float, int, str]]:
-    """Mean PREFIX DEPTH over one boot's prefill census. ``(mean, n, rank)``.
-
-    THE PREFIX IS ACCUMULATED, NOT READ. No line states it: a ``Prefill batch``
-    line carries ``#new-token`` (this chunk) and ``#cached-token`` (the
-    prefix-cache hit), never "how much of this request is already computed".
-    But group P admits ONE chunked request per pass, so a request is a maximal
-    run of consecutive lines on one rank and the prefix at chunk *j* is the sum
-    of ``#new-token`` over chunks *0..j-1* plus that run's cache hit. A chunk
-    SHORTER than the run's own maximum ends the request -- the last chunk of a
-    prompt, or the zero-remainder 1-token end anchor -- and the accumulator
-    resets.
-
-    ONE RANK ONLY, and it is named in the answer: every stage prints the same
-    batch, so summing across ranks would triple the denominator without adding
-    a single measurement.
-
-    ``None`` when the file does not exist or carries no census -- absence of
-    the instrument, never a measured zero (#892).
-    """
-    rows: Dict[str, List[Tuple[int, int]]] = {}
-    try:
-        with open(path, "r", errors="replace") as fh:
-            for line in fh:
-                m = _PREFILL_RE.search(line)
-                if m is None:
-                    continue
-                rows.setdefault(m.group("rank"), []).append(
-                    (int(m.group("new")), int(m.group("cached")))
-                )
-    except OSError:
-        return None
-    if not rows:
-        return None
-    rank = sorted(rows)[0]
-    seq = rows[rank]
-    full = max(n for n, _ in seq)
-    prefixes: List[int] = []
-    acc = 0
-    for new, cached in seq:
-        prefixes.append(acc + cached)
-        if new < full:
-            acc = 0
-        else:
-            acc += new
-    return (sum(prefixes) / float(len(prefixes)), len(prefixes), rank)
 
 
-def newest_prefill_census_log(
-    evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
-) -> Optional[str]:
-    """Newest ``*.P.log`` that actually CARRIES a prefill census.
-
-    ``accept``: as :func:`newest_bubble_log` (PDFLIP-FORM calibration identity).
-
-    Same rule and the same reason as :func:`newest_bubble_log`: a boot that
-    died before its first prefill has no census, and reading its silence as
-    "mean prefix 0" would derive the design depth from a file rather than from
-    a measurement.
-    """
-    try:
-        names = [n for n in os.listdir(evidence_dir) if n.endswith(".P.log")]
-    except OSError:
-        return None
-    for path in sorted(
-        (os.path.join(evidence_dir, n) for n in names),
-        key=lambda p: os.path.getmtime(p),
-        reverse=True,
-    ):
-        if accept is not None and not accept(path):
-            continue
-        if read_mean_prefill_prefix(path) is not None:
-            return path
-    return None
 
 
 def calib_identity_of(ns) -> Optional["pdflip_form.CalibrationIdentity"]:
@@ -19461,20 +12785,8 @@ def calib_identity_of(ns) -> Optional["pdflip_form.CalibrationIdentity"]:
         power_limits=calib_power_limits(form))
 
 
-@functools.lru_cache(maxsize=1)
-def _running_power_by_class():
-    return pdflip_form.running_power_by_class()
 
 
-def calib_power_limits(form) -> Tuple[Tuple[str, Tuple[float, ...]], ...]:
-    """UNIFY S9 (release table row 27, Agent PL): the limits the cards run now,
-    for the ``power_limit`` term of the calibration identity -- one NVML read
-    per launcher, and only when the profile's records row keys the term. ()
-    = unknown (NVML silent): the term is then not applied (never a refusal)."""
-    row = pdflip_form.profile_row(getattr(form, "profile", ""))
-    if row is None or "power_limit" not in row.records.fields:
-        return ()
-    return _running_power_by_class()
 
 
 def record_line_spec(ns) -> str:
@@ -19495,8 +12807,6 @@ def calib_log_accept_of(ns) -> Optional[Callable[[str], bool]]:
     return ident.accepts_log if ident is not None else None
 
 
-def _profile_row_or_27b(profile: Optional[str]):
-    return pdflip_form.profile_row(profile) or _PROFILE_27B
 
 
 #: UNIFY S3: argparse defaults that come from the booted MODEL'S REGISTRY ROW
@@ -19552,30 +12862,8 @@ PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str, object], object]], ..
 )
 
 
-def _p_chunk_dynamic_runnable(ns) -> bool:
-    """Whether --p-chunk-policy dynamic can run with ``ns``'s other flags --
-    the refusals of :func:`apply_p_chunk_policy`, read from the parsed flags
-    (the graph is installed later): the plan's baseline width (--p-chunk-fixed,
-    else the --p-prefill-graph bucket, else CHUNKED_PREFILL_TOKENS 4096) and its
-    floor (--p-chunk-min, else that width) must not exceed --p-chunk-max, and
-    the graph bucket neither. The measured form (27b.env, chunkab rc9j) is
-    dynamic WITH --p-prefill-graph 512; without a graph the baseline 4096 is
-    above the default max 2048 and the launcher would refuse the boot -- so a
-    registry default of dynamic applies only where it is runnable."""
-    bucket = int(getattr(ns, "p_prefill_graph", 0) or 0)
-    cap = int(getattr(ns, "p_chunk_max", P_CHUNK_MAX_DEFAULT) or P_CHUNK_MAX_DEFAULT)
-    fixed = int(getattr(ns, "p_chunk_fixed", 0) or 0) or bucket or CHUNKED_PREFILL_TOKENS
-    low = int(getattr(ns, "p_chunk_min", 0) or 0) or fixed
-    return 0 < low <= cap and not (bucket and cap < bucket)
 
 
-def _row_format_default(profile, ns, row_value, formats, code_default):
-    """A best-form value the row measured on some checkpoint FORMATS only: the
-    row's value when the booted checkpoint's registry format
-    (pdflip_form.format_of, by calibration identity) is one of them, else the
-    code default."""
-    fmt = pdflip_form.format_of(profile, str(getattr(ns, "model", "") or ""))
-    return row_value if fmt and fmt in formats else code_default
 
 
 def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
@@ -19616,195 +12904,28 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
     return changed
 
 
-def profile_arg_defaults_line(ns, changed: Sequence[str]) -> Optional[str]:
-    """The launcher's one line naming every CLI default the registry row set
-    (None when the row changed nothing)."""
-    if not changed:
-        return None
-    parts = ", ".join(f"{d}={getattr(ns, d, None)!r}" for d in changed)
-    return (f"PDFLIP-PROFILE-ARG-DEFAULTS (registry row {getattr(ns, 'profile', '') or PROFILE_QWEN27B}; "
-            f"unset flags only, a given flag wins): {parts}")
 
 
-def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
-    """Current PCIe link width per CUDA ordinal, from NVML. ``None`` if unknown.
-
-    The measured link table this rig owns
-    (``pp_crossing_transport.MEASURED_GBPS_BY_LANES``) is keyed by an edge's
-    BOTTLENECK lane count, so the lane width is the join key -- read here per
-    card rather than assumed, because "GPU0 is the x4 slot" is a fact about
-    today's NVML enumeration and this launcher already refuses to hardcode
-    that kind of fact (``order_cards``).
-    """
-    out: List[Optional[int]] = []
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-    except Exception:
-        return [None for _ in cards]
-    try:
-        for c in cards:
-            try:
-                h = pynvml.nvmlDeviceGetHandleByIndex(int(c.nvml_index))
-                out.append(int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(h)))
-            except Exception:
-                out.append(None)
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-    return out
 
 
-def card_power_limits_w(cards: Sequence[Card]) -> List[Optional[float]]:
-    """ENFORCED power limit per CUDA ordinal, W, from NVML; ``None`` if unknown.
-
-    27B line (user 24.09. ~18:55Z: the cards run power-limited -- 5090 400 W of
-    600, 3080 230 W of 320 -- and the limits may be raised). A per-layer cost
-    measured at one limit is not the cost at another, so every boot prints
-    its limits (:func:`card_power_line`) and a stage fit is checked against
-    them (:func:`stage_fit_family_cost`)."""
-    out: List[Optional[float]] = []
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-    except Exception:
-        return [None for _ in cards]
-    try:
-        for c in cards:
-            try:
-                h = pynvml.nvmlDeviceGetHandleByIndex(int(c.nvml_index))
-                out.append(float(pynvml.nvmlDeviceGetEnforcedPowerLimit(h)) / 1000.0)
-            except Exception:
-                out.append(None)
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-    return out
 
 
-#: The one line a stage-fit RECORD is read back from (group P's cards in stage
-#: order). Parsed by :func:`read_card_power_record`; change both together.
-CARD_POWER_MARKER = "PP-CUT CARD-POWER (the record for --pp-cut-stage-fit):"
-_CARD_POWER_RE = re.compile(r"stage (\d+) card='([^']*)' uuid=(\S+) limit_w=(\S+)")
 #: Two limits within this many watts are the same limit.
 CARD_POWER_TOLERANCE_W = 5.0
 
 
-def card_power_line(cards: Sequence[Card], limits_w: Sequence[Optional[float]]) -> str:
-    return CARD_POWER_MARKER + " " + " ; ".join(
-        "stage %d card='%s' uuid=%s limit_w=%s"
-        % (r, c.name, c.uuid, "unknown" if w is None else "%.0f" % w)
-        for r, (c, w) in enumerate(zip(cards, limits_w))
-    )
 
 
-def read_card_power_record(front_log: str) -> Optional[List[Tuple[str, Optional[float]]]]:
-    """``[(card name, limit W or None), ...]`` in stage order from a boot's
-    front log, or ``None`` when the boot printed no record (every boot before
-    this line existed)."""
-    try:
-        with open(front_log, "r", errors="replace") as fh:
-            for line in fh:
-                if CARD_POWER_MARKER not in line:
-                    continue
-                rows = sorted(
-                    (int(s), name, None if lim == "unknown" else float(lim))
-                    for s, name, _uuid, lim in _CARD_POWER_RE.findall(line)
-                )
-                if rows:
-                    return [(name, lim) for _s, name, lim in rows]
-    except OSError:
-        return None
-    return None
 
 
-_P_LOG_MODEL_RE = re.compile(r"server_args=ServerArgs\(model_path='([^']*)'")
 
 
-def p_log_model_path(path: str, max_lines: int = 20000) -> str:
-    """The ``model_path`` a P log's boot ran (its first server_args line); ``""``
-    when the log names none within ``max_lines``."""
-    try:
-        with open(path, errors="replace") as fh:
-            for n, line in enumerate(fh):
-                if "server_args=ServerArgs(" in line:
-                    m = _P_LOG_MODEL_RE.search(line)
-                    if m:
-                        return m.group(1)
-                if n >= max_lines:
-                    break
-    except OSError:
-        return ""
-    return ""
 
 
-#: The source boot of a census produced by pdflip/xchg_census.py, as its
-#: provenance names it ("ring-table boot boot_weg2_<tag>_<tree>_<date>_<time>").
-_CENSUS_SOURCE_BOOT_RE = re.compile(r"ring-table boot (boot_weg2_[A-Za-z0-9_]+)")
 
 
-def census_checkpoint(census_path: str,
-                      evidence_dirs: Sequence[str]) -> Tuple[str, str]:
-    """``(checkpoint path, how it was read)`` of the checkpoint a census was
-    MEASURED on; ``("", why)`` when it cannot be named. The census's own
-    ``checkpoint`` field first (xchg_census.py writes it since weg2xsn441), else
-    the ``server_args`` model_path of its source boot's P log."""
-    try:
-        with open(census_path) as fh:
-            blob = json.load(fh)
-    except (OSError, ValueError) as exc:
-        return "", "the census is unreadable (%s)" % exc
-    ck = blob.get("checkpoint") if isinstance(blob, dict) else None
-    if isinstance(ck, str) and ck:
-        return ck, "the census's own checkpoint field"
-    m = _CENSUS_SOURCE_BOOT_RE.search(str(blob.get("provenance", "")))
-    if not m:
-        return "", "the census names no source boot in its provenance"
-    stem = m.group(1)
-    for d in evidence_dirs:
-        if not d:
-            continue
-        path = os.path.join(d, stem + ".P.log")
-        if os.path.isfile(path):
-            model = p_log_model_path(path)
-            if model:
-                return model, "%s.P.log server_args" % stem
-    return "", ("its source boot %s has no readable P log with a server_args line "
-                "under %s" % (stem, ", ".join(d for d in evidence_dirs if d) or "-"))
 
 
-def census_checkpoint_decision(census_path: str, model_path: str,
-                               evidence_dirs: Sequence[str],
-                               allow_foreign: bool) -> Optional[str]:
-    """The census must price THIS checkpoint (weg2xsn441: the FP8 boot ran on the
-    INT8 census of weg2xsn246, the flip's VRAM was priced for the other
-    checkpoint's bytes, and nothing said so before the metal). None when it
-    does; a NAMED line when it cannot be verified or is allowed foreign;
-    W161 otherwise -- in the dry run, before any card is touched."""
-    src, how = census_checkpoint(census_path, evidence_dirs)
-    if not src:
-        return ("PDFLIP XCHG-CENSUS checkpoint UNVERIFIED: %s -- the flip's VRAM peaks "
-                "are priced from %s for a checkpoint this launcher cannot name"
-                % (how, census_path))
-    if os.path.realpath(src) == os.path.realpath(str(model_path)):
-        return None
-    what = ("the census %s was measured on %s (%s); this boot runs %s -- its "
-            "per-tag bytes, dormant residue and flip peaks are the other "
-            "checkpoint's (format, scale geometry, embedding dtype, load residue)"
-            % (census_path, src, how, model_path))
-    if allow_foreign:
-        return ("PDFLIP XCHG-CENSUS FOREIGN (allowed by --pdflip-xchg-census-foreign): "
-                + what + " -- this boot MEASURES its own census, it is not priced by one")
-    raise PdFlipLaunchRefused(
-        "W161 PdFlipXchgCensusForeign: " + what + ". Produce this checkpoint's census "
-        "(pdflip/xchg_census.py --ring-table-boot <a boot of it>), or pass "
-        "--pdflip-xchg-census-foreign for the boot that measures it.")
 
 
 def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
@@ -19898,90 +13019,10 @@ def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
     return cost, prov + " | " + verdict, fitted
 
 
-def forced_lane_borrow(cards: Sequence[Card], lanes: Sequence[Optional[int]],
-                       log=None) -> List[Optional[int]]:
-    """AP2 1006: the PCIe width per ordinal the crossing price is looked up at.
-    The measured link table (``MEASURED_GBPS_BY_LANES``) holds this rig's widths
-    only (x4, x8); a card at another width (x16 on most boards) or one NVML does
-    not report used to drop every candidate crossing it as UNPRICED, so a
-    foreign inventory ended in W40 "not one cut ... priceable" even with --force.
-
-    Unchanged whenever every width has a measured entry (the reference rig: the
-    list comes back as it went in). Otherwise the value refusal HW-UNCALIBRATED:
-    without --force refused by name; with it the ordinal is priced at the
-    largest MEASURED width not above its own (x16 -> x8: never faster than
-    measured), an unreported width at the smallest measured one, named
-    UNMEASURED. A width below every measured one (x1, x2) gets no borrow -- any
-    measured price would be optimistic -- and stays unpriced."""
-    from flliper.srt.distributed.pp_crossing_transport import MEASURED_GBPS_BY_LANES
-
-    have = sorted(int(k) for k in MEASURED_GBPS_BY_LANES)
-    out = [None if x is None else int(x) for x in lanes]
-    moved = []
-    for i, w in enumerate(out):
-        if w is not None and w in have:
-            continue
-        below = [k for k in have if w is None or k <= w]
-        if not below:
-            continue
-        new = below[0] if w is None else below[-1]
-        moved.append(f"ordinal {i} ({card_identity.class_label(cards[i]) if i < len(cards) else '?'}) "
-                     f"x{w if w is not None else '?'} -> x{new}")
-        out[i] = new
-    if not moved:
-        return list(lanes)
-    refusals.refuse_value(
-        card_identity.CODE_UNCALIBRATED,
-        f"{card_identity.CODE_UNCALIBRATED}: PP-CUT crossing prices are measured at PCIe widths "
-        f"{', '.join('x%d' % k for k in have)} only; " + "; ".join(moved)
-        + " -- --force prices these at the nearest measured width not faster than their own: UNMEASURED "
-        "on this board (a crossing measurement of this rig writes the table)",
-        PdFlipLaunchRefused, log=log)
-    return out
 
 
-def per_pair_crossing_ms(
-    lanes: Sequence[Optional[int]], payload_bytes: int
-) -> Dict[Tuple[int, int], float]:
-    """``{(src_stage, dst_stage): ms}`` for one crossing of ``payload_bytes``.
-
-    Priced from the MEASURED point-to-point table, at the edge's bottleneck
-    lane count -- ``min`` of the two cards' widths, which is what "bottleneck"
-    means and what those numbers were measured at. A pair whose lane count has
-    no measured entry is OMITTED, never interpolated: ``pp_cut.crossing_price``
-    then refuses to rank the candidates that use it, and an unrankable
-    candidate is reported rather than priced at a guess.
-    """
-    from flliper.srt.distributed.pp_crossing_transport import MEASURED_GBPS_BY_LANES
-
-    out: Dict[Tuple[int, int], float] = {}
-    for a in range(len(lanes)):
-        for b in range(len(lanes)):
-            if a == b or lanes[a] is None or lanes[b] is None:
-                continue
-            gbps = MEASURED_GBPS_BY_LANES.get(min(int(lanes[a]), int(lanes[b])))
-            if gbps is None:
-                continue
-            out[(a, b)] = float(payload_bytes) / (float(gbps) * 1e9) * 1e3
-    return out
 
 
-def chunked_prefill_size_of(argv: Sequence[str]) -> int:
-    """The chunk this launcher's own argv states, read back off it.
-
-    Same rule as ``--max-running-requests`` in the pool model: a second copy of
-    the number here would drift the day the flag moves, and the depth price is
-    linear in it.
-    """
-    argv = list(argv)
-    if "--chunked-prefill-size" not in argv:
-        raise PdFlipLaunchRefused(
-            "W42 PdFlipDepthUnfunded: group P's argv states no "
-            "--chunked-prefill-size, so one in-flight microbatch has no "
-            "priceable size and the depth cannot be funded against the pool. "
-            "Refusing rather than assuming a chunk."
-        )
-    return int(argv[argv.index("--chunked-prefill-size") + 1])
 
 
 #: THE DERIVATION IS NOT RE-GROUNDED, so a derived depth is not shipped
@@ -20238,54 +13279,12 @@ def solve_p_depth(
     )
 
 
-def _csv_ints(text: str) -> List[int]:
-    return [int(x.strip()) for x in str(text).split(",") if x.strip()]
-
-
-def _csv_floats(text: str) -> List[float]:
-    return [float(x.strip()) for x in str(text).split(",") if x.strip()]
 
 
 
 
-def flip_order_split(cut: PCutFacts, n_layers: int) -> Tuple[List[int], str]:
-    """The per-stage layer counts the FLIP-ORDER MAP may be built from.
 
-    FIX 2.  ``main`` used to derive this from the module score constants, at a
-    point that runs before ``solve_p_cut`` -- so it answered for the INCUMBENT
-    while group P was launched on the SOLVED cut, and the front got a map that
-    was complete, confident and wrong (measured on this tip: incumbent
-    ``[32,18,14]`` against the shipped maxkv cut's ``[31,17,16]``, which moves
-    ``weights_3`` and ``weights_6`` onto other cards).  It comes off the cut
-    now, and this function is the whole decision -- extracted from ``main`` so
-    it can be tested by CALLING it rather than by reading main's AST, which is
-    the only reason the previous instance of this defect had to be found by a
-    reviewer instead of by a test.
 
-    Returns ``([], reason)`` in the three cases where no honest map exists.
-    NO MAP is the honest degradation: ``interleave_pause_order`` refuses an
-    INCOMPLETE map and the front falls back to the identity pause order with
-    the reason printed.  It does NOT refuse a complete-but-wrong one, which is
-    the weg2dk4 death, so every case that cannot be stated exactly is stated
-    as nothing.
-    """
-    split = list(cut.layer_counts)
-    if not split:
-        return [], "solve_p_cut published no layer counts"
-    if sum(split) != n_layers:
-        return [], f"solved split {split} sums to {sum(split)}, not {n_layers}"
-    if cut.gapped:
-        # A gapped cut's stages own NON-CONTIGUOUS layer bands, and
-        # chunk_tag_cards walks cumulative per-stage counts -- that walk IS the
-        # contiguous assumption, so no count vector can state this map.  Before
-        # this fix a gapped boot silently got the incumbent's CONTIGUOUS map
-        # here: the same wrong-map class, one layer deeper.
-        return [], (
-            f"the solved cut is GAPPED ({cut.layer_set}); its stages own "
-            f"non-contiguous layer bands and chunk_tag_cards walks cumulative "
-            f"contiguous counts, so no count vector can state this map"
-        )
-    return split, ""
 
 
 #: WHICH OBJECTIVE THE SOLVER IS ASKED, per arm of ``--pp-solve-objective``.
@@ -20313,40 +13312,8 @@ P_SOLVER_OBJECTIVE_OF = {
 PCUT_BOUNCE_SLACK_ENV = "FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB"
 
 
-def region_form_lane_price_cap(d_vector: str = XCHG_D_VECTOR_DEFAULT,
-                               legs: str = "both",
-                               n_stages: Optional[int] = None) -> int:
-    """#1464b: the lane count the ledger charges in the REGION form for EVERY
-    cut -- the measured record of the ordered default cut (39,13,12 -> 5),
-    0 when that record does not exist (then nothing is capped and the old
-    per-cut count prices, as before)."""
-    if n_stages is not None and pdflip_pp_ordered_cut_for(n_stages) is None:
-        # HW-P1c 1003: the incumbent record is the THREE-stage ordered cut's;
-        # another stage count has no incumbent -> its own worst-case lane count
-        # (host_ledger.resolve_xchg_lanes, N_PAIRS + N_CARDS) stands.
-        return 0
-    rec = host_ledger.XCHG_LANES_BY_CUT.get(
-        host_ledger.xchg_cut_key(_csv(DEFAULT_PP_ORDERED_CUT), str(d_vector), str(legs)))
-    try:
-        return max(0, int((rec or {}).get("lanes", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
 
 
-def host_price_is_region_form(ns) -> bool:
-    """#1464: does this arm's exchange run its legs through the boot's
-    ``xchg.bin`` region (hook + semaphores) rather than the per-lane file
-    bounce?  True for every exchange+host arm: ``--pdflip-xchg-inject`` has no
-    "off" choice, and both leg call sites pass ``hook=``/``sems=``.  Kept as
-    its own predicate so a future arm that really runs ``run_bounce_leg``
-    (no hook) can say so in ONE place; ``FLLIPER_PDFLIP_PCUT_LANE_PRICE=1``
-    restores the lane price for the cut pick (measurement/diagnosis only).
-    """
-    if os.environ.get("FLLIPER_PDFLIP_PCUT_LANE_PRICE", "") == "1":
-        return False
-    return xchg_bounce_arm_pins_host(
-        str(getattr(ns, "pdflip_weight_source", WEIGHT_SOURCE_DEFAULT)),
-        str(getattr(ns, "pdflip_xchg_oncard", ONCARD_MODE_DEFAULT)))
 
 
 def host_price_for_cut(ns, stage_ratio: str) -> Tuple[float, int, str]:
@@ -20403,244 +13370,22 @@ def host_price_for_cut(ns, stage_ratio: str) -> Tuple[float, int, str]:
     return float(nbytes) / host_ledger.GIB, int(lanes), source
 
 
-def host_priced_pick(rows, price, incumbent_gib: float, slack_gib: float):
-    """#1447, pure: ``rows`` are frontier candidates FASTEST FIRST, already at
-    or above the pool floor; ``price(row) -> (gib, lanes, source)``.  Returns
-    ``(first fundable row or None, log lines)`` -- fundable = its bounce is
-    within ``incumbent_gib + slack_gib``.  Every row is priced and printed,
-    the ones the boot did not take included."""
-    picked = None
-    lines = []
-    for row in rows:
-        gib, lanes, source = price(row)
-        ok = float(gib) <= float(incumbent_gib) + float(slack_gib) + 1e-9
-        lines.append(
-            "PP-CUT HOST-PRICE cut=%s attn=%s makespan_ms=%.1f pool=%d xchg_bounce=%.2f GiB "
-            "lanes=%d (%s) vs incumbent %.2f + slack %.2f -> %s"
-            % (_csv(row.layers), _csv(row.attn), float(row.makespan_ms), int(row.pool_tokens),
-               float(gib), int(lanes), source, float(incumbent_gib), float(slack_gib),
-               "FUNDABLE" if ok else "over the host budget"))
-        if ok and picked is None:
-            picked = row
-    return picked, lines
 
 
-def _arm_run_peak_gib(arm) -> Optional[float]:
-    """The arm's priced run peak, or None when the arm cannot say."""
-    try:
-        v = arm.predicted_run_peak_gib()
-        return None if v is None else float(v)
-    except Exception:  # noqa: BLE001
-        return None
 
 
-def _fmt_gib(v: Optional[float]) -> str:
-    return "n/a" if v is None else f"{v:.2f}"
 
 
-#: #1453: the KV arena never shrinks below this (8 GiB = 262144 slots of 32 KiB,
-#: one 262k-token request), and the excess is rounded UP to the next 0.25 GiB.
-ARENA_FROM_LEDGER_FLOOR_GIB = 8.0
 
 
-def arena_from_ledger(cur_gib: float, run_peak_gib: Optional[float], guard_gib,
-                      *, enabled: bool = True) -> Tuple[Optional[float], str]:
-    """``(new arena GiB or None, why)`` -- pure.  None means: leave it."""
-    if not enabled:
-        return None, "off (FLLIPER_PDFLIP_ARENA_FROM_LEDGER=0 or hicache disabled); arena %.2f GiB stays" % cur_gib
-    if guard_gib is None:
-        return None, "no --host-riegel-gib on this boot; arena %.2f GiB stays" % cur_gib
-    if run_peak_gib is None:
-        return None, "the arm carries no run peak; arena %.2f GiB stays" % cur_gib
-    over = float(run_peak_gib) - float(guard_gib)
-    if over <= 0:
-        return None, ("run_peak %.2f <= riegel %.2f GiB (headroom %.2f); arena %.2f GiB stays"
-                      % (run_peak_gib, guard_gib, -over, cur_gib))
-    give = math.ceil(over * 4) / 4
-    new = max(ARENA_FROM_LEDGER_FLOOR_GIB, float(cur_gib) - give)
-    if new >= float(cur_gib):
-        return None, ("run_peak %.2f is %.2f over the riegel %.2f but the arena is at its floor %.2f GiB"
-                      % (run_peak_gib, over, guard_gib, cur_gib))
-    return new, ("run_peak %.2f GiB is %.2f over the riegel %.2f -> arena %.2f -> %.2f GiB "
-                 "(%d KV slots of 32 KiB), re-pricing"
-                 % (run_peak_gib, over, guard_gib, cur_gib, new, int(new * (1 << 30) // 32768)))
 
 
-def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str):
-    """WHICH priced candidate group P ships, and why.  Pure.
-
-    ONE mechanism, reconciled on train 2 from two that had grown in parallel:
-    the argv slice made the OBJECTIVE the solver's own argument (``maxkv`` by
-    default, the standing law), while the train added a shipped-candidate
-    picker over the solver's ranked field.  Both answered the same question --
-    which of the priced rows the boot pays for -- and two answers to one
-    question is the second-bookkeeping shape.  The flag name and default are
-    the argv slice's; the ranked-field lookup and its refusal are the train's;
-    ``incumbent`` becomes a third value of the one flag rather than a second
-    flag.
-
-    Why the picker is needed at all, measured, not asserted:
-
-    * the maxkv law (user 2026-09-08, #1254): the pool-maximal cut and the
-      makespan cut differ by 47.7 % of the KV pool on this box, and a boot may
-      not pay that trade by accident.  That is why `makespan` stopped being the
-      default;
-    * boot weg2rg6 PROVED one cut on metal (32,18,14 / attention 8,4,4), and
-      boot weg2tr1 then showed WHY that matters more than the ranking: the pool
-      model does not price PP2's per-stage FIXED POSTS (lm_head, the MTP/draft
-      head, the draft pools) and read that stage at 966,544 tokens against a
-      PROFILED 155,164, while the kv-floor row wants SIXTEEN layers on it.  So
-      `incumbent` is the default until #1259/#1019/#1260 put those posts in the
-      model -- an exception WITH AN EXPIRY, stated at the flag, not a standing
-      disagreement with the law.
-
-    The candidate is looked up in the solver's OWN ranked field rather than
-    constructed here -- a hand-built row would carry a pool figure this
-    launcher invented.  An incumbent the solver did not rank is a REFUSAL (W40)
-    naming it, never a silent fallback to the ranking's winner.
-    """
-    if objective == "makespan":
-        return (decision.makespan or decision.chosen), (
-            "the makespan-optimal cut (--pp-solve-objective makespan, THE "
-            "DEFAULT since 2026-09-08 by user order -- verbatim: 'nimm als "
-            "default ab jetzt makespan'). This is the solver's SPEED cut "
-            "(42,11,11 / attn 10,3,3 in the perf boots) and it BUYS TTFT WITH "
-            "KV: the pool it prices is smaller than the incumbent's, and both "
-            "alternatives stay priced on this same line so the cost is visible "
-            "every boot rather than inferred later"
-        )
-    if objective == "maxkv":
-        return decision.kv_floor, (
-            "the pool-maximal kv-floor cut (--pp-solve-objective maxkv): the "
-            "standing maxkv law #1254 against the pool model AS IT STANDS -- "
-            "which does not yet price PP2's lm_head/MTP/draft posts (#1259, "
-            "#1019, #1260), the reason the shipped default is the incumbent"
-        )
-    cand = incumbent_candidate(decision, incumbent_layers, incumbent_attn)
-    if cand is not None:
-        return cand, (
-            "the INCUMBENT cut (--pp-solve-objective incumbent, THE DEFAULT "
-            "from boot weg2tr1 UNTIL 2026-09-08, when the user made makespan "
-            "the default): boot-proven on weg2rg6, looked up in the "
-            "solver's own ranked field so its pool is priced by this boot's "
-            "model and not by that boot's. Default because the pool model does "
-            "not price PP2's per-stage fixed posts (lm_head + MTP/draft head + "
-            "draft pools; weg2tr1 priced 966,544 against a profiled 155,164), "
-            "so the kv-floor row's 16 layers on PP2 maximise a number that is "
-            "wrong there. Returns to maxkv with #1259/#1019/#1260"
-        )
-    want_layers = tuple(int(n) for n in incumbent_layers)
-    want_attn = tuple(int(a) for a in incumbent_attn)
-    raise PdFlipLaunchRefused(
-        "W40 PdFlipPPCutRefused: --pp-solve-objective incumbent asks for the cut "
-        f"{','.join(str(n) for n in want_layers)} / attention "
-        f"{','.join(str(a) for a in want_attn)}, and the solver did not rank it "
-        f"as a choosable candidate ({len(decision.ranked)} ranked). Refusing "
-        "rather than shipping the ranking's winner under the incumbent's name "
-        "-- that substitution is exactly what would desynchronise argv from the "
-        "flip-order map."
-    )
 
 
-def incumbent_candidate(decision, incumbent_layers, incumbent_attn):
-    """The incumbent's row in the solver's ranked field, or ``None``.
-
-    Split out of :func:`pick_shipped_cut` because the PP-CUT SHIPPED line
-    prices the incumbent on EVERY boot, including the boots that do not ship
-    it -- an alternative that is not priced is an alternative nobody can
-    compare, which is how the makespan default came to be paid unnoticed.  A
-    missing row is printed as "not ranked"; only ASKING for it and not
-    finding it is a refusal.
-    """
-    want_layers = tuple(int(n) for n in incumbent_layers)
-    want_attn = tuple(int(a) for a in incumbent_attn)
-    for cand in decision.ranked:
-        if (
-            cand.kind == "contiguous"
-            and tuple(cand.layers) == want_layers
-            and tuple(cand.attn) == want_attn
-        ):
-            return cand
-    return None
 
 
-def shipped_line(
-    decision,
-    chosen,
-    ship_why,
-    incumbent_row,
-    makespan_row,
-    *,
-    incumbent_fallback: str,
-    floor_source: str,
-) -> str:
-    """THE ``PP-CUT SHIPPED`` line. Pure, so it can be RENDERED by a test.
-
-    Split out for the same reason :func:`incumbent_candidate` was: this line is
-    the boot's whole statement of which priced row it pays for, and until
-    #1286b the only proof it still rendered was a boot. It carries twelve
-    substitutions across a %-format, which is exactly the failure class an edit
-    to it produces -- a wrong arity raises TypeError at emit time, i.e. after
-    the weights are loaded, i.e. a spent window. Now a desk test builds a
-    decision and renders it.
-
-    ``incumbent_fallback`` is passed IN rather than built from
-    ``P_PP_STAGE_RATIO_SCORES`` here, and that is not style. #1233 pins the
-    census of functions that read the incumbent score vector, precisely because
-    an extra reader is how a constant drifts back into the argv path; this
-    formatter has no business joining that list, so the one string it would
-    need is handed to it by the caller that legitimately holds the vector.
-
-    #1286b renamed ``pool_tokens=`` to ``chosen_pool=`` and added
-    ``pool_floor=``: a pool figure whose constraint is not printed beside it is
-    the shape that let weg2sb5f's +64.1 %% sit in plain sight across two logs.
-    ``pool_tokens=`` survives on the ``PP-CUT solver:`` table rows and on
-    ``PP-POOL-JOIN``, and no parser on this rig reads it off THIS line.
-
-    ``floor_source`` is REQUIRED and keyword-only (2026-09-09) for the same
-    reason ``pool_floor=`` was added beside ``chosen_pool=``: once a floor has
-    a SHIPPED DEFAULT, the number alone no longer says whether the boot was
-    obeying a standing user order or an operator's one-off ``--pp-solve-pool-
-    floor``.  Those two produce the same ``pool_floor=578199`` and want
-    opposite responses from a reader, so the line prints which.  No default
-    value here on purpose: a caller that forgets it must fail loudly at the
-    call site rather than quietly publish an unattributed floor.
-    """
-    return (
-        "PP-CUT SHIPPED: layers=%s attn=%s chosen_pool=%d pool_floor=%s "
-        "pool_floor_source=%s makespan_ms=%.1f -- %s. "
-        "The two objectives this boot did NOT take stay priced beside it and are "
-        "therefore not paid by accident: incumbent %s pool %s makespan %s, "
-        "pool-maximal (kv-floor) %s pool %d makespan %.1f, makespan-optimal %s "
-        "pool %d makespan %.1f (--pp-solve-objective incumbent|maxkv|makespan "
-        "ships them)."
-        % (
-            ",".join(str(n) for n in chosen.layers),
-            ",".join(str(a) for a in chosen.attn),
-            int(chosen.pool_tokens),
-            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
-            floor_source,
-            chosen.makespan_ms,
-            ship_why,
-            incumbent_row.fmt() if incumbent_row is not None else incumbent_fallback,
-            "%d" % int(incumbent_row.pool_tokens) if incumbent_row is not None
-            else "n/a (NOT RANKED by this solve)",
-            "%.1f" % incumbent_row.makespan_ms if incumbent_row is not None
-            else "n/a",
-            decision.kv_floor.fmt(),
-            int(decision.kv_floor.pool_tokens),
-            decision.kv_floor.makespan_ms,
-            makespan_row.fmt(),
-            int(makespan_row.pool_tokens),
-            makespan_row.makespan_ms,
-        )
-    )
 
 
-#: #145: das Praefix, an dem der Gate-Lauf und der Verdrahtungs-Check die
-#: D-Seiten-Zeile finden. EIN Marker, beide Zeilen, damit `grep -c` eine
-#: Zahl liefert und nicht zwei Muster braucht.
-D_RANK_SOLVE_MARKER = "D-RANK VRAM (#145)"
 
 
 #: VRAM-VERTRAG M1: the pass a D solve's label belongs to (anything else, the
@@ -20737,23 +13482,6 @@ EXTEND_RATE_MEASURE_ENV = "FLLIPER_PDFLIP_EXTEND_RATE_MEASURE"
 EXTEND_RATE_MARKER = "EXTEND-RATE"
 
 
-def _d_extend_rate_measure_env(ns, log, label: str, source: str, rtext: str, why: str) -> None:
-    """Q-694b: arm the per-rank run-time measurement in the D group env (a value named in
-    --env-d wins) and name the start rate's source: ``EXTEND-RATE source=record|derived``."""
-    from flliper.srt.pdflip import extend_trim as _et
-
-    _env_d = getattr(ns, "env_d", "") or ""
-    # a value other than our own came from the user (a second solve pass sees its own write)
-    _given = str(parse_group_env(_env_d).get(EXTEND_RATE_MEASURE_ENV, "1")).strip() != "1"
-    if not _given:
-        ns.env_d = set_group_env(_env_d, EXTEND_RATE_MEASURE_ENV, "1")
-    _on = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_RATE_MEASURE_ENV, "")
-              ).strip().lower() in ("1", "true", "yes", "on")
-    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source={source} start={rtext} "
-        f"measure={'on' if _on else 'off'}{' (aus --env-d, Vorrang)' if _given else ''} "
-        f"safety={_et.RATE_SAFETY} ({why}; je Rang gilt max(start, gemessen x {_et.RATE_SAFETY}), "
-        f"gemessen = max(Allokator-Peak, reserved-Zuwachs) / Zeilen ueber jeden Ziel-Extend "
-        f">= {_et.GROWTH_PER_ROW_MIN_ROWS} Zeilen, Ratsche nur nach oben)")
 
 
 def _d_extend_derived_rate_env(ns, log, label: str, *, capped: bool) -> Optional[str]:
@@ -20839,181 +13567,18 @@ def _d_extend_flip_rate_env(ns, log, label: str, cards: Optional[Sequence[Card]]
     return _rtext
 
 
-#: 27B int4ar 23.10.: the line of the flip arm's trim threshold
-EXTEND_TRIM_FLIP_MARKER = "EXTEND-TRIM-FLIP"
-EXTEND_TRIM_ENV = "FLLIPER_PDFLIP_EXTEND_TRIM_MIB"
 
 
-def d_flip_trim_lines(ns, cards: Optional[Sequence[Card]], n: int) -> Tuple[List[float], List[str]]:
-    """#201 TRIM-LAW (Unify-RISK (c)): the corridor line per D rank the flip arm's trim threshold is priced on, with
-    its source -- the line of the rank's OWN card (:func:`d_card_vote_lines`, the one launcher reader of the card law,
-    the same line PDFLIP-VOTE-LINE-BOOK books and the rank's vote keeps): ``cards[r]`` is D rank ``r``'s card by NVML
-    UUID. Under VOTE-LINE-SINGLE the fixed part is the one in ``ns.env_d`` (what the ranks read). Where no line of
-    this card is usable -- no D cards at this call, a rank count that does not match, an unmeasured / hand-set floor,
-    a footprint of another form -- the rank gets the STATED LAW ``corridor_law_mib()`` (the pre-#201 value), and the
-    source says why (``Rueckfall Korridor-Gesetz``). The rank lifts a threshold under its own line itself
-    (``extend_trim.lift_threshold_to_law``), so a launcher read that names another line than the rank's can only
-    trim earlier, never later."""
-    law = float(corridor_guard.corridor_law_mib())
-    if cards is None or len(list(cards)) != int(n):
-        why = ("keine D-Karten an dieser Stelle" if cards is None
-               else f"{len(list(cards))} D-Karten fuer {int(n)} Raten")
-        return [law] * int(n), [f"Rueckfall Korridor-Gesetz {law:.0f} ({why})"] * int(n)
-    cards = list(cards)
-    fixed = None
-    raw = str(parse_group_env(getattr(ns, "env_d", "") or "").get(_budget_rest.VOTE_FIXED_ENV, "") or "").strip()
-    if raw:
-        try:
-            fv = [float(x) for x in raw.split(",") if x.strip()]
-            fixed = (fv * int(n)) if len(fv) == 1 else (fv if len(fv) == int(n) else None)
-        except ValueError:
-            fixed = None
-    try:
-        floors, lines, usable, form_why = d_card_vote_lines(cards, "D", fixed)
-    except Exception as exc:  # noqa: BLE001 -- an unreadable card law: the stated law, named
-        why = f"Kartengesetz unlesbar ({type(exc).__name__}: {exc})"
-        return [law] * int(n), [f"Rueckfall Korridor-Gesetz {law:.0f} ({why})"] * int(n)
-    out: List[float] = []
-    srcs: List[str] = []
-    for r, c in enumerate(cards):
-        cf = floors[c.uuid]
-        if usable[r]:
-            out.append(float(lines[r]))
-            single = fixed is not None  # usable implies measured, and a measured floor takes the fixed part
-            srcs.append(f"Kartengesetz {float(lines[r]):.0f} ({cf.source}:{cf.mib}"
-                        + (", VOTE-LINE-SINGLE near-OOM + fixed" if single else "") + ")")
-        else:
-            why = form_why[r] if form_why[r] is not None else f"Boden {cf.source}:{cf.mib} nicht gemessen"
-            out.append(law)
-            srcs.append(f"Rueckfall Korridor-Gesetz {law:.0f} ({why})")
-    return out, srcs
 
 
-def _d_extend_flip_trim_env(ns, log, label: str, rtext: str,
-                            cards: Optional[Sequence[Card]] = None) -> Optional[str]:
-    """27B int4ar 23.10. (D TP2 2x3080, boot dkr27bint4arbar1int4ar10231400 a45112428e, D.log _1023_140032): wherever
-    the flip arm armed the vote (Q-694 rate + Q-710 floor), arm the rc12e trim too -- a value named in --env-d wins.
-
-    The vote funds the chunk from DRIVER free alone (a4f4b8fec1). The 27B launcher never wrote the trim itself (only
-    the NF #145 ledger path does, :func:`d_extend_trim_env`); the INT8 profile carried it by hand
-    (``27b.env``: ``--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1200,1100,800``), the duo profile and the int4ar profile
-    derived from it did not. Metal without it: 0 trims, D TP1 at 40-170 MiB driver free from 14:11Z on (near-OOM under
-    the corridor rule), reserved 18.4 GiB vs 17.2 GiB allocated, every vote 1 row, the Q-710 floor raised it to 256
-    (128-135 at 40 MiB free) -- 21003 D tokens in 137 extends, ~426 tok/s wall.
-
-    Threshold per rank = ``ceil(line of the rank's card + floor_rows(CHUNKED_PREFILL_TOKENS) x rate)``
-    (:func:`extend_trim.flip_trim_thresholds`): the driver free at which the vote funds at least the floor chunk
-    above the line; under it the extend first hands the fully free cache segments back. #201 TRIM-LAW (24.10.): the
-    line is the rank's OWN card's (:func:`d_flip_trim_lines`, D rank -> card UUID from ``cards``), not the stated law
-    for every rank: a MEASURED card whose line is under 1024 trims no earlier than its law needs, one over 1024 is no
-    longer priced under its line (the OOM direction). Unmeasured / foreign-form / no cards: the stated law, named.
-    Review MUSS 1 (ADMIT-BASIS): the written value is never under ``budget_rest.ADMIT_TRIM_BASIS`` (1104, the
-    threshold the admission records were measured under -- the admission trim reads this same list), named per rank,
-    until a re-measurement under the lower threshold replaces the records. No reserve, no new term: the line, the floor chunk and the rate are the ones the vote itself uses. Dual layout /
-    P0 / Next Flash never reach this (they never reach :func:`_d_extend_flip_rate_env`'s armed branch)."""
-    from flliper.srt.pdflip import extend_trim as _et
-
-    n = len([x for x in str(rtext or "").split(",") if x.strip()])
-    if n <= 0:
-        return None
-    lines, srcs = d_flip_trim_lines(ns, cards, n)
-    law_value = _et.flip_trim_thresholds(rtext, CHUNKED_PREFILL_TOKENS, 1, lines)
-    if not law_value:
-        return None
-    # #201 review MUSS 1 (ADMIT-BASIS): the same list is the admission trim's threshold, and the admission records
-    # (D_ADMIT_NEED_MIB, the duo non-booking) were measured with it at 1104 -- never WRITE a computed value under that
-    # basis (budget_rest.ADMIT_TRIM_BASIS; measured regime, not a reserve) until a re-measurement replaces it
-    _bound = _budget_rest.admit_trim_bound([float(x) for x in law_value.split(",")])
-    value = ",".join(str(int(v)) for v, _held in _bound)
-    _basis_name, _basis_mib = _budget_rest.ADMIT_TRIM_BASIS
-    _env_d = getattr(ns, "env_d", "") or ""
-    _have = parse_group_env(_env_d)
-    # a value other than our own came from the user (a second solve pass sees its own write)
-    _given = EXTEND_TRIM_ENV in _have and str(_have.get(EXTEND_TRIM_ENV, "")).strip() != value
-    if not _given:
-        ns.env_d = set_group_env(_env_d, EXTEND_TRIM_ENV, value)
-    _now = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_TRIM_ENV, "")).strip()
-    _rows = _et.floor_rows(CHUNKED_PREFILL_TOKENS, 1)
-    _per = " | ".join(
-        f"rang{r}" + (f" nvml{cards[r].nvml_index}" if cards is not None and len(list(cards)) == n else "")
-        + f": {srcs[r]} -> {law_value.split(',')[r]}"
-        + (f"; {_budget_rest.ADMIT_TRIM_BASIS_MARKER} {_basis_mib} haelt (Admissions-Records unter {_basis_name}="
-           f"{_basis_mib} gemessen -- neu messen, bevor die Schwelle darunter darf) -> {value.split(',')[r]}"
-           if _bound[r][1] else "")
-        for r in range(n))
-    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_TRIM_FLIP_MARKER} {EXTEND_TRIM_ENV}={_now}"
-        f"{' (aus --env-d gesetzt, unveraendert; berechnet ' + value + ')' if _given else ''} (je Rang ceil(Linie der "
-        f"eigenen Karte + Bodenchunk {_rows} x Rate); darunter gibt D vor dem Extend die ganz freien Cache-Segmente an "
-        f"den Treiber zurueck, damit die Breitenabstimmung den echten Kartenstand liest) [{TRIM_LAW_MARKER} {_per}]")
-    if _given:
-        # review R1 (#201): a hand value under the basis stays in force (the user's regime, not overruled) but is
-        # named: the admission records were measured at the basis, so an untrimmed pass can enter the admission under
-        # 400 + A_peak on that rank
-        try:
-            _hv = [float(x) for x in _now.split(",") if x.strip()]
-            _hv = (_hv * n) if len(_hv) == 1 else _hv
-            for _r, _v in _budget_rest.admit_trim_hand_under_basis(_hv):
-                log(f"{D_RANK_SOLVE_MARKER} {label} WARNUNG {TRIM_LAW_MARKER} {_budget_rest.ADMIT_TRIM_HAND_MARKER} "
-                    f"rank={_r} value={_v:.0f} basis={_basis_mib}: der Handwert aus --env-d {EXTEND_TRIM_ENV} liegt "
-                    f"unter der Basis, unter der die Admissions-Records gemessen sind (Schwelle >= 400 + A_peak 522 = "
-                    f"922) -- bleibt unveraendert wirksam (Nutzer-Handwert, nicht ueberstimmt); eine ADMIT-NEED-Form "
-                    f"(int4ar/duo) laeuft damit ausserhalb ihres gemessenen Regimes")
-        except ValueError:
-            pass  # an unreadable hand value is the rank's own parse_thresholds warning (trim off), not ours
-    return _now
 
 
-#: #201: the per-rank provenance of the flip arm's trim threshold (card law or the named stated-law fallback)
-TRIM_LAW_MARKER = "TRIM-LAW"
 
 
-#: Q-710: the arming variable of the chunk-cap floor (the vote never crawls)
-EXTEND_CAP_FLOOR_ENV = "FLLIPER_PDFLIP_EXTEND_CAP_FLOOR"
-EXTEND_CAP_FLOOR_MARKER = "EXTEND-CAP-FLOOR"
 
 
-def _d_extend_cap_floor_env(ns, log, label: str) -> None:
-    """Q-710 (INT8 y8vb 03.10. 19:34-19:51Z): arm the vote floor wherever the flip arm armed
-    the Q-694 chunk cap -- and only there. On a card with < 300 MiB free in the D phase the
-    rc12g vote was ONE row, the group cut to 1 token per forward (3905 extends of ~152 ms in 17
-    min, 133 s without a decode step). With the flag the vote keeps a floor chunk derived from
-    the configured chunk width and what the free card funds at the priced rate, and a fresh
-    D-direct request longer than a starved group width is refused at the X gate so the front
-    routes it through P (``EXTEND-CAP-FLOOR route=P``). A value named in --env-d wins. The P0
-    arm, Next Flash (ledger rate) and the dual layout never reach this."""
-    _env_d = getattr(ns, "env_d", "") or ""
-    _given = EXTEND_CAP_FLOOR_ENV in parse_group_env(_env_d) and \
-        str(parse_group_env(_env_d).get(EXTEND_CAP_FLOOR_ENV, "1")).strip() != "1"
-    if not _given:
-        ns.env_d = set_group_env(_env_d, EXTEND_CAP_FLOOR_ENV, "1")
-    _on = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_CAP_FLOOR_ENV, "")
-              ).strip().lower() in ("1", "true", "yes", "on")
-    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_CAP_FLOOR_MARKER} floor={'on' if _on else 'off'}"
-        f"{' (aus --env-d, Vorrang)' if _given else ''}: der Chunk-Deckel faellt nie unter "
-        f"chunked_prefill_size/16 (begrenzt auf floor(card_free_post / Rate)); ein frischer "
-        f"D-Direktprefill laenger als eine Gruppenbreite unter dem Boden geht ueber P")
 
 
-def d_verdict_measured_terms(fremd, nicht_torch, card_terms, other_record, n: int, record_name: str):
-    """27B port fix 21.10. (rc29b INT8: the #145 verdict printed REST 3096 MiB on D TP1, the card held 1332 MiB free at
-    idle): ``(fremd, nichttorch, booked_from)`` for the D verdict. A flag given (``fremd`` / ``nicht_torch`` not None) is
-    kept. Unset, they are booked from what this pass and the records MEASURED -- never guessed: fremd = the budget's
-    ``dormant`` term (P's dormant footprint the budget charged), nichttorch = the budget's ``carve`` term (NVML reserved)
-    + the record ``D_TORCH_CAP_OTHER_MIB`` (D's non-torch part: context/driver/communicator/lmem, max over the awake
-    VRAM-PEAK lines of 8 boots). Without terms or record a term stays None (the verdict names it NICHT GEBUCHT)."""
-    booked: List[str] = []
-    v_fremd, v_nt = fremd, nicht_torch
-    terms = list(card_terms) if card_terms is not None else None
-    if terms is None or len(terms) != n:
-        return v_fremd, v_nt, booked
-    if v_fremd is None:
-        v_fremd = [float(t.get("dormant", 0) or 0) for t in terms]
-        booked.append("fremd=dormant_other (budget term)")
-    if v_nt is None and other_record is not None and len(list(other_record)) == n \
-            and all(o is not None for o in other_record):
-        v_nt = [float(t.get("carve", 0) or 0) + float(o) for t, o in zip(terms, other_record)]
-        booked.append("nichttorch=driver_carve (budget term) + RECORD %s" % record_name)
-    return v_fremd, v_nt, booked
 
 
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
@@ -21754,263 +14319,16 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
     return pplan.refusal
 
 
-def publish_store_identity(model: str, map_path: str, log) -> str:
-    """H2c: die Identitaet des geteilten Expertenstores fuer diesen Boot.
-
-    Ein Sentinel ``*.written.json`` sagte bis hier nur "diese Plaetze sind
-    geschrieben" -- nicht mit welchem Checkpoint und welcher Slot-Karte. Der
-    Store ueberlebt den Prozess; ein Boot mit anderem Checkpoint oder anderen
-    FR/``--rank-moe-ratio`` haette mit D-Store-Adopt (H2) fremde Bytes als
-    eigene Experten gelesen. Deshalb war H2 im Profil aus
-    (ENTSCHEIDUNGEN-0927, 28.09.: "Expertenstore-Identitaet ist VORBEDINGUNG").
-
-    Ohne Karte ``""``: dann gibt es keine Slot-Zuordnung, und store_adopt
-    bleibt inaktiv. Ein Fehler beim Rechnen ist ebenfalls ``""`` -- das ist
-    die sichere Richtung (D liest vom Checkpoint), nie eine halbe Identitaet.
-    """
-    if not map_path:
-        log("H2c STORE-IDENTITY ENTFAELLT: no experts card -> D-Store-Adopt inactive")
-        return ""
-    from flliper.srt.layers.moe import expert_store as _es
-
-    try:
-        ident = _es.compute_identity(model, map_path)
-    except OSError as exc:
-        log("H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inactive"
-            % (type(exc).__name__, exc))
-        return ""
-    log("H2c STORE-IDENTITY id=%s model=%s map=%s (beide Gruppen; ein Sentinel "
-        "ohne diese Identitaet belegt nichts)" % (ident or "-", model, map_path))
-    return ident
 
 
-EXPERT_MAP_DIR_ENV = "FLLIPER_PDFLIP_EXPERT_MAP_DIR"
 
 
-def expert_map_dir(evidence_dir: str, log) -> str:
-    """Where the expert maps (#107 Platztausch, V1) are written: the evidence
-    dir when this process can write it, else a NAMED writable fallback
-    (``FLLIPER_PDFLIP_EXPERT_MAP_DIR``, default ``<tmp>/pdflip-expert-maps``).
-
-    Dry runs against a container's evidence tree (owned by the container's
-    user) printed 'PDFLIP-EXPERT-MAP failed: PermissionError' and published no
-    map -- so the dry run never showed the map the boot would build. Both
-    groups read the map by the path in their env, so any directory this
-    launcher can write and the ranks can read is correct; the redirect is
-    logged so a reader never looks for the map in the wrong place."""
-    try:
-        os.makedirs(evidence_dir, exist_ok=True)
-    except OSError:
-        pass
-    if os.path.isdir(evidence_dir) and os.access(evidence_dir, os.W_OK | os.X_OK):
-        return evidence_dir
-    import tempfile
-
-    alt = (os.environ.get(EXPERT_MAP_DIR_ENV)
-           or os.path.join(tempfile.gettempdir(), "pdflip-expert-maps"))
-    os.makedirs(alt, exist_ok=True)
-    log(f"PDFLIP-EXPERT-MAP-DIR {evidence_dir} is not writable by this process -> "
-        f"maps go to {alt} ({EXPERT_MAP_DIR_ENV}); both groups read them by the "
-        f"path in their env")
-    return alt
 
 
-def publish_expert_map(ns, model: str, evidence_dir: str, log,
-                       p_stage_layers=None,
-                       chunk_layers: Optional[int] = None) -> str:
-    """Die EXPERTEN-KARTE bauen und ablegen; Pfad zurueck, sonst "".
-
-    #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird requires ne
-    karte"*. `expert_map.build` gab es seit dem Tag, `expert_store.expert_map`
-    liest sie aus ``FLLIPER_MOE_EXPERT_MAP`` -- und NIEMAND hat sie je
-    geschrieben (gemessen 22.09.: 2 Leser-Dateien, 0 Schreiber, in keinem
-    Boot-argv). Ein Leser ohne Schreiber ist kein Riegel, er ist ein
-    Kommentar (Memory ``riegel-hinter-dem-was-er-sichert``).
-
-    Was das kostete: ohne Karte faellt ``_expert_store_rows_for`` auf die
-    globale Residenz-Id-Datei zurueck. Die kennt EINE Zahl fuer alle Karten,
-    also muss sie im Schnitt aller Stufen und Raenge liegen -- bei FR_P
-    0.377/0.700/0.442 und FR_D 0.006/... bleibt genau EINE Id uebrig, die
-    78+79 residenten Experten der beiden 3080er fallen heraus. Der Store
-    wuchs dadurch von 420 auf 511 Slots (+22 %), liegt in tmpfs (= shmem =
-    Host-RAM), und der Kernel toetete D-Rang 0 (w128, oom_kill 30 -> 31).
-    Die Karte rechnet fuer dieselbe Form 354 Slots.
-
-    KONSERVATIV: fehlt ein Vektor oder widerspricht sich die Karte, wird
-    NICHTS geschrieben und der Lauf rechnet wie bisher -- eine halbe Karte
-    waere eine falsche Slot-Zuordnung, und die ist Datenverlust.
-    """
-    import json as _json
-
-    _skip = pdflip_form.gate_skip_line("#107 PDFLIP-EXPERT-MAP", getattr(ns, "pdflip_boot_form", None))
-    if _skip:
-        log(_skip)
-        return ""
-    try:
-        # LOKAL importieren wie jede andere Funktion hier: `_pp_cut` ist im
-        # Modulraum NICHT gebunden (nur in solve_p_cut/solve_d_ranks). Ohne
-        # diese Zeile haette der `except BaseException` unten den NameError
-        # geschluckt und "failed" geloggt -- ein Fix, der seine eigene
-        # Fehlerklasse reproduziert. Der Test hat es gefangen.
-        from flliper.srt.planner import pp_cut as _pp_cut
-        from flliper.srt.layers.moe import expert_map as _em
-
-        ratios, fr_tp, fr_pp = expert_map_vectors(ns)
-        gaps = []
-        if not ratios:
-            gaps.append("--rank-moe-ratio (extra_d)")
-        if not fr_tp:
-            gaps.append("--rank-moe-resident-fraction (extra_d)")
-        if not fr_pp:
-            gaps.append("--pp-cut-expert-device-fraction / extra_p")
-        if gaps:
-            log("#107 EXPERTEN-KARTE ENTFAELLT: %s fehlt. Ohne sie rechnet "
-                "jede Gruppe wieder selbst und die Residenz der jeweils "
-                "anderen Raenge zaehlt nicht mit." % ", ".join(gaps))
-            return ""
-        total = int(_pp_cut.checkpoint_weight_terms(model).num_experts)
-        # #159: `mirror` laesst P dieselben Ids waehlen wie D. Der Austausch
-        # kann nur Bytes umhaengen, die BEIDE Seiten als denselben Tensor
-        # beschreiben; ohne den Spiegel ist die Schnittmenge gemessen ZWEI
-        # von 193 (fnFL2w132). Env-Schalter, damit die alte Form fuer einen
-        # A/B byte-identisch erreichbar bleibt.
-        # DEFAULT AUS (22.09. 21:0xZ, fnFL2w133): der Spiegel ist erst zur
-        # HAELFTE gebaut. Er aendert die KARTE, aber die Residenz stellt im
-        # Rang weiter `resident_fraction_for_rank()` her -- "die ersten N".
-        # Karte und Rang widersprechen sich dann, und der Rang refused beim
-        # Laden: "#107: 113 eigene kalte Experten haben in der KARTE keinen
-        # Platz (erste: [236,237,238,239])" -- Id 236 ist in der Karte
-        # resident, im Rang kalt. w133 starb daran, waehrend w132 mit
-        # derselben Kette bis zum Wake kam.
-        #
-        # Was fehlt, ist `expert_map.resident_of()` im Ladepfad: die Funktion
-        # existiert seit #107 und hat NULL Aufrufer -- dieselbe Klasse, die
-        # heute schon #140, #156 und #107 selbst getroffen hat. Erst wenn der
-        # Rang seine Residenz AUS DER KARTE nimmt, darf der Spiegel an.
-        _mirror = str(os.environ.get("PDFLIP_EXPERT_MAP_MIRROR", "0")).strip() \
-            in ("1", "true", "True", "on")
-        # PLATZTAUSCH (Nutzer-Entscheid 22.09. 22:20Z): die Version-2-Karte.
-        # Jede Phase haelt ihre eigene Anzahl; koordiniert wird nur die WAHL
-        # der Ids (geschachtelt). Sie braucht den REALISIERTEN P-Layer-Split,
-        # weil P's Residenz je STUFE gilt und ein Rang seinen Layer ueber die
-        # Stufe adressiert (unter tp=1 ist moe_tp_rank fuer alle Stufen 0).
-        emap, _layer_stage = build_expert_karte(total, ratios, fr_pp, fr_tp,
-                                                 p_stage_layers, _mirror)
-        if _layer_stage is None and not _mirror:
-            _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
-            log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
-                "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
-                % (_stages or "unbekannt", len(fr_pp)))
-        reason = _em.refuse_if_inconsistent(emap)
-        if reason:
-            log("#107 EXPERTEN-KARTE VERWORFEN (not written): %s" % reason)
-            return ""
-        _refuse_unbuilt_platztausch_buffers(emap, chunk_layers=chunk_layers)
-        file_path = os.path.join(expert_map_dir(evidence_dir, log), f"expert_map_{ns.tag}.json")
-        with open(file_path, "w") as fh:
-            _json.dump(emap, fh)
-        # #239 rc12z29c-Blocker 2: die D-Form, die diese Karte beschreibt --
-        # jeder D-Start wird dagegen geprueft (refuse_d_form_off_the_map)
-        ns._expert_map_d_form = {"ratios": [str(x) for x in ratios],
-                                 "fractions": [str(x) for x in fr_tp]}
-        if _em.is_nested(emap):
-            _pp = emap["phases"]["P"]
-            _dp = emap["phases"]["D"]
-            _row_mib = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0)
-            log(
-                "PLATZTAUSCH-KARTE %s: %d experts, Store %d slots per Layer "
-                "(= Komplement der Schnittmenge %d, in BEIDEN Phasen dieselbe "
-                "Belegung, beim Flip wird nichts zurueckgeschrieben); P je Stufe "
-                "resident %s davon gemeinsam %s; D je Rang resident %s. Der "
-                "Austausch bewegt je Layer den gemeinsamen Praefix, das Extra "
-                "holt der aufwachende Rang aus dem Store."
-                % (file_path, total, int(emap["slots"]), int(emap["shared_resident"]),
-                   [len(x) for x in _pp["resident"]],
-                   [len(x) for x in _pp["common"]],
-                   [len(x) for x in _dp["resident"]])
-                + (" Store ~%.1f GiB." % (int(emap["slots"]) * _row_mib
-                                          * len(emap.get("p_layer_stage", []))
-                                          / 1024.0) if _row_mib else "")
-            )
-            _nj = _em.nested_join_verdict(emap)
-            if _nj:
-                log("PLATZTAUSCH FLIP-JOIN UNMOEGLICH: " + " | ".join(_nj))
-            log_draft_swap(ns, emap, fr_pp_before=getattr(ns, "_h25_fr_p_before", None),
-                           total=total, ratios=ratios, fr_tp=fr_tp,
-                           layer_stage=_layer_stage, row_mib=_row_mib, log=log)
-            return file_path
-        _join = _em.join_verdict(emap)
-        if _join:
-            log("#159 FLIP-JOIN IMPOSSIBLE -- this boot cannot flip:")
-            for _z in _join:
-                log("     " + _z)
-            log("     The swap is an OWNER CHANGE: what the one "
-                "Gruppe nicht resident haelt, kann die andere nicht "
-                "uebernehmen. Gleiche ANZAHL genuegt nicht -- P nimmt die "
-                "ersten N von 0..total, D je Rang die ersten N SEINES Bandes; "
-                "bei 158 gegen 158 ist die Schnittmenge EINS. Gemessen "
-                "fnFL2w130/w131/w132: jedes Mal W68 PdFlipXchgPlanDisagree beim "
-                "Wake, 40 Minuten nach dem Start, alle drei PP-Raenge tot.")
-        else:
-            log("#159 FLIP-JOIN ok: beide Gruppen halten je Layer dieselben Ids")
-        log(
-            "#107 EXPERTEN-KARTE %s: %d Experten, %d Store-Plaetze, P haelt je "
-            "Stufe %s, D je Rang %s; der Flip bewegt %d Zeilen, %d bleiben auf "
-            "den Karten liegen. BEIDE Gruppen lesen diese Datei -- vorher "
-            "rechnete jede selbst und die Residenz der anderen Raenge fiel "
-            "unter den Tisch."
-            % (file_path, total, int(emap["slots"]),
-               [len(x) for x in emap["phases"]["P"]["resident"]],
-               [len(x) for x in emap["phases"]["D"]["resident"]],
-               int(emap["moves"]), int(emap["shared_resident"]))
-        )
-        return file_path
-    except PdFlipLaunchRefused:
-        # W120 kippt den Boot -- mit Absicht, und als EINZIGE Ausnahme der
-        # Regel darunter: eine Karte, die ein Rang nicht baut, flippt nicht
-        # (x100), und ohne Karte flippt der Lauf erst recht nicht.
-        raise
-    except BaseException as _exc:  # noqa: BLE001 -- eine Karte kippt nie den Boot
-        log("#107 EXPERTEN-KARTE failed: %s: %s" % (type(_exc).__name__, _exc))
-        return ""
 
 
-def expert_map_vectors(ns) -> Tuple[List[str], List[str], List[float]]:
-    """(--rank-moe-ratio, FR_D, FR_P) exactly as :func:`publish_expert_map`
-    reads them -- one reader, so the host ledger's store post
-    (:func:`planned_expert_store_bytes`) sizes the store the map will build."""
-    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
-    fr_tp = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
-    _fp_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "")
-    fr_pp = (_csv_floats(_fp_text) if _fp_text else
-             [float(x) for x in (_argv_vector(
-                 getattr(ns, "extra_p", ""), "--rank-moe-resident-fraction") or [])])
-    return ratios, fr_tp, fr_pp
 
 
-def build_expert_karte(total, ratios, fr_pp, fr_tp, p_stage_layers, mirror: bool = False):
-    """(karte, p_layer_stage) -- the Version-2 (Platztausch) map when the
-    realised P layer split matches FR_P, else the Version-1 map with
-    p_layer_stage None. The ONE build both the map writer and the ledger's
-    dry sizing call."""
-    from flliper.srt.layers.moe import expert_map as _em
-
-    _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
-    if _stages and len(_stages) == len(fr_pp) and not mirror:
-        _layer_stage = [s for s, n in enumerate(_stages) for _ in range(n)]
-        return _em.build_nested(
-            total=total,
-            ratios=[int(float(x)) for x in ratios],
-            fr_pp=[float(x) for x in fr_pp],
-            fr_tp=[float(x) for x in fr_tp],
-            p_layer_stage=_layer_stage,
-            pad_tp=1,
-        ), _layer_stage
-    return _em.build(total=total,
-                     ratios=[int(float(x)) for x in ratios],
-                     fr_pp=[float(x) for x in fr_pp],
-                     fr_tp=[float(x) for x in fr_tp],
-                     mirror=mirror), None
 
 
 #: 29.09. (Planer post COLD_TIER_SHM): filesystems whose pages are shmem --
@@ -22022,56 +14340,8 @@ COLD_TIER_REPRICE_EPS_GIB = 0.01
 COLD_TIER_MARKER = "PDFLIP-HOST-LEDGER COLD-TIER"
 
 
-def expert_store_dir_of(ns) -> str:
-    """The expert store directory the RANKS get: --env-d, then --env-p, then
-    the launcher's own environment (ENV-LAUNCHER != RANG -- the NF arm sets it
-    in the group env only)."""
-    from flliper.srt.layers.moe.expert_store import STORE_DIR_ENV
-
-    for spec in (getattr(ns, "env_d", ""), getattr(ns, "env_p", "")):
-        v = parse_group_env(spec or "").get(STORE_DIR_ENV)
-        if v:
-            return str(v)
-    return str(os.environ.get(STORE_DIR_ENV, "") or "")
 
 
-def planned_expert_store_bytes(ns, model: str, p_stage_layers=None,
-                               karte_path: str = "") -> Tuple[Optional[int], str]:
-    """The expert store's size from its DIMENSIONING source, never from df:
-    store slots per layer x MoE layers x row bytes. ``karte_path`` = the map
-    as written (after the D form is pinned); else the map is dry-built from
-    the same vectors :func:`publish_expert_map` reads. (None, why) when no
-    map could be built -- the ranks then size their store themselves."""
-    from flliper.srt.planner import pp_cut as _pp_cut
-
-    _terms = []
-
-    def terms():
-        if not _terms:
-            _terms.append(_pp_cut.checkpoint_weight_terms(model))
-        return _terms[0]
-
-    if karte_path:
-        with open(karte_path) as fh:
-            emap = json.load(fh)
-        src = f"map {karte_path}"
-    else:
-        ratios, fr_tp, fr_pp = expert_map_vectors(ns)
-        if not (ratios and fr_tp and fr_pp):
-            return None, "no map vectors (--rank-moe-ratio / FR_D / FR_P) -- no map, no sized store"
-        _mirror = str(os.environ.get("PDFLIP_EXPERT_MAP_MIRROR", "0")).strip() in ("1", "true", "True", "on")
-        emap, _ls = build_expert_karte(int(terms().num_experts), ratios, fr_pp, fr_tp,
-                                        p_stage_layers, _mirror)
-        src = "map dry-built from the vectors publish_expert_map reads"
-    # the row the P cut priced (ns._expert_row_mib, same checkpoint terms) --
-    # read only once a map exists: a dense checkpoint has no rows to price
-    row = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0) * _pp_cut.MIB
-    if row <= 0:
-        row = float(terms().expert_layer_weight_bytes) / max(1, int(terms().num_experts))
-    slots = int(emap["slots"])
-    layers = len(emap.get("p_layer_stage") or []) or int(terms().n_layers)
-    return int(slots * layers * row), (f"slots {slots} x {layers} layers x "
-                                       f"{row / _pp_cut.MIB:.3f} MiB/row ({src})")
 
 
 def cold_tier_shm_post(ns, model: str, p_stage_layers=None, karte_path: str = "",
@@ -22108,240 +14378,22 @@ def cold_tier_shm_post(ns, model: str, p_stage_layers=None, karte_path: str = ""
 
 
 
-#: The env the D ranks read FR_D from (resident_fraction.resident_fraction_for_rank).
-D_FR_ENV = "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"
 
 
-def _same_vector(a, b) -> bool:
-    try:
-        fa, fb = [float(x) for x in a], [float(x) for x in b]
-    except (TypeError, ValueError):
-        return False
-    return len(fa) == len(fb) and all(abs(x - y) <= 1e-9 for x, y in zip(fa, fb))
 
 
-def refuse_d_form_off_the_map(ns, log) -> None:
-    """W170: the D form a D start carries must be the map's (#239 rc12z29c).
-
-    Called right before every D env/argv is built (d-only, dry run, real). A
-    no-op without a published map. Reads what D will actually read: the
-    ratio and FR in --extra-d and FR in --env-d. Whatever moved it after the
-    map (a later solve, the P1c FR-D ceiling, an operator edit) is refused by
-    name here, never discovered by D's loader."""
-    form = getattr(ns, "_expert_map_d_form", None)
-    if not form:
-        return
-    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
-    fr = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
-    env_fr_text = parse_group_env(getattr(ns, "env_d", "") or "").get(D_FR_ENV)
-    moved = []
-    if not _same_vector(ratios or [], form["ratios"]):
-        moved.append(f"--rank-moe-ratio {ratios} (Karte {form['ratios']})")
-    if not _same_vector(fr or [], form["fractions"]):
-        moved.append(f"--rank-moe-resident-fraction {fr} (Karte {form['fractions']})")
-    if env_fr_text is not None and not _same_vector(
-            [x for x in str(env_fr_text).split(",") if x.strip()], form["fractions"]):
-        moved.append(f"--env-d {D_FR_ENV}={env_fr_text} (Karte {form['fractions']})")
-    if moved:
-        raise PdFlipDFormOffTheMap(
-            "W170 PdFlipDFormOffTheMap: D would start with a form the Platztausch map "
-            "does not describe -- " + "; ".join(moved) + ". P loaded its prefix and "
-            "store slots from the map; D would die at load. Fix the solve that "
-            "moved it, not the map (#239 rc12z29c)")
-    log(f"KARTE-FORM (#239 rc12z29c) D-START geprueft: --rank-moe-ratio "
-        f"{','.join(form['ratios'])}, FR_D {','.join(form['fractions'])} = die Form der Karte")
 
 
-def repoint_store_geometry_at_pinned_form(xchg_env: Dict[str, str], form: dict,
-                                          total: int, log) -> None:
-    """#239 rc12z29c-Blocker 2: the geometry published from --extra-d BEFORE
-    the pre-map D solve (#106 STORE-GEOMETRY, #134 bands, the V1 map) carries
-    the stated vectors -- rc12z29c's D log still printed '#96 STORE-SLOTS
-    rank=2 ... ratios=[183, 137, 168] fracs=[0.06, 0.51, 0.48]'. With the
-    Platztausch map that line is only a diagnostic (the map is the slot
-    authority), but a run whose map fails falls back to exactly these values.
-    So every geometry published from the vectors follows the pinned form."""
-    from flliper.srt.layers.moe import expert_map as _em
-
-    ratios, fracs = list(form["ratios"]), list(form["fractions"])
-    if "FLLIPER_MOE_EXPERT_STORE_GEOMETRY" in xchg_env:
-        was = xchg_env["FLLIPER_MOE_EXPERT_STORE_GEOMETRY"]
-        xchg_env["FLLIPER_MOE_EXPERT_STORE_GEOMETRY"] = f"{','.join(ratios)}|{','.join(fracs)}"
-        log(f"PDFLIP-STORE-GEOMETRY shared={xchg_env['FLLIPER_MOE_EXPERT_STORE_GEOMETRY']} "
-            f"source=KARTE-FORM (#239 rc12z29c; vorher {was} aus dem genannten Vektor)")
-    if "FLLIPER_PDFLIP_EXPERT_BAND_SIZE" in xchg_env:
-        _bs, _bc = _em.band_geometry([int(float(x)) for x in ratios], int(total))
-        if _bs > 0:
-            xchg_env["FLLIPER_PDFLIP_EXPERT_BAND_SIZE"] = str(_bs)
-            xchg_env["FLLIPER_PDFLIP_EXPERT_BANDS"] = str(_bc)
-        else:
-            xchg_env.pop("FLLIPER_PDFLIP_EXPERT_BAND_SIZE", None)
-            xchg_env.pop("FLLIPER_PDFLIP_EXPERT_BANDS", None)
-        log(f"PDFLIP-EXPERT-BAND size={_bs} count={_bc} from the KARTE-FORM (#239 rc12z29c)")
-    if xchg_env.pop(_em.MAP_ENV, None) is not None:
-        log("PDFLIP-EXPERT-MAP (V1, aus dem genannten Vektor) rejected (#239 rc12z29c): "
-            "die Karte kommt aus publish_expert_map und der gepinnten Form")
 
 
-def _refuse_unbuilt_platztausch_buffers(emap: dict, *,
-                                        chunk_layers: Optional[int]) -> None:
-    """W120 VOR dem ersten Byte: die Karte gibt einem Rang einen
-    Platztausch-Puffer, den er beim Laden nicht baut.
-
-    fnFL2x100 (FR_P 0.45/0.95/1.0): P-Stufe 2 hielt alle 512 Experten, baute
-    darum keinen Puffer und publizierte fuer Layer 40-47 den nackten Stapel;
-    der Join liess D's 32 Puffer (3,69 GB) als "destination-only" fallen, und
-    D TP1 starb im ersten Schlaf-Leg an W106 auf weights_14 -- nach 5 Minuten
-    Laden, READY und Kontroll-Decode. Das ist aus der Karte allein ablesbar,
-    also refused der Dry-Run es, mit Stufe/Rang, Layern und Tags.
-    """
-    from flliper.srt.layers.moe import expert_map as _em
-
-    unbuilt = _em.unbuilt_platztausch_buffers(emap)
-    if not unbuilt:
-        return
-    row_list = []
-    for u in unbuilt:
-        wer = (f"P-Stufe {u.index}" if u.phase == _em.PHASE_PP
-               else f"D-Rang {u.index}")
-        tags = ("?" if not chunk_layers else ",".join(
-            f"weights_{t}" for t in sorted({l // int(chunk_layers)
-                                             for l in u.layers})))
-        row_list.append(
-            f"{wer}: {u.resident} von {u.experts} Experten resident -> kein "
-            f"Puffer (Layer {u.layers[0] if u.layers else '?'}-"
-            f"{u.layers[-1] if u.layers else '?'}, Tags {tags}); groesste "
-            f"Fraction mit Puffer {u.max_fraction:.3f}")
-    raise PdFlipLaunchRefused(
-        "W120 PdFlipPlatztauschBufferUnbuilt: " + " | ".join(row_list)
-        + ". Ein Rang mit weniger als 2 Scratch-Zeilen baut keinen "
-        "Platztausch-Puffer (plan_load_time_staging: R >= E; scratch_slot_count: "
-        "E-R < 2) und publiziert den nackten Expertenstapel unter einem anderen "
-        "Namen -- der Flip-Join findet fuer diese Layer kein Gegenstueck "
-        "(x100: W106 auf D TP1 weights_14, 120 s spaeter W29, Gruppe tot). "
-        "Bei der genannten Fraction umfasst der Puffer weiterhin jede Zeile.")
 
 
-def log_draft_swap(ns, emap, *, fr_pp_before, total, ratios, fr_tp, layer_stage,
-                   row_mib: float, log) -> None:
-    """H25 (Praezisierung 08:30Z "ein systemram gegen vram tausch"): the host
-    balance of the swap in ONE line -- the Platztausch store before and after
-    the draft post (the map is rebuilt with the arm's own FR_P for "before"),
-    plus D's parked draft. Only when group P carries no draft."""
-    if str(getattr(ns, "draft_kv_on_p", "on")) != "off":
-        return
-    from flliper.srt.layers.moe import expert_map as _em
-    from flliper.srt.pdflip import draft_post as _dp
-
-    slots_after = int(emap["slots"])
-    slots_before = slots_after
-    if fr_pp_before:
-        slots_before = int(_em.build_nested(
-            total=total, ratios=[int(float(x)) for x in ratios],
-            fr_pp=[float(x) for x in fr_pp_before], fr_tp=[float(x) for x in fr_tp],
-            p_layer_stage=layer_stage, pad_tp=1)["slots"])
-    path = _argv_scalar(getattr(ns, "extra_d", ""), "--speculative-draft-model-path") or ""
-    host = _dp.d_draft_host_mib(str(path), share_embed=d_draft_share_embed(ns)) if path else None
-    log(_dp.draft_swap_line(slots_before=slots_before, slots_after=slots_after,
-                            layers=len(layer_stage), row_mib=float(row_mib),
-                            d_draft_host=host))
 
 
-def d_draft_share_embed(ns) -> bool:
-    """Group D's FLLIPER_PDFLIP_DRAFT_SHARE_EMBED (H1b): --env-d wins over the
-    launcher's own environment, which the ranks inherit."""
-    raw = parse_group_env(getattr(ns, "env_d", "") or "").get("FLLIPER_PDFLIP_DRAFT_SHARE_EMBED")
-    if raw is None:
-        return bool(envs.FLLIPER_PDFLIP_DRAFT_SHARE_EMBED.get())
-    return str(raw).strip().lower() in ("1", "true", "yes", "y")
 
 
-def apply_p_draft_post(ns, cards, fracs, stage_layers, row_mib: float,
-                       num_experts: int, log) -> List[float]:
-    """H25: raise the last P stage's expert fraction by the draft's post and
-    publish it to ``--pp-cut-expert-device-fraction``, ``--extra-p
-    --rank-moe-resident-fraction`` and ``--env-p
-    FLLIPER_MOE_RESIDENT_EXPERT_FRACTION`` -- the three places FR_P lives
-    (arm_fnFL2.sh: "FR_P steht an DREI Stellen"); a reader left on the old
-    value would be the argv-doppelung class. Returns the fractions the pool
-    model prices."""
-    from flliper.srt.pdflip import draft_post as _dp
-
-    path = (_argv_scalar(getattr(ns, "extra_p", ""), "--speculative-draft-model-path")
-            or _argv_scalar(getattr(ns, "extra_d", ""), "--speculative-draft-model-path")
-            or "")
-    new, post, why = _dp.raise_for_draft_post(
-        fracs=fracs, stage_layers=stage_layers, row_mib=row_mib,
-        num_experts=num_experts, draft_path=str(path), cards=cards)
-    if post is None:
-        log(f"PP-CUT draft post (H25) ENTFAELLT: {why}")
-        return list(fracs)
-    log(post.line())
-    ns._h25_draft_post = _dp.summary(post)
-    ns._h25_fr_p_before = [float(x) for x in fracs]
-    ns.pp_cut_expert_device_fraction = ",".join(_dp._fmt(x) for x in new)
-    ns.extra_p = _dp.replace_vector_flag(ns.extra_p, "--rank-moe-resident-fraction", new)
-    ns.env_p = _dp.replace_env_vector(getattr(ns, "env_p", ""),
-                                      "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", new)
-    log(f"PP-CUT draft post (H25) FR_P {[round(float(x), 4) for x in fracs]} -> "
-        f"{ns.pp_cut_expert_device_fraction} (published to --pp-cut-expert-device-"
-        f"fraction, --extra-p --rank-moe-resident-fraction, --env-p "
-        f"FLLIPER_MOE_RESIDENT_EXPERT_FRACTION)")
-    return new
 
 
-def _restage_p_card_reference(ns, cards, reference, support, co_tenant, stage_layers, log, *,
-                              layer_kinds, dense_mib_per_layer, mamba_mib_per_linear_layer_per_slot):
-    """AP2 1006 (W167 at N != 3): the P-card reference (built in, or from
-    ``--p-card-reference-logs``) was measured on its own stage count -- the NF
-    built-in one on 3 stages of [RTX5090, RTX3080, RTX3080]. A launch of another
-    card count used to stop at W167 ("Stufenzahl 2 gegen 3") even with --force.
-
-    Now the reference is RE-STAGED (``p_card_chunk.restage_reference``): each
-    live stage takes the measured row of the reference stage of the SAME ROLE
-    (first / middle / last, ``role_stage_map``) and its K0 is shifted by its
-    layer count exactly as a same-count recut. When every live stage sits on a
-    card of the class its reference stage was measured on (5090 + 3080 from the
-    reference rig) the row is the class's own measurement: one ``PP-CUT RESTAGE``
-    line, DERIVED. When a stage borrows another class's row (a middle 5090 of
-    2 x 5090 + 2 x 3080, any 3090) it is the value refusal HW-UNCALIBRATED:
-    without ``--force`` refused by name as before, with it FORCED-PAST and named
-    UNMEASURED. A reference that cannot be re-staged (layer types / Dense /
-    Mamba price unknown, one stage) stays W167."""
-    smap = _p_card.role_stage_map(len(stage_layers), len(reference.stage_layers))
-    if smap is None:
-        _p_card.recut_check(reference.stage_layers, stage_layers, layer_kinds, _p_card.CARD_MARKER)
-        raise _p_card.PCutRecutRefused(   # pragma: no cover - recut_check refuses every count mismatch
-            f"{_p_card.RECUT_REFUSAL_CODE}: {_p_card.CARD_MARKER} -- no stage role to place")
-    ref_new, sup_new, co_new = _p_card.restage_reference(
-        reference, support, co_tenant, stage_layers, smap, layer_kinds=layer_kinds,
-        dense_mib_per_layer=dense_mib_per_layer,
-        mamba_mib_per_linear_layer_per_slot=mamba_mib_per_linear_layer_per_slot)
-    prof = str(getattr(ns, "profile", None) or pdflip_form.DEFAULT_PROFILE)
-    ref_classes, _ = records_inventory(prof)
-    ref_classes = tuple(ref_classes) if len(ref_classes) == len(reference.stage_layers) else ()
-    live = [card_identity.class_label(cards[s]) if s < len(cards) else "?" for s in range(len(stage_layers))]
-    rows = "; ".join(
-        f"stage{s} ({live[s]}) <- reference stage{m} ({ref_classes[m] if ref_classes else '?'}, "
-        f"{int(reference.stage_layers[m])} -> {int(stage_layers[s])} layers, K0 "
-        f"{float(reference.headroom0_mib[m]):.0f} -> {float(ref_new.headroom0_mib[s]):.0f} MiB)"
-        for s, m in enumerate(smap))
-    head = (f"{_p_card.CARD_MARKER} RESTAGE ref={_p_card.split_text(reference.stage_layers)} "
-            f"({reference.source}) -> {_p_card.split_text(stage_layers)}: {rows}")
-    borrowed = [s for s, m in enumerate(smap) if not ref_classes or live[s] != ref_classes[m]]
-    if not borrowed:
-        log(head + " -- every stage on a card of the class its reference stage was measured on: "
-            "DERIVED by role and layer count, not measured (the first boot of this cut is the measurement)")
-        return ref_new, sup_new, co_new
-    refusals.refuse_value(
-        card_identity.CODE_UNCALIBRATED,
-        f"{_p_card.RECUT_REFUSAL_CODE} {card_identity.CODE_UNCALIBRATED}: {head} -- stage(s) "
-        + ", ".join(str(s) for s in borrowed)
-        + " sit on a card of ANOTHER class than the reference stage they take the row from "
-        f"(reference cards [{', '.join(ref_classes) or 'unknown'}]); --force BORROWS that row: UNMEASURED on "
-        "this card. Without --force: give boots of this cut on these cards (--p-card-reference-logs).",
-        PdFlipLaunchRefused, log=log)
-    return ref_new, sup_new, co_new
 
 
 def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
@@ -22550,83 +14602,10 @@ P_FR_CAP_MARKER = "PP-CUT W132-FR_P-KAPPUNG"
 
 
 
-def p_card_fr_cap(fits, fracs: Sequence[float], num_experts: int,
-                  lru_rows: Sequence[int]) -> PFrCap:
-    """FR_P als Obergrenze: jede Stufe, die die Karte reisst, auf ihre
-    Karten-Decke (``PCardFit.ceiling_fraction`` = groesste Fraction, deren
-    Puffer in die tragbaren Zeilen passt); jede andere Stufe EXAKT wie gegeben.
-
-    Untergrenze ist die bestehende Mindestresidenz der Stufe:
-    ``largest_fraction_for_rows`` gibt None, wenn die Karte nicht einmal EINEN
-    residenten Experten plus ihren Scratch traegt -- dann bleibt W132 mit Namen
-    (``refusal``), statt auf 0 zu kappen. Ebenso, wenn die Decke nicht unter
-    der gegebenen Fraction liegt (dann liegt der Mangel nicht an den Zeilen,
-    und Kappen haelfe nicht)."""
-    from flliper.srt.planner import expert_residency as _er
-
-    new = [float(x) for x in fracs]
-    stages, lines, why = [], [], []
-    for fit in fits:
-        if not fit.refused:
-            continue
-        s = int(fit.stage)
-        short = float(fit.near_oom_mib) - float(fit.headroom_mib)
-        ceil = fit.ceiling_fraction
-        if ceil is None:
-            why.append(
-                "stage%d (%s): keine Kappung -- die Karte traegt nicht einmal einen "
-                "residenten Experten plus Scratch %d (Mindestresidenz, "
-                "largest_fraction_for_rows), es fehlen %.0f MiB"
-                % (s, fit.card, int(lru_rows[s]), short))
-            continue
-        if float(ceil) >= float(fracs[s]):
-            why.append(
-                "stage%d (%s): keine Kappung -- die Karten-Decke f %.3f liegt nicht "
-                "unter der gegebenen f %.4f, der Mangel (%.0f MiB) liegt nicht an den "
-                "Experten-Zeilen" % (s, fit.card, float(ceil), float(fracs[s]), short))
-            continue
-        new[s] = float(ceil)
-        stages.append(s)
-        rows_new = _er.buffer_rows(local_experts=int(num_experts), fraction=float(ceil),
-                                   scratch_rows=int(lru_rows[s]))
-        lines.append(
-            "stage%d (%s): f %.4f -> %.3f (%d -> %d Zeilen, Decke %d Zeilen): Kopfraum "
-            "am letzten Chunk %.0f MiB < near-OOM %.0f, es fehlen %.0f MiB (Chunk-Index "
-            "%d, Prompt %d); FR_P ist die Obergrenze, der Planer kappt"
-            % (s, fit.card, float(fracs[s]), float(ceil), int(fit.buffer_rows), rows_new,
-               int(fit.ceiling_max_rows), float(fit.headroom_mib), float(fit.near_oom_mib),
-               short, int(fit.last_chunk_index), int(fit.prompt_tokens)))
-    return PFrCap(tuple(new), tuple(stages), tuple(lines), "; ".join(why))
 
 
-def publish_p_fractions(ns, fracs: Sequence[float]) -> None:
-    """FR_P an die DREI Stellen, an denen es lebt (arm_fnFL2.sh: "FR_P steht
-    an DREI Stellen"; dieselben wie ``apply_p_draft_post``)."""
-    from flliper.srt.pdflip import draft_post as _dp
-
-    ns.pp_cut_expert_device_fraction = ",".join(_dp._fmt(x) for x in fracs)
-    ns.extra_p = _dp.replace_vector_flag(ns.extra_p, "--rank-moe-resident-fraction", fracs)
-    ns.env_p = _dp.replace_env_vector(getattr(ns, "env_p", ""),
-                                      "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", fracs)
 
 
-def n_stage_incumbent(n_stages: int, n_layers: int, ms_per_layer: Sequence[float]) -> List[int]:
-    """HW-P1c 1003 (PP-CUT-PIN): the solver's starting cut for a P group of
-    ``n_stages`` stages: layers in proportion to each stage's speed (1 / its
-    measured ms per layer), every stage >= 1 layer, the sum exact. A STARTING
-    point (the cost model's incumbent); the cut that ships is the solver's."""
-    n = int(n_stages)
-    rates = [1.0 / max(1e-9, float(m)) for m in list(ms_per_layer)[:n]]
-    if len(rates) != n:
-        rates = [1.0] * n
-    tot = sum(rates)
-    counts = [max(1, int(round(r / tot * int(n_layers)))) for r in rates]
-    counts[-1] = int(n_layers) - sum(counts[:-1])
-    while counts[-1] < 1:   # the last stage must keep a layer: take from the largest
-        j = max(range(n - 1), key=lambda i: counts[i])
-        counts[j] -= 1
-        counts[-1] += 1
-    return counts
 
 
 def derived_family_cost(ns, cards: Sequence["Card"], families, chunk_tokens: int):
@@ -26084,198 +18063,26 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def bs_source(flag: str, argv: Optional[Sequence[str]] = None) -> str:
-    """``"flag"`` if this boot was TOLD its bs, ``"default"`` if it inherited it.
-
-    Every boot record must be able to answer "was this operating point chosen
-    for this boot, or is it the shipped provisional default?" without a second
-    document -- the user order of 2026-09-09 calls the pair explicitly
-    re-measurable, so a record that shows only the VALUE cannot later be sorted
-    into "measured arm" and "inherited arm".
-
-    Read off the argv that was PARSED, not off a comparison with the default:
-    an operator who passes ``--d-bs 4`` explicitly while the default is also 4
-    has still chosen it, and a value-comparison would silently call that boot a
-    default boot. Both spellings argparse accepts are matched (``--d-bs 4`` and
-    ``--d-bs=4``).
-    """
-    words = list(sys.argv[1:] if argv is None else argv)
-    return "flag" if any(w == flag or w.startswith(flag + "=") for w in words) else "default"
 
 
-def profile_standard_form(ns) -> bool:
-    """UNIFY (operator 26.09.): the NF H91 standard form for this launch (D
-    seats 1..6 per phase, pool waves, seat posts): an explicit
-    FLLIPER_PDFLIP_STANDARD_FORM in the launcher's env wins (build_env hands the
-    same env to P, D and the front), else the registry row's
-    ``standard_form`` for ``ns.profile``; an unknown profile is off."""
-    return standard_form_resolved(ns)[0]
 
 
-def standard_form_resolved(ns) -> Tuple[bool, str]:
-    if pdflip_form.profile_row(getattr(ns, "profile", None)) is None and not str(
-            os.environ.get(pdflip_form.STANDARD_FORM_ENV, "")).strip():
-        return False, "unknown profile"
-    return pdflip_form.standard_form_state(os.environ, getattr(ns, "profile", None))
 
 
-def d_park_split_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
-    """27B park (review RV B5): the front fires the immediate park from the
-    launcher's env (FLLIPER_PDFLIP_D_PARK_IMMEDIATE / the profile row), D parks
-    only with its FLIP park on (d_seats.d_flip_park_active over D's env = the
-    launcher env + --env-d). An explicit FLLIPER_PDFLIP_D_PARK=0 decides alone on
-    D -- profile_docker.render writes exactly that line for qwen27b -- so the
-    front would park and D answer 409 every phase (PARK-FAILED, the pre-park
-    fallback, K0). Refused at launch instead, by name. None = consistent."""
-    env = dict(os.environ if environ is None else environ)
-    prof = getattr(ns, "profile", None)
-    front_on, front_src = pdflip_form.d_park_immediate_state(env, prof)
-    if not front_on:
-        return None
-    d_env = dict(env)
-    d_env.update(parse_group_env(str(getattr(ns, "env_d", "") or "")))
-    raw = str(d_env.get("FLLIPER_PDFLIP_D_PARK", "") or "").strip()
-    if raw:
-        d_on, d_src = raw.lower() not in ("0", "false", "no", "off"), "FLLIPER_PDFLIP_D_PARK=" + raw
-    else:
-        d_imm, d_imm_src = pdflip_form.d_park_immediate_state(d_env, prof)
-        d_sf, d_sf_src = pdflip_form.standard_form_state(d_env, prof)
-        d_on, d_src = d_imm or d_sf, "immediate %s, standard form %s" % (d_imm_src, d_sf_src)
-    if d_on:
-        return None
-    return ("PDFLIP D-PARK-SPLIT refused: the front's immediate park is ON (%s) but group D's flip "
-            "park is OFF (%s) -- the front would park every D phase and D answer 409 "
-            "(PARK-FAILED). Unset FLLIPER_PDFLIP_D_PARK (or set it 1) in the profile/--env-d, or turn "
-            "FLLIPER_PDFLIP_D_PARK_IMMEDIATE off" % (front_src, d_src))
 
 
-#: VISION-SYNC LAW (user 02.10. ~08:00Z, both lines; ported from the NF line c651892375 launcher.py:24175-24205 by VISION-WEIGHTS AP4): the
-#: switches that would let a vision stage outlive its pass (pdflip/vision_rank_runner: the async stage and its PP0 row term). Either one ON is
-#: refused at launch, by name. On the 27B line the runner's default is the async stage (vision_rank_runner.vision_async_on, default ON): only an
-#: EXPLICIT on is refused here, an unset switch is the old default path and stays unchanged; ``--pdflip-vision-place weights`` is synchronous
-#: always (vision_rank_runner.arm_victims refuses the async switch at arming too).
-VISION_ASYNC_SWITCHES: Tuple[str, ...] = (
-    "FLLIPER_PDFLIP_VISION_ASYNC",
-    "FLLIPER_PDFLIP_P_ROW_VISION_ASYNC",
-)
-VISION_SYNC_LAW = (
-    "VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): vision runs ONLY synchronously, BEFORE "
-    "the real prefill; spare VRAM goes to MoE experts (NF) and to the L15 cache (27B), never "
-    "to a vision tower that sits there across passes")
 
 
-def vision_async_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
-    """VISION-SYNC LAW: the refusal line when :data:`VISION_ASYNC_SWITCHES` are
-    set ON in the launcher's own environment (which build_env and the front
-    inherit) or in ``--env-p`` / ``--env-d``; None when every one is unset or
-    off (an explicit 0/false/no/off is the law's own value and passes). Any
-    spelling of a switch's rename family counts."""
-    env = dict(os.environ if environ is None else environ)
-    scopes = (
-        ("launcher env", env),
-        ("--env-p", parse_group_env(str(getattr(ns, "env_p", "") or ""))),
-        ("--env-d", parse_group_env(str(getattr(ns, "env_d", "") or ""))),
-    )
-    hits: List[str] = []
-    for where, scope in scopes:
-        for name in VISION_ASYNC_SWITCHES:
-            raw = pdflip_form._explicit_env(scope, name)
-            if raw is not None and raw.lower() not in ("0", "false", "no", "off"):
-                hits.append(f"{where} {name}={raw}")
-    if not hits:
-        return None
-    return ("PDFLIP VISION-ASYNC refused: %s -- %s. Set it 0 (27B line: an UNSET FLLIPER_PDFLIP_VISION_ASYNC is the async stage, "
-            "vision_rank_runner.vision_async_on default ON; NF line: unset = sync)" % (", ".join(hits), VISION_SYNC_LAW))
 
 
-#: VISION-WEIGHTS AP4 (plan PLAN-VISION-GEWICHTE-VERDRAENGEN-1009 section 8): the places that are guaranteed broken in the dual layout. The tower
-#: of kvtail needs free KV-tail pages and the dual P pool is born trimmed to 0 tokens (pdflip/dual_p_kv_stage.py:1-25), so ``reserve_tail_pages``
-#: returns None (pdflip/vision_rank_stage.py:117-129); ``auto`` resolves to kvtail first. ``weights`` is the place of the dual.
-VISION_PLACES_BROKEN_IN_DUAL: Tuple[str, ...] = ("kvtail", VISION_PLACE_AUTO)
-W111_VISION_PLACE_DUAL = "W111 PdFlipVisionArmRefused"
 
 
-def vision_place_dual_refusal(ns, argv: Optional[Sequence[str]] = None) -> Optional[str]:
-    """VISION-WEIGHTS AP4: ``--pdflip-vision-place kvtail|auto`` told on the command line together with ``--dual-layout`` (and the transient tower) is
-    refused by name -- the dual P pool has no KV-tail page to lend, so the first image would be refused at request time (W105). Only a place that
-    was TOLD counts (``bs_source``: the argv, not a comparison with the default): a profile that does not name the place keeps the old default path
-    byte for byte (text-only serving works, the golden dry runs are unchanged); the place for the dual is ``weights``. None = consistent."""
-    if not bool(getattr(ns, "dual_layout", False)):
-        return None
-    if str(getattr(ns, "pdflip_vision", VISION_OFF)) != VISION_TRANSIENT:
-        return None
-    place = str(getattr(ns, "pdflip_vision_place", VISION_PLACE_AUTO) or VISION_PLACE_AUTO)
-    if place not in VISION_PLACES_BROKEN_IN_DUAL or bs_source("--pdflip-vision-place", argv) != "flag":
-        return None
-    return (f"{W111_VISION_PLACE_DUAL}: --pdflip-vision-place {place} with --dual-layout: the dual P pool is born trimmed to 0 tokens "
-            "(pdflip/dual_p_kv_stage.py), so the tower has no KV-tail page to lend and the first image request would be refused (W105). "
-            "Use --pdflip-vision-place weights (the tower borrows weight memory of PP0, only the hull parts that are not D's shard) "
-            "or leave --pdflip-vision-place unset")
 
 
-def vision_tower_dir(ns) -> str:
-    """VISION-GGUF (09.10.): the directory the transient tower is read from -- ``--model``, or for a GGUF FILE ``--tokenizer-path``
-    (``planner.vision_stage_load.tower_source_dir``, the rank's rule; raises ``VisionStageLoadRefused`` when that holds no sharded
-    checkpoint). ``--tokenizer-path`` is read only for a GGUF model."""
-    from flliper.srt.planner.vision_stage_load import tower_source_dir
-
-    model = str(ns.model)
-    if not model_is_gguf_file(model):
-        return model
-    return tower_source_dir(model_path=model, tokenizer_path=str(ns.tokenizer_path or ""))
 
 
-def vision_gguf_tower_refusal(ns) -> Optional[str]:
-    """VISION-GGUF (09.10.): ``--pdflip-vision transient`` with a GGUF ``--model`` reads the tower from ``--tokenizer-path``. Refused by name
-    before any card is taken when that directory holds no single-shard tower in a safetensors index, or when its ``vision_config`` differs
-    from the GGUF's (the rank builds the tower from the GGUF's config and fills it from the other checkpoint; ``model_type`` aside, the
-    two must agree). None = consistent, or not this case (a safetensors model, or not transient: unchanged)."""
-    if str(ns.pdflip_vision) != VISION_TRANSIENT or not model_is_gguf_file(str(ns.model)):
-        return None
-    from flliper.srt.planner.vision_stage_load import find_tower_shard
-
-    try:
-        tower_dir = vision_tower_dir(ns)
-        find_tower_shard(tower_dir)
-        configs = []
-        for path in (str(ns.model), tower_dir):
-            with open(model_config_path(path)) as fh:
-                configs.append(json.load(fh).get("vision_config") or {})
-    except Exception as exc:  # noqa: BLE001 -- every path out is the named refusal
-        return f"{W111_VISION_PLACE_DUAL}: --pdflip-vision transient on a GGUF --model: {type(exc).__name__}: {exc}"
-    mine, theirs = configs
-    differ = sorted(k for k in set(mine) | set(theirs) if k != "model_type" and mine.get(k) != theirs.get(k))
-    if not mine or differ:
-        return (f"{W111_VISION_PLACE_DUAL}: --pdflip-vision transient on a GGUF --model: the vision_config of {ns.model} "
-                f"{'is missing' if not mine else 'differs in ' + ', '.join(differ)} against --tokenizer-path {tower_dir}, "
-                "whose checkpoint the tower is read from")
-    return None
 
 
-def vision_victim_host_term(ns) -> Tuple[float, str]:
-    """VISION-WEIGHTS AP4: ``(MiB, provenance)`` of the host image of the displaced weights (ledger post ``vision_victim_host``).
-
-    Non-zero only with ``--pdflip-vision transient`` + ``--pdflip-vision-place weights`` on a dense (27B) form: the victim bytes (= the tower bytes,
-    plan section 2) wait in an anonymous pageable host image while one image is encoded and are freed after the give-back (TRANSIENT, 0 between
-    images). NF (experts): 0, the victim rows have their copy in the expert store. A tower size that cannot be read is said (0 MiB, unmeasured),
-    never guessed. HOST RAM IS A WARNING ONLY (user rule 2026-10-06): this term never refuses."""
-    from flliper.srt.pdflip import vision_victim_plan as _vvp
-
-    if not _vvp.active(getattr(ns, "pdflip_vision", VISION_OFF), getattr(ns, "pdflip_vision_place", VISION_PLACE_AUTO)):
-        return 0.0, "none (--pdflip-vision-place is not 'weights')"
-    form = getattr(ns, "pdflip_boot_form", None)
-    if getattr(form, "arch", None) == "moe":
-        return 0.0, "none (victim = resident expert rows; their copy is in the expert store, already booked)"
-    try:
-        tower_dir = vision_tower_dir(ns)
-    except Exception as exc:  # noqa: BLE001 -- unmeasured is said (vision_gguf_tower_refusal stops the boot first)
-        return 0.0, f"UNMEASURED ({type(exc).__name__}: {exc})"
-    nbytes, src = _vvp.tower_bytes_from_checkpoint(tower_dir)
-    if nbytes is None:
-        return 0.0, f"UNMEASURED ({src})"
-    kind = _vvp.KIND_PP_ONLY if bool(getattr(ns, "dual_layout", False)) else _vvp.KIND_DENSE
-    return nbytes / (1 << 20), (f"victim={kind}: the tower bytes wait in a pageable host image per image request, freed after the give-back "
-                                f"({src}); transient, 0 between images; printed only, in no ledger sum")
 
 
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
@@ -26333,70 +18140,8 @@ def apply_profile_d_seat_vram_default(ns) -> Optional[str]:
             "--env-d FLLIPER_OPT_PDFLIP_D_SEAT_VRAM=0 = H95 B)" % item)
 
 
-def prefix_switches_announce(ns, boot_form, environ: Optional[Mapping[str, str]] = None) -> str:
-    """RG (operator 26.09.): the PDFLIP-PREFIX-SWITCHES line of this boot (value
-    and source -- env or profile -- per prefix switch, pdflip/form.py
-    PREFIX_SWITCHES), computed on a COPY of the launcher env: the writers are
-    build_env (P, D) and the front spawn. Refuses (PdFlipLaunchRefused) when
-    --env-p/--env-d would run MZ differently on P and D."""
-    env = dict(os.environ if environ is None else environ)
-    rows = pdflip_form.publish_prefix_switches(env, boot_form.profile)
-    split = pdflip_form.prefix_p_eq_d_mismatch(
-        env, parse_group_env(getattr(ns, "env_p", "") or ""),
-        parse_group_env(getattr(ns, "env_d", "") or ""))
-    if split:
-        raise PdFlipLaunchRefused(split)
-    return pdflip_form.prefix_switches_line(rows)
 
 
-def l15_mib_by_card_identity(ns, cards: List[Card], log,
-                             environ: Optional[Dict[str, str]] = None) -> None:
-    """HW-GENERIC 1002 (L15): FLLIPER_PDFLIP_L15_MIB keyed by CARD IDENTITY.
-
-    Resolves the value's card keys (``GPU-<uuid>=``, ``pci:<bus id>=``,
-    ``nvml<i>=``, or the legacy budget ordinal ``c<i>=``) ONCE against the
-    ordered ``cards`` (``l15_plan.resolve_l15_mib``) and hands the ranks the
-    canonical ordinal form: rewritten in ``environ`` (default ``os.environ``,
-    which ``build_env`` copies for P and D and ``resolve_posts`` reads) and in
-    ``--env-p`` / ``--env-d`` (applied last by ``build_env``) when they carry
-    the key. An ordinal-only value is left byte-identical. One
-    ``L15-MIB-CARDS`` line per source names key -> ordinal -> card; a bad key
-    is refused BY NAME (W-L15-CARDKEY). With the master on, a cap-0 rank
-    count other than one prints ``L15-CAP0`` (a warning: D rank i sits on
-    ordinal i, ``--rank-gpu-id 0,1,2``)."""
-    env = os.environ if environ is None else environ
-    key = l15_plan.L15_MIB_ENV
-    sources = [("env", env.get(key))]
-    groups = {a: parse_group_env(getattr(ns, a, "") or "") for a in ("env_p", "env_d")}
-    sources += [(a, g[key]) for a, g in groups.items() if key in g]
-    for src, raw in sources:
-        if raw is None:
-            continue
-        pci = {}
-        if "pci:" in str(raw).lower():
-            # the launcher Card carries no bus id; the registry's NVML reader does
-            pci = {d.uuid: d.pci_bus_id for d in nvml_registry.list_devices()}
-        try:
-            res = l15_plan.resolve_l15_mib(raw, cards, pci)
-        except ValueError as exc:
-            raise PdFlipLaunchRefused(f"{exc} (source {src})") from exc
-        if res.mode == "auto":
-            continue
-        log(l15_plan.mib_cards_line(res, cards, src))
-        if res.rewritten and src == "env":
-            env[key] = res.value
-        elif res.rewritten:
-            setattr(ns, src, set_group_env(getattr(ns, src, ""), key, res.value))
-    # the value the D ranks run: --env-d (applied last) over the launcher env
-    d_env = dict(env)
-    d_env.update({k: v for k, v in parse_group_env(getattr(ns, "env_d", "") or "").items()
-                  if k in (key, l15_plan.L15_MASTER_ENV)})
-    if l15_plan.master_on(d_env):
-        from flliper.srt.pdflip import l15_shadow
-
-        line = l15_shadow.cap0_line(l15_shadow.cap0_ranks(d_env, len(cards)))
-        if line is not None:
-            log(line)
 
 
 def rank_reserve_kwargs(group: str, ns, cards: Sequence["Card"],
@@ -29649,34 +21394,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 #: replaced the subtraction.
 
 
-def xchg_census_is_reserve(profile: Optional[str]) -> bool:
-    """Does ``profile``'s exchange-form census REPLACE the group-D constant?
-
-    The registry row decides (``ModelProfile.d_residue_census``): Next Flash
-    yes (cb1575e94e), the 27B no -- its line keeps the weg2xsn14 constant.
-    No/unknown profile = the launcher default (``--profile`` qwen27b)."""
-    row = pdflip_form.profile_row(profile or pdflip_form.DEFAULT_PROFILE)
-    return bool(getattr(row, "d_residue_census", False))
 
 
-def d_expect_from_p_records(profile: Optional[str]) -> bool:
-    """Does D's EXPECTATION budget (before P's first sleep) price P's measured
-    dormant residue from the records? The registry row decides
-    (``ModelProfile.d_expect_from_p_records``); independent of the reserve
-    question :func:`xchg_census_is_reserve` answers. No/unknown profile = the
-    launcher default (``--profile`` qwen27b)."""
-    row = pdflip_form.profile_row(profile or pdflip_form.DEFAULT_PROFILE)
-    return bool(getattr(row, "d_expect_from_p_records", False))
 
 
-def d_early_start_proven(profile: Optional[str]) -> bool:
-    """``--pdflip-d-early-start auto`` = on for this profile: the registry row
-    carries a metal proof (``ModelProfile.d_early_start_proven``) AND prices
-    the early plan from P's records. No/unknown profile = the launcher
-    default (qwen27b)."""
-    row = pdflip_form.profile_row(profile or pdflip_form.DEFAULT_PROFILE)
-    return (bool(getattr(row, "d_early_start_proven", False))
-            and d_expect_from_p_records(profile))
 
 
 def xchg_form_dormant_reserve(
@@ -29936,43 +21657,10 @@ def _write_state(state: BootState) -> None:
     os.replace(tmp, path)
 
 
-#: #1248: first W-code substring in a refusal message, for the one-line
-#: summary. Not every PdFlipLaunchRefused carries one (build_env's
-#: PYTORCH_CUDA_ALLOC_CONF refusal does not) -- covers the "Wnn" and "Wnnb"
-#: forms actually used in this file (e.g. W11b PdFlipDraftBuildUnaccounted).
-_W_CODE_RE = re.compile(r"\bW\d+[a-z]?\b")
 
 
-def _w_code_of(e: BaseException) -> str:
-    """Best-effort W-code out of a refusal's message; "W?" when absent
-    rather than inventing one."""
-    m = _W_CODE_RE.search(str(e))
-    return m.group(0) if m else "W?"
 
 
-def _cards_empty(cards: list[dict]) -> bool:
-    """True iff NVML reports zero tenant-held MiB on every card this boot
-    claimed (``BootState.cards``, i.e. ``Card.__dict__`` entries).
-
-    Reuses the SAME reader :func:`teardown` already prints from
-    (``nvml_registry.memory_snapshot`` / ``tenant_used_mib``, the
-    carve-out-honest figure, #539) so this check and that print can never
-    disagree about what "empty" means. Conservative on any read failure or
-    on a card missing from the snapshot: an unread/unmatched card proves
-    nothing, so this returns False rather than claiming an unverified
-    guarantee -- the opposite mistake (claiming empty when it is not) is the
-    one #1248 exists to stop repeating.
-    """
-    try:
-        snap = nvml_registry.memory_snapshot()
-    except Exception:  # noqa: BLE001 - unread NVML must read as "not proven empty", never crash the refusal path
-        return False
-    used_by_index = {d.index: m.tenant_used_mib for d, m in snap}
-    for c in cards:
-        idx = c.get("nvml_index") if isinstance(c, dict) else getattr(c, "nvml_index", None)
-        if idx not in used_by_index or used_by_index[idx] != 0:
-            return False
-    return True
 
 
 #: S104 review A2 (nf-review-s104-1020): a scheduler process that still lives this long after the teardown's TERM
@@ -30283,89 +21971,10 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
     return rc
 
 
-#: MAMBA-ARENA-FLOOR (16.10.): the most mamba state slots one running request can
-#: hold -- MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO 3 + the overlap ping-pong 2
-#: (model_runner_kv_cache_mixin._calculate_mamba_ratio), and the most
-#: mamba_pool_floor.mamba_slots_per_running_req returns (1 + 2 + 1 + 1). With the
-#: runtime's own safety margin, ceil(bs x 5 x 1.25) is an UPPER bound on the
-#: demand-driven device pool (_auto_mamba_demand_size = max(ceil(t*ratio*1.25),
-#: ratio, t*slots_per_req), then min(.., fit_cap)): measured D 1016_103428
-#: target_concurrency=6 ratio=5 safety=1.25 -> 38 = ceil(6 x 6.25). An upper bound
-#: over-sizes the arena, the safe direction (host RAM only warns).
-MAMBA_ARENA_SLOTS_PER_REQUEST_UPPER = 5
-MAMBA_ARENA_ENV = "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS"
 
 
-def mamba_arena_group_floor(extra: str, bs_fallback) -> Tuple[int, int, int, str]:
-    """(floor, device_slots, max_running, source) of ONE group's share of the mamba
-    arena: device_slots + max_running + 1 -- the host anchor pool's law
-    (memory_pool_host.mamba_anchor_slot_floor), applied to the arena every
-    rank of both groups shares. device_slots = the group's own
-    --max-mamba-cache-size when its argv names one (the last value, as argparse),
-    else the upper bound of the demand-driven pool. (0, 0, 0, why) when the
-    group's concurrency is not knowable here."""
-    bs = _argv_scalar(extra or "", "--max-running-requests")
-    try:
-        bs = int(bs) if bs is not None else int(bs_fallback or 0)
-    except (TypeError, ValueError):
-        bs = 0
-    if bs <= 0:
-        return 0, 0, 0, "max_running_requests unknown"
-    mmc = _argv_scalar(extra or "", "--max-mamba-cache-size")
-    try:
-        dev, src = int(mmc), "--max-mamba-cache-size"
-    except (TypeError, ValueError):
-        dev = int(math.ceil(bs * MAMBA_ARENA_SLOTS_PER_REQUEST_UPPER * P_MAMBA_AUTO_SAFETY_MARGIN))
-        src = "demand upper bound ceil(%d x %d x %.2f)" % (bs, MAMBA_ARENA_SLOTS_PER_REQUEST_UPPER, P_MAMBA_AUTO_SAFETY_MARGIN)
-    return dev + bs + 1, dev, bs, src
 
 
-def mamba_arena_slots_into_groups(ns, group_envs) -> str:
-    """MAMBA-ARENA-FLOOR (16.10., boot 1016_124240: the shared mamba arena held 32
-    slots from a profile env, complete=32 of 32, D lost anchors at=evict
-    why=mamba_claim backuped=False). The ONE mamba arena is shared by every rank of
-    both groups, so its slot count must hold both groups' floors at once (P's
-    parked anchors and D's sleep flush coexist): floor = sum over the groups of
-    device_slots + max_running + 1. A value under it -- profile env, launcher
-    default, anything -- is RAISED to it in both group envs (the ranks and the
-    ledger then read the same number); never a refusal (host RAM warns). Returns
-    the line to log."""
-    groups = [("D", getattr(ns, "extra_d", "") or "", getattr(ns, "d_bs", None))]
-    if not bool(getattr(ns, "d_only", False)):
-        groups.insert(0, ("P", getattr(ns, "extra_p", "") or "", getattr(ns, "p_bs", None)))
-    parts, floor = [], 0
-    for name, extra, bs_fb in groups:
-        f, dev, bs, src = mamba_arena_group_floor(extra, bs_fb)
-        parts.append("%s: %s" % (name, ("device %d [%s] + running %d + 1 = %d" % (dev, src, bs, f)) if f else src))
-        floor += f
-    named = any(e and str(e.get(MAMBA_ARENA_ENV, "") or "") for e in (group_envs or ())) or bool(
-        str(os.environ.get(MAMBA_ARENA_ENV, "") or ""))
-    cur = int(float(_group_env_value(MAMBA_ARENA_ENV, group_envs, "140")))
-    if floor <= 0:
-        return "PDFLIP-MAMBA-ARENA-FLOOR skipped: %s (slots %d kept)" % ("; ".join(parts), cur)
-    if not named:
-        # nobody named a count: the arena gets the floor itself (computed, not the
-        # fixed launcher default 140 -- host RAM next to NF is the scarce side)
-        val = str(int(floor))
-        for attr in ("env_d", "env_p"):
-            setattr(ns, attr, set_group_env(str(getattr(ns, attr, "") or ""), MAMBA_ARENA_ENV, val))
-        for e in group_envs or ():
-            if e is not None:
-                e[MAMBA_ARENA_ENV] = val
-        return "PDFLIP-MAMBA-ARENA-FLOOR COMPUTED: %s=%d in both group envs (%s; one arena for both groups)" % (
-            MAMBA_ARENA_ENV, floor, "; ".join(parts))
-    if cur >= floor:
-        return "PDFLIP-MAMBA-ARENA-FLOOR ok: %s=%d >= floor %d (%s; one arena for both groups)" % (
-            MAMBA_ARENA_ENV, cur, floor, "; ".join(parts))
-    val = str(int(floor))
-    for attr in ("env_d", "env_p"):
-        setattr(ns, attr, set_group_env(str(getattr(ns, attr, "") or ""), MAMBA_ARENA_ENV, val))
-    for e in group_envs or ():
-        if e is not None:
-            e[MAMBA_ARENA_ENV] = val
-    return ("PDFLIP-MAMBA-ARENA-FLOOR RAISED: %s %d -> %d in both group envs (%s; one arena for both groups, "
-            "a count under the sum loses anchors at=evict why=mamba_claim). Host RAM only warns, it never "
-            "refuses this." % (MAMBA_ARENA_ENV, cur, floor, "; ".join(parts)))
 
 
 if __name__ == "__main__":

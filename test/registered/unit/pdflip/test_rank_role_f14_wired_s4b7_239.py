@@ -70,4 +70,5 @@ def test_the_flag_has_no_other_reader():
             if "unwired_token_cut_seams(" in text and rel != "rank_role.py":
                 callers.append(rel)
     assert requires == []
-    assert callers == [os.path.join("pdflip", "launcher.py")], callers
+    # the launcher is split over launcher*.py (refactor, 28.10.): the one reader is "the launcher", wherever its code lives now
+    assert callers and all(c.startswith(os.path.join("pdflip", "launcher")) for c in callers), callers

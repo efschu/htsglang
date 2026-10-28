@@ -41,6 +41,16 @@ XSN28 = dict(bytes_per_direction=29119878266, n_layers=64,
              slot_bytes=134217728)
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 class TheTermIsChargedPerLane(CustomTestCase):
     def test_one_lane_is_byte_identical_to_before(self):
         t = xb.bounce_terms(**XSN28)
@@ -199,7 +209,7 @@ class TheLaneCountIsMeasuredAndKeyedOnTheCut(CustomTestCase):
 
         from flliper.srt.pdflip import launcher as lc
 
-        src = "\n".join(ln for ln in inspect.getsource(lc).splitlines()
+        src = "\n".join(ln for ln in _launcher_text().splitlines()
                         if not ln.strip().startswith("#"))
         self.assertIn("resolve_xchg_lanes(", src)
         self.assertIn("xchg_cut_key(", src)

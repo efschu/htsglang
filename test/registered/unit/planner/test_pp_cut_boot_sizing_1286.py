@@ -554,7 +554,14 @@ def _repo_source(relpath: str) -> str:
         candidate = os.path.join(root, relpath)
         if os.path.exists(candidate):
             with open(candidate, "r", encoding="utf-8") as fh:
-                return fh.read()
+                text = fh.read()
+            if relpath.endswith("pdflip/launcher.py"):    # split over launcher_*.py (behaviour-neutral refactor, 28.10.)
+                import glob
+
+                for part in sorted(glob.glob(os.path.join(os.path.dirname(candidate), "launcher_*.py"))):
+                    with open(part, "r", encoding="utf-8") as fh:
+                        text += "\n" + fh.read()
+            return text
     raise unittest.SkipTest(f"{relpath} not found from {here}")
 
 

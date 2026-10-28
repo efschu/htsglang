@@ -51,13 +51,23 @@ _MODULES = {"checkpoint_census": checkpoint_census, "xchg_bounce": xchg_bounce,
 _LOCAL = ("argv_p", "argv_d", "common_flags")
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _calls():
     """(target_name, attr, node) for every launcher call this pin binds.
 
     Two shapes: `module.attr(...)` into the sizing modules, and bare-name calls
     to the launcher's own argv builders.
     """
-    tree = ast.parse(inspect.getsource(launcher))
+    tree = ast.parse(_launcher_text())
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -177,7 +187,7 @@ class TheLaneCountHasOneProducer(CustomTestCase):
     def test_both_consumers_go_through_the_one_producer(self):
         """The ledger's charge and the ranks' published inputs must be keyed
         the same way, or the rank guard refuses a correctly priced boot."""
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         self.assertEqual(
             src.count("host_ledger.resolve_xchg_lanes("), 1,
             "resolve_xchg_lanes must be reached through xchg_lane_count only")
@@ -201,7 +211,7 @@ class TheLaneCountHasOneProducer(CustomTestCase):
         window moved, the code did not. Both facts are asserted on their own
         terms instead: the lane count is produced by the ONE producer, and the
         publication consumes exactly that name."""
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         self.assertIn("_pub_lane_n, _ = xchg_lane_count(", src,
                       "the publication no longer gets its lane count from the "
                       "one producer")

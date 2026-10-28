@@ -18,6 +18,7 @@ The fixture is made by ``tools/release/persisted_consts_1009.py --ref <freeze>``
 
 import hashlib
 import importlib
+import re
 import importlib.util
 import json
 import pathlib
@@ -69,7 +70,17 @@ def _current():
     p = str(ROOT / "tools" / "release")
     if p not in sys.path:
         sys.path.insert(0, p)
-    return importlib.import_module("persisted_consts_1009").from_root(str(ROOT))
+    cur = importlib.import_module("persisted_consts_1009").from_root(str(ROOT))
+    # the launcher is split over launcher_*.py (behaviour-neutral refactor, 28.10.): their constants are the launcher's
+    target = "python/flliper/srt/pdflip/launcher.py"
+    for table in cur.values():
+        if not isinstance(table, dict):
+            continue
+        for path in [k for k in table if re.search(r"srt/pdflip/launcher_[^/]+\.py$", k)]:
+            part = table.pop(path)
+            if isinstance(part, list) and isinstance(table.get(target, []), list):
+                table[target] = list(table.get(target, [])) + part
+    return cur
 
 
 class TestNamedPins(CustomTestCase):

@@ -43,8 +43,9 @@ SRC = Path(L.__file__).resolve().parent
 
 
 def _defs(path: Path, name: str) -> int:
-    tree = ast.parse(path.read_text())
-    return sum(1 for n in ast.walk(tree)
+    # launcher.py is split over launcher*.py (refactor, 28.10.): "launcher.py" means the launcher as a whole
+    paths = sorted(path.parent.glob("launcher*.py")) if path.name == "launcher.py" else [path]
+    return sum(1 for p in paths for n in ast.walk(ast.parse(p.read_text()))
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
 
 

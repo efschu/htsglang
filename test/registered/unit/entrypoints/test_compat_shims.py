@@ -275,7 +275,10 @@ class TestOtherGenerationServers(CustomTestCase):
         L = self.launcher
         self.assertEqual(L.LAUNCH_SERVER_MODULES, (self.run + ".launch_server", self.other + ".launch_server"))
         self.assertEqual(L.BOOT_TOKEN_ENV_KEYS, (self.env_run.encode() + b"=", self.env_other.encode() + b"="))
-        src = open(L.__file__, encoding="utf-8").read()
+        import pathlib
+
+        # the launcher is split over launcher*.py (refactor, 28.10.)
+        src = "\n".join(p.read_text(encoding="utf-8") for p in sorted(pathlib.Path(L.__file__).parent.glob("launcher*.py")))
         self.assertIn('_env_name_variants("' + self.env_run + '")', src,
                       "the key the launcher reads must be the one build_env writes")
         self.assertIn('env["' + self.env_run + '"] = ', src)

@@ -622,8 +622,13 @@ class ReviewSoll(Base):
 
 class LauncherWiring(unittest.TestCase):
     def test_seal_flush_and_export_precede_the_front_spawn_after_every_refusal_site(self):
-        src = open(LAUNCHER_SRC, encoding="utf-8").read()
-        main = src[src.index("\ndef main("):src.index("\ndef xchg_census_is_reserve(")]
+        import importlib.util
+        import pathlib
+
+        spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+        ls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ls)
+        main = ls.definition_source("main")          # def main stays in launcher.py; the text after it moved (refactor, 28.10.)
         seal = main.index("refusals.seal_records()")
         spawn = main.index("fp = subprocess.Popen(front_argv")
         self.assertLess(seal, main.index("host_ledger.flush_held_records(log)"))

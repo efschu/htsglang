@@ -156,8 +156,11 @@ def test_the_launcher_reads_the_axis_and_does_not_resolve_twice():
 
 
 def test_one_producer_detection_and_one_produce_switch():
-    tree = ast.parse(inspect.getsource(L))
-    names = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
+    import pathlib
+
+    # the launcher is split over launcher*.py (refactor, 28.10.)
+    names = [n.name for p in sorted(pathlib.Path(L.__file__).parent.glob("launcher*.py"))
+             for n in ast.parse(p.read_text(encoding="utf-8")).body if isinstance(n, ast.FunctionDef)]
     for name in ("p_group_has_draft_producer", "dflash_produce_on_p", "resolve_draft_on_p",
                  "gate_w10", "spec_form_env"):
         assert names.count(name) == 1, name

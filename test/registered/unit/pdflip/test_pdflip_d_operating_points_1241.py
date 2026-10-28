@@ -591,11 +591,13 @@ class OperatingPointVectorTest(unittest.TestCase):
         self.assertTrue(rows)
 
     def test_the_spec_and_KV_literals_have_exactly_ONE_writer_each(self):
-        import inspect
+        import importlib.util
+        import pathlib
 
-        from flliper.srt.pdflip import launcher as lz
-
-        src = inspect.getsource(lz)
+        spec = importlib.util.spec_from_file_location("_launcher_source", pathlib.Path(__file__).with_name("_launcher_source.py"))
+        ls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ls)
+        src = ls.merged_text()          # the launcher is split over launcher*.py (refactor, 28.10.)
         # d3e9625651 (DFlash2 part E, 2026-09-17) added --spec-form, whose
         # VOCABULARY also spells "NEXTN": the form's default and the argparse
         # choices. That is the name of a form, not a second writer of the
