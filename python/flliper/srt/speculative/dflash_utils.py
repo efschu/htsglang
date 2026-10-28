@@ -612,6 +612,122 @@ SELECTOR_Q_GUARD_STATS = ("slots", "fallback", "nonfinite", "badsum", "notin", "
 _SELECTOR_Q_SUM_TOL = 1e-3
 
 
+def _triton_interpreter_usable() -> bool:
+    """27B port: TRITON_INTERPRET=1 only works when it was set BEFORE triton was imported (the language's own jit functions, tl.sum
+    and friends, are then interpreted functions). An env var set later in the same process (a test that flips it) leaves them compiled
+    jit functions and the interpreter cannot run a kernel that calls them -- that process takes the eager guard."""
+    import triton.language as tl
+    from triton.runtime.jit import JITFunction
+
+    return not isinstance(tl.sum, JITFunction)
+
+
+def _qguard_fused_on(draft_probs: torch.Tensor, candidate_ids: torch.Tensor, q_rows: torch.Tensor,
+                     draft_tokens: torch.Tensor, stats: Optional[torch.Tensor]) -> bool:
+    """formhp-qguard-1028: the fused guard applies (switch on, a device Triton runs on -- CUDA, or the CPU under
+    TRITON_INTERPRET=1 --, the layouts it addresses)."""
+    import os
+
+    from flliper.srt.environ import envs
+
+    if not envs.FLLIPER_FORMHP_QGUARD_FUSED.get():
+        return False
+    if not (draft_probs.is_cuda or (os.environ.get("TRITON_INTERPRET") == "1" and _triton_interpreter_usable())):
+        return False
+    if draft_probs.dim() != 3 or draft_probs.stride(-1) != 1 or draft_probs.dtype != torch.float32:
+        return False
+    if candidate_ids.dim() != 3 or q_rows.shape != candidate_ids.shape or draft_tokens.dim() != 2:
+        return False
+    if tuple(candidate_ids.shape[:2]) != tuple(draft_probs.shape[:2]) or tuple(draft_tokens.shape) != tuple(
+            draft_probs.shape[:2]):
+        return False
+    if stats is not None and (stats.dtype != torch.int64 or stats.numel() != len(SELECTOR_Q_GUARD_STATS)
+                              or not stats.is_contiguous()):
+        return False
+    return candidate_ids.shape[-1] >= 1
+
+
+_QGUARD_KERNEL = None
+
+
+def _qguard_kernel():
+    """formhp-qguard-1028: one program per (row, slot): the guard's checks over the K candidates, the scatter of q (or the
+    point mass at the drafted token) into the slot's dense row, the six counters by atomic adds."""
+    global _QGUARD_KERNEL
+    if _QGUARD_KERNEL is not None:
+        return _QGUARD_KERNEL
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _qguard(dp_ptr, ids_ptr, q_ptr, x_ptr, fb_ptr, st_ptr, G, K,
+                dp_sb, dp_sg, id_sb, id_sg, id_sk, q_sb, q_sg, q_sk, x_sb, x_sg,
+                TOL: tl.constexpr, HAS_STATS: tl.constexpr, BK: tl.constexpr):
+        pid = tl.program_id(0)
+        b = pid // G
+        g = pid % G
+        k = tl.arange(0, BK)
+        km = k < K
+        ids = tl.load(ids_ptr + b * id_sb + g * id_sg + k * id_sk, mask=km, other=0).to(tl.int64)
+        q = tl.load(q_ptr + b * q_sb + g * q_sg + k * q_sk, mask=km, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + b * x_sb + g * x_sg).to(tl.int64)
+        fin = (q == q) & (tl.abs(q) != float("inf"))
+        nonfinite = tl.sum((km & (fin == 0)).to(tl.int32), axis=0) > 0
+        row_finite = nonfinite == 0
+        q0 = tl.where(fin & km, q, 0.0)
+        negative = row_finite & (tl.sum((km & (q0 < 0)).to(tl.int32), axis=0) > 0)
+        badsum = row_finite & (tl.abs(tl.sum(q0, axis=0) - 1.0) > TOL)
+        match = km & (ids == x)
+        nmatch = tl.sum(match.to(tl.int32), axis=0)
+        qx = tl.sum(tl.where(match, q0, 0.0), axis=0)
+        notin = row_finite & ((nmatch != 1) | (qx <= 0.0) | (qx != qx))
+        # duplicate ids: any pair i < j among the K candidates (the eager guard sorts; same answer)
+        kj = tl.arange(0, BK)
+        idj = tl.load(ids_ptr + b * id_sb + g * id_sg + kj * id_sk, mask=kj < K, other=0).to(tl.int64)
+        pair = (ids[:, None] == idj[None, :]) & (k[:, None] < kj[None, :]) & km[:, None] & (kj < K)[None, :]
+        dup = tl.sum(tl.sum(pair.to(tl.int32), axis=1), axis=0) > 0
+        fallback = nonfinite | negative | badsum | notin | dup
+        row = dp_ptr + b * dp_sb + g * dp_sg
+        tl.store(row + ids, tl.where(fallback, 0.0, q0), mask=km)
+        tl.debug_barrier()
+        # the point mass at x: the row is zero there (zero on entry, zeros scattered for an invalid row) -- the eager
+        # guard's scatter_add_ of the fallback flag
+        cur = tl.load(row + x)
+        tl.store(row + x, cur + fallback.to(tl.float32), mask=fallback)
+        tl.store(fb_ptr + pid, fallback)
+        if HAS_STATS:
+            tl.atomic_add(st_ptr + 0, 1)
+            tl.atomic_add(st_ptr + 1, fallback.to(tl.int64))
+            tl.atomic_add(st_ptr + 2, nonfinite.to(tl.int64))
+            tl.atomic_add(st_ptr + 3, (badsum | negative).to(tl.int64))
+            tl.atomic_add(st_ptr + 4, notin.to(tl.int64))
+            tl.atomic_add(st_ptr + 5, dup.to(tl.int64))
+
+    _QGUARD_KERNEL = _qguard
+    return _qguard
+
+
+def _selector_q_guard_scatter_fused(*, draft_probs, candidate_ids, q_rows, draft_tokens, stats) -> torch.Tensor:
+    """formhp-qguard-1028: :func:`selector_q_guard_scatter` as one launch (no eager op besides the mask's allocation)."""
+    import triton
+
+    B, G, K = (int(s) for s in candidate_ids.shape)
+    fallback = torch.empty((B, G), dtype=torch.bool, device=draft_probs.device)
+    if B * G == 0:
+        return fallback
+    kern = _qguard_kernel()
+    st = stats if stats is not None else fallback  # never written without HAS_STATS
+    kern[(B * G,)](
+        draft_probs, candidate_ids, q_rows, draft_tokens, fallback, st, G, K,
+        draft_probs.stride(0), draft_probs.stride(1),
+        candidate_ids.stride(0), candidate_ids.stride(1), candidate_ids.stride(2),
+        q_rows.stride(0), q_rows.stride(1), q_rows.stride(2),
+        draft_tokens.stride(0), draft_tokens.stride(1),
+        TOL=_SELECTOR_Q_SUM_TOL, HAS_STATS=stats is not None, BK=max(2, triton.next_power_of_2(K)),
+    )
+    return fallback
+
+
 def selector_q_guard_scatter(
     *,
     draft_probs: torch.Tensor,
@@ -646,7 +762,27 @@ def selector_q_guard_scatter(
     the drafted tokens the target verifies (candidates[:, 1:]).
     ``stats``: optional int64 [len(SELECTOR_Q_GUARD_STATS)] accumulator.
     Returns the per-slot fallback mask [bs, gamma] (bool).
+
+    formhp-qguard-1028: one fused launch when FLLIPER_FORMHP_QGUARD_FUSED (default on) and the layouts allow it; the eager
+    torch body below otherwise. The values scattered and the counters are the same (the sum check's fp32 order may differ
+    in the last bit, |sum - 1| against a 1e-3 tolerance).
     """
+    if _qguard_fused_on(draft_probs, candidate_ids, q_rows, draft_tokens, stats):
+        return _selector_q_guard_scatter_fused(draft_probs=draft_probs, candidate_ids=candidate_ids, q_rows=q_rows,
+                                               draft_tokens=draft_tokens, stats=stats)
+    return _selector_q_guard_scatter_torch(draft_probs=draft_probs, candidate_ids=candidate_ids, q_rows=q_rows,
+                                           draft_tokens=draft_tokens, stats=stats)
+
+
+def _selector_q_guard_scatter_torch(
+    *,
+    draft_probs: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    q_rows: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    stats: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The eager guard (``selector_q_guard_scatter``'s contract; the A/B and the fused kernel's reference)."""
     ids = candidate_ids.to(torch.int64)
     x = draft_tokens.to(device=ids.device, dtype=torch.int64)
     q = q_rows.to(torch.float32)

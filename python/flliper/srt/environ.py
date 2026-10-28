@@ -332,6 +332,10 @@ class Envs:
     # exact for any proposal. Off (0) = the unchecked scatter (A/B only): a
     # NaN row then drops every selector candidate from the output.
     FLLIPER_DFLASH_Q_GUARD = EnvBool(True)
+    # formhp-qguard-1028: the q guard as ONE fused Triton launch per round instead of ~50 eager torch ops (py-spy formb165
+    # bs1: selector_q_guard_scatter 1.77 ms of a_acc's 2.97 ms on the scheduler thread, dispatch under the GIL). Same
+    # values scattered, same counters. Off (0) = the eager torch guard (A/B).
+    FLLIPER_FORMHP_QGUARD_FUSED = EnvBool(True)
     # DFLASH window pool (FLLIPER_DFLASH_WINDOW_POOL=1): run the draft-slot
     # mapper and the per-round window rebuild without host reads, so the host
     # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
