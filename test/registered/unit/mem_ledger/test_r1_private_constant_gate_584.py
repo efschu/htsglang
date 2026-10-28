@@ -221,7 +221,7 @@ KNOWN = {
         "change at all. Named here so the split is visible rather than "
         "arriving as a new unpinned constant."
     ),
-    "pdflip/launcher.py::P_CORRIDOR_HOLDBACK_MIB": (
+    "pdflip/launcher_add_r5_L0.py::P_CORRIDOR_HOLDBACK_MIB": (
         "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
         "made (#1286). It is the boot's own 'gapped corridor holdback' post, "
         "read off the success-path line model_runner_kv_cache_mixin.py:1174 "

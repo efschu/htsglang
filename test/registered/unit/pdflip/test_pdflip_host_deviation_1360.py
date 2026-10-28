@@ -39,6 +39,16 @@ _KW = dict(
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _choose(**extra):
     return hl.choose(
         int(123.78 * GIB), int(110.0 * GIB), arms=[(1, 150)],
@@ -170,7 +180,7 @@ class SizingIsUntouched1360(CustomTestCase):
         """#781 fossil class: ONE spelling, on the command line."""
         import inspect
         from flliper.srt.pdflip import launcher as lc
-        src = inspect.getsource(lc)
+        src = _launcher_text()
         self.assertIn('"--host-ledger-deviation"', src)
         self.assertIn('"--host-riegel-gib"', src)
         for fossil in ("HOST_LEDGER_DEVIATION", "HOST_RIEGEL",

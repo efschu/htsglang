@@ -66,9 +66,24 @@ def _clean(text: Optional[str]) -> str:
 def launcher_flags(launcher_path: str) -> Dict[str, Dict[str, object]]:
     """``--flag`` -> ``{help, default, choices, nargs, bare, type, line}`` from the launcher's ``add_argument``
     calls (every spelling of the flag maps to the same record)."""
-    with open(launcher_path, encoding="utf-8") as fh:
-        tree = ast.parse(fh.read(), launcher_path)
     out: Dict[str, Dict[str, object]] = {}
+    for path in launcher_sources(launcher_path):
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), path)
+        _launcher_flags_of(tree, os.path.basename(path), out)
+    return out
+
+
+def launcher_sources(launcher_path: str) -> List[str]:
+    """``launcher.py`` plus its ``launcher_*.py`` siblings: the launcher was split behaviour-neutrally (refactor 28.10.), its flags are
+    registered by ``_add_args_*`` functions that live in the siblings. Any other file stays what it is."""
+    here = os.path.dirname(os.path.abspath(launcher_path))
+    if os.path.basename(launcher_path) != "launcher.py":
+        return [launcher_path]
+    return [launcher_path] + sorted(os.path.join(here, f) for f in os.listdir(here) if f.startswith("launcher_") and f.endswith(".py"))
+
+
+def _launcher_flags_of(tree: ast.AST, fname: str, out: Dict[str, Dict[str, object]]) -> None:
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument"):
             continue
@@ -86,10 +101,10 @@ def launcher_flags(launcher_path: str) -> Dict[str, Dict[str, object]]:
             "action": action,
             "type": (kw["type"].id if "type" in kw and isinstance(kw["type"], ast.Name) else None),
             "line": node.lineno,
+            "file": fname,
         }
         for n in names:
             out[n] = dict(rec)
-    return out
 
 
 def server_args_flags(server_args_path: str) -> Dict[str, Dict[str, object]]:

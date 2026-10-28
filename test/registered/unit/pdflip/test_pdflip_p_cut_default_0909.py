@@ -158,6 +158,16 @@ FRONTIER_SN5PRE = (
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _field(frontier):
     return [
         CutCandidate(layers=layers, attn=attn, makespan_ms=ms, pool_tokens=float(pool))
@@ -571,7 +581,7 @@ class TheCapIsTheShippedPool(CustomTestCase):
         self.assertIn("pool_floor=%s", src)
 
     def test_the_constant_is_gone(self):
-        src = (PDFLIP_DIR / "launcher.py").read_text()
+        src = _launcher_text()
         tree = ast.parse(src)
         ints = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == 428000]
         self.assertEqual(ints, [], f"the weg2zr2 cap is restated at {ints}")
@@ -634,7 +644,7 @@ class TheCutIsWrittenExactlyOnce(CustomTestCase):
 
     def test_the_argparse_default_stays_none(self):
         found = None
-        tree = ast.parse((PDFLIP_DIR / "launcher.py").read_text())
+        tree = ast.parse(_launcher_text())
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
                 continue

@@ -59,6 +59,16 @@ CARDS = [
 ]
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 class FakeVariant:
     def __init__(self, gemm, membw):
         self.gemm_tflops = gemm
@@ -529,7 +539,7 @@ class OperatingPointVectorTest(unittest.TestCase):
         rows, _ = self.rows()
         unit = next(r for r in rows if r.position == "decode-bs6").round_unit
         self.assertIn("BOOT-UNPROVEN", unit)
-        src = inspect.getsource(lz)
+        src = _launcher_text()
         i = src.index('"--d-tp-objective"')
         help_text = src[i : i + 4000]
         self.assertIn("REGIME PREMISES ARE", help_text)
@@ -548,7 +558,7 @@ class OperatingPointVectorTest(unittest.TestCase):
 
         from flliper.srt.pdflip import launcher as lz
 
-        src = inspect.getsource(lz)
+        src = _launcher_text()
         i = src.index('"--d-tp-objective"')
         help_text = src[i : i + 4000]
         self.assertNotIn("would give any rank ZERO heads of a family", help_text)

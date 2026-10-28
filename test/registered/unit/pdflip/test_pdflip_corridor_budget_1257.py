@@ -111,6 +111,16 @@ SB5F_CARDS = (
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 class _Card:
     """The three attributes ``solve_corridor_budgets`` reads off a launcher
     ``Card`` (``launcher.py:951-962``).  Duck-typed on purpose: this file must
@@ -660,7 +670,7 @@ class TheLauncherWiresItOnDOnly(CustomTestCase):
     @staticmethod
     def _calls():
         from flliper.srt.pdflip import launcher
-        tree = ast.parse(inspect.getsource(launcher))
+        tree = ast.parse(_launcher_text())
         out = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "budgets_from_dc":
@@ -687,7 +697,7 @@ class TheLauncherWiresItOnDOnly(CustomTestCase):
         """Only the INPUT is selectable. A ``--no-corridor-constraint`` style
         flag would make the law optional, which it is not."""
         from flliper.srt.pdflip import launcher
-        src = inspect.getsource(launcher)
+        src = _launcher_text()
         for forbidden in ("--no-corridor", "--disable-corridor", "--corridor-constraint"):
             self.assertNotIn(forbidden, src)
         self.assertIn("--corridor-budget-sample", src)

@@ -46,6 +46,16 @@ KV_WARNING = (
 )
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _write(tmp_path, lines, name="D.log"):
     p = tmp_path / name
     p.write_text("\n".join(lines) + "\n")
@@ -387,7 +397,7 @@ def test_the_launcher_no_longer_scrapes_the_warning():
 
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     assert "HiCache host KV pool" not in src
     assert "0.9 * min" not in src
     assert "carrier_census" in src
@@ -408,7 +418,7 @@ def test_the_launcher_has_no_flag_that_ships_a_bound_of_zero():
 
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     # the flag itself, not the retraction comment that records why it went
     assert 'add_argument("--no-carrier-route"' not in src, (
         "the off switch that did the opposite of what it said is back")
@@ -430,7 +440,7 @@ def test_zero_is_documented_the_same_way_in_the_front_and_in_the_launcher():
     fsrc = inspect.getsource(front.main)
     assert "0 = no CARRIER-EXCEEDS route" in fsrc
     assert "NOT an off switch" in fsrc
-    assert "0 is NOT an off switch" in inspect.getsource(launcher)
+    assert "0 is NOT an off switch" in _launcher_text()
 
     # the guards those sentences describe are still the guards
     # #1290: the carrier guard lives in `serviceable_route` now -- one
@@ -783,7 +793,7 @@ def test_the_launcher_delegates_the_whole_decision_and_keeps_no_second_check(tmp
 
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     assert "_cc.decide_bound(_cen, ns.carrier_max_tokens" in src
     assert "raise PdFlipLaunchRefused(_dec.detail)" in src
     # 30.09.: a TOKEN, not a substring -- 7f0e2eb39b (28.09., L3 identity) wrote
@@ -802,7 +812,7 @@ def test_the_flag_help_states_the_interval_and_every_refusal_it_can_produce():
 
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     start = src.index('"--carrier-max-tokens", type=int, default=None')
     help_text = src[start:src.index("ap.add_argument(", start + 10)]
     assert "floor < N <= measured" in help_text
@@ -920,7 +930,7 @@ def _decision_region() -> str:
 
     from flliper.srt.pdflip import launcher
 
-    src = inspect.getsource(launcher)
+    src = _launcher_text()
     a = src.index("for _sl in _cen.lines:")
     b = src.index("state.carrier_max_tokens = carrier_max_tokens", a)
     body = src[a:b].split("\n")[2:]  # drop the loop itself, keep what follows

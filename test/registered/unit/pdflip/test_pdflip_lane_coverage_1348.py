@@ -45,6 +45,16 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from flliper.test.test_utils import CustomTestCase
 
 
+def _launcher_text() -> str:
+    """The launcher source as one text: launcher.py plus launcher_*.py (split behaviour-neutrally, refactor 28.10.)."""
+    import pathlib
+
+    from flliper.srt.pdflip import launcher as _lc
+
+    pdflip = pathlib.Path(_lc.__file__).resolve().parent
+    return "\n".join(p.read_text(encoding="utf-8") for p in [pdflip / "launcher.py", *sorted(pdflip.glob("launcher_*.py"))])
+
+
 def _repo_root() -> str:
     here = os.path.abspath(__file__)
     for _ in range(8):
@@ -506,7 +516,7 @@ class TheLauncherFlagIsOffByDefault(CustomTestCase):
         ``action=`` that is right there. That near-miss is the reason this is
         a helper and not an inline pattern.
         """
-        src = open(os.path.join(ROOT, "python/flliper/srt/pdflip/launcher.py")).read()
+        src = _launcher_text()
         i = src.index('add_argument(\n        "--xchg-coverage-diff"')
         return src[i : i + 1600]
 
