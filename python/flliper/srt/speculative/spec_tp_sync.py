@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
 import logging
 from enum import IntEnum
+from typing import Callable, List, Optional, Sequence
 
 import torch
 
@@ -96,6 +98,15 @@ def parse_spec_tp_sync(spec: str) -> frozenset[SpecTpSyncSite]:
     return sites
 
 
+def reduce_min_cpu(values: Sequence[int], *, cpu_group) -> List[int]:
+    """Element-wise MIN of small integers over ``cpu_group`` (gloo, host tensors). Every rank of the group must call it
+    the same number of times, in the same order -- a MIN over 0/1 flags is an AND, over FAIL(0) < UNDECIDED(1) < PASS(2)
+    codes it is "any rank failed -> failed, else any rank undecided -> undecided"."""
+    t = torch.tensor([int(v) for v in values], dtype=torch.int64)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
+    return [int(v) for v in t.tolist()]
+
+
 class SpecTpSync:
     """Broadcasts a speculative decision from rank 0 to its TP group."""
 
@@ -173,6 +184,16 @@ class SpecTpSync:
                 except Exception:  # noqa: BLE001
                     pass
         return values
+
+    def verdict_reducer(self) -> Optional[Callable[[Sequence[int]], List[int]]]:
+        """27b-rank-uniform-1028: the reduction a once-per-process self-test verdict (FORMHP-DRAFT-PLAN-SKIP,
+        FORMHP-VPREP-EARLY) is made rank-uniform with -- element-wise MIN over the TP group's CPU (gloo) group, the
+        channel ``available_memory_gb`` already reduces on, never the GPU graph path. ``None`` on a single rank: the
+        caller decides locally and nothing is synchronised (TP=1 byte-identical). Not gated by FLLIPER_SPEC_TP_SYNC:
+        a rank-local verdict in front of a collective is a hang, not a tunable."""
+        if self._tp_group.world_size <= 1:
+            return None
+        return functools.partial(reduce_min_cpu, cpu_group=self._tp_group.cpu_group)
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
         """Free GPU memory, reduced to the group minimum when ``site`` is on."""
