@@ -67,6 +67,10 @@ WRITER_AUDIT = {
     "set_kv_buffer_prefix_valid_tiled": (
         "bound=kv_store_bound(...) -> tl.device_assert (#355)"
     ),
+    # 27b-xkv-1028: every draft layer of one materialization in one launch, the same bound
+    "set_kv_buffer_prefix_valid_layers_tiled": (
+        "bound=kv_store_bound(...) -> tl.device_assert (#355)"
+    ),
     # --- deliberately unbounded, with the reason ---
     "store_cache_cpu": None,  # CPU op, no device assert to speak of
     "copy_all_layer_kv_cache_func": None,  # move path: host maybe_detect_oob on both locs
@@ -101,6 +105,7 @@ NOT_WRITERS = {
     "load_cpu_copy",
     "set_kv_buffer",  # dispatchers; the physical writers are the entries above
     "set_kv_buffer_prefix_valid",
+    "set_kv_buffer_prefix_valid_layers",  # dispatcher (27b-xkv-1028); the writer is the _layers_tiled kernel
     "set_mla_kv_buffer",
     "move_kv_cache",
     "register_layer_transfer_counter",

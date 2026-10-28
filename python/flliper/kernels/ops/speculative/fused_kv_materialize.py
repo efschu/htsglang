@@ -395,8 +395,12 @@ class FusedKVMaterializeHelper:
         ctx_hidden: torch.Tensor,
         positions: torch.Tensor,
         write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+        write_all_layers_kv: Optional[Callable[[torch.Tensor, torch.Tensor], bool]] = None,
     ) -> None:
-        """Materialize KV cache for all layers using batched projection."""
+        """Materialize KV cache for all layers using batched projection.
+
+        27b-xkv-1028: ``write_all_layers_kv(k [layers, rows, ...], v)`` writes every layer at once (one cast, one launch) and
+        returns True, or returns False and the layers are written one by one through ``write_layer_kv``."""
         total_ctx = ctx_hidden.shape[0]
         if total_ctx == 0:
             return
@@ -457,5 +461,8 @@ class FusedKVMaterializeHelper:
             k_out=tmp_k,
             v_out=tmp_v,
         )
+        # 27b-xkv-1028 (FORMHP-XKV-LAYERS): all layers in one cast + one launch when the caller can; False = per layer
+        if write_all_layers_kv is not None and write_all_layers_kv(cache_k, cache_v):
+            return
         for layer_idx in range(self.n_layers):
             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])

@@ -24,6 +24,7 @@ from flliper.srt.layers.logits_processor import should_apply_lm_head_quant_metho
 from flliper.srt.managers.schedule_batch import ScheduleBatch
 from flliper.srt.managers.scheduler import GenerationBatchResult
 from flliper.srt.managers.tp_worker import TpModelWorker
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 from flliper.srt.managers.pdflip_d_hostgap import meter as _d_hostgap_meter
 from flliper.srt.managers.pdflip_d_hostgap import split_mark as _d_hostgap_split_mark
 from flliper.srt.managers.pdflip_d_hostgap import (
@@ -2700,10 +2701,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
 
+        prefix_valid = ctx_cache_loc_2d is not None and commit_lens is not None
+
+        def _write_all_layers_kv(cache_k_all: torch.Tensor, cache_v_all: torch.Tensor) -> bool:
+            # 27b-xkv-1028 (FORMHP-XKV-LAYERS, memory_pool.set_kv_buffer_prefix_valid_layers): one cast + one launch for all layers
+            if not isinstance(token_to_kv_pool, MHATokenToKVPool):
+                return False
+            attns = [self.draft_model.layers[i].self_attn.attn for i in range(int(cache_k_all.shape[0]))]
+            return token_to_kv_pool.set_kv_buffer_prefix_valid_layers(
+                layers=attns,
+                loc_2d=ctx_cache_loc_2d,
+                commit_lens=commit_lens,
+                cache_k_all=cache_k_all,
+                cache_v_all=cache_v_all,
+            )
+
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
+            write_all_layers_kv=_write_all_layers_kv if prefix_valid else None,
         )
 
     @staticmethod
