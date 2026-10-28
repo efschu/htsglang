@@ -502,6 +502,9 @@ def _window_updater(window=2048):
         qo_indptr=[torch.zeros(9, dtype=torch.int32), torch.zeros(9, dtype=torch.int32)],
         _swa_kv_pool=None,
         call_begin_forward=_cbf,
+        # FORMHP-DRAFT-PLAN-SKIP (27B port): the updater now carries the skipped / probed wrapper ids, empty = plan both as before
+        skip_wrapper_ids=frozenset(),
+        probe_wrapper_ids=frozenset(),
     )
     return upd, seen
 
