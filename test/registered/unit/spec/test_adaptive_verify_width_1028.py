@@ -13,9 +13,13 @@ from flliper.srt.speculative.adaptive_verify_width import (
     AcceptEma,
     AdaptiveKConfig,
     AdaptiveVerifyWidth,
+    RowCostFit,
     VerifyCostCurve,
+    adopt_fits,
     choose_width,
     expected_accept_tokens,
+    fit_coef,
+    fit_observe,
     flat_curve,
     initial_ema,
     linear_sps,
@@ -212,6 +216,51 @@ class TestLearning(unittest.TestCase):
         self.assertEqual(out.accept_rate[:2], (0.75, 0.25))
         self.assertEqual(out.accept_rate[2:], (0.5,) * (B - 3))
         self.assertEqual(out.observed_ct[:3], (1, 1, 0))
+
+
+class TestOnlineCostFit(unittest.TestCase):
+    """NF's online window-period fit (fLLiper 0d9fe5dcc SpanFit), rows as regressor."""
+
+    def _fit(self, samples):
+        fit = RowCostFit()
+        for rows, ms in samples:
+            fit = fit_observe(fit=fit, rows=rows, ms=ms)
+        return fit
+
+    def test_recovers_linear_cost_and_needs_both_ends(self):
+        """Noiseless a + c*rows comes back exactly; with one rows value only
+        (the incumbent end) the fit refuses to price the other end."""
+        both = self._fit([(r, 21.5 + 0.93 * r) for r in (24, 15) * 6])
+        a, c = fit_coef(fit=both, min_spread=3)
+        self.assertAlmostEqual(a, 21.5, places=6)
+        self.assertAlmostEqual(c, 0.93, places=6)
+        self.assertIsNone(fit_coef(fit=self._fit([(24, 43.8)] * 20), min_spread=3))
+
+    def test_host_bound_period_keeps_full_width(self):
+        """NF bs1: the period does not shrink with the rows (host-bound) ->
+        c = 0 -> every width costs the same -> k = N, even though the curve
+        prior (c = 0.93) would have narrowed a weak draft."""
+        fit = self._fit([(r, 30.0) for r in (8, 5) * 6])
+        a, c = fit_coef(fit=fit, min_spread=1)
+        self.assertAlmostEqual(c, 0.0, places=9)
+        curve = _curve(a_ms=21.5, c_ms=0.93, widths=(5, B))
+        ema = _ema(0.4)
+        prior = choose_width(cfg=_cfg(), curve=curve, ema=ema, batch_size=1, incumbent=B)
+        fitted = choose_width(cfg=_cfg(), curve=curve, ema=ema, batch_size=1, incumbent=B,
+                              adopted=((1, a, c),))
+        self.assertEqual((prior, fitted), (5, B))
+
+    def test_fit_probes_narrow_until_adopted(self):
+        """Without an adopted fit for this bs every fit_probe_every-th round
+        verifies the narrowest tier (so the fit gets both ends); after the
+        group adopts a fit the probes stop."""
+        curve = _curve(a_ms=21.5, c_ms=0.0, widths=(5, B))
+        ctl = AdaptiveVerifyWidth(cfg=_cfg(fit_probe_every=4), curve=curve)
+        seq = [ctl.next_width(batch_size=1) for _ in range(8)]
+        self.assertEqual(seq, [B, B, B, 5, B, B, B, 5])
+        ctl.state = adopt_fits(state=ctl.state, fits=[(1, 30.0, 0.0)])
+        self.assertEqual({ctl.next_width(batch_size=1) for _ in range(8)}, {B})
+        self.assertEqual(ctl.state.fit_probe_ct, 2)
 
 
 class TestCurveFile(unittest.TestCase):

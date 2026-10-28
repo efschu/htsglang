@@ -44,7 +44,10 @@ from flliper.srt.environ import envs
 from flliper.srt.speculative.adaptive_verify_width import (
     AdaptiveKConfig,
     AdaptiveVerifyWidth,
+    RowCostFit,
     VerifyCostCurve,
+    fit_coef,
+    fit_observe,
     load_curve_file,
     state_digest,
 )
@@ -155,6 +158,86 @@ def pad_out_tokens(*, out_tokens: torch.Tensor, draft_tokens: torch.Tensor) -> t
     return torch.cat([out_tokens, filler], dim=1)
 
 
+def _selftest_block(*, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic dummy round (same on every rank): rows that miss at
+    once, in the middle, one before the end and never."""
+    g = torch.Generator().manual_seed(20261028)
+    draft = torch.randint(0, 1000, (4, block_size), generator=g)
+    target = torch.randint(1000, 2000, (4, block_size), generator=g)
+    for r, agree in enumerate((0, block_size // 2, block_size - 2, block_size - 1)):
+        target[r, :agree] = draft[r, 1 : agree + 1]
+    return draft, target
+
+
+def _eager_accept(*, candidates: torch.Tensor, target_predict: torch.Tensor):
+    from flliper.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
+    from flliper.srt.speculative.dflash_worker_v2 import _commit_accept
+
+    accept, bonus = compute_dflash_correct_drafts_and_bonus(
+        candidates=candidates, target_predict=target_predict
+    )
+    out, commit = _commit_accept(candidates, accept, bonus)
+    return commit.to(torch.int64), out
+
+
+def _triton_accept(*, candidates: torch.Tensor, target_predict: torch.Tensor, block_size: int):
+    from flliper.kernels.ops.speculative.dflash import (
+        _compute_dflash_accept_bonus_triton_unchecked,
+    )
+
+    bs, dev = int(candidates.shape[0]), candidates.device
+    i32 = dict(dtype=torch.int32, device=dev)
+    commit = torch.zeros((bs,), **i32)
+    out = torch.zeros((bs, block_size), dtype=torch.int64, device=dev)
+    _compute_dflash_accept_bonus_triton_unchecked(
+        candidates=candidates,
+        target_top1=target_predict,
+        accept_lens_out=torch.zeros((bs,), **i32),
+        commit_lens_out=commit,
+        bonus_ids_out=torch.zeros((bs,), **i32),
+        out_tokens_out=out,
+        prefix_lens=torch.zeros((bs,), dtype=torch.int64, device=dev),
+        new_seq_lens_out=torch.zeros((bs,), dtype=torch.int64, device=dev),
+    )
+    return commit.to(torch.int64), out
+
+
+def accept_selftest(*, device, block_size: int, widths, use_triton: bool) -> bool:
+    """Boot self-test of the accept at every tier (NF: 'bei k=N bitgleich').
+
+    Reference = eager accept on the CPU at the full width. On the device, for
+    every width k (B included): eager and (when the worker uses it) Triton
+    accept of the first k slots must commit min(commit_B, k) tokens, equal to
+    the reference's first ones -- at k = B that is bit-identity. Exercises the
+    Triton BLOCK_SIZE variant each tier compiles. Any failure -> False (the
+    ladder stays off group-wide via ``plan_ladder``).
+    """
+    try:
+        draft, target = _selftest_block(block_size=block_size)
+        ref_commit, ref_out = _eager_accept(candidates=draft, target_predict=target)
+        for k in sorted({int(w) for w in widths} | {int(block_size)}):
+            cand = draft[:, :k].contiguous().to(device)
+            pred = target[:, :k].contiguous().to(device)
+            runs = [_eager_accept(candidates=cand, target_predict=pred)]
+            if use_triton:
+                runs.append(_triton_accept(candidates=cand, target_predict=pred, block_size=block_size))
+            want = torch.clamp(ref_commit, max=k)
+            for commit, out in runs:
+                commit, out = commit.cpu(), out.cpu()
+                if not torch.equal(commit, want):
+                    logger.error("ADAPTIVE-K self-test k=%d commit %s != %s", k, commit.tolist(), want.tolist())
+                    return False
+                for r in range(int(want.shape[0])):
+                    n = int(want[r])
+                    if not torch.equal(out[r, :n], ref_out[r, :n]):
+                        logger.error("ADAPTIVE-K self-test k=%d row %d tokens differ", k, r)
+                        return False
+        return True
+    except Exception as e:  # noqa: BLE001 -- any failure keeps k = B, loudly
+        logger.error("ADAPTIVE-K self-test raised %s: %s", type(e).__name__, e)
+        return False
+
+
 # --------------------------------------------------------------------------
 # Runtime
 # --------------------------------------------------------------------------
@@ -179,6 +262,11 @@ class DFlashVerifyWidth:
         self.saved: tuple | None = None
         self.stale_ct = 0
         self.ineligible_ct = 0
+        # Rank-LOCAL measurements; they reach the decision only through the
+        # census gather (rank 0's fit, adopted by every rank the same round).
+        self.local_fits: dict[int, RowCostFit] = {}
+        self.period_sum: dict[int, list] = {}
+        self.last_round: tuple[int, int, float] | None = None
         if self.enabled and self.tp_rank == 0:
             logger.info(
                 "ADAPTIVE-K boot: B=%d curve=%s candidate_widths=%s",
@@ -189,7 +277,9 @@ class DFlashVerifyWidth:
 
     # ---- boot ------------------------------------------------------------
 
-    def plan_ladder(self, *, cpu_group, free_mib: float, user_reserve_mib: int) -> bool:
+    def plan_ladder(
+        self, *, cpu_group, free_mib: float, user_reserve_mib: int, selftest_ok: bool
+    ) -> bool:
         """Boot-time, group-wide: may the k<B states be captured at all?
 
         One gather of (curve bytes, free MiB) over the TP group; every rank
@@ -205,7 +295,7 @@ class DFlashVerifyWidth:
             return False
         import torch.distributed as dist
 
-        mine = (msgspec.msgpack.encode(self.controller.curve), float(free_mib))
+        mine = (msgspec.msgpack.encode(self.controller.curve), float(free_mib), bool(selftest_ok))
         box = [mine]
         if cpu_group is not None and dist.is_initialized() and dist.get_world_size(cpu_group) > 1:
             box = [None] * dist.get_world_size(cpu_group)
@@ -216,6 +306,8 @@ class DFlashVerifyWidth:
         reason = None
         if any(b[0] != box[0][0] for b in box):
             reason = "ranks read different curves"
+        elif not all(b[2] for b in box):
+            reason = f"accept self-test failed on ranks {[i for i, b in enumerate(box) if not b[2]]}"
         elif min_free < need:
             reason = f"group min free {min_free:.0f} MiB < need {need:.0f} MiB"
         if self.tp_rank == 0:
@@ -266,10 +358,19 @@ class DFlashVerifyWidth:
 
     # ---- per round ---------------------------------------------------------
 
+    def begin_forward(self, *, target_model_runner, is_decode: bool) -> None:
+        """Every forward: undo a width swap a raised round left behind, and
+        break the round-period chain on a non-decode forward (prefill / idle
+        rounds in between would be billed to the decode rows)."""
+        self.restore(target_model_runner=target_model_runner)
+        if not is_decode:
+            self.last_round = None
+
     def begin_round(self, *, target_model_runner, batch_size: int, eligible: bool) -> int:
         """Plan this decode round's width and activate its state."""
         if not self.enabled:
             return self.block_size
+        self._measure_period(batch_size=int(batch_size))
         self.round_idx += 1
         self._consume(upto=self.round_idx - 2)
         width = self.controller.next_width(batch_size=batch_size)
@@ -288,6 +389,7 @@ class DFlashVerifyWidth:
             self.stale_ct += 1
             width = self.block_size
         self.width = width
+        self.last_round = (int(batch_size), int(batch_size) * width, time.perf_counter())
         if width != self.block_size:
             state = self.states[width]
             self.saved = (
@@ -321,6 +423,28 @@ class DFlashVerifyWidth:
 
     # ---- internals -------------------------------------------------------
 
+    def _measure_period(self, *, batch_size: int) -> None:
+        """Round period (begin of the previous decode round -> now) for the
+        previous round's rows, when it ran at the same bs with no other
+        forward between (NF: window period, verify launch to verify launch)."""
+        last = self.last_round
+        if last is None or last[0] != batch_size or not self.controller.active:
+            return
+        ms = 1000.0 * (time.perf_counter() - last[2])
+        fit = self.local_fits.get(batch_size, RowCostFit())
+        self.local_fits[batch_size] = fit_observe(fit=fit, rows=last[1], ms=ms)
+        acc = self.period_sum.setdefault(batch_size, [0.0, 0])
+        acc[0] += ms
+        acc[1] += 1
+
+    def _local_coefs(self) -> list[tuple[int, float, float]]:
+        out = []
+        for bs, fit in sorted(self.local_fits.items()):
+            coef = fit_coef(fit=fit, min_spread=bs)
+            if coef is not None:
+                out.append((bs, coef[0], coef[1]))
+        return out
+
     def _consume(self, *, upto: int) -> None:
         while self.pending and self.pending[0].round_idx <= upto:
             obs = self.pending.popleft()
@@ -332,35 +456,55 @@ class DFlashVerifyWidth:
             )
 
     def _census(self) -> None:
-        line = self.controller.census()
+        """Rank check + group adoption of rank 0's cost fits, then the line.
+
+        One all_gather of (round, digest, local fits): digests must match
+        (else crash-stop), and every rank installs the SAME fits (rank 0's)
+        in the same round, so the rank-local wall clock never splits k.
+        """
+        box = _gather_census(
+            payload=(
+                self.round_idx,
+                state_digest(state=self.controller.state),
+                self._local_coefs(),
+            )
+        )
+        if any(b[:2] != box[0][:2] for b in box):
+            raise RuntimeError(
+                f"ADAPTIVE-K RANK DIVERGENCE at round {self.round_idx}: "
+                f"{[b[:2] for b in box]} -- crash-stop (ranks would replay "
+                "different verify graphs)"
+            )
+        self.controller.adopt(fits=box[0][2])
         if self.tp_rank == 0:
+            periods = " ".join(
+                f"bs{b}:{v[0] / v[1]:.1f}({v[1]})" for b, v in sorted(self.period_sum.items()) if v[1]
+            ) or "-"
             logger.info(
-                "%s stale_fallback=%d ineligible=%d states=%s",
-                line,
+                "%s round_ms=%s stale_fallback=%d ineligible=%d states=%s",
+                self.controller.census(),
+                periods,
                 self.stale_ct,
                 self.ineligible_ct,
                 sorted(self.states),
             )
-        _check_rank_digest(digest=state_digest(state=self.controller.state), round_idx=self.round_idx)
+        self.period_sum = {}
 
 
-def _check_rank_digest(*, digest: int, round_idx: int) -> None:
+def _gather_census(*, payload: tuple) -> list:
+    """all_gather over the TP cpu group; ``[payload]`` without a group."""
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        return
+        return [payload]
     from flliper.srt.distributed import get_tp_group
 
     group = get_tp_group().cpu_group
     if dist.get_world_size(group) == 1:
-        return
+        return [payload]
     box: list = [None] * dist.get_world_size(group)
-    dist.all_gather_object(box, (int(round_idx), int(digest)), group=group)
-    if any(b != box[0] for b in box):
-        raise RuntimeError(
-            f"ADAPTIVE-K RANK DIVERGENCE at round {round_idx}: {box} -- crash-stop "
-            "(ranks would replay different verify graphs)"
-        )
+    dist.all_gather_object(box, payload, group=group)
+    return box
 
 
 @contextlib.contextmanager

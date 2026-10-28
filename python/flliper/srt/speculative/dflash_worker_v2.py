@@ -1408,10 +1408,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         free_mib = 1024.0 * get_available_gpu_memory(
             self.device, self.gpu_id, distributed=False
         )
+        from flliper.srt.speculative.dflash_verify_width import accept_selftest
+
+        selftest_ok = accept_selftest(
+            device=self.device,
+            block_size=int(self.block_size),
+            widths=self._adaptive_k.controller.widths,
+            use_triton=bool(self._use_triton_accept_bonus),
+        )
         if not self._adaptive_k.plan_ladder(
             cpu_group=get_tp_group().cpu_group,
             free_mib=free_mib,
             user_reserve_mib=self.server_args.user_reserve_mib_scalar(),
+            selftest_ok=selftest_ok,
         ):
             return
         self._adaptive_k.build_states(
@@ -3445,8 +3454,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         # that stood here is gone. The target prefill computes its own.
         self._validate_phase1_sampling_support(batch)
         # FLLIPER_ADAPTIVE_K belt: a round that raised after its width swap
-        # must not leave the next forward (prefill, flip) on a k-state.
-        self._adaptive_k.restore(target_model_runner=self.target_worker.model_runner)
+        # must not leave the next forward (prefill, flip) on a k-state; a
+        # non-decode forward also breaks the round-period chain of the fit.
+        self._adaptive_k.begin_forward(
+            target_model_runner=self.target_worker.model_runner,
+            is_decode=not (
+                batch.forward_mode.is_extend()
+                or batch.is_extend_in_batch
+                or batch.forward_mode.is_idle()
+            ),
+        )
         # seq_lens_cpu_ready (FLLIPER_PDFLIP_D_DEFER_SEQ_LENS_CPU): the scheduler
         # deferred the host half of this batch's length read; batch.seq_lens_cpu
         # / seq_lens_sum are None until it is called. Idempotent. The decode
@@ -3523,7 +3540,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_width = self._adaptive_k.begin_round(
             target_model_runner=self.target_worker.model_runner,
             batch_size=bs,
-            eligible=not (batch.has_grammar or batch.return_logprob),
+            # Full width (as NF): grammar, logprobs, DFlash2 selector sampling.
+            eligible=not (
+                batch.has_grammar
+                or batch.return_logprob
+                or (self.selector is not None and not _is_all_greedy(batch.sampling_info))
+            ),
         )
 
         # --- 1) Draft a fixed block with the draft model.

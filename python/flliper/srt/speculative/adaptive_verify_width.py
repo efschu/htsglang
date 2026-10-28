@@ -115,6 +115,10 @@ class AdaptiveKConfig(msgspec.Struct, frozen=True, kw_only=True):
     probe_every: int = 32
     census_every: int = DEFAULT_CENSUS_EVERY
     force_width: int = 0
+    #: every N-th round, while this bs has no adopted cost fit, verify the
+    #: NARROWEST tier so both ends of the fit get measured (NF probe idea,
+    #: Basalt draft_policy). 0 = never.
+    fit_probe_every: int = 8
 
 
 class AdaptiveKState(msgspec.Struct, frozen=True, kw_only=True):
@@ -130,6 +134,31 @@ class AdaptiveKState(msgspec.Struct, frozen=True, kw_only=True):
     num_accept_tokens_ct: int = 0
     width_hist: tuple[int, ...]
     ema: AcceptEma
+    fit_probe_ct: int = 0
+    #: (bs, a_ms, c_ms_per_row) adopted group-wide at a census: the online
+    #: cost model that replaces the curve's prior for that bs.
+    adopted_fit: tuple[tuple[int, float, float], ...] = ()
+
+
+class RowCostFit(msgspec.Struct, frozen=True, kw_only=True):
+    """Exponentially weighted least squares of ``ms = a + c * rows`` for ONE bs.
+
+    Port of NF's ``formhp_adaptive_k.SpanFit`` (fLLiper 0d9fe5dcc) with the
+    dense 27B regressor ``rows`` in place of Form B's distinct-expert share
+    U(N). Fed with the measured decode ROUND PERIOD (begin of round N to
+    begin of round N+1 at the same bs, no other forward between): the
+    objective is committed tokens per wall ms, so a host-bound shape whose
+    period does not shrink with the rows fits c ~ 0 and keeps the full width.
+    """
+
+    sw: float = 0.0
+    sr: float = 0.0
+    srr: float = 0.0
+    sy: float = 0.0
+    sry: float = 0.0
+    count: int = 0
+    rows_min: int = 0
+    rows_max: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -204,16 +233,78 @@ def load_curve_file(*, path: str) -> VerifyCostCurve | None:
         return None
 
 
-def round_cost_ms(*, curve: VerifyCostCurve, width: int, batch_size: int) -> float:
+def round_cost_ms(
+    *,
+    curve: VerifyCostCurve,
+    width: int,
+    batch_size: int,
+    adopted: tuple[tuple[int, float, float], ...] = (),
+) -> float:
     """Cost (ms) of a round verifying *width* slots for *batch_size* rows.
 
+    The group-adopted online fit for this bs wins over the curve's prior.
     Returns ``inf`` for a width the curve does not carry, which makes it
     ineligible in ``choose_chain_length``.
     """
     if width not in curve.widths:
         return math.inf
     bs = max(1, int(batch_size))
+    for fit_bs, a_ms, c_ms in adopted:
+        if fit_bs == bs:
+            return a_ms + c_ms * bs * int(width)
     return 1000.0 * curve.sps.step_time(num_reqs=bs, budget=bs * (int(width) - 1))
+
+
+#: NF SpanFit constants (fLLiper 0d9fe5dcc): forgetting factor (half-life ~34
+#: rounds) and spans needed before a fit counts.
+FIT_FORGET = 0.98
+FIT_MIN_SPANS = 6
+
+
+def fit_observe(*, fit: RowCostFit, rows: int, ms: float, forget: float = FIT_FORGET) -> RowCostFit:
+    """Fold one (rows, period ms) sample in; non-finite / non-positive ignored."""
+    if not (math.isfinite(ms) and ms > 0.0):
+        return fit
+    r = float(rows)
+    first = fit.count == 0
+    return RowCostFit(
+        sw=forget * fit.sw + 1.0,
+        sr=forget * fit.sr + r,
+        srr=forget * fit.srr + r * r,
+        sy=forget * fit.sy + ms,
+        sry=forget * fit.sry + r * ms,
+        count=fit.count + 1,
+        rows_min=int(rows) if first else min(fit.rows_min, int(rows)),
+        rows_max=int(rows) if first else max(fit.rows_max, int(rows)),
+    )
+
+
+def fit_coef(*, fit: RowCostFit, min_spread: int) -> tuple[float, float] | None:
+    """(a_ms, c_ms_per_row), or None until identifiable (both ends measured).
+
+    ``c < 0`` (noise: cost falling with rows) is clamped to 0, which prices
+    every width the same and so keeps the full width.
+    """
+    if fit.count < FIT_MIN_SPANS or fit.rows_max - fit.rows_min < max(1, int(min_spread)):
+        return None
+    mu = fit.sr / fit.sw
+    var = fit.srr / fit.sw - mu * mu
+    if var <= 1e-12:
+        return None
+    c = max(0.0, (fit.sry / fit.sw - mu * fit.sy / fit.sw) / var)
+    return fit.sy / fit.sw - c * mu, c
+
+
+def adopt_fits(
+    *, state: AdaptiveKState, fits: Sequence[tuple[int, float, float]]
+) -> AdaptiveKState:
+    """Install the group-agreed cost fits (one rank's, broadcast at a census)."""
+    merged = {bs: (a, c) for bs, a, c in state.adopted_fit}
+    for bs, a, c in fits:
+        merged[int(bs)] = (float(a), float(c))
+    return msgspec.structs.replace(
+        state, adopted_fit=tuple((bs, a, c) for bs, (a, c) in sorted(merged.items()))
+    )
 
 
 def candidate_widths(*, cfg: AdaptiveKConfig, curve: VerifyCostCurve | None) -> tuple[int, ...]:
@@ -311,6 +402,7 @@ def choose_width(
     ema: AcceptEma,
     batch_size: int,
     incumbent: int,
+    adopted: tuple[tuple[int, float, float], ...] = (),
 ) -> int:
     """argmax_k E[tokens](k) / step_ms(k), with the hysteresis margin.
 
@@ -328,7 +420,9 @@ def choose_width(
     survival = survival_curve(ema=ema)
 
     def cost(chain: int) -> float:
-        return round_cost_ms(curve=curve, width=chain + 1, batch_size=batch_size)
+        return round_cost_ms(
+            curve=curve, width=chain + 1, batch_size=batch_size, adopted=adopted
+        )
 
     best = 1 + choose_chain_length(
         survival,
@@ -383,6 +477,7 @@ def plan_round(
         state.switch_ct,
         state.probe_ct,
     )
+    fit_probe_ct = state.fit_probe_ct
     if len(widths) == 1:
         incumbent = width = widths[0]
     elif round_ct <= cfg.warmup_rounds:
@@ -390,6 +485,16 @@ def plan_round(
     elif cfg.probe_every > 0 and round_ct % cfg.probe_every == 0 and incumbent != b:
         width = b
         probe_ct += 1
+    elif (
+        cfg.fit_probe_every > 0
+        and round_ct % cfg.fit_probe_every == 0
+        and incumbent == b
+        and all(bs != int(batch_size) for bs, _, _ in state.adopted_fit)
+    ):
+        # No adopted cost fit for this bs: measure the narrow end (the full
+        # end is measured by every other round). Does not move the incumbent.
+        width = widths[0]
+        fit_probe_ct += 1
     else:
         if held > cfg.min_dwell:
             chosen = choose_width(
@@ -398,6 +503,7 @@ def plan_round(
                 ema=state.ema,
                 batch_size=batch_size,
                 incumbent=incumbent,
+                adopted=state.adopted_fit,
             )
             if chosen != incumbent:
                 incumbent, held, switch_ct = chosen, 0, switch_ct + 1
@@ -412,6 +518,7 @@ def plan_round(
         held_rounds=held,
         switch_ct=switch_ct,
         probe_ct=probe_ct,
+        fit_probe_ct=fit_probe_ct,
         width_hist=tuple(hist),
     )
 
@@ -460,16 +567,25 @@ def census_line(
     )
     scores = []
     for w in candidate_widths(cfg=cfg, curve=curve):
-        c = round_cost_ms(curve=curve, width=w, batch_size=batch_size) if curve else math.nan
+        c = (
+            round_cost_ms(curve=curve, width=w, batch_size=batch_size, adopted=state.adopted_fit)
+            if curve
+            else math.nan
+        )
         e = expected_accept_tokens(ema=state.ema, width=w)
         scores.append(f"k{w}:E{e:.2f}/{c:.2f}ms")
+    fits = " ".join(f"bs{b}:{a:.1f}+{c:.2f}r" for b, a, c in state.adopted_fit) or "-"
     return (
         f"ADAPTIVE-K census rounds={state.round_ct} hist={hist} "
         f"incumbent={state.incumbent} switches={state.switch_ct} "
-        f"probes={state.probe_ct} accept_length={mean:.3f} rates={rates} "
-        f"bs={batch_size} score={' '.join(scores)} "
+        f"probes={state.probe_ct} fit_probes={state.fit_probe_ct} "
+        f"accept_length={mean:.3f} rates={rates} "
+        f"bs={batch_size} score={' '.join(scores)} fit={fits} "
         f"curve={curve.source if curve else 'none(k=B)'} "
-        f"digest={state_digest(state=state):08x}"
+        f"digest={state_digest(state=state):08x} "
+        "(legend: k = verified slots per row incl. the anchor; E = expected "
+        "committed tokens per row; ms = round cost from the adopted fit "
+        "a+c*rows, else the curve prior)"
     )
 
 
@@ -511,6 +627,10 @@ class AdaptiveVerifyWidth:
     def census_due(self) -> bool:
         every = int(self.cfg.census_every)
         return every > 0 and self.state.round_ct > 0 and self.state.round_ct % every == 0
+
+    def adopt(self, *, fits: Sequence[tuple[int, float, float]]) -> None:
+        """Install group-agreed cost fits (call on every rank, same round)."""
+        self.state = adopt_fits(state=self.state, fits=fits)
 
     def census(self) -> str:
         return census_line(
