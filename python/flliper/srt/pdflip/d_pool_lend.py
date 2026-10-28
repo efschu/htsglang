@@ -149,11 +149,18 @@ def armed(env=None) -> bool:
 
 # -- pure verdicts --------------------------------------------------------------------------------------------
 
-def intent(*, lent: bool, pend: int, incoming: int, busy: bool, streak: int, settle: int, min_rows: int) -> Intent:
+def intent(*, lent: bool, pend: int, incoming: int, busy: bool, streak: int, settle: int, min_rows: int,
+           idle: int = 0) -> Intent:
     """REPLICATED, pure: what the round's context asks of the lend, before the live floor is read.
 
     * a second pending prefill: the tail goes back at once (the pool must hold both);
     * no pending prefill and ``settle`` decode rounds (a running batch) in a row: back (hysteresis);
+    * lent, no pending prefill and NOTHING running for ``settle`` passes in a row (``idle``): back. The tail is
+      lent only while one prefill runs; an idle D that stays lent shows the front a pool that is too small for the
+      next request, the front holds it back (SEAT-AGE-PLAN deficit), and D never sees a pending prefill to size
+      for: both wait for each other (boot int4arxd 28.10. 01:12Z: lent to T=28672 after an 8k prompt, a 32k prompt
+      waited until the timeout). One idle pass is not enough: the pass right after a prefill runs before the
+      finished request is merged into the running batch;
     * exactly one pending prefill of at least ``min_rows`` (or any while lent): size the pool (release, or grow
       when it outgrew T);
     * lent, no pending prefill, decodes running: size the pool too (decode growth must not run into the cap)."""
@@ -162,6 +169,8 @@ def intent(*, lent: bool, pend: int, incoming: int, busy: bool, streak: int, set
     if pend == 0:
         if lent and busy and streak >= settle:
             return Intent("back", "settled streak=%d" % streak)
+        if lent and not busy and idle >= settle:
+            return Intent("back", "idle passes=%d" % idle)
         return Intent("check") if (lent and busy) else Intent("none")
     if lent or incoming >= min_rows:
         return Intent("check")
@@ -220,6 +229,7 @@ class PoolLend(_pk.PKvStage):
         self.trim_fn = trim_fn or _empty_cache
         self.rounds = 0
         self.streak = 0
+        self.idle = 0                           # passes in a row with nothing pending and nothing running
         self.next_round = 0
         self.refusals = 0
         self.had_pending = False
@@ -563,14 +573,16 @@ def round_start(sched) -> Optional[str]:
     actor.rounds += 1
     pend, busy = _pending(sched), _busy(sched)
     actor.streak = next_streak(streak=actor.streak, pend=pend, busy=busy)
+    actor.idle = actor.idle + 1 if (not pend and not busy) else 0
     if pend and not actor.had_pending and actor.refusals == 0:
         actor.next_round = 0                    # a new prefill reads the floor now, not at the old cadence
     actor.had_pending = bool(pend)
     incoming = d_incoming_tokens(sched)
     it = intent(lent=actor.lent, pend=pend, incoming=incoming, busy=busy, streak=actor.streak,
-                settle=actor.knobs.settle, min_rows=actor.knobs.min_rows)
+                settle=actor.knobs.settle, min_rows=actor.knobs.min_rows, idle=actor.idle)
     if it.kind == "back":
         actor.streak = 0
+        actor.idle = 0
         actor.next_round = actor.rounds + actor.knobs.settle
         return "back" if actor.grow_to(int(actor.top), why=it.why) else None
     if it.kind == "check" and actor.rounds >= actor.next_round:
@@ -583,5 +595,5 @@ def quiesce_for_sleep(sched) -> bool:
     actor = _ACTOR
     if actor is None:
         return False
-    actor.streak, actor.next_round, actor.had_pending = 0, 0, False
+    actor.streak, actor.idle, actor.next_round, actor.had_pending = 0, 0, 0, False
     return actor.quiesce()

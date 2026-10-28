@@ -251,8 +251,19 @@ class Pure(CustomTestCase):
         self.assertEqual(L.intent(lent=True, pend=1, **{**kw, "incoming": 100}).kind, "check")   # lent: size it
         self.assertEqual(L.intent(lent=True, pend=0, **{**kw, "streak": 2}).kind, "check")
         self.assertEqual(L.intent(lent=True, pend=0, **{**kw, "streak": 3}).kind, "back")        # hysteresis
-        self.assertEqual(L.intent(lent=True, pend=0, **{**kw, "streak": 99, "busy": False}).kind, "none")
+        self.assertEqual(L.intent(lent=True, pend=0, **{**kw, "streak": 99, "busy": False}).kind, "none")  # one idle pass
         self.assertEqual(L.intent(lent=False, pend=0, **kw).kind, "none")
+
+    def test_an_idle_lent_d_gives_the_tail_back_after_settle_idle_passes(self):
+        # boot int4arxd 28.10. 01:12Z: lent to T=28672 after an 8k prompt that finished at once (nothing running),
+        # the front held the next 32k prompt back on the lent pool's deficit and D saw no pending prefill: both
+        # waited until the timeout. Lent and idle for ``settle`` passes in a row -> back. One idle pass is not
+        # enough (the pass right after a prefill runs before the finished request joins the running batch).
+        kw = dict(incoming=0, streak=0, settle=3, min_rows=4096, busy=False)
+        self.assertEqual(L.intent(lent=True, pend=0, idle=2, **kw).kind, "none")
+        self.assertEqual(L.intent(lent=True, pend=0, idle=3, **kw).kind, "back")
+        self.assertEqual(L.intent(lent=False, pend=0, idle=99, **kw).kind, "none")              # nothing lent
+        self.assertEqual(L.intent(lent=True, pend=1, idle=99, **{**kw, "incoming": 100}).kind, "check")  # mid-prefill
 
     def test_streak_counts_busy_idle_keeps_pending_resets(self):
         self.assertEqual(L.next_streak(streak=2, pend=0, busy=True), 3)
@@ -424,9 +435,19 @@ class Round(CustomTestCase):
         s = sched(waiting=[req(30000)])
         L.round_start(s)
         s.waiting_queue.clear()
-        for _ in range(20):
+        for _ in range(actor.knobs.settle - 1):
             self.assertIsNone(L.round_start(s))                                  # nothing running: no hysteresis
         self.assertTrue(actor.lent)
+
+    def test_a_long_idle_gives_the_lend_back(self):
+        # the same idle D, ``settle`` passes later: the tail returns (int4arxd 28.10.: the front waited on it)
+        _drv, _pool, _alloc, actor, _, _ = make()
+        s = sched(waiting=[req(30000)])
+        L.round_start(s)
+        s.waiting_queue.clear()
+        outs = [L.round_start(s) for _ in range(actor.knobs.settle + 2)]
+        self.assertIn("back", outs)
+        self.assertFalse(actor.lent)
 
     def test_the_need_outgrowing_t_grows_the_pool(self):
         drv, _pool, alloc, actor, _, _ = make()
