@@ -271,13 +271,21 @@ def switch_on() -> bool:
     return bool(envs.FLLIPER_OPT_PDFLIP_D_SEAT_VRAM.get())
 
 
+#: one warning per boot: an unreadable D-SEAT-REWAKE switch stopped the seat re-plan like a switched-off one, without a line
+_REWAKE_WARNED: list = []
+
+
 def _rewake_on() -> bool:
     """D-SEAT-REWAKE (pdflip/d_seat_rewake.py): the live seat re-plan."""
     try:
         from flliper.srt.environ import envs
 
         return bool(envs.FLLIPER_PDFLIP_D_SEAT_REWAKE.get())
-    except Exception:  # noqa: BLE001 -- an unreadable switch is off
+    except Exception as exc:  # noqa: BLE001 -- an unreadable switch is off
+        if not _REWAKE_WARNED:
+            _REWAKE_WARNED.append(str(exc))
+            logger.warning("%s D-SEAT-REWAKE switch unreadable (%s): treated as OFF, the live seat re-plan stops "
+                           "(this line once per boot)", LINE_MARK, exc)
         return False
 
 

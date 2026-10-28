@@ -1138,6 +1138,10 @@ def _infeasible_skip_armed() -> bool:
         return False
 
 
+#: one warning per boot: a failing ledger peek made every later round 'feasible' without a line
+_INFEASIBLE_WARNED: list = []
+
+
 def infeasible_cards(stages, covered, level_tokens: int, stream_room: int = 0) -> list:
     """[(card, need, have, P, D)] of every card on which this grant stays short even if D gave back
     everything it holds there (need > ledger free + D committed). ``need`` is what ``group_grant``
@@ -1161,7 +1165,11 @@ def infeasible_cards(stages, covered, level_tokens: int, stream_room: int = 0) -
             if need > have + d + (int(stream_room) if i == 0 else 0):
                 out.append((i, need, have, int(st.committed.get("P", 0)), d))
         return out
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 -- never an exception into the round
+        if not _INFEASIBLE_WARNED:
+            _INFEASIBLE_WARNED.append(str(exc))
+            logger.warning("%s infeasible_cards: the ledger peek failed (%s): the answer is [] ('feasible') for every round "
+                           "while it fails (this line once per boot)", MARK, exc)
         return []
 
 
