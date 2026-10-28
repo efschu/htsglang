@@ -8,6 +8,7 @@ Schalter-Default ist AN, die Eignung haengt am Early-Draft der Runde). Rot ohne 
 
 import inspect
 import logging
+import types
 
 import torch
 
@@ -96,5 +97,8 @@ def test_worker_runs_the_verify_prep_through_staged_prep_for_early_draft_rounds(
 def test_worker_state_is_per_worker():
     a = object.__new__(DFlashWorkerV2)
     b = object.__new__(DFlashWorkerV2)
+    for w in (a, b):  # 27b-rank-uniform-1028: the state takes the TP verdict reducer (None = TP=1) and the static early-draft flag
+        w.__dict__["_tp_sync"] = types.SimpleNamespace(verdict_reducer=lambda: None)
+        w.__dict__["_early_draft"] = True
     assert a._vprep_early_state() is a._vprep_early_state()
     assert a._vprep_early_state() is not b._vprep_early_state()

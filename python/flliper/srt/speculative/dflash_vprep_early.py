@@ -22,6 +22,19 @@ prep + fix, snapshot every tensor and scalar the replay can read (the graph regi
 backends' replay metadata, the verify forward batch's fields), then the OLD prep after the wait (the round's result) and compare
 bitwise. Any difference, an error, or an unmatched snapshot keeps the old order for the process. Switch ``FLLIPER_FORMHP_VPREP_EARLY``
 (default on; 0/false/no/off = the old order). Read per call.
+
+Rank-uniform (27b-rank-uniform-1028). The 27B verifies with TP2/TP3 and CUDA graphs carrying collectives; every TP rank (solo shadows
+included) runs ``staged_prep`` once per round. A rank-local verdict would let one rank arm the early prep while another keeps the old
+order -- the graph choice / replay state may then differ in a round the self-test did not cover. With ``reduce_min`` (the worker's
+``SpecTpSync.verdict_reducer``, element-wise MIN over the TP CPU group; None at TP=1 = the local behaviour, nothing synchronised):
+
+* once, when the worker creates the state (:meth:`VprepEarly.agree_static`): the switch and the worker's static early-draft flag --
+  any rank without them -> FAILED on every rank;
+* every self-test round: the round's outcome FAIL < UNDECIDED < PASS is reduced -> a rank arms only when EVERY rank passed every
+  self-test round; one failing rank keeps the old order on all of them;
+* armed: an error no longer flips the verdict on its own rank (the round prepares again after the wait, the old way, which is exact);
+  every ``AGREE_EVERY`` rounds (the round counter is rank-uniform: one tick per round and rank) the ranks reduce "no armed error"
+  and disarm together.
 """
 
 from __future__ import annotations
@@ -29,7 +42,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -39,6 +52,10 @@ ENV = "FLLIPER_FORMHP_VPREP_EARLY"
 TAG = "FORMHP-VPREP-EARLY"
 SELFTEST_ROUNDS = 3
 LOG_EVERY = 2000  # one counter line per this many rounds
+AGREE_EVERY = 64  # armed, TP>1: one CPU-group reduction of "no armed error" per this many rounds
+# a self-test round's outcome, ordered so that the MIN over the ranks is the group's outcome
+FAIL, UNDECIDED, PASS = 0, 1, 2
+_OUTCOME = {FAIL: "FAILED", UNDECIDED: "undecided", PASS: "PASSED"}
 _MAX_TENSOR_BYTES = 64 << 20  # a replay metadata tensor is KB..MB; anything bigger (a KV pool) is not written by the prep
 _MAX_TOTAL_BYTES = 256 << 20  # a snapshot that would clone more is refused (the self-test then keeps the old order)
 
@@ -158,22 +175,70 @@ def fix_after_wait(runner: Any, forward_batch: Any, exact_seq_lens_cpu: torch.Te
 
 
 class VprepEarly:
-    """Per worker: ``verdict`` None = self-test running, True = armed, False = old order for the process."""
+    """Per worker: ``verdict`` None = self-test running, True = armed, False = old order for the process.
+    ``reduce_min``: None = this rank decides alone (TP=1); else the TP CPU-group MIN, see the module doc (rank-uniform)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reduce_min: Optional[Callable[[Sequence[int]], List[int]]] = None) -> None:
         self.verdict: Optional[bool] = None
         self.passes = 0
         self.why = ""
+        self.reduce_min = reduce_min
+        self.armed_errors = 0  # TP>1, armed: errors since the last reduction (the round prepared again, the old way)
         # round census (27B port, 28.10.: the wall-clock effect is open on the metal, the counters say how many rounds took which path):
         # old = old order (switch off / not eligible / verdict False), early = armed early prep, selftest = self-test round,
         # redo = early prep done but the round prepared again after the wait (eager graph choice, error)
         self.counts: Dict[str, int] = {"old": 0, "early": 0, "selftest": 0, "redo": 0}
+
+    def agree_static(self, *, local_ok: bool, why: str) -> None:
+        """Once per process, on every rank in the same round: are the switch and the caller's static precondition (``local_ok``)
+        the same on every rank? MIN over each flag and its complement; a flag that differs between ranks -> FAILED on every rank
+        (a flag that is off everywhere already keeps every rank on the old order). No-op without ``reduce_min``."""
+        if self.reduce_min is None or self.verdict is not None:
+            return
+        flags = [1 if switch_on() else 0, 1 if local_ok else 0]
+        red = self.reduce_min(flags + [1 - f for f in flags])
+        uniform = [bool(red[i] or red[i + len(flags)]) for i in range(len(flags))]
+        if not all(uniform):
+            self.record(False, f"rank-uniform: differs between ranks -- {ENV}: {not uniform[0]}, {why}: {not uniform[1]}")
+
+    def settle(self, *, mode: Optional[str], fail: Optional[str], compared: Optional[Tuple[bool, str]]) -> None:
+        """The round's verdict input -- ``fail`` (an error's text) and ``compared`` (the self-test's compare) -- applied once per
+        round, before the tick. Without ``reduce_min``: exactly the old local record. With it: a self-test round reduces its outcome
+        (every rank is in the same mode -- the verdict and the switch are agreed, the eligibility is batch state); an armed error is
+        counted for the periodic reduction instead of flipping this rank alone."""
+        if self.reduce_min is None:
+            if fail is not None:
+                self.record(False, fail)
+            elif compared is not None:
+                self.record(*compared)
+            return
+        if mode == "armed":
+            if fail is not None:
+                self.armed_errors += 1
+                if self.armed_errors == 1:
+                    logger.warning("%s armed round error on this rank (prepared again after the wait, old way; the ranks disarm "
+                                   "together at the next reduction): %s", TAG, fail)
+            return
+        if mode != "selftest":
+            return
+        code = FAIL if fail is not None or (compared is not None and not compared[0]) else (PASS if compared else UNDECIDED)
+        why = fail if fail is not None else (compared[1] if compared is not None else "no snapshot this round")
+        group = self.reduce_min([code])[0]
+        if group == FAIL:
+            self.record(False, why if code == FAIL else f"{why}; rank-uniform: another rank's self-test FAILED")
+        elif group == PASS:
+            self.record(True, why)
 
     def tick(self, kind: str) -> None:
         self.counts[kind] += 1
         n = sum(self.counts.values())
         if n % LOG_EVERY == 0:
             logger.info("%s rounds=%d %s verdict=%s (%s=0 = old order)", TAG, n, self.counts, self.verdict, ENV)
+        if self.reduce_min is not None and self.verdict is True and n % AGREE_EVERY == 0:
+            red = self.reduce_min([0 if self.armed_errors else 1])
+            if not red[0]:
+                self.record(False, f"rank-uniform: armed round error(s) on some rank (here {self.armed_errors})")
+            self.armed_errors = 0
 
     def mode(self) -> Optional[str]:
         """``None`` (old order), ``"armed"`` or ``"selftest"``."""
@@ -205,12 +270,14 @@ def staged_prep(*, state: "VprepEarly", eligible: bool, prep: Any, marks: Any, w
     mode = state.mode() if eligible else None
     early = None
     snap = None
+    fail = None  # the round's first error (27b-rank-uniform-1028: applied by state.settle at the round's end, not on the spot)
+    compared = None
     if mode is not None:
         try:
             early = prep()
             marks()
         except Exception as e:  # noqa: BLE001 -- the old order is always correct
-            state.record(False, f"early prep raised {type(e).__name__}: {e}")
+            fail = f"early prep raised {type(e).__name__}: {e}"
             early = None
     wait()
     vp = None
@@ -223,19 +290,21 @@ def staged_prep(*, state: "VprepEarly", eligible: bool, prep: Any, marks: Any, w
             else:
                 snap = snapshot(runner, early[1])
         except Exception as e:  # noqa: BLE001
-            state.record(False, f"fix / snapshot raised {type(e).__name__}: {e}")
+            fail = f"fix / snapshot raised {type(e).__name__}: {e}"
     if vp is not None:
+        state.settle(mode=mode, fail=fail, compared=None)
         state.tick("early")
-    else:
-        kind = "old" if mode is None else ("selftest" if snap is not None else "redo")
-        vp = prep()
-        if snap is not None:
-            try:
-                ok, why = compare(snap, snapshot(runner, vp[1]))
-            except Exception as e:  # noqa: BLE001
-                ok, why = False, f"compare raised {type(e).__name__}: {e}"
-            state.record(ok, f"bs {bs}: {why}")
-        if early is None:
-            marks()
-        state.tick(kind)
+        return vp
+    kind = "old" if mode is None else ("selftest" if snap is not None else "redo")
+    vp = prep()
+    if snap is not None:
+        try:
+            ok, why = compare(snap, snapshot(runner, vp[1]))
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, f"compare raised {type(e).__name__}: {e}"
+        compared = (ok, f"bs {bs}: {why}")
+    if early is None:
+        marks()
+    state.settle(mode=mode, fail=fail, compared=compared)
+    state.tick(kind)
     return vp

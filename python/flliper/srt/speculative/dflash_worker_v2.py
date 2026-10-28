@@ -3278,7 +3278,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if st is None:
             from flliper.srt.speculative.dflash_vprep_early import VprepEarly
 
-            st = self.__dict__["_vprep_early"] = VprepEarly()
+            # 27b-rank-uniform-1028: every TP rank (solo shadows included) runs staged_prep once per round and creates this state in
+            # the same (first) round -> the static agreement below and the self-test outcomes are MIN-reduced over the TP CPU group
+            # (no reducer, nothing synchronised at TP=1)
+            st = self.__dict__["_vprep_early"] = VprepEarly(reduce_min=self._tp_sync.verdict_reducer())
+            st.agree_static(local_ok=bool(self._early_draft), why="FLLIPER_PDFLIP_D_EARLY_DRAFT")
         return st
 
     def _draft_plan_skip_updater(self):
@@ -3298,7 +3302,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if ps is None:
             from flliper.srt.speculative.dflash_plan_skip import DraftPlanSkip
 
-            ps = self.__dict__["_draft_plan_skip"] = DraftPlanSkip()
+            # 27b-rank-uniform-1028: solo placement -> only the host drafts (the shadows never reach the self-test): local verdict.
+            # Otherwise the TP CPU-group MIN (None at TP=1), so a replicated TP=1 draft arms only when every rank passed.
+            reduce_min = None if self._spec_solo_active else self._tp_sync.verdict_reducer()
+            ps = self.__dict__["_draft_plan_skip"] = DraftPlanSkip(reduce_min=reduce_min)
         return ps
 
     def _draft_plan_skip_probe_ids(self, batch, host_lens_exact, hole_buf):
@@ -3314,7 +3321,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         no_collective = self._spec_solo_is_host or int(self.draft_model_runner.tp_size) == 1
         if not no_collective or not _is_all_greedy(batch.sampling_info):
             return ()
-        return ps.candidate(self._draft_plan_skip_updater(), self.draft_model_runner.model)
+        upd = self._draft_plan_skip_updater()
+        # 27b-rank-uniform-1028: the gate above reads only batch state and process config the draft path already needs rank-uniform;
+        # the switch, the updater and the static scan are rank-local -> agreed (identity when this rank decides alone)
+        return ps.agree_candidate(upd, ps.candidate(upd, self.draft_model_runner.model))
 
     def _draft_plan_skip_snapshot(self, draft_out, bs):
         lo = draft_out.logits_output
@@ -3338,27 +3348,31 @@ class DFlashWorkerV2(BaseSpecWorker):
             out = self.draft_model_runner.forward(make_fb())
             return self._draft_plan_skip_snapshot(out, bs)
         except Exception as e:  # noqa: BLE001 -- a self-test never breaks a round
-            ps.decide(upd, False, f"probe forward raised {type(e).__name__}: {e}")
+            from flliper.srt.speculative.dflash_plan_skip import FAIL
+
+            # this round's one outcome reduction (the judge is skipped on a None snapshot)
+            ps.settle(upd, code=FAIL, why=f"probe forward raised {type(e).__name__}: {e}")
             return None
         finally:
             upd.probe_wrapper_ids = frozenset()
 
     def _draft_plan_skip_judge(self, snap, draft_out, bs, ids):
-        from flliper.srt.speculative.dflash_plan_skip import outputs_equal
+        from flliper.srt.speculative.dflash_plan_skip import FAIL, PASS, UNDECIDED, outputs_equal
 
         ps = self.__dict__["_draft_plan_skip"]
+        upd = self._draft_plan_skip_updater()
         ref = self._draft_plan_skip_snapshot(draft_out, bs)
         if not (snap[0] and ref[0]):
             # an eager draft round proves nothing about the captured one: decide on a graph round, at most a few probes
-            ps.undecided += 1
-            if ps.undecided >= ps.max_undecided:
-                ps.decide(self._draft_plan_skip_updater(), False, f"{ps.undecided} probe rounds without a draft graph replay")
+            ps.settle(upd, code=UNDECIDED, why="eager draft round")
             return
         if snap[1] is None and snap[2] is None:
-            ps.decide(self._draft_plan_skip_updater(), False, "the draft forward exposed neither hidden rows nor tokens")
+            ps.settle(upd, code=FAIL, why="the draft forward exposed neither hidden rows nor tokens")
             return
         ok, why = outputs_equal(snap[1:], ref[1:])
-        ps.decide(self._draft_plan_skip_updater(), ok, f"bs {bs}, probe (wrapper {list(ids)} on one key) vs old plan: {why}", ids)
+        why = f"bs {bs}, probe (wrapper {list(ids)} on one key) vs old plan: {why}"
+        # 27b-rank-uniform-1028: armed only when every probing rank passed (MIN over the TP CPU group; local without a reducer)
+        ps.settle(upd, code=PASS if ok else FAIL, why=why, ids=ids)
 
     def forward_batch_generation(
         self,
