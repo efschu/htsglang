@@ -273,10 +273,16 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     spec_tokens = server_args.max_speculative_num_draft_tokens
     page_size = server_args.page_size
 
+    # 27b-r2tbound-1028: the algorithm is only consulted for the page>1 topk>1 tree. get_req_to_token_row_headroom calls this for
+    # every spec configuration, also from ServerArgs._pp_cut_hybrid_pool_cap, which runs before handle_speculative_decoding resolves
+    # the NEXTN alias (from_string("NEXTN") raises); page 1 or topk 1 never needs the algorithm, so it is not parsed there.
+    if page_size == 1 or spec_topk == 1:
+        return max(spec_steps * spec_topk, spec_tokens)
+
     from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
+    if not spec_algo.has_draft_kv():
         return max(spec_steps * spec_topk, spec_tokens)
     else:
         # spec v2 tree (page>1, topk>1): worst-case page-aligned footprint per
@@ -380,14 +386,52 @@ def get_alloc_reserve_per_decode(
     return write_footprint + commit_lag
 
 
+class ReqToTokenRowOverflow(RuntimeError):
+    """formhp-r2tbound-1028: a decode allocation would write past the end of a req_to_token row. ``assign_req_to_token_pool`` writes row
+    ``r`` as ``req_to_token + r * row_width + col`` -- a column >= row_width IS row ``r + 1`` (another request's token slots), or past
+    the tensor for the last row. Raised on the host before the allocation, so nothing has been written or allocated."""
+
+
+def get_req_to_token_row_headroom(server_args: Optional[ServerArgs] = None, page_size: Optional[int] = None) -> int:
+    """formhp-r2tbound-1028: req_to_token columns beyond ``context_len`` that a decode allocation can write.
+
+    A request the host still prepares has ``len(output) < max_new_tokens <= max_req_len - input - 1`` with ``max_req_len <=
+    context_len - 1`` (scheduler ``max_new_tokens`` clamp, ``_update_finish_state_impl``), so its committed KV length
+    (``input + len(output) - 1``) is at most ``context_len - 4``. The decode allocation watermark is ``ceil_page(committed +
+    reserve)`` (DFLASH ``prepare_for_decode`` rounds to whole pages; EAGLE writes ``committed + reserve``), i.e. at most
+    ``context_len + reserve + page - 1`` for any context length. The old headroom ``4 + max_draft_tokens`` did not count the page
+    rounding at all: NF (page 64, ctx 262144, reserve 16 / 24 with FORMHP-DRAFT-CHAIN) writes up to column 262207 of a row
+    262156 / 262164 wide -- 52 / 44 slot ids into the next request's row. The reserve is taken at its widest (the global write
+    footprint and the verify block, incl. the draft chain's extra term)."""
+    if server_args is None:
+        server_args = get_server_args()
+    page = max(1, int(page_size or server_args.page_size or 1))
+    max_draft = int(server_args.max_speculative_num_draft_tokens or 0)
+    reserve = get_alloc_reserve_per_decode(server_args)
+    if max_draft > 0:
+        reserve = max(reserve, get_alloc_reserve_per_decode(server_args, alloc_len=max_draft))
+    return max(4 + max_draft, int(reserve) + page - 1)
+
+
+def check_req_to_token_row(max_end: int, req_to_token: torch.Tensor, *, where: str, detail: str = "") -> None:
+    """formhp-r2tbound-1028: the host bound before a req_to_token write -- ``max_end`` (exclusive end column of the widest row write)
+    must fit the row. Raises :class:`ReqToTokenRowOverflow` naming the site; nothing is written."""
+    width = int(req_to_token.shape[1])
+    if int(max_end) > width:
+        raise ReqToTokenRowOverflow(
+            f"{where}: req_to_token row write up to column {int(max_end)} exceeds the row width {width} by "
+            f"{int(max_end) - width} (the excess would land in the next request's row). {detail} Row headroom = "
+            f"get_req_to_token_row_headroom (formhp-r2tbound-1028)."
+        )
+
+
 def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """req_to_token row headroom beyond the model context length.
 
-    Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
-    draft footprint can outgrow the default num_draft_tokens headroom.
+    Sized to hold the decode over-allocation INCLUDING the page rounding of the watermark (get_req_to_token_row_headroom,
+    formhp-r2tbound-1028); the spec v2 page>1 topk>1 holey draft footprint is a reserve term of it.
     """
-    # FIXME(lsyin): temporary fix for the context length issue under spec decoding
-    extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
+    extra = get_req_to_token_row_headroom(server_args)
     if (
         server_args.speculative_algorithm is not None
         and server_args.page_size > 1

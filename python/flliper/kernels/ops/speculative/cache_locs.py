@@ -53,7 +53,10 @@ def assign_req_to_token_pool(
 
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
     for _ in range(num_loop):
-        mask = save_offset < kv_end
+        # formhp-r2tbound-1028: never past the row end -- column pool_len of row r IS row r + 1 (another request's slots). The
+        # callers check their host bound first (mem_cache.common.check_req_to_token_row); this mask keeps any unchecked caller
+        # inside its own row.
+        mask = (save_offset < kv_end) & (save_offset < pool_len)
         data = tl.load(out_cache_ptr + load_offset, mask=mask)
         tl.store(token_pool + save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE

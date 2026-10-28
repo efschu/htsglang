@@ -39,7 +39,7 @@ from flliper.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from flliper.srt.mem_cache.common import get_req_to_token_extra_context_len
+from flliper.srt.mem_cache.common import get_req_to_token_extra_context_len, get_req_to_token_row_headroom
 from flliper.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from flliper.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from flliper.srt.mem_cache.memory_pool import (
@@ -3250,9 +3250,8 @@ class ModelRunnerKVCacheMixin:
         # cross-algorithm secondary rung reserve up to max_... slots per
         # decode; mem_cache/common.get_req_to_token_extra_context_len already
         # uses the max on the classic path.
-        extra_max_context_len = 4
-        if self.server_args.max_speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.max_speculative_num_draft_tokens
+        # formhp-r2tbound-1028: the decode watermark's columns incl. its page rounding (and the FORMHP-DRAFT-CHAIN reserve)
+        extra_max_context_len = get_req_to_token_row_headroom(self.server_args, page_size=self.page_size)
 
         # SET-AWARE ON BOTH LISTS, for the reason spelled out at
         # ``stage_owned_layer_ids``: under FLLIPER_PP_LAYER_SET the
@@ -3330,9 +3329,8 @@ class ModelRunnerKVCacheMixin:
             "unified memory pool does not support MLA-SWA hybrid yet"
         )
         # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        # formhp-r2tbound-1028: the decode watermark's columns incl. its page rounding (and the FORMHP-DRAFT-CHAIN reserve)
+        extra_max_context_len = get_req_to_token_row_headroom(self.server_args, page_size=self.page_size)
         self.req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,

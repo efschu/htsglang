@@ -11,6 +11,7 @@ from flliper.srt.managers.schedule_batch import ScheduleBatch
 from flliper.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    check_req_to_token_row,
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
@@ -190,6 +191,22 @@ class DFlashDraftInputV2(SpecInput):
             elif uniform_top_k and top_k != uniform_top_k_value:
                 uniform_top_k = False
 
+        # formhp-r2tbound-1028: the page-rounded watermark must fit the req_to_token row -- the assign kernel below writes columns
+        # [cur, nxt) of row req_pool_idx, and a column past the row end is the NEXT request's row. Checked before anything is
+        # allocated or written; the width comes from get_req_to_token_row_headroom.
+        if num_needed_tokens > 0:
+            _max_nxt = int(nxt_kv_lens_cpu_t.max())
+            if _max_nxt > int(batch.req_to_token_pool.req_to_token.shape[1]):
+                _i = int(nxt_kv_lens_cpu_t.argmax())
+                check_req_to_token_row(
+                    _max_nxt,
+                    batch.req_to_token_pool.req_to_token,
+                    where="DFLASH prepare_for_decode",
+                    detail=(
+                        f"request row {_i}: committed {int(batch_seq_lens_cpu_t[_i])} + reserve {reserve} rounded to page "
+                        f"{page_size} -> {_max_nxt} (allocated so far {int(cur_kv_lens_cpu_t[_i])})."
+                    ),
+                )
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
