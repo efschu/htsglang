@@ -169,15 +169,29 @@ def _gate(sched) -> LendGate:
     return gate
 
 
+#: one warning per boot: the card free memory could not be read, so the lend stays off while that lasts
+_FREE_WARNED: list = []
+
+
+def _warn_free_unreadable(why: str) -> None:
+    if _FREE_WARNED:
+        return
+    _FREE_WARNED.append(why)
+    logger.warning("%s card free memory unreadable (%s): nothing is lent while this lasts (this line once per boot)",
+                   MARK, why)
+
+
 def _card_free_bytes() -> Optional[int]:
     try:
         import torch
 
         if not torch.cuda.is_available():
+            _warn_free_unreadable("cuda not available")
             return None
         return int(torch.cuda.mem_get_info()[0])
     except Exception as exc:  # noqa: BLE001 -- no driver: nothing to lend
         logger.debug("%s skipped: %s", MARK, exc)
+        _warn_free_unreadable(str(exc))
         return None
 
 

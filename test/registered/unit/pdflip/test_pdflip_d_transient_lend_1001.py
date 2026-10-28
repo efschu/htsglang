@@ -219,3 +219,41 @@ def test_the_launcher_writes_the_ledger_floor():
 
     ledger = types.SimpleNamespace(floor_mib=(766.2, 700.0, 701.0))
     assert launcher.d_lend_floor_env(ledger) == "767,700,701"
+
+
+
+def _unreadable_lines(caplog):
+    return [r.getMessage() for r in caplog.records if dtl.MARK in r.getMessage() and "unreadable" in r.getMessage()]
+
+
+def test_a_card_without_cuda_warns_once_per_boot_and_lends_nothing(caplog):
+    """CUDA unavailable switched the whole lend off with no line at all: a boot with a degraded driver lost its VRAM
+    elasticity unannounced. One WARNING per boot names it (a second read adds none); the verdict stays None = lend
+    nothing, never optimistic."""
+    import logging
+
+    import torch
+
+    dtl._FREE_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger=dtl.logger.name), \
+            mock.patch.object(torch.cuda, "is_available", return_value=False):
+        assert dtl._card_free_bytes() is None
+        assert dtl._card_free_bytes() is None
+    assert len(_unreadable_lines(caplog)) == 1, _unreadable_lines(caplog)
+    dtl._FREE_WARNED.clear()
+
+
+def test_a_raising_mem_get_info_warns_once_per_boot_and_lends_nothing(caplog):
+    """``mem_get_info`` raising was a debug line only (invisible at the default level): same contract as above."""
+    import logging
+
+    import torch
+
+    dtl._FREE_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger=dtl.logger.name), \
+            mock.patch.object(torch.cuda, "is_available", return_value=True), \
+            mock.patch.object(torch.cuda, "mem_get_info", side_effect=RuntimeError("driver gone")):
+        assert dtl._card_free_bytes() is None
+        assert dtl._card_free_bytes() is None
+    assert len(_unreadable_lines(caplog)) == 1, _unreadable_lines(caplog)
+    dtl._FREE_WARNED.clear()
