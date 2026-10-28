@@ -3272,6 +3272,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         return _verify_plain_greedy(sampling_info)
 
     # -- formhp-devdraft-b2-1028: FORMHP-DRAFT-PLAN-SKIP (speculative/dflash_plan_skip.py) --------------------------------------------
+    def _vprep_early_state(self):
+        """formhp-devdraft-vprep-1028: the FORMHP-VPREP-EARLY verdict of this worker (speculative/dflash_vprep_early.py)."""
+        st = self.__dict__.get("_vprep_early")
+        if st is None:
+            from flliper.srt.speculative.dflash_vprep_early import VprepEarly
+
+            st = self.__dict__["_vprep_early"] = VprepEarly()
+        return st
+
     def _draft_plan_skip_updater(self):
         from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
@@ -3967,64 +3976,98 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._audit_mark("blk_bcast")  # DFLASH AUDIT (env-gated)
 
         # --- 2) Target verify.
-        if seq_lens_cpu_ready is not None:
-            # Idempotent belt (the solo-shadow branch above has no draft prep):
-            # the verify's host bound below reads the exact mirror.
-            seq_lens_cpu_ready()
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
+        sampling_info = batch.sampling_info
+
+        def _verify_prep():
+            """The verify input + forward batch (+ graph load / attention metadata). Reads round N's exact host lengths at one place,
+            the host bound below; without them (an early prep, FORMHP-VPREP-EARLY) it takes the reservation bound."""
+            verify_input_ids = draft_tokens.reshape(-1)
+            verify_input = DFlashVerifyInput(
+                draft_token=verify_input_ids,
+                positions=positions,
+                draft_token_num=int(self.block_size),
+                custom_mask=custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                dcp_verify_prebuilt=dcp_verify_prebuilt,
+            )
+
+            batch.out_cache_loc = verify_out_cache_loc
+
+            # upstream 44fd17b696 (the hunk the fork had not ported; the
+            # post-verify-lengths half is #37818 above): the decode batch's mamba
+            # track fields are None after any filter/merge and spec batches skip
+            # the refresh in prepare_for_decode, so rebuild the track indices from
+            # the requests (and clear the stale mask/seqlens) BEFORE the verify
+            # ForwardBatch snapshots them and before the post-verify commit reads
+            # them. Without it the GPU wrote no track while the scheduler still
+            # recorded the grid anchor (mamba_last_track_seqlen). Inert unless
+            # enable_mamba_extra_buffer (checked inside the helper).
+            prepare_mamba_track_for_verify(batch)
+
+            seq_lens_pre_verify = (
+                batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+            )
+            seq_lens_cpu_backup = batch.seq_lens_cpu
+            seq_lens_sum_backup = batch.seq_lens_sum
+            if seq_lens_cpu_backup is not None:
+                # Verify host bound = committed prefix + one verify block (matches draft).
+                verify_host_seq_lens = seq_lens_cpu_backup + block_size
+                batch.seq_lens_cpu = verify_host_seq_lens
+                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+
+            verify_forward_batch, can_graph = verify_input.prepare_for_verify(
+                batch, self.target_worker
+            )
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+            return verify_input, verify_forward_batch, seq_lens_pre_verify, bool(can_graph)
 
         # #1485b (moved, agent review 17.09.): the ranks' draft blocks differ
         # (5090 sm_120 vs 3080 sm_86 in the REPLICATED selector math, TP1==TP2
         # != TP0); rank 0's block has to be the one every rank VERIFIES and
         # writes KV for -- syncing after the verify left ranks 1/2 with
         # target/draft KV of a block they then discarded.
+        # formhp-devdraft-vprep-1028: ONCE per round, ahead of the prep (a self-test round prepares twice; a collective must not
+        # run twice), and ahead of the length wait (it needs only the drafted block).
         self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, draft_tokens)
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_input = DFlashVerifyInput(
-            draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
-            custom_mask=custom_mask,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            dcp_verify_prebuilt=dcp_verify_prebuilt,
+
+        def _prep_marks():
+            _d_hostgap_split_mark("vprep")
+            self._audit_mark("verify_prep")  # DFLASH AUDIT (env-gated)
+
+        def _length_wait():
+            if seq_lens_cpu_ready is not None:
+                # Idempotent belt (the solo-shadow branch above has no draft prep):
+                # the verify's host bound reads the exact mirror.
+                seq_lens_cpu_ready()
+
+        # formhp-devdraft-vprep-1028 (FORMHP-VPREP-EARLY, speculative/dflash_vprep_early.py): in an early-draft round the prep runs
+        # BEFORE the length wait with the reservation bound; after the wait the exact host values go where the old order put them.
+        from flliper.srt.speculative import dflash_vprep_early as _vpe_mod
+
+        _vp = _vpe_mod.staged_prep(
+            state=self._vprep_early_state(),
+            eligible=bool(
+                seq_lens_cpu_ready is not None
+                and _early_draft
+                and draft_input.nxt_kv_lens_cpu is not None
+                and batch.seq_lens_cpu is None
+                and not getattr(batch, "has_grammar", False)
+            ),
+            prep=_verify_prep,
+            marks=_prep_marks,
+            wait=_length_wait,
+            exact_lens=lambda: batch.seq_lens_cpu,
+            runner=self.target_worker.model_runner.decode_cuda_graph_runner,
+            block_size=block_size,
+            bs=bs,
         )
-
-        batch.out_cache_loc = verify_out_cache_loc
-        sampling_info = batch.sampling_info
-
-        # upstream 44fd17b696 (the hunk the fork had not ported; the
-        # post-verify-lengths half is #37818 above): the decode batch's mamba
-        # track fields are None after any filter/merge and spec batches skip
-        # the refresh in prepare_for_decode, so rebuild the track indices from
-        # the requests (and clear the stale mask/seqlens) BEFORE the verify
-        # ForwardBatch snapshots them and before the post-verify commit reads
-        # them. Without it the GPU wrote no track while the scheduler still
-        # recorded the grid anchor (mamba_last_track_seqlen). Inert unless
-        # enable_mamba_extra_buffer (checked inside the helper).
-        prepare_mamba_track_for_verify(batch)
-
-        seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
-        )
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.nxt_kv_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
-
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
-        _d_hostgap_split_mark("vprep")
-        self._audit_mark("verify_prep")  # DFLASH AUDIT (env-gated)
+        verify_input, verify_forward_batch, seq_lens_pre_verify, _vp_graph = _vp
 
         # upstream #30096 (adapted to the fork's synchronous bitmask path, the
         # one EAGLE v2 uses here; #31488's overlapped GrammarTree/barrier is

@@ -26,6 +26,7 @@ Pins:
 
 import ast
 import inspect
+import re
 import textwrap
 from types import SimpleNamespace
 
@@ -199,8 +200,10 @@ def test_mutant_call_after_prepare_for_verify_is_red():
     src = inspect.getsource(dfw.DFlashWorkerV2)
     anchor = "batch.seq_lens_cpu = seq_lens_cpu_backup"
     assert src.count(anchor) == 1
+    # the anchor sits inside the nested _verify_prep (FORMHP-VPREP-EARLY port): keep its own indentation
+    indent = re.search(rf"^( *){re.escape(anchor)}$", src, re.M).group(1)
     late = src.replace(f"{HELPER}(batch)", "pass").replace(
-        anchor, f"{anchor}\n        {HELPER}(batch)"
+        anchor, f"{anchor}\n{indent}{HELPER}(batch)"
     )
     with pytest.raises(AssertionError, match="must precede prepare_for_verify"):
         _check_wiring(late)
