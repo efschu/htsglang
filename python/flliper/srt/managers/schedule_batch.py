@@ -3369,6 +3369,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync (fLLiper PR #36933).
     mix_running_indices_cpu: Optional[torch.Tensor] = None
+    # MIXED-VERIFY (pdflip/mixed_verify.py): on a PREFILL batch, the running decode batch whose own speculative round
+    # ``Scheduler.run_batch`` launches right BEFORE this batch (same scheduler pass, one stream). Consumed (set to None) by run_batch.
+    mixed_verify_decode: Optional["ScheduleBatch"] = None
+    # ... and, set by run_batch, that decode batch's (snapshot copy, result) pair; ``process_batch_result`` hands it to the decode
+    # processor first, then processes this prefill batch as usual. MOVED by ``copy()`` to the snapshot (the result queue holds the copy).
+    mixed_verify_pair: Optional[tuple] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -5324,6 +5330,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,
         # merge_batch) on the original don't corrupt this snapshot.
+        # MIXED-VERIFY: the decode pair MOVES to the snapshot (its only consumer is the result processor). Left on the original it
+        # would ride along if that prefill batch later became the running batch (an empty running batch is aliased onto the merged
+        # prefill batch) and its next snapshot would hand the old decode result to the processor a second time.
+        pair, self.mixed_verify_pair = self.mixed_verify_pair, None
         return ScheduleBatch(
             reqs=self.reqs[:],
             # Per-request extend/prefix lens, snapshotted (sliced like reqs) so the
@@ -5339,6 +5349,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
+            mixed_verify_pair=pair,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,

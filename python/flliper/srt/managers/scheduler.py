@@ -250,6 +250,7 @@ from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
 from flliper.srt.pdflip import r2_kurz_chunk as _pdflip_r2_kurz_chunk  # R2-KURZ-CHUNK 1024 (SOLL R2/R7)
+from flliper.srt.pdflip import mixed_verify as _mixed_verify_mod  # MIXED-VERIFY stage 1 (arm / census / ring size)
 from flliper.srt.pdflip import mixed_d_short as _mds_stamp  # MIXED-D chunk stamp + S50 total (short-chunked)
 from flliper.srt.pdflip import store_reprobe_epoch as _store_reprobe_epoch  # REPROBE-1023 (SOLL R11)
 from flliper.srt.managers import pdflip_told_ack_early as _pdflip_told_ack_early  # S50 TOLD-ACK-EARLY
@@ -2643,6 +2644,22 @@ class Scheduler(
         )
         if self._mixed_d_short:
             self.is_mixed_chunk = True
+        # MIXED-VERIFY (stage 1, user 29.10.): where the MIXED-D gate says yes on a DFLASH target, run the decode batch's own
+        # speculative round and then the prefill batch in ONE scheduler pass instead of folding the decodes in as 1-token tails
+        # (pdflip/mixed_verify.py; FLLIPER_PDFLIP_MIXED_VERIFY=0 = the tail mix, byte for byte). A process constant: every rank
+        # arms alike; the per-pass verdict rides the gate's group MIN (_mixed_d_agreed).
+        from flliper.srt.pdflip import mixed_verify as _mv
+
+        self._mixed_verify = _mv.armed(
+            mixed_d_short=self._mixed_d_short,
+            is_dflash=self.spec_algorithm.is_dflash(),
+            pp_size=self.ps.pp_size,
+            dp_attention=bool(self.require_mlp_sync or self.server_args.enable_dp_attention),
+            two_batch_overlap=bool(self.server_args.enable_two_batch_overlap),
+            pdmux=bool(self.server_args.enable_pdmux),
+        )
+        # the per-pass verdict of _mixed_d_agreed for the mix block right behind it (False unless the pass chose mixed-verify)
+        self._mixed_verify_pass = False
 
         # --p-chunk-policy (pdflip/p_chunk_policy.py, 25.09.): the P group's
         # per-request chunk plan. None unless the launcher handed this rank
@@ -3079,7 +3096,12 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
-        self.batch_record_buf = [None] * 2
+        # MIXED-VERIFY: a mixed-verify pass launches TWO forwards (decode round, prefill), each pinned for the one-pass result offset
+        self.batch_record_buf = [None] * (
+            _mixed_verify_mod.RING_SLOTS_ARMED
+            if self._mixed_verify
+            else _mixed_verify_mod.RING_SLOTS_DEFAULT
+        )
         self.batch_record_ct = 0
         # DECOUPLE S4b: the 2-slot keep-alive ring assumes ONE forward per
         # iteration (2 slots cover the 1-iteration result-processing offset).
@@ -15360,33 +15382,47 @@ class Scheduler(
             )
         if _do_mix:
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            running_batch.filter_batch()
-            if not running_batch.is_empty():
-                if self._cross_schedule_mode:
-                    self.draft_worker.maybe_switch_rung(running_batch)
-                running_batch.prepare_for_decode()
-                new_batch.mix_with_running(running_batch)
-                new_batch.decoding_reqs = running_batch.reqs
-                if not self.enable_overlap and not self.spec_algorithm.is_none():
-                    # Non-overlap spec never writes the relay; stash the
-                    # tails' pending tokens for the mixed input resolve.
-                    # (fLLiper PR #36933 1:1; S33 review A3.)
-                    last_tokens = torch.tensor(
-                        [r.output_ids[-1] for r in running_batch.reqs],
-                        dtype=torch.int64,
-                        device=self.device,
-                    )
-                    self.future_map.stash_bonus_tokens(
-                        running_batch.req_pool_indices, last_tokens
-                    )
-            running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=running_batch.batch_is_full
-            )
+            running_batch = self._fold_running_into_prefill(new_batch, running_batch)
         else:
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
 
+
+    def _fold_running_into_prefill(self, new_batch, running_batch):
+        """The mix block of the prefill build: the running decodes join this pass's prefill batch. Returns the pass's running batch.
+
+        Tail mix (PR #36933): the decodes become 1-token extend rows of ``new_batch``, the running batch is emptied.
+        MIXED-VERIFY (``self._mixed_verify_pass``, the group's verdict of ``_mixed_d_agreed``): the decodes stay a decode batch of their
+        own, prepared for their round exactly as the tail block prepares them; ``run_batch`` launches that round first and the prefill
+        batch right behind it (``ScheduleBatch.mixed_verify_decode``), so the decode rows keep draft + verify + accept + commit."""
+        running_batch.filter_batch()
+        if running_batch.is_empty():
+            # every running decode finished since the gate looked: nothing to fold (the tail block's old behaviour)
+            return ScheduleBatch(reqs=[], batch_is_full=running_batch.batch_is_full)
+        if self._cross_schedule_mode:
+            self.draft_worker.maybe_switch_rung(running_batch)
+        running_batch.prepare_for_decode()
+        if self._mixed_verify_pass:
+            new_batch.decoding_reqs = None
+            new_batch.mixed_verify_decode = running_batch
+            _mixed_verify_mod.note_step(running_batch.batch_size(), new_batch.extend_num_tokens)
+            return running_batch
+        new_batch.mix_with_running(running_batch)
+        new_batch.decoding_reqs = running_batch.reqs
+        if not self.enable_overlap and not self.spec_algorithm.is_none():
+            # Non-overlap spec never writes the relay; stash the
+            # tails' pending tokens for the mixed input resolve.
+            # (fLLiper PR #36933 1:1; S33 review A3.)
+            last_tokens = torch.tensor(
+                [r.output_ids[-1] for r in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.future_map.stash_bonus_tokens(
+                running_batch.req_pool_indices, last_tokens
+            )
+        return ScheduleBatch(reqs=[], batch_is_full=running_batch.batch_is_full)
 
     def _mixed_d_agreed(self, new_batch, running_batch, local_ok: bool) -> bool:
         """MIXED-D gate (S32): the short verdict, MIN-reduced over the TP cpu group (R11: no rank-local batch shape).
@@ -15402,11 +15438,31 @@ class Scheduler(
         chunked = _mds.chunked_big(new_batch.reqs, self.chunked_req, hx)
         no_fwd = _mds.end_state_handoff(new_batch.reqs)
         mine = local_ok and _mds.short_gate(u, x, hx, chunked, no_fwd)
-        agreed = bool(self._pdflip_group_min_flags([mine])[0])
+        if not self._mixed_verify:
+            agreed = bool(self._pdflip_group_min_flags([mine])[0])
+        else:
+            # MIXED-VERIFY: the second flag rides the SAME collective (one all_reduce, as before), so the choice between the
+            # decode-round-plus-prefill pass and the 1-token-tail mix is the group's, never a rank's (R11)
+            mv_reason = self._mixed_verify_refusal(running_batch)
+            flags = self._pdflip_group_min_flags([mine, mv_reason == ""])
+            agreed = bool(flags[0])
+            self._mixed_verify_pass = _mixed_verify_mod.decide(flags[0], flags[1], True)
+            if agreed and not self._mixed_verify_pass:
+                _mixed_verify_mod.note_fallback(mv_reason or "group_veto")
         if agreed:
             _mds.note_mixed(u, len(running_batch.reqs), hx, x)
         _mds.note_verdict(_mds.refusal_reason(u, x, hx, chunked, no_fwd, local_ok), agreed)
         return agreed
+
+    def _mixed_verify_refusal(self, running_batch) -> str:
+        """Rank-local MIXED-VERIFY eligibility of this pass ("" = yes); the caller reduces it with the gate's flag."""
+        from flliper.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+        return _mixed_verify_mod.refusal_reason(
+            n_running=len(running_batch.reqs),
+            has_grammar=bool(running_batch.has_grammar),
+            spec_state_ok=isinstance(running_batch.spec_info, DFlashDraftInputV2),
+        )
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -15699,7 +15755,7 @@ class Scheduler(
         attr_snapshot = [
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
-        self.batch_record_ct = (self.batch_record_ct + 1) % 2
+        self.batch_record_ct = (self.batch_record_ct + 1) % len(self.batch_record_buf)
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
@@ -15825,6 +15881,15 @@ class Scheduler(
         divergence must crash the group at the single site that owns the
         decision -- not be compensated for here, one rank at a time.
         """
+        # MIXED-VERIFY (pdflip/mixed_verify.py): this prefill batch carries the running decode batch (prepared for its round by
+        # _fold_running_into_prefill). Its speculative round (draft + verify + accept + commit, the same code as a separate decode
+        # pass) launches FIRST through this very funnel, the prefill batch right behind it, on the same stream and in the same
+        # order on every rank. The pair rides the batch to process_batch_result, so the loops see one (batch, result) per pass.
+        dec = batch.mixed_verify_decode
+        if dec is not None:
+            batch.mixed_verify_decode = None
+            dec_result = self.run_batch(dec)
+            batch.mixed_verify_pair = (dec.copy(), dec_result)
         # nf-pd-post: a deferred #639 ballot is decided before any forward
         # that can enter a collective (a skip batch runs none)
         if _prefix_lens_check.has_deferred() and not getattr(batch, "pdflip_skip_extend", False):
@@ -16357,6 +16422,11 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # MIXED-VERIFY: the decode round launched ahead of this prefill batch is processed first, by the decode processor
+        pair = batch.mixed_verify_pair
+        if pair is not None:
+            batch.mixed_verify_pair = None
+            self.process_batch_result(pair[0], pair[1])
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
         _pdflip_beacon.beat_done(getattr(self, "forward_ct", 0))
 

@@ -2708,6 +2708,13 @@ class Envs:
     # tp_prefill_max_tokens > 0 (group D), never an E2 END-state hand-off. Measurement arm: default OFF so the flip forms keep
     # the SOLL R2 gate; set 1 in the D env of the D-only boot. Census reason `always` on the MIXED-D CENSUS line.
     FLLIPER_PDFLIP_MIXED_D_ALWAYS = EnvBool(False)
+    # MIXED-VERIFY (user 29.10. evening "mixed chunk mit spec-verify ... implementieren"): where the MIXED-D gate above says yes and
+    # the target runs DFLASH, the running decode rows are NOT folded into the prefill forward as 1-token extends (PR #36933 form:
+    # 1 token per row, draft state dropped) -- the decode batch runs its normal round (draft + verify + accept + commit, E tokens)
+    # and the prefill batch follows in the SAME scheduler pass (one stream, fixed order, one result pair). Bit-identical per decode
+    # row by construction (the decode batch is the decode batch). New feature -> default ON; 0 = the 1-token-tail mix, byte for byte.
+    # Needs FLLIPER_PDFLIP_MIXED_D_SHORT (the gate). Design: deskq/bl/mixed_verify_entwurf_1029.md.
+    FLLIPER_PDFLIP_MIXED_VERIFY = EnvBool(True)
     # MIXED-D CENSUS (S50): every this many gate decisions one line "MIXED-D CENSUS" with the mixed share and the refusal
     # reasons (big_chunk / no_halfx / u_ge_halfx / e2_handoff / local_block / group_veto). 0 = no census line.
     FLLIPER_PDFLIP_MIXED_D_CENSUS_N = EnvInt(64)
