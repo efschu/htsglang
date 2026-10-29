@@ -108,13 +108,26 @@ def normalize_tool_content(role: str, content):
 
 
 def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
-    """Parse OpenAI tool call arguments for chat templates."""
+    """Parse OpenAI tool call arguments for chat templates.
+
+    Arguments that are not decodable JSON (an empty string for a call without
+    parameters, a string cut off by a broken stream, unescaped inner quotes)
+    are shown to the model as an empty object. Rejecting them made the whole
+    conversation fail with a 400 on every later turn, because the bad call
+    stays in the client's history (same recovery as vLLM #48922). A VALID
+    JSON value that is not an object is still a client error.
+    """
     try:
         parsed_arguments = orjson.loads(arguments)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError(
-            "Assistant tool call function.arguments must be valid JSON."
-        ) from exc
+    except orjson.JSONDecodeError:
+        logger.warning(
+            "Assistant tool call function.arguments is not valid JSON "
+            "(%d chars, starts %r); showing the call to the model without "
+            "arguments.",
+            len(arguments),
+            arguments[:80],
+        )
+        return {}
 
     if not isinstance(parsed_arguments, dict):
         raise ValueError(
