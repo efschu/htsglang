@@ -21079,6 +21079,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser(prog="flliper serve")
     ServerArgs.add_cli_args(parser)
 
+    # --print-config: print the effective arguments as a command line and exit
+    # (flliper.srt.server_args_print). Not a ServerArgs field, so it is taken
+    # off argv here.
+    print_config = "--print-config" in argv
+    argv = [token for token in argv if token != "--print-config"]
+
     # Check for config file and merge arguments if present
     if "--config" in argv:
         # Import here to avoid circular imports
@@ -21108,7 +21114,20 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    if print_config:
+        import sys
+
+        from flliper.srt.server_args_print import render_effective_cli
+
+        def make_parser() -> argparse.ArgumentParser:
+            fresh = argparse.ArgumentParser(prog="flliper serve")
+            ServerArgs.add_cli_args(fresh)
+            return fresh
+
+        print("\n".join(render_effective_cli(make_parser, server_args.redacted_dict())))
+        sys.exit(0)
+    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233
