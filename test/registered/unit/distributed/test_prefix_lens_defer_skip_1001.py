@@ -122,10 +122,10 @@ def test_run_batch_decides_before_a_forward_but_not_before_a_skip(dist):
     import types
 
     plc.assert_prefix_lens_rank_uniform([0, 2048], defer=True)
-    skip = types.SimpleNamespace(pdflip_skip_extend=True)
+    skip = types.SimpleNamespace(pdflip_skip_extend=True, mixed_verify_decode=None)
     assert Scheduler.run_batch(_sched_stub(), skip) == "ran"
     assert plc.has_deferred()                        # the skip's own pass does not wait
-    decode = types.SimpleNamespace(pdflip_skip_extend=False)
+    decode = types.SimpleNamespace(pdflip_skip_extend=False, mixed_verify_decode=None)
     assert Scheduler.run_batch(_sched_stub(), decode) == "ran"
     assert not plc.has_deferred() and dist.events[-1] == "wait"
 

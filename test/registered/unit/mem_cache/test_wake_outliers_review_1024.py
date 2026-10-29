@@ -130,7 +130,7 @@ def test_run_batch_raising_still_ends_the_launch(wcd, monkeypatch):
     monkeypatch.setenv(wcd.ENV_MAX_MS, "50")
     assert wcd.arm(has_work=True)
     with pytest.raises(RuntimeError, match="forward failed"):
-        raw(fake, types.SimpleNamespace())
+        raw(fake, types.SimpleNamespace(mixed_verify_decode=None))
     assert wcd.state()["in_launch"] is False
     t0 = time.monotonic()
     wcd.wait("x")

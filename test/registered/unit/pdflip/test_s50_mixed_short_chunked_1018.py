@@ -48,6 +48,7 @@ def _fake_sched(chunked_req=None, others=()):
     return types.SimpleNamespace(
         server_args=types.SimpleNamespace(tp_prefill_max_tokens=RIEGEL),
         chunked_req=chunked_req,
+        _mixed_verify=False,   # MIXED-VERIFY off: the gate's collective stays the single ``[mine]`` flag
         _pdflip_group_min_flags=_Group(others),
     )
 

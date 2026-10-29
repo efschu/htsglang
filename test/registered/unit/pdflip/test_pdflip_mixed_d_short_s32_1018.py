@@ -320,7 +320,8 @@ def test_non_overlap_spec_tail_uses_request_state():
 
 
 def test_call_edge_non_overlap_spec_stashes_the_tails_pending_token():
-    src = ast.unparse(_fn(_tree("managers/scheduler.py"), "_get_new_batch_prefill_raw"))
+    # MIXED-VERIFY (29.10.): the mix block moved to ``_fold_running_into_prefill`` (tail form unchanged, same order)
+    src = ast.unparse(_fn(_tree("managers/scheduler.py"), "_fold_running_into_prefill"))
     i = src.index("new_batch.mix_with_running(running_batch)")
     tail = src[i:i + 900]
     assert "if not self.enable_overlap and (not self.spec_algorithm.is_none()):" in tail
