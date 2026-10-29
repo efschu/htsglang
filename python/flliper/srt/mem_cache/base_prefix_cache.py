@@ -444,6 +444,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def note_waiting_queue(self, waiting_queue: List[Any]) -> None:
+        """Once per scheduling round: hand the waiting queue to a queue-aware eviction strategy.
+        No-op for caches without one (27b-queue-evict-1029)."""
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass

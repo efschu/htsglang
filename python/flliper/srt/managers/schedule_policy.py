@@ -423,6 +423,9 @@ class SchedulePolicy:
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
+        # 27b-queue-evict-1029: the queue-aware eviction strategy reads the order lazily at its next
+        # eviction pass (after the sort below), so handing the list over first is enough
+        self.tree_cache.note_waiting_queue(waiting_queue)
 
         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
         # set it in _compute_prefix_matches; do the same full match for

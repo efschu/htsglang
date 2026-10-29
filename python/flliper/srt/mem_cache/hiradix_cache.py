@@ -1443,6 +1443,7 @@ class HiRadixCache(RadixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
+        self.eviction_strategy.note_eviction_run()
         if self.cache_controller.write_policy == "write_back":
             num_evicted = self._evict_write_back(num_tokens)
         else:
@@ -1590,6 +1591,7 @@ class HiRadixCache(RadixCache):
         return freed_device
 
     def evict_host(self, num_tokens: int):
+        self.eviction_strategy.note_eviction_run()
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves

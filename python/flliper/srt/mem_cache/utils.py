@@ -49,6 +49,7 @@ from flliper.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
+    QueueAwareStrategy,
     SLRUStrategy,
 )
 
@@ -60,11 +61,15 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
     "filo": FILOStrategy,
     "priority": PriorityStrategy,
     "slru": SLRUStrategy,
+    "queue_aware": QueueAwareStrategy,
 }
 
 
 def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
     policy = eviction_policy.lower()
+    # 27b-queue-evict-1029: the default policy is upgraded behind FLLIPER_EVICT_POLICY_QUEUE_AWARE
+    if policy == "lru" and envs.FLLIPER_EVICT_POLICY_QUEUE_AWARE.get():
+        policy = "queue_aware"
     try:
         return _EVICTION_POLICY_FACTORIES[policy]()
     except KeyError:

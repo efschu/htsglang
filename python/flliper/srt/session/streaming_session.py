@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
@@ -441,6 +441,9 @@ class StreamingSession(BasePrefixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
+
+    def note_waiting_queue(self, waiting_queue: List[Any]) -> None:
+        self.inner.note_waiting_queue(waiting_queue)
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.try_inc_lock_ref(node)

@@ -3614,6 +3614,11 @@ class Envs:
     FLLIPER_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     FLLIPER_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     FLLIPER_RADIX_FORCE_MISS = EnvBool(False)
+    # 27b-queue-evict-1029: radix_eviction_policy=lru becomes QueueAwareStrategy (evict_policy.py) --
+    # what no waiting request needs leaves first, then the waiters' prefixes the queue needs LATEST.
+    # Order of eviction only, nothing computed changes. Default ON: offline simulation
+    # (devtools/evict_sim_queue_aware_1029.py) not worse than LRU in any cell. 0 = plain LRU.
+    FLLIPER_EVICT_POLICY_QUEUE_AWARE = EnvBool(True)
     FLLIPER_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     FLLIPER_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     FLLIPER_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)

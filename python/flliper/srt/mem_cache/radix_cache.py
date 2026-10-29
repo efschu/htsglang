@@ -566,12 +566,16 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
+    def note_waiting_queue(self, waiting_queue: List[Any]) -> None:
+        self.eviction_strategy.note_waiting_queue(waiting_queue)
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
+        self.eviction_strategy.note_eviction_run()
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves

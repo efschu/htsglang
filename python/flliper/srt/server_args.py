@@ -354,7 +354,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "queue_aware"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]

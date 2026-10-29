@@ -2905,6 +2905,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self._insert_helper(self.root_node, key, value, params)
         return result
 
+    def note_waiting_queue(self, waiting_queue: List[Any]) -> None:
+        self.eviction_strategy.note_waiting_queue(waiting_queue)
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -2915,6 +2918,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # outermost one): L3-DROP and the UD branch of every leaf of the peel draw on the same budget.
         _depth = getattr(self, "_pdflip_l3_chain_depth", 0)
         if _depth == 0:
+            self.eviction_strategy.note_eviction_run()  # 27b-queue-evict-1029: one pass = the outermost call
             UnifiedRadixCache._pdflip_l3_drain_budget_reset(self)
             # S39: the tokens this peel asks for bound what TP0 queues for its broadcast drop ([need, queued])
             self._s39_peel = [int(getattr(params, "num_tokens", 0) or 0), 0]
@@ -4904,6 +4908,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
+        self.eviction_strategy.note_eviction_run()
         tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
         comp = self.components.get(component_type)
         if comp is not None:
