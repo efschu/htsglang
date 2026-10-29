@@ -58,6 +58,7 @@ try:
 except:
     StructuralTag = Any
 
+from flliper.srt.entrypoints.openai.text_sanitize import scrub_lone_surrogates
 from flliper.srt.sampling.thinking_budget import validate_thinking_budget
 from flliper.utils import convert_json_schema_to_str
 
@@ -680,6 +681,13 @@ class FunctionResponse(BaseModel):
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
 
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def _scrub_lone_surrogates(cls, value):
+        # A broken emoji in parsed arguments would make the response encoder
+        # raise (500); see text_sanitize.
+        return scrub_lone_surrogates(value)
+
 
 class ToolCall(BaseModel):
     """Tool call response."""
@@ -967,6 +975,17 @@ class ChatCompletionRequest(BaseModel):
         # Same contract as SamplingParams.verify and vLLM's
         # validate_thinking_token_budget: -1 normalizes to "no budget".
         return validate_thinking_budget(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _scrub_lone_surrogates_in_input(cls, values):
+        # A lone surrogate from a JSON "\\ud83d" escape cannot be tokenized
+        # (TypeError -> 500 on every later turn); see text_sanitize.
+        if isinstance(values, dict):
+            for key in ("messages", "tools"):
+                if key in values:
+                    values[key] = scrub_lone_surrogates(values[key])
+        return values
 
     @model_validator(mode="before")
     @classmethod
