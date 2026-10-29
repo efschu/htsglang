@@ -112,7 +112,7 @@ def test_no_exact_count_no_cap_or_image_request_passes(monkeypatch):
 def test_wiring_gate_runs_before_any_verdict_seat_or_pending():
     src = inspect.getsource(F)
     g = src.index("_ol_refusal = self._overlong_gate(rid, request.path, _xx)")
-    assert src.index("_ctx_refusal = self._context_gate(rid, text, _xx, est_prompt)") < g
+    assert src.index("_ctx_refusal = self._context_gate(rid, text, _xx, est_prompt, path=request.path)") < g
     assert g < src.index("route = serviceable_route(remainder, carrier_est,")
     assert g < src.index("p = Pending(rid, request.path, payload, text, time.time(), fut,")
 

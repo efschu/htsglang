@@ -8647,7 +8647,7 @@ class Front:
                 return int(kv)
         return ctx
 
-    def _context_gate(self, rid: str, text: str, xx: Any, est_prompt: int):
+    def _context_gate(self, rid: str, text: str, xx: Any, est_prompt: int, path: str = ""):
         """400 for a request the groups would refuse as over-context, else None."""
         uri_chars = 0
         if "data:image/" in text:
@@ -8678,6 +8678,12 @@ class Front:
         logger.warning("PDFLIP CONTEXT-GATE REFUSED rid=%s tokens=%d ctx=%d by=%s (400 before any "
                        "route, seat, flip or park -- the groups refuse it anyway)",
                        rid, tokens, ctx, how)
+        if path == "/v1/messages":
+            # Claude Code compacts its history only on this wording (``prompt is too long: N tokens > M maximum``) in the
+            # Anthropic error object; the OpenAI-shaped body below left it with a plain 400 and no way to shrink the prompt
+            return web.json_response({"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": f"prompt is too long: {tokens} tokens > {ctx} maximum"}}, status=400)
         return web.json_response({"error": {
             "message": (f"The input ({tokens} tokens) is longer than the model's context "
                         f"length ({ctx} tokens)."),
@@ -12611,7 +12617,7 @@ class Front:
                     store_span = int(_xx.depth_hint)
         # CONTEXT-GATE (y7i e7a70285bd, 11:32-11:33Z): an over-context request
         # is answered 400 HERE -- before any verdict, seat, flip or park.
-        _ctx_refusal = self._context_gate(rid, text, _xx, est_prompt)
+        _ctx_refusal = self._context_gate(rid, text, _xx, est_prompt, path=request.path)
         if _ctx_refusal is not None:
             Front._pb_resolve(self, rid, _pb_fut, "none", 0)
             return _ctx_refusal
