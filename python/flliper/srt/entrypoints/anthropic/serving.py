@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
@@ -107,6 +108,30 @@ STOP_REASON_MAP = {
 # Cadence for keep-alive ``ping`` events on an otherwise silent stream.
 # Module-level so tests can shorten it; read at runtime, never captured.
 PING_INTERVAL_SECONDS = 5.0
+
+
+# The two refusals of an input that does not fit the context: the tokenizer
+# manager ("The input (N tokens) is longer than the model's context length (M
+# tokens).") and the scheduler ("Input length (N tokens) exceeds the maximum
+# allowed length (M tokens). ...").
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"(?:The input|Input length) \((\d+) tokens\) (?:is longer than the model's "
+    r"context length|exceeds the maximum allowed length) \((\d+) tokens\)"
+)
+
+
+def _prompt_too_long_message(message: str) -> Optional[str]:
+    """Anthropic's wording for an input that does not fit, or None.
+
+    Claude Code recognises the overflow by ``prompt is too long: N tokens > M
+    maximum`` (the real API's message; vLLM #59617 does the same) and only
+    then compacts the conversation. Our own wording is unknown to it, so the
+    session stayed stuck on the same error.
+    """
+    match = _CONTEXT_OVERFLOW_RE.search(message)
+    if match is None:
+        return None
+    return f"prompt is too long: {match.group(1)} tokens > {match.group(2)} maximum"
 
 
 class ToolCallAssemblyError(Exception):
@@ -1498,6 +1523,9 @@ class AnthropicServing:
             content_block_start has no matching content_block_stop, so
             the close step is mandatory even on the error path.
             """
+            too_long = _prompt_too_long_message(message)
+            if too_long is not None and error_type == "invalid_request_error":
+                message = too_long
             frames: list[str] = []
             frames.extend(_ensure_message_started(None))
             for event in _close_content_block_events():
@@ -2104,6 +2132,10 @@ class AnthropicServing:
         provided — is logged at WARNING level so operators can still grep
         server-side, but it never reaches the wire.
         """
+        if status_code == 400:
+            too_long = _prompt_too_long_message(message)
+            if too_long is not None:
+                error_type, message = "invalid_request_error", too_long
         if exception_name:
             logger.warning(
                 "Anthropic error response %s (exception=%s): %s",
