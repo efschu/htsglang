@@ -61,23 +61,22 @@ def armed(
     return not (dp_attention or two_batch_overlap or pdmux)
 
 
-def refusal_reason(*, n_running: int, has_grammar: bool, spec_state_ok: bool) -> str:
+def refusal_reason(*, n_running: int, has_grammar: bool, spec_state_ok: bool, pp_size: int = 1) -> str:
     """Census name of the rank-local eligibility (first matching term); "" = this rank says yes.
 
     ``has_grammar``: a running request holds a grammar (overlap + spec + grammar syncs the loop per decode batch,
     ``Scheduler.is_disable_overlap_for_batch``: the 1-token-tail path keeps its old behaviour there).
-    ``spec_state_ok``: the running batch carries a ``DFlashDraftInputV2`` (the worker's decode branch raises on anything else)."""
+    ``spec_state_ok``: the running batch carries a ``DFlashDraftInputV2`` (the worker's decode branch raises on anything else).
+    ``pp_size``: the pipeline width NOW (a phase-flip process changes layout at run time; :func:`armed` read it once at init)."""
     if int(n_running) <= 0:
         return "no_running"
+    if int(pp_size) != 1:
+        return "pp_layout"
     if has_grammar:
         return "grammar"
     if not spec_state_ok:
         return "no_draft_state"
     return ""
-
-
-def local_eligible(*, n_running: int, has_grammar: bool, spec_state_ok: bool) -> bool:
-    return refusal_reason(n_running=n_running, has_grammar=has_grammar, spec_state_ok=spec_state_ok) == ""
 
 
 def decide(gate_verdict: int, mv_verdict: int, armed_here: bool) -> bool:

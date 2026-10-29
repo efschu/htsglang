@@ -148,6 +148,9 @@ class SpeculativeAlgorithm(Enum):
         next draft input read batch.seq_lens, which resolve_mixed_spec_tails rebuilds for the tail rows) --
         the same shape as upstream's DFLASH hunk. Only group D arms it (scheduler ``_mixed_d_short``); the
         explicit ``--enable-mixed-chunk`` stays forced off by ``speculative_hook._handle_dflash``.
+        MIXED-VERIFY (29.10., ``pdflip/mixed_verify.py``): on DFLASH the gate's yes no longer folds the decodes in as 1-token tails
+        (1 token per row, draft state dropped) -- the decode batch runs its own speculative round and the prefill batch follows in the
+        same scheduler pass (``FLLIPER_PDFLIP_MIXED_VERIFY=0`` = the tail form described here).
         Rollback: ``FLLIPER_PDFLIP_MIXED_D_SHORT=0``. GPU-only risks (window pool with 1-token tail rows,
         DCP, mamba extra_buffer tracking of tails): named in deskq/done/27b-r2kurz-rc40-1024.md.
         """

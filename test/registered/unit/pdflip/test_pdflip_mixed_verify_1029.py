@@ -72,9 +72,12 @@ def test_eligibility_terms_and_their_order():
     DFlashDraftInputV2 would raise in the worker's decode branch. Red if a term is dropped or the census names move."""
     ok = dict(n_running=3, has_grammar=False, spec_state_ok=True)
     assert mv.refusal_reason(**ok) == ""
+    assert mv.refusal_reason(**{**ok, "n_running": 1}) == ""              # a single decode request is a full decode batch
     assert mv.refusal_reason(**{**ok, "n_running": 0}) == "no_running"
     assert mv.refusal_reason(**{**ok, "has_grammar": True}) == "grammar"
     assert mv.refusal_reason(**{**ok, "spec_state_ok": False}) == "no_draft_state"
+    assert mv.refusal_reason(**{**ok, "pp_size": 3}) == "pp_layout"        # a flip process that is in its PP layout NOW
+    assert mv.refusal_reason(**{**ok, "pp_size": 1}) == ""
     assert mv.refusal_reason(n_running=0, has_grammar=True, spec_state_ok=False) == "no_running"   # first matching term
 
 
@@ -97,6 +100,7 @@ class _Batch:
         self.calls = []
         self.batch_is_full = False
         self.req_pool_indices = "rpi-" + name
+        self.spec_info = "draft-state-" + name   # the DFlashDraftInputV2 of the round; mix_with_running would null it
         self.mixed_verify_decode = None
         self.decoding_reqs = "unset"
         self.extend_num_tokens = 100
@@ -140,6 +144,7 @@ def test_mixed_verify_pass_keeps_the_decode_batch_a_decode_batch():
     new, run = _Batch(2, "new"), _Batch(3, "run")
     out = fold(s, new, run)
     assert out is run                                         # the decode batch stays the running batch of the pass
+    assert run.spec_info == "draft-state-run" and run.req_pool_indices == "rpi-run" and len(run.reqs) == 3   # rows + draft state untouched
     assert new.mixed_verify_decode is run                     # ... and rides the prefill batch into run_batch
     assert new.decoding_reqs is None                          # no tail rows: the result processor never takes the tail branch
     assert run.calls == ["filter_batch", "prepare_for_decode"]
@@ -204,6 +209,7 @@ def _agree_sched(mixed_verify, flags_reply, spec_ok=True, grammar=False):
         _mixed_verify_pass=False,
         chunked_req=None,
         server_args=types.SimpleNamespace(tp_prefill_max_tokens=6000),
+        ps=types.SimpleNamespace(pp_size=1),
     )
     s._pdflip_group_min_flags = mock.Mock(side_effect=lambda f: flags_reply(f))
     s._mixed_verify_refusal = lambda rb: Scheduler._mixed_verify_refusal(s, rb)
@@ -277,9 +283,11 @@ def _run_sched():
     s = mock.MagicMock()
     s.run_batch = lambda b, pp=None: Scheduler.run_batch(s, b, pp)
     order = []
+    s.seen = []
 
     def forward(b, pp=None):
         order.append(b.name)
+        s.seen.append(b)
         return "result-" + b.name
 
     s._run_batch_forward = forward
@@ -303,6 +311,7 @@ def test_run_batch_launches_the_decode_round_first_then_the_prefill_and_pairs_th
     pre = _sb("pre", ForwardMode.EXTEND, decode=dec)
     result = s.run_batch(pre)
     assert order == ["dec", "pre"]
+    assert s.seen[0] is dec and s.seen[1] is pre              # the decode batch goes through the funnel as ITSELF, unwrapped, unmerged
     assert result == "result-pre"
     assert pre.mixed_verify_decode is None
     assert pre.mixed_verify_pair[0].name == "dec.copy" and pre.mixed_verify_pair[1] == "result-dec"

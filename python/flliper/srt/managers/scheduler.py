@@ -15462,6 +15462,7 @@ class Scheduler(
             n_running=len(running_batch.reqs),
             has_grammar=bool(running_batch.has_grammar),
             spec_state_ok=isinstance(running_batch.spec_info, DFlashDraftInputV2),
+            pp_size=self.ps.pp_size,
         )
 
     def _can_schedule_lora_req(
