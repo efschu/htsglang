@@ -372,3 +372,18 @@ def test_mamba_track_of_the_prefill_rows_survives_the_merge_and_tails_get_no_tra
     ScheduleBatch.mix_with_running(new, running)
     assert new.mamba_track_mask.tolist() == [True, False]
     assert new.mamba_track_indices.tolist() == [9, 0] and new.mamba_track_seqlens.tolist() == [2, 0]
+
+
+def test_always_arm_mixes_every_size_on_group_d_only(monkeypatch):
+    """29.10. re-measurement arm (user: "das D layout ohne flip mit mixed immer an"): ``FLLIPER_PDFLIP_MIXED_D_ALWAYS=1`` opens the
+    gate for any u, no halbX and a big chunked request included -- the D-only boot has no front, so without the arm the gate never
+    opens. P (X = 0) and an E2 hand-off stay out. Default OFF: the flip forms keep the R2 gate (u < halbX) byte for byte."""
+    assert envs.FLLIPER_PDFLIP_MIXED_D_ALWAYS.default is False
+    assert mds.short_gate(10 * X, X, 0, True) is False                      # off: no halbX, big chunk -> never
+    monkeypatch.setenv("FLLIPER_PDFLIP_MIXED_D_ALWAYS", "1")
+    assert mds.always() is True
+    assert mds.short_gate(10 * X, X, 0, True) is True                       # on: any size, no halbX, chunked
+    assert mds.short_gate(10, 0, HX, False) is False                        # P / no riegel stays out
+    assert mds.short_gate(10, X, HX, False, no_forward=True) is False      # E2 END-state hand-off: no target forward
+    assert mds.refusal_reason(10 * X, X, 0, True, False, True) == ""
+    assert mds.refusal_reason(10 * X, X, 0, True, False, False) == "local_block"

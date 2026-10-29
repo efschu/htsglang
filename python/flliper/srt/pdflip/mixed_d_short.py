@@ -81,12 +81,21 @@ def short_gate(u_tokens: int, x_tokens: int, half_x_tokens: int, chunked: bool, 
     ``x_tokens`` <= 0 = not group D (P: no riegel). ``half_x_tokens`` = :func:`batch_half_x` (the front's halbX, 0 = none
     carried -> never). ``chunked`` = a BIG chunked request in or behind this batch (:func:`chunked_big`, R6 rest;
     S50: a chunked request whose whole uncached amount is under halbX is short). ``no_forward`` = an E2 hand-off."""
+    if always():
+        return int(x_tokens) > 0 and not no_forward
     if int(x_tokens) <= 0 or chunked or no_forward:
         return False
     hx = int(half_x_tokens)
     if hx <= 0:
         return False
     return int(u_tokens) < hx
+
+
+def always() -> bool:
+    """Measurement arm (user 29.10.): mix every D prefill batch, any size (D-only boot, no halbX). Default OFF."""
+    from flliper.srt.environ import envs
+
+    return bool(envs.FLLIPER_PDFLIP_MIXED_D_ALWAYS.get())
 
 
 def chunked_enabled() -> bool:
@@ -157,6 +166,8 @@ def refusal_reason(u_tokens: int, x_tokens: int, half_x_tokens: int, chunked: bo
         return "not_d"
     if no_forward:
         return "e2_handoff"
+    if always():
+        return "" if local_ok else "local_block"
     if chunked:
         return "big_chunk"
     if int(half_x_tokens) <= 0:

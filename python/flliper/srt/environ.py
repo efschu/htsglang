@@ -2702,6 +2702,12 @@ class Envs:
     # A request whose total is >= halbX stays BIG: none of its chunks mixes (R3 timer end, R6 rest), as before.
     # New feature -> default ON; 0 = any chunked request blocks the mix (S32 form), byte for byte.
     FLLIPER_PDFLIP_MIXED_D_SHORT_CHUNKED = EnvBool(True)
+    # MIXED-D ALWAYS (user 29.10. "das D layout ohne flip mit mixed immer an", re-measurement of mixed chunk on 27B int8):
+    # every prefill batch on group D folds the running decodes in, whatever its size (no halbX, no chunk-big test) -- the
+    # arm for a D-only boot (`--d-only`: no front, so no halbX is ever carried and the SHORT gate never opens). Still needs
+    # tp_prefill_max_tokens > 0 (group D), never an E2 END-state hand-off. Measurement arm: default OFF so the flip forms keep
+    # the SOLL R2 gate; set 1 in the D env of the D-only boot. Census reason `always` on the MIXED-D CENSUS line.
+    FLLIPER_PDFLIP_MIXED_D_ALWAYS = EnvBool(False)
     # MIXED-D CENSUS (S50): every this many gate decisions one line "MIXED-D CENSUS" with the mixed share and the refusal
     # reasons (big_chunk / no_halfx / u_ge_halfx / e2_handoff / local_block / group_veto). 0 = no census line.
     FLLIPER_PDFLIP_MIXED_D_CENSUS_N = EnvInt(64)
