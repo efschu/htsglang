@@ -66,6 +66,7 @@ from flliper.srt.speculative.draft_worker_common import (
 )
 from flliper.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.srt.speculative.dflash_accept_agree import AGREEMENT_ROUNDS, resolve_triton_accept
 from flliper.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from flliper.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
@@ -707,6 +708,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._accept_sync_fused = accept_sync_fused_on()
         self._accept_bonus_flats: List[torch.Tensor] = []
         self._accept_bonus_last_flat: Optional[torch.Tensor] = None
+        # 27b-accept-rank-uniform-1030: rounds in which the TP group agrees whether the Triton accept kernel worked
+        self._accept_agree_rounds_left = AGREEMENT_ROUNDS
         if self._early_draft:
             logger.info(
                 "DGAP-EARLY-DRAFT armed (FLLIPER_PDFLIP_D_EARLY_DRAFT=1): a deferred "
@@ -4325,6 +4328,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 except Exception as _e:  # noqa: BLE001
                     logger.warning("#1488 n/a (%s: %s)", type(_e).__name__, _e)
             if self._use_triton_accept_bonus:
+                triton_error = None
                 try:
                     (
                         accept_len,
@@ -4343,7 +4347,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                         prefix_lens=prefix_lens,
                         new_seq_lens_out=new_seq_lens,
                     )
-                    # #1485b: the decisions this kernel derived, group-wide
+                except Exception as e:
+                    triton_error = e
+                # 27b-accept-rank-uniform-1030: ONE verdict for the whole TP group (see dflash_accept_agree)
+                triton_ok, self._accept_agree_rounds_left = resolve_triton_accept(
+                    error=triton_error,
+                    rounds_left=self._accept_agree_rounds_left,
+                    reduce_min=self._tp_sync.verdict_reducer(),
+                )
+                if triton_ok:
+                    # #1485b: the decisions this kernel derived, group-wide. The broadcasts sit OUTSIDE the try: a
+                    # collective error must not turn into a rank-local eager fallback.
                     if self._accept_sync_fused:
                         # FLLIPER_DFLASH_ACCEPT_SYNC_FUSED: the five outputs are
                         # views of this slot's flat buffer -- one broadcast.
@@ -4354,11 +4368,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     else:
                         for _t in (accept_len, commit_lens, bonus, out_tokens, new_seq_lens):
                             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, _t)
-                except Exception as e:
+                else:
                     self._use_triton_accept_bonus = False
                     logger.warning(
-                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
-                        e,
+                        "DFLASH Triton accept/bonus not usable on every rank; eager path from here on: %s",
+                        triton_error,
                     )
                     accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                         candidates=candidates,
